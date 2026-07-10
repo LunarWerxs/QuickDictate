@@ -34,10 +34,11 @@ use crate::state::App;
 /// "Latest release" endpoint: the Connections Studio proxy, which relays
 /// GitHub's `releases/latest` JSON for LunarWerxs/QuickDictate **verbatim**
 /// (so parsing here is unchanged from the GitHub API) and logs one anonymous
-/// analytics row per hit as an install-count statistic — no personal data,
-/// 90-day retention; the request carries the `X-Install-Id` header resolved
-/// by [`init_install_id`] plus the app version (`?v=`, for anonymous
-/// version-adoption stats). See SECURITY.md for the full disclosure. Release
+/// analytics row per hit as an install-count statistic — random id, version,
+/// and coarse CDN-derived geo, never the caller's IP; 90-day retention. The
+/// request carries the `X-Install-Id` header resolved by [`init_install_id`]
+/// plus the app version (`?v=`, for anonymous version-adoption stats). See
+/// SECURITY.md for the full disclosure. Release
 /// *binaries* still download straight from GitHub via the asset URLs in the
 /// payload. On any failure the check reports Failed — which the auto path
 /// treats as silence.

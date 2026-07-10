@@ -50,7 +50,7 @@ a terminal, any web text field. It runs on <i>your own</i> speech-to-text API ke
 | ✋ **Hold or tap** | Hold a key while you talk, or tap to start and stop. Both are configurable. |
 | 💬 **Streams as you speak** | Words appear live as you talk on the streaming providers. |
 | 🪄 **Little touches that add up** | A fix-list for words it mishears, per-app profiles, and a *"scratch that"* voice command. |
-| 🔒 **One anonymous ping, that's it** | Nothing leaves your machine except your dictation audio (to the provider you picked), the optional daily update check — which goes to LunarWerx's update endpoint and doubles as an anonymous install count (a random id and the app version, no personal data, 90-day retention; details in [SECURITY.md](.github/SECURITY.md)) — and, only if you opt in, Connections settings sync (preferences only, never keys/audio). Turn off *Check for updates daily* and even the ping stops. |
+| 🔒 **One anonymous ping, that's it** | Nothing leaves your machine except your dictation audio (to the provider you picked), the optional daily update check — which goes to LunarWerx's update endpoint and doubles as an anonymous install count (a random id, the app version, and an approximate IP-derived region — never the IP itself or any direct identifier — with 90-day retention; details in [SECURITY.md](.github/SECURITY.md)) — and, only if you opt in, Connections settings sync (preferences only, never keys/audio). Turn off *Check for updates daily* and even the ping stops. |
 
 ## 🚀 Quick start
 
