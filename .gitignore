@@ -1,0 +1,54 @@
+# Rust build output (massive; regenerated on `cargo build`).
+/target/
+
+# Local runtime/tooling output.
+/.saydeploy/
+/.vscode/
+/.idea/
+
+# Per-run files written next to the exe.
+quickdictate.log
+quickdictate-panic.log
+quickdictate-dev-port.txt
+quickdictate-update.txt
+
+# Connections settings-sync: DPAPI-sealed refresh token (machine+user bound).
+# Never plaintext, never committed.
+quickdictate-connections.dat
+
+# Self-update leftovers (old/new exe during the in-place swap).
+*.old
+*.new
+
+# The user's REAL config may contain their own API keys — never commit it.
+# Ship settings.example.json (empty keys) as the template instead.
+settings.json
+
+# Secrets / env.
+# `*.env` is broad on purpose: any local env file holding keys (my.keys.env,
+# *.local.env, etc.) is ignored by default so no credential can slip in.
+.env
+*.env
+*.pem
+*.key
+
+# Packaged artifacts / loose binaries.
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.exe
+
+# Generated test audio (recreate with scripts/gen_test_audio.ps1). The live
+# provider tests are #[ignore] + need real keys, so these aren't needed in CI.
+tests/fixtures/*.wav
+
+# Headless UI screenshots (scripts/ui_shot.ps1) — dev-only artifacts.
+ui-shot*.png
+ui-*.png
+
+# Backups / editor cruft.
+**/*.rs.bk
+**/*.rs.b4
+*~

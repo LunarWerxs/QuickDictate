@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt · clippy · build · test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust (stable + rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Clippy (google feature)
+        run: cargo clippy --all-targets --features google -- -D warnings
+
+      - name: Build release (default)
+        run: cargo build --release
+
+      - name: Build release (google feature)
+        run: cargo build --release --features google
+
+      # Unit tests only. The live provider tests are #[ignore] — they need real
+      # API keys + network and are run locally, never in CI.
+      - name: Test
+        run: cargo test --features google

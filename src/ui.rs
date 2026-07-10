@@ -1,0 +1,580 @@
+//! Tray icon + cursor-following status pip.
+//!
+//! The pip is a layered window rendered via `UpdateLayeredWindow` with a
+//! 32-bit premultiplied-alpha DIB. That gives us a *real* anti-aliased
+//! circle (and anti-aliased text) -- the previous `Ellipse` + `LWA_COLORKEY`
+//! approach could only produce 1-bit alpha, which read as a chunky octagon.
+
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Result;
+use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
+use tray_icon::{TrayIcon, TrayIconBuilder};
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{
+    COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
+};
+use windows::Win32::Graphics::Gdi::{
+    CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, DrawTextW, GetDC,
+    ReleaseDC, SelectObject, SetBkMode, SetTextColor, AC_SRC_ALPHA, AC_SRC_OVER,
+    ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, CLIP_DEFAULT_PRECIS,
+    DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, FW_BOLD,
+    HBITMAP, HDC, OUT_DEFAULT_PRECIS, TRANSPARENT, VARIABLE_PITCH,
+};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::WindowsAndMessaging::HMENU;
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCursorPos, LoadCursorW, PeekMessageW,
+    PostQuitMessage, RegisterClassExW, ShowWindow, TranslateMessage, UpdateLayeredWindow,
+    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, IDC_ARROW, MSG, PM_REMOVE, SW_HIDE, SW_SHOWNA,
+    ULW_ALPHA, WM_DESTROY, WM_QUIT, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+};
+
+use crate::state::{App, Status};
+
+const PIP_SIZE: i32 = 48;
+const PIP_OFFSET_X: i32 = 18;
+const PIP_OFFSET_Y: i32 = 18;
+
+pub fn spawn(app: Arc<App>) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("qd-ui".into())
+        .spawn(move || {
+            if let Err(e) = run(app) {
+                tracing::error!("ui thread: {e:#}");
+            }
+        })
+        .expect("spawn ui thread")
+}
+
+fn run(app: Arc<App>) -> Result<()> {
+    let tray_state = build_tray()?;
+    let menu_rx = MenuEvent::receiver();
+
+    let overlay = unsafe { Overlay::create(PIP_SIZE)? };
+    tracing::info!("overlay hwnd={:?}", overlay.hwnd.0);
+
+    let mut last_status = Status::Idle;
+    let mut last_pos: Option<POINT> = None;
+    let mut last_word_count: u32 = u32::MAX;
+    let mut msg = MSG::default();
+    // Rebuild the "Recent transcriptions" submenu only when the history has
+    // actually changed since we last drew it (cheap version counter, see
+    // `TranscriptHistory::version`), not on every poll tick.
+    let mut last_history_version: u64 = u64::MAX;
+
+    // Smoothed display counter — lerps toward the live word count so the pip
+    // animates instead of snapping. Asymmetric rates: fast on the way up
+    // (feels responsive), slow on the way down (damps STT revision jitter).
+    let mut display_count: f32 = 0.0;
+
+    loop {
+        if app.shutdown.load(Ordering::Acquire) {
+            break;
+        }
+
+        while unsafe { PeekMessageW(&mut msg, HWND::default(), 0, 0, PM_REMOVE).as_bool() } {
+            unsafe {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            if msg.message == WM_QUIT {
+                app.shutdown.store(true, Ordering::Release);
+                break;
+            }
+        }
+
+        while let Ok(ev) = menu_rx.try_recv() {
+            // The tray is intentionally minimal — Settings, Recent
+            // transcriptions, and Quit. About / updates / log / JSON editing
+            // all live inside the Settings window now.
+            let id = ev.id().as_ref();
+            if ev.id() == &MenuId::new("settings") {
+                crate::settings_ui::show_settings(Arc::clone(&app));
+            } else if ev.id() == &MenuId::new("quit") {
+                tracing::info!("Quit selected from tray menu");
+                app.shutdown.store(true, Ordering::Release);
+            } else if let Some(idx) = id.strip_prefix("history:") {
+                match idx.parse::<usize>() {
+                    Ok(i) => {
+                        // Clicking a recent transcription copies it to the
+                        // clipboard (the user pastes it themselves) rather than
+                        // auto-pasting into the focused window.
+                        let entry = app.history.lock().get(i);
+                        match entry {
+                            Some(entry) if !entry.text.is_empty() => {
+                                match crate::output::copy_to_clipboard(&entry.text) {
+                                    Ok(()) => tracing::info!(
+                                        "Recent transcriptions: copied entry {i} ({} chars) to clipboard",
+                                        entry.text.chars().count()
+                                    ),
+                                    Err(e) => tracing::warn!(
+                                        "Recent transcriptions: clipboard copy failed: {e:#}"
+                                    ),
+                                }
+                            }
+                            _ => tracing::warn!(
+                                "Recent transcriptions: entry {i} is missing or empty"
+                            ),
+                        }
+                    }
+                    Err(_) => tracing::warn!("bad history menu id: {id}"),
+                }
+            }
+        }
+
+        // Keep the "Recent transcriptions" submenu in sync with the app's
+        // history. Cheap to check every tick (one lock + an integer
+        // compare); only rebuilds the actual menu items when it changed.
+        {
+            let version = app.history.lock().version();
+            if version != last_history_version {
+                let snapshot = app.history.lock().snapshot();
+                tray_state.rebuild_history_menu(&snapshot);
+                last_history_version = version;
+            }
+        }
+
+        let status = app.status();
+        let cfg = app.config.load();
+        let target_count = app.word_count.load(Ordering::Acquire) as f32;
+        let want_visible = cfg.mouse_follower_enabled && status != Status::Idle;
+
+        // Smooth the counter toward the live word count. Asymmetric lerp:
+        // fast counting up (responsive), slow counting down (damps STT
+        // partial-transcript revision jitter so the pip doesn't snap back).
+        if want_visible {
+            let rate = if target_count > display_count {
+                0.50
+            } else {
+                0.15
+            };
+            display_count += (target_count - display_count) * rate;
+        } else {
+            display_count = 0.0;
+        }
+        let smooth_count = display_count.round() as u32;
+
+        unsafe {
+            if want_visible {
+                let mut p = POINT::default();
+                if GetCursorPos(&mut p).is_ok() {
+                    let pos_changed =
+                        !matches!(last_pos, Some(prev) if prev.x == p.x && prev.y == p.y);
+                    let status_changed = status != last_status;
+                    let count_changed = smooth_count != last_word_count;
+                    // Render whenever anything changes — the smoothed counter
+                    // changes most frames during active dictation, giving a
+                    // fluid animation.
+                    if pos_changed || status_changed || count_changed {
+                        overlay.render(
+                            status,
+                            smooth_count,
+                            p.x + PIP_OFFSET_X,
+                            p.y + PIP_OFFSET_Y,
+                        );
+                        last_pos = Some(p);
+                        last_word_count = smooth_count;
+                    }
+                }
+            } else if last_status != Status::Idle || last_pos.is_some() {
+                overlay.hide();
+                last_pos = None;
+                last_word_count = u32::MAX;
+            }
+        }
+        last_status = status;
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    Ok(())
+}
+
+// ===== Tray =====
+
+struct TrayState {
+    _tray: TrayIcon,
+    history_menu: Submenu,
+}
+
+/// Max chars of a transcript to show as a menu item's label before eliding.
+/// Keeps the submenu from stretching off-screen with a long dictation.
+const HISTORY_LABEL_CHARS: usize = 40;
+
+impl TrayState {
+    /// Rebuild the "Recent transcriptions" submenu's items from a fresh
+    /// snapshot. Called only when the history's version counter changes, so
+    /// this isn't on the hot 16ms UI-poll path in the common case.
+    fn rebuild_history_menu(&self, entries: &[crate::state::HistoryEntry]) {
+        // Clear whatever's there now (placeholder or stale entries).
+        while self.history_menu.remove_at(0).is_some() {}
+
+        if entries.is_empty() {
+            let placeholder = MenuItem::with_id(
+                MenuId::new("history:none"),
+                "(no recent transcriptions)",
+                false, // disabled -- informational only
+                None,
+            );
+            let _ = self.history_menu.append(&placeholder);
+            return;
+        }
+
+        for (i, entry) in entries.iter().enumerate() {
+            let age = time_ago(entry.when);
+            let label = format!("{} — {}", elide(&entry.text, HISTORY_LABEL_CHARS), age);
+            let item = MenuItem::with_id(MenuId::new(format!("history:{i}")), label, true, None);
+            let _ = self.history_menu.append(&item);
+        }
+    }
+}
+
+/// Coarse "how long ago" label for a history entry's timestamp, e.g. "just
+/// now", "3m ago", "2h ago". No dependency on a date/time crate -- this is
+/// display-only, so a rough bucket is all we need.
+fn time_ago(when: std::time::SystemTime) -> String {
+    let elapsed = match when.elapsed() {
+        Ok(d) => d,
+        Err(_) => return "just now".to_string(), // clock skew; don't show a negative age
+    };
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        "just now".to_string()
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
+}
+
+/// Trim `s` to at most `max_chars` characters (Unicode scalar count), folding
+/// any internal newlines to spaces first so a multi-line dictation still
+/// reads as one tidy menu-item line.
+fn elide(s: &str, max_chars: usize) -> String {
+    let flat: String = s.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+    let truncated: String = flat.chars().take(max_chars).collect();
+    if flat.chars().count() > max_chars {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
+fn build_tray() -> Result<TrayState> {
+    let version = env!("CARGO_PKG_VERSION");
+    let version_label = format!("QuickDictate v{version}");
+
+    let menu = Menu::new();
+    let settings = MenuItem::with_id(MenuId::new("settings"), "Settings…", true, None);
+    let history_menu = Submenu::new("Recent transcriptions", true);
+    let placeholder = MenuItem::with_id(
+        MenuId::new("history:none"),
+        "(no recent transcriptions)",
+        false,
+        None,
+    );
+    history_menu.append(&placeholder)?;
+    let separator = PredefinedMenuItem::separator();
+    let separator2 = PredefinedMenuItem::separator();
+    let quit = MenuItem::with_id(MenuId::new("quit"), "Quit QuickDictate", true, None);
+    menu.append(&settings)?;
+    menu.append(&separator)?;
+    menu.append(&history_menu)?;
+    menu.append(&separator2)?;
+    menu.append(&quit)?;
+
+    let icon = make_icon();
+    let tray = TrayIconBuilder::new()
+        .with_tooltip(&version_label)
+        .with_icon(icon)
+        .with_menu(Box::new(menu))
+        .build()?;
+    Ok(TrayState {
+        _tray: tray,
+        history_menu,
+    })
+}
+
+fn make_icon() -> tray_icon::Icon {
+    // The tray/notification variant (transparent glyph, not the filled tile — see
+    // `crate::icon`), pre-scaled to 32² so Windows' notification area has a crisp
+    // source to downsample from at any DPI.
+    let (rgba, w, h) = crate::icon::notification_rgba(32);
+    tray_icon::Icon::from_rgba(rgba, w, h).expect("tray icon")
+}
+
+// ===== Layered overlay =====
+
+/// Owns the layered window plus an in-memory 32-bit BGRA bitmap we render
+/// into and then ship to the screen via `UpdateLayeredWindow`. All fields
+/// are accessed only from the UI thread.
+struct Overlay {
+    hwnd: HWND,
+    mem_dc: HDC,
+    bitmap: HBITMAP,
+    pixels: *mut u32,
+    size: i32,
+    visible: std::cell::Cell<bool>,
+}
+
+impl Overlay {
+    unsafe fn create(size: i32) -> Result<Self> {
+        let class_name: Vec<u16> = "QuickDictateOverlay\0".encode_utf16().collect();
+        let h_module = GetModuleHandleW(PCWSTR::null())?;
+        let h_instance = HINSTANCE(h_module.0);
+
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(overlay_wnd_proc),
+            hInstance: h_instance,
+            lpszClassName: PCWSTR(class_name.as_ptr()),
+            hCursor: LoadCursorW(HINSTANCE::default(), IDC_ARROW).unwrap_or_default(),
+            ..Default::default()
+        };
+        let atom = RegisterClassExW(&wc);
+        if atom == 0 {
+            let err = windows::Win32::Foundation::GetLastError();
+            if err.0 != 1410 {
+                anyhow::bail!("RegisterClassExW failed: {:?}", err);
+            }
+        }
+
+        // WS_EX_LAYERED is required for UpdateLayeredWindow; we deliberately
+        // DO NOT call SetLayeredWindowAttributes -- the two APIs are mutually
+        // exclusive on a given window.
+        let ex_style =
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
+        let style = WS_POPUP;
+        let hwnd = CreateWindowExW(
+            ex_style,
+            PCWSTR(class_name.as_ptr()),
+            PCWSTR::null(),
+            style,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            size,
+            size,
+            HWND::default(),
+            HMENU::default(),
+            h_instance,
+            None,
+        )?;
+
+        // 32-bit top-down BGRA DIB section. CreateDIBSection hands us the raw
+        // pixel buffer so we can write directly without GDI's rasterizer.
+        let screen_dc = GetDC(HWND::default());
+        let mem_dc = CreateCompatibleDC(screen_dc);
+        let _ = ReleaseDC(HWND::default(), screen_dc);
+
+        let mut bmi: BITMAPINFO = std::mem::zeroed();
+        bmi.bmiHeader = BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: size,
+            biHeight: -size, // negative => top-down rows
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            biSizeImage: 0,
+            biXPelsPerMeter: 0,
+            biYPelsPerMeter: 0,
+            biClrUsed: 0,
+            biClrImportant: 0,
+        };
+        let mut pixels_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let bitmap = CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut pixels_ptr, None, 0)?;
+        if pixels_ptr.is_null() {
+            anyhow::bail!("CreateDIBSection returned null pixel pointer");
+        }
+        SelectObject(mem_dc, bitmap);
+
+        Ok(Self {
+            hwnd,
+            mem_dc,
+            bitmap,
+            pixels: pixels_ptr as *mut u32,
+            size,
+            visible: std::cell::Cell::new(false),
+        })
+    }
+
+    unsafe fn hide(&self) {
+        if self.visible.get() {
+            let _ = ShowWindow(self.hwnd, SW_HIDE);
+            self.visible.set(false);
+        }
+    }
+
+    /// Software-render the disc + word count into the DIB, then ship it to
+    /// the screen via UpdateLayeredWindow. Pixels are premultiplied BGRA as
+    /// required by ULW_ALPHA.
+    unsafe fn render(&self, status: Status, word_count: u32, screen_x: i32, screen_y: i32) {
+        let total = (self.size * self.size) as usize;
+        let pixels = std::slice::from_raw_parts_mut(self.pixels, total);
+        // Clear to fully transparent.
+        for p in pixels.iter_mut() {
+            *p = 0;
+        }
+
+        // Disc color picked by status. Values are (R, G, B).
+        let (r, g, b) = match status {
+            Status::Idle => return, // window will be hidden; nothing to draw
+            Status::Starting => (0xFA, 0xB0, 0x05), // amber
+            Status::Listening => (0x22, 0xC5, 0x5E), // green
+            Status::Error => (0xEF, 0x44, 0x44), // red
+        };
+        let cx = (self.size as f32 - 1.0) / 2.0;
+        let cy = (self.size as f32 - 1.0) / 2.0;
+        // Leave 1 px gutter so the soft edge doesn't get cropped by the window.
+        let radius_outer = (self.size as f32 / 2.0) - 1.0;
+        // 1 px feather for the anti-aliased edge.
+        let edge = 1.0_f32;
+
+        for y in 0..self.size {
+            for x in 0..self.size {
+                let dx = x as f32 - cx;
+                let dy = y as f32 - cy;
+                let dist = (dx * dx + dy * dy).sqrt();
+                // Smooth alpha: 1.0 inside, ramps to 0 across `edge` pixels at the rim.
+                let a = ((radius_outer - dist) / edge).clamp(0.0, 1.0);
+                if a == 0.0 {
+                    continue;
+                }
+                let alpha = (a * 255.0 + 0.5) as u32;
+                // Premultiplied BGRA: BB GG RR AA stored as 0xAARRGGBB on
+                // little-endian (which Windows expects).
+                let pr = ((r as f32) * a + 0.5) as u32;
+                let pg = ((g as f32) * a + 0.5) as u32;
+                let pb = ((b as f32) * a + 0.5) as u32;
+                let idx = (y * self.size + x) as usize;
+                pixels[idx] = (alpha << 24) | (pr << 16) | (pg << 8) | pb;
+            }
+        }
+
+        // Draw the word count text on top. GDI doesn't touch the alpha channel,
+        // but the disc region we draw on already has alpha=255 in the interior,
+        // so the text inherits full opacity wherever a glyph hits the disc.
+        let label = match status {
+            Status::Error => "!".to_string(),
+            _ => format!("{word_count}"),
+        };
+        let mut label_utf16: Vec<u16> = label.encode_utf16().collect();
+        let font_height = (self.size as f32 * 0.45) as i32;
+        let face: Vec<u16> = "Segoe UI\0".encode_utf16().collect();
+        let font = CreateFontW(
+            -font_height,
+            0,
+            0,
+            0,
+            FW_BOLD.0 as i32,
+            0u32,
+            0u32,
+            0u32,
+            DEFAULT_CHARSET.0 as u32,
+            OUT_DEFAULT_PRECIS.0 as u32,
+            CLIP_DEFAULT_PRECIS.0 as u32,
+            ANTIALIASED_QUALITY.0 as u32,
+            (VARIABLE_PITCH.0 as u32) | (FF_DONTCARE.0 as u32),
+            PCWSTR(face.as_ptr()),
+        );
+        let old_font = SelectObject(self.mem_dc, font);
+        let _ = SetBkMode(self.mem_dc, TRANSPARENT);
+
+        // Drop shadow: 1 px down-right, black.
+        let _ = SetTextColor(self.mem_dc, COLORREF(0x00000000));
+        let mut shadow_rect = RECT {
+            left: 1,
+            top: 1,
+            right: self.size + 1,
+            bottom: self.size + 1,
+        };
+        DrawTextW(
+            self.mem_dc,
+            &mut label_utf16,
+            &mut shadow_rect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
+        // Main text: white.
+        let _ = SetTextColor(self.mem_dc, COLORREF(0x00FFFFFF));
+        let mut text_rect = RECT {
+            left: 0,
+            top: 0,
+            right: self.size,
+            bottom: self.size,
+        };
+        DrawTextW(
+            self.mem_dc,
+            &mut label_utf16,
+            &mut text_rect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
+        SelectObject(self.mem_dc, old_font);
+        let _ = DeleteObject(font);
+
+        // Ship the bitmap to the screen, also moving the window.
+        // UpdateLayeredWindow won't reveal a hidden window -- it only updates
+        // an already-visible one. So show it on first use.
+        let pt_dst = POINT {
+            x: screen_x,
+            y: screen_y,
+        };
+        let sz = SIZE {
+            cx: self.size,
+            cy: self.size,
+        };
+        let pt_src = POINT { x: 0, y: 0 };
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+        if let Err(e) = UpdateLayeredWindow(
+            self.hwnd,
+            HDC::default(),
+            Some(&pt_dst),
+            Some(&sz),
+            self.mem_dc,
+            Some(&pt_src),
+            COLORREF(0),
+            Some(&blend),
+            ULW_ALPHA,
+        ) {
+            tracing::warn!("UpdateLayeredWindow failed: {e}");
+        }
+        if !self.visible.get() {
+            // SW_SHOWNA shows without stealing focus.
+            let _ = ShowWindow(self.hwnd, SW_SHOWNA);
+            self.visible.set(true);
+        }
+    }
+}
+
+impl Drop for Overlay {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DeleteObject(self.bitmap);
+            let _ = DeleteDC(self.mem_dc);
+        }
+    }
+}
+
+unsafe extern "system" fn overlay_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_DESTROY => {
+            PostQuitMessage(0);
+            LRESULT(0)
+        }
+        // No WM_PAINT handler: UpdateLayeredWindow drives all visuals.
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}

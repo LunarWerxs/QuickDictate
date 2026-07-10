@@ -1,0 +1,49 @@
+{
+  "mode": "toggle",
+  "language": "en-US",
+  "toggle_hotkey": "f14",
+  "hold_hotkey": "f13",
+  "reinsert_hold_ms": 1500,
+  "listen_tail_ms": 800,
+  "auto_space": true,
+  "auto_newline": false,
+  "auto_punct": true,
+  "hotkeys_enabled": true,
+  "enable_sound": false,
+  "close_behavior": "minimize",
+  "window_width": 280,
+  "window_height": 140,
+  "window_x": null,
+  "window_y": null,
+  "mouse_follower_enabled": true,
+  "delay_output_till_release": true,
+  "clipboard_restore_delay_ms": 300,
+  "spinner_type": "star_wars",
+  "enable_logging": false,
+  "log_transcripts": false,
+  "max_log_mb": 5,
+
+  "stt_provider": "elevenlabs",
+  "elevenlabs_keys": [],
+  "deepgram_keys": [],
+  "openai_keys": [],
+  "assemblyai_keys": [],
+  "dashscope_keys": [],
+  "google_keys": [],
+  "stt_model": null,
+  "dashscope_intl": false,
+  "update_auto_check": true,
+  "run_at_startup": false,
+  "prewarm_keys": true,
+
+  "enable_text_replacements": true,
+  "text_replacements": {
+    "Chat GPT": "ChatGPT",
+    "Github": "GitHub"
+  },
+
+  "profiles_enabled": true,
+  "profiles": [],
+
+  "voice_commands": false
+}

@@ -1,0 +1,125 @@
+[package]
+name = "quickdictate"
+version = "0.3.0"
+edition = "2021"
+description = "Ultra-low-latency bring-your-own-key dictation (multi-provider STT)"
+license = "MIT"
+
+[[bin]]
+name = "quickdictate"
+path = "src/main.rs"
+
+[features]
+default = []
+# Gates the Google Cloud STT batch provider module. (reqwest itself is now an
+# unconditional dependency — the check-for-update feature needs HTTPS in every
+# build — so this feature only toggles the provider code.)
+google = []
+
+[build-dependencies]
+embed-resource = "2"
+
+[dev-dependencies]
+# WAV reader for the live provider tests (reads the TTS speech fixtures).
+hound = "3"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+# Keep unwinding so panics surface via our panic hook instead of silently
+# aborting the whole process (we run with windows_subsystem = "windows", so
+# stderr is /dev/null and aborts vanish without a trace).
+panic = "unwind"
+# Strip both debuginfo and the symbol table for a slightly smaller binary. The
+# panic hook's useful output (thread, `file:line`, message) is compile-time
+# embedded and unaffected. Only the `{backtrace:?}` frame *names* are lost
+# (this is the gnu toolchain — DWARF/symbols are in-binary, no external .pdb),
+# so shipped crash logs show addresses instead of names for those frames; that's
+# an acceptable trade for release. Rebuild unstripped to symbolicate if needed.
+strip = true
+
+[profile.release.package."*"]
+opt-level = 3
+
+[profile.dev]
+opt-level = 1
+
+[dependencies]
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "io-util",
+    "net",
+] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = { version = "0.3", default-features = false, features = [
+    "sink",
+    "std",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+base64 = "0.22"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+cpal = "0.15"
+once_cell = "1"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+url = "2"
+regex = "1"
+arc-swap = "1"
+# PNG decode/resize for the About box artwork (LunarWerx wordmark, GitHub mark).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Settings window (tray → "Settings…"). glow backend keeps it lean-ish.
+eframe = { version = "0.35", default-features = false, features = [
+    "default_fonts",
+    "glow",
+] }
+# Must match eframe 0.35's winit (for EventLoopBuilderExtWindows so the settings
+# window can run on a non-main thread).
+winit = "0.30"
+# HTTPS client: check-for-update (all builds, blocking API on worker threads)
+# + the Google batch provider (async, behind `--features google`).
+# TLS backend: native-tls → schannel (the OS's own TLS, already resident on
+# Windows, uses the system cert store). Shares the one stack tokio-tungstenite
+# already pulls, so we avoid bundling a second full rustls + ring + webpki-roots
+# pile (the whole Mozilla CA set) purely for HTTP.
+reqwest = { version = "0.12", default-features = false, features = [
+    "native-tls",
+    "json",
+    "blocking",
+] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Com",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_Media_Audio",
+    "Win32_Media_Multimedia",
+    "Win32_System_Console",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_Security_Cryptography",
+    "Win32_UI_Controls",
+    "Win32_UI_HiDpi",
+] }
+tray-icon = "0.19"
+# HKCU Run-key management for the run_at_startup setting.
+windows-registry = "0.5"
