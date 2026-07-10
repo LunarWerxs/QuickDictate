@@ -264,13 +264,7 @@ fn text_to_replacements(text: &str) -> Vec<(String, String)> {
             if line.is_empty() {
                 return None;
             }
-            let (f, t) = if let Some(i) = line.find("=>") {
-                (&line[..i], &line[i + 2..])
-            } else if let Some(i) = line.find('=') {
-                (&line[..i], &line[i + 1..])
-            } else {
-                return None;
-            };
+            let (f, t) = line.split_once("=>").or_else(|| line.split_once('='))?;
             let f = f.trim().to_string();
             (!f.is_empty()).then(|| (f, t.trim().to_string()))
         })
