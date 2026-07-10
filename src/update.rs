@@ -18,7 +18,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use windows::core::PCWSTR;
@@ -98,6 +98,13 @@ fn client() -> Option<reqwest::blocking::Client> {
         .ok()
 }
 
+/// The last successful `fetch_latest_json` payload, held so the install step
+/// can reuse the JSON the user just said yes to instead of re-fetching — the
+/// SECURITY.md promise is **one anonymous row per check**, and a second fetch
+/// would log a second row. `latest_exe_asset` *takes* it (single use), so a
+/// manual install path with no prior check still fetches fresh.
+static LAST_LATEST_JSON: Mutex<Option<serde_json::Value>> = Mutex::new(None);
+
 fn fetch_latest_json() -> Option<serde_json::Value> {
     // ?v= reports the running version for the endpoint's anonymous
     // version-adoption stats. The server also falls back to parsing the
@@ -115,7 +122,11 @@ fn fetch_latest_json() -> Option<serde_json::Value> {
         tracing::info!("update: releases API returned HTTP {}", resp.status());
         return None;
     }
-    resp.json().ok()
+    let json: serde_json::Value = resp.json().ok()?;
+    if let Ok(mut cached) = LAST_LATEST_JSON.lock() {
+        *cached = Some(json.clone());
+    }
+    Some(json)
 }
 
 /// One real network check: latest tag vs compiled-in version.
@@ -251,9 +262,15 @@ struct Asset {
 }
 
 /// Pick the release's exe asset. Prefers a name containing "quickdictate";
-/// falls back to the first `.exe` asset.
+/// falls back to the first `.exe` asset. Reuses the JSON from the check that
+/// prompted this install (one ping per check, as SECURITY.md promises);
+/// fetches fresh only if no check preceded it.
 fn latest_exe_asset() -> Option<(String, Asset)> {
-    let json = fetch_latest_json()?;
+    let cached = LAST_LATEST_JSON.lock().ok().and_then(|mut g| g.take());
+    let json = match cached {
+        Some(json) => json,
+        None => fetch_latest_json()?,
+    };
     let tag = json
         .get("tag_name")?
         .as_str()?

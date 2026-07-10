@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **The update check now goes through LunarWerx's own endpoint and doubles as an anonymous install count.** The daily check asks `studio.connections.icu` (which relays GitHub's release info verbatim) instead of GitHub directly, carrying a crypto-random install id, the app version, and — via the CDN — an approximate region; never your IP or any direct identifier, with 90-day retention. Exactly **one** anonymous row per check: the install step reuses the response from the check you just approved instead of fetching again. Turning off *Check for updates daily* stops the ping entirely. Release binaries still download straight from GitHub. Full disclosure: `SECURITY.md`.
+
 ## [0.3.0] - 2026-07-09
 
 ### Changed

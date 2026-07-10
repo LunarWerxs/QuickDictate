@@ -194,7 +194,7 @@ The released `.exe` is currently **unsigned**, and QuickDictate installs a globa
 
 ## Contributing
 
-Bug reports and pull requests are welcome — there are issue templates under [.github/ISSUE_TEMPLATE](../.github/ISSUE_TEMPLATE), and the [CI checks](../.github/workflows/ci.yml) run against every PR.
+Bug reports and pull requests are welcome — there are issue templates under [.github/ISSUE_TEMPLATE](../.github/ISSUE_TEMPLATE), and the [CI checks](../.github/workflows/ci.yml) run against every PR. Releases are cut following the checklist in [RELEASING.md](../RELEASING.md).
 
 ## License
 
