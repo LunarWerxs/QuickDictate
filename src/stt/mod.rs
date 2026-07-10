@@ -409,31 +409,35 @@ async fn run_session(
     let (mut samples_rx, flusher) = app.audio.subscribe(fmt.sample_rate);
 
     let connect_start = Instant::now();
-    let ProviderSession { sink, mut stream } =
-        match tokio::time::timeout(CONNECT_TIMEOUT, provider.connect(&key, &opts)).await {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                // A connect-stage failure is (almost always) a per-key problem —
-                // bad credential, arrears, quota — so signal the retry shell to
-                // rotate to the next key instead of giving up on the whole press.
-                // (This was the DashScope red-"!" bug: its arrears error surfaces
-                // at connect, and a plain error here killed the session outright.)
-                keys.mark_failed(&key, provider.classify_connect_error(&e));
-                tracing::warn!(
-                    "session[{epoch}] {provider_id} connect failed with key ...{key_suffix}: {e}"
-                );
-                return Err(anyhow!(EXHAUSTED_SIGNAL));
-            }
-            Err(_) => {
-                // Exceeded CONNECT_TIMEOUT: a stalled handshake, not a bad key.
-                // Treat it as transient and rotate rather than hang the press.
-                keys.mark_failed(&key, FailKind::Transient);
-                tracing::warn!(
+    let ProviderSession { sink, mut stream } = match tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        provider.connect(&key, &opts),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            // A connect-stage failure is (almost always) a per-key problem —
+            // bad credential, arrears, quota — so signal the retry shell to
+            // rotate to the next key instead of giving up on the whole press.
+            // (This was the DashScope red-"!" bug: its arrears error surfaces
+            // at connect, and a plain error here killed the session outright.)
+            keys.mark_failed(&key, provider.classify_connect_error(&e));
+            tracing::warn!(
+                "session[{epoch}] {provider_id} connect failed with key ...{key_suffix}: {e}"
+            );
+            return Err(anyhow!(EXHAUSTED_SIGNAL));
+        }
+        Err(_) => {
+            // Exceeded CONNECT_TIMEOUT: a stalled handshake, not a bad key.
+            // Treat it as transient and rotate rather than hang the press.
+            keys.mark_failed(&key, FailKind::Transient);
+            tracing::warn!(
                     "session[{epoch}] {provider_id} connect timed out after {CONNECT_TIMEOUT:?} with key ...{key_suffix}"
                 );
-                return Err(anyhow!(EXHAUSTED_SIGNAL));
-            }
-        };
+            return Err(anyhow!(EXHAUSTED_SIGNAL));
+        }
+    };
     tracing::info!(
         "session[{epoch}] {provider_id} connected in {:?}",
         connect_start.elapsed()

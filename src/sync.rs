@@ -470,7 +470,9 @@ fn fetch_userinfo(access_token: &str) -> (String, String, String) {
     if !resp.status().is_success() {
         return empty();
     }
-    let Ok(body) = resp.json::<Value>() else { return empty() };
+    let Ok(body) = resp.json::<Value>() else {
+        return empty();
+    };
     let email = body["email"].as_str().unwrap_or_default().to_string();
     let name = body["name"]
         .as_str()

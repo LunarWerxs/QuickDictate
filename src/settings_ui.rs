@@ -1976,7 +1976,8 @@ impl SettingsApp {
                         }
                         if !self.sync.name.is_empty() {
                             ui.label(
-                                RichText::new(format!("\u{00b7} {}", self.sync.name)).color(muted()),
+                                RichText::new(format!("\u{00b7} {}", self.sync.name))
+                                    .color(muted()),
                             );
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

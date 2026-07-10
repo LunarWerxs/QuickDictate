@@ -224,7 +224,11 @@ fn main() -> Result<()> {
             tracing::error!("{rest}");
             let body = rest.to_string();
             std::thread::spawn(move || {
-                update::msg_box("QuickDictate — settings problem", &body, MB_OK | MB_ICONWARNING);
+                update::msg_box(
+                    "QuickDictate — settings problem",
+                    &body,
+                    MB_OK | MB_ICONWARNING,
+                );
             });
         } else {
             tracing::info!("{line}");
