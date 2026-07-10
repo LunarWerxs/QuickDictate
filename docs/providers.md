@@ -187,5 +187,7 @@ one of the five streaming providers; pick Google only if you specifically want
 Google's recognition quality/language coverage and can live without live
 word-by-word feedback.
 
-Whichever you choose, remember this app has no telemetry: your audio and API
-keys go only to the provider you select, never to the QuickDictate maintainer.
+Whichever you choose, remember: your audio and API keys go only to the
+provider you select, never to the QuickDictate maintainer. (The only thing the
+app ever reports is the anonymous daily update-check ping described in
+[SECURITY.md](../.github/SECURITY.md).)

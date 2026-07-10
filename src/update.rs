@@ -1,6 +1,7 @@
 //! Check-for-update + silent portable self-update.
 //!
-//! Modeled directly on SageThumbs 2K's updater: GitHub "latest release" API,
+//! Modeled directly on SageThumbs 2K's updater: the GitHub "latest release"
+//! JSON (reached via LunarWerx's Studio proxy — see [`RELEASES_API`]),
 //! lenient `vX.Y.Z` tag parsing with a plain tuple compare, a daily-throttled
 //! on-disk cache so we hit the network at most once per day, and a
 //! MZ-header + size + SHA-256 verified download. The install step differs
@@ -17,7 +18,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use windows::core::PCWSTR;
@@ -27,17 +28,24 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MB_YESNO,
 };
 
+use crate::config::Config;
 use crate::state::App;
 
-/// GitHub "latest release" endpoint. NOTE: must match the public repo name
-/// when it's created (owner decided on "QuickDictate" under LunarWerxs, the
-/// same org as SageThumbs-2k). Until the repo exists this returns 404 and
-/// every check reports Failed — which the auto path treats as silence.
-pub const RELEASES_API: &str =
-    "https://api.github.com/repos/LunarWerxs/QuickDictate/releases/latest";
+/// "Latest release" endpoint: the Connections Studio proxy, which relays
+/// GitHub's `releases/latest` JSON for LunarWerxs/QuickDictate **verbatim**
+/// (so parsing here is unchanged from the GitHub API) and logs one anonymous
+/// analytics row per hit as an install-count statistic — no personal data,
+/// 90-day retention; the request carries the `X-Install-Id` header resolved
+/// by [`init_install_id`] plus the app version (`?v=`, for anonymous
+/// version-adoption stats). See SECURITY.md for the full disclosure. Release
+/// *binaries* still download straight from GitHub via the asset URLs in the
+/// payload. On any failure the check reports Failed — which the auto path
+/// treats as silence.
+pub const RELEASES_API: &str = "https://studio.connections.icu/v1/app/quickdictate/latest";
 pub const RELEASES_URL: &str = "https://github.com/LunarWerxs/QuickDictate/releases";
 
-/// GitHub's API rejects requests without a User-Agent.
+/// GitHub rejects requests without a User-Agent (the release download still
+/// goes there directly); the Studio proxy sees the same header.
 const USER_AGENT: &str = concat!("QuickDictate/", env!("CARGO_PKG_VERSION"));
 
 /// At most one real network check per this interval (auto path only).
@@ -54,6 +62,12 @@ const CACHE_FILE: &str = "quickdictate-update.txt";
 
 /// Only one check/download may run at a time (tray spam, About + auto, etc.).
 static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Anonymous install id sent as `X-Install-Id` with releases-API hits so the
+/// endpoint can count unique installs rather than raw checks. Resolved once
+/// at startup by [`init_install_id`]; unset (RNG or persist failure) simply
+/// means the header is omitted.
+static INSTALL_ID: OnceLock<String> = OnceLock::new();
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UpdateCheck {
@@ -84,7 +98,18 @@ fn client() -> Option<reqwest::blocking::Client> {
 }
 
 fn fetch_latest_json() -> Option<serde_json::Value> {
-    let resp = client()?.get(RELEASES_API).send().ok()?;
+    // ?v= reports the running version for the endpoint's anonymous
+    // version-adoption stats. The server also falls back to parsing the
+    // User-Agent, but the explicit param is its preferred channel and
+    // survives any edge/CDN header-forwarding change.
+    let url = format!("{RELEASES_API}?v={}", env!("CARGO_PKG_VERSION"));
+    let mut req = client()?.get(url);
+    // Only the latest-release check carries the install id — the binary
+    // download in download_and_install() goes to GitHub and must not.
+    if let Some(id) = INSTALL_ID.get() {
+        req = req.header("X-Install-Id", id.as_str());
+    }
+    let resp = req.send().ok()?;
     if !resp.status().is_success() {
         tracing::info!("update: releases API returned HTTP {}", resp.status());
         return None;
@@ -106,6 +131,75 @@ pub fn check() -> UpdateCheck {
         }
         (Some(_), Some(_)) => UpdateCheck::UpToDate,
         _ => UpdateCheck::Failed, // unparseable tag — don't guess
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Anonymous install id (X-Install-Id)
+// ---------------------------------------------------------------------------
+
+/// Crypto-random UUIDv4 via CNG (`BCryptGenRandom`, the same checked call as
+/// `sync.rs::rand_bytes`). Deliberately **never** derived from hostname, MAC,
+/// username, or any other machine identifier — the id must identify nothing
+/// but itself. `None` if the system RNG fails (no id beats a predictable one).
+fn new_install_id() -> Option<String> {
+    use windows::Win32::Security::Cryptography::{
+        BCryptGenRandom, BCRYPT_ALG_HANDLE, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+    };
+    let mut b = [0u8; 16];
+    let status = unsafe {
+        BCryptGenRandom(
+            BCRYPT_ALG_HANDLE::default(),
+            &mut b,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if !status.is_ok() {
+        return None;
+    }
+    b[6] = (b[6] & 0x0f) | 0x40; // version 4
+    b[8] = (b[8] & 0x3f) | 0x80; // RFC 4122 variant
+    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    Some(format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    ))
+}
+
+/// Resolve the anonymous install id and cache it for [`fetch_latest_json`]:
+/// reuse the one persisted in settings.json, or on the very first launch
+/// generate a fresh UUID and persist it (via [`Config::save_install_id`],
+/// which fills the template's empty slot in place rather than rewriting the
+/// whole file). Called once from `main()` before any check can run — both
+/// the startup auto-check and the tray/About manual path (which has no `App`
+/// handle) read the cached value. An id that failed to persist is **not**
+/// sent: it would change every launch and inflate the install count.
+pub fn init_install_id(app: &App) {
+    let cfg = app.config.load();
+    let existing = cfg.install_id.trim();
+    if !existing.is_empty() {
+        let _ = INSTALL_ID.set(existing.to_string());
+        return;
+    }
+    let Some(id) = new_install_id() else {
+        tracing::warn!("update: system RNG failed; checks will carry no install id");
+        return;
+    };
+    let mut new_cfg = (**cfg).clone();
+    new_cfg.install_id = id.clone();
+    match new_cfg.save_install_id(&Config::settings_path()) {
+        Ok(()) => {
+            app.config.store(Arc::new(new_cfg));
+            let _ = INSTALL_ID.set(id);
+            tracing::info!("update: generated anonymous install id");
+        }
+        Err(e) => {
+            tracing::warn!("update: could not persist install id ({e}); checks will carry none");
+        }
     }
 }
 
@@ -413,11 +507,51 @@ mod tests {
     }
 
     #[test]
+    fn install_id_is_a_lowercase_v4_uuid_and_unique() {
+        let a = new_install_id().expect("system RNG available");
+        let b = new_install_id().expect("system RNG available");
+        assert_ne!(a, b, "two ids must not collide");
+        assert_eq!(a.len(), 36);
+        for (i, ch) in a.chars().enumerate() {
+            match i {
+                8 | 13 | 18 | 23 => assert_eq!(ch, '-', "dash expected at {i} in {a}"),
+                _ => assert!(
+                    matches!(ch, '0'..='9' | 'a'..='f'),
+                    "lowercase hex expected at {i} in {a}"
+                ),
+            }
+        }
+        assert_eq!(&a[14..15], "4", "version nibble in {a}");
+        assert!(
+            matches!(&a[19..20], "8" | "9" | "a" | "b"),
+            "RFC 4122 variant nibble in {a}"
+        );
+    }
+
+    #[test]
+    #[ignore = "live network"]
+    fn live_studio_latest_release_parses() {
+        // The Studio proxy must relay GitHub's releases/latest JSON verbatim —
+        // the same fields check() and latest_exe_asset() consume. NOTE: each
+        // run logs one anonymous analytics row on the endpoint.
+        let resp = client()
+            .unwrap()
+            .get(RELEASES_API)
+            .send()
+            .expect("Studio endpoint reachable");
+        assert!(resp.status().is_success(), "HTTP {}", resp.status());
+        let json: serde_json::Value = resp.json().unwrap();
+        let tag = json.get("tag_name").and_then(|v| v.as_str()).unwrap();
+        println!("latest QuickDictate tag = {tag}");
+        assert!(parse_ver(tag).is_some(), "tag {tag} should parse");
+    }
+
+    #[test]
     #[ignore = "live network"]
     fn live_github_latest_release_parses() {
-        // The QuickDictate repo may not be published yet, so validate the
-        // fetch + tag-parse path against the sibling LunarWerx project's
-        // public releases (same API shape our check() consumes).
+        // The Studio endpoint proxies GitHub's releases/latest verbatim, so
+        // GitHub's shape is still the contract; validate the fetch + tag-parse
+        // path against the sibling LunarWerx project's public releases.
         let resp = client()
             .unwrap()
             .get("https://api.github.com/repos/LunarWerxs/SageThumbs-2k/releases/latest")

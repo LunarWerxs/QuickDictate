@@ -275,6 +275,13 @@ fn main() -> Result<()> {
     let app = App::new((*cfg_arc).clone(), rt_handle.clone(), Arc::clone(&audio));
     let keys = KeyPool::new(&app.config.load());
 
+    // Resolve (or first-generate + persist) the anonymous install id that
+    // update checks send as X-Install-Id (see SECURITY.md). Must run before
+    // anything else can save settings.json or fire a check — including the
+    // tray/About manual path, which has no App handle and reads the cached
+    // value from update::INSTALL_ID.
+    update::init_install_id(&app);
+
     // First-run / empty-key onboarding (§6): if no provider has a usable key,
     // open the Settings window straight away so the user lands directly on the
     // fix (the window shows an "add a key to get started" banner). We also log

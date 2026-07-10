@@ -2,11 +2,12 @@
 
 ## Supported Versions
 
-QuickDictate is currently in beta (`0.1.x`). Security fixes are made against the latest `0.1.x` release only — please update to the newest release before reporting an issue.
+QuickDictate is under active development, and security fixes are made against the **latest release only** (currently the `0.3.x` line) — please update to the newest release before reporting an issue.
 
 | Version | Supported |
 | ------- | --------- |
-| 0.1.x   | Yes       |
+| 0.3.x (latest release) | Yes |
+| Older releases | No |
 
 ## Reporting a Vulnerability
 
@@ -36,7 +37,8 @@ QuickDictate is **bring-your-own-key**: you supply your own API key(s) for the S
 ## What Data Leaves Your Machine
 
 - When you dictate, your **microphone audio is streamed directly to the third-party cloud speech-to-text provider you configure** in `settings.json` (one of: ElevenLabs, Deepgram, OpenAI, AssemblyAI, DashScope, or Google Cloud Speech-to-Text) — over WebSocket for the streaming providers, or HTTPS for the Google batch provider. Audio goes only to that provider, using your own API key.
-- **There is no analytics or tracking.** QuickDictate does not phone home to the maintainer or any analytics/tracking service, and your audio, transcripts, and API keys never leave your machine except to the STT provider you configured, as described above.
+- **The update check goes to LunarWerx's own endpoint and doubles as an anonymous install count.** With *Check for updates daily* on (`update_auto_check`, the default; the check runs at most once per 24 hours), QuickDictate asks `https://studio.connections.icu/v1/app/quickdictate/latest` whether a newer release exists. The endpoint relays GitHub's release info verbatim and logs **one anonymous row per check** as an install-count statistic. The request carries an `X-Install-Id` header: a **crypto-random UUID** generated locally on first launch and stored in your `settings.json` (`install_id`) — never derived from your hostname, MAC address, username, or any other machine or personal identifier, so it identifies nothing but itself. Delete the `install_id` value to get a fresh one. The request also reports the **app version** (a `?v=` query parameter, mirroring the `QuickDictate/x.y.z` User-Agent) so version adoption can be counted anonymously. No personal data is collected, and rows are **deleted after 90 days**. Turning the toggle off stops the daily check entirely; the manual "Check for Updates…" button sends the same request, but only when you click it. The release binary itself still downloads directly from GitHub.
+- **There is no other analytics or tracking.** Beyond the update-check ping described above, QuickDictate does not phone home to the maintainer or any analytics/tracking service, and your audio, transcripts, and API keys never leave your machine except to the STT provider you configured, as described above.
 - **One opt-in exception: Connections settings sync.** QuickDictate can optionally sync your *portable preferences* (mode, language, hotkeys, STT provider/model, and similar) to a LunarWerx Connections account, so they follow you between machines. This is **off by default** and only activates if you explicitly sign in from the Settings window. When enabled, it syncs preferences only — it never transmits your API keys, audio, or transcripts. See [docs/SETTINGS_SYNC.md](../docs/SETTINGS_SYNC.md) for exactly what syncs and how to turn it off.
 - **Local logging is summary-only by default.** When `enable_logging` (or `QUICKDICTATE_LOG`) is on, `quickdictate.log` records event summaries — char counts, provider, timing — never your recognized text. The separate `log_transcripts` setting (off by default) opts into writing your full dictated text to that local log file; only enable it for deep debugging, and turn it back off afterwards. Either way, this stays a local file on your machine — it is never transmitted anywhere.
 - Recognized text is delivered locally to whatever application currently has focus, via synthesized keystrokes — it does not pass through any additional network service beyond the STT provider itself.

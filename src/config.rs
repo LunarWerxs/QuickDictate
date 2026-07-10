@@ -231,12 +231,25 @@ pub struct Config {
     #[serde(default = "default_false")]
     pub dashscope_intl: bool,
 
-    /// Automatically check GitHub for a newer release at startup (throttled to
-    /// once per day). Checking is silent unless an update exists; downloading
-    /// and installing always asks first. The tray's "Check for Updates…" works
-    /// regardless of this flag.
+    /// Automatically check for a newer release at startup (throttled to once
+    /// per day). The check goes to LunarWerx's update endpoint (see
+    /// `update::RELEASES_API`), which relays GitHub's release info and also
+    /// counts the hit as one anonymous install ping — details in SECURITY.md.
+    /// Checking is silent unless an update exists; downloading and installing
+    /// always asks first. The tray's "Check for Updates…" works regardless of
+    /// this flag.
     #[serde(default = "default_true")]
     pub update_auto_check: bool,
+
+    /// Anonymous install id, sent as the `X-Install-Id` header with update
+    /// checks so the update endpoint can count unique installs instead of raw
+    /// hits. A crypto-random UUID generated locally on first launch (see
+    /// `update::init_install_id`) — **never** derived from hostname, MAC,
+    /// username, or any other machine/personal identifier, so it identifies
+    /// nothing but itself. Sent only with update checks (see SECURITY.md);
+    /// clear the value to get a fresh id on the next launch.
+    #[serde(default)]
+    pub install_id: String,
 
     /// Start QuickDictate automatically at Windows login (per-user Run key,
     /// no admin rights needed). Reconciled on every launch: flipping this and
@@ -360,6 +373,7 @@ impl Default for Config {
             stt_model: None,
             dashscope_intl: false,
             update_auto_check: true,
+            install_id: String::new(),
             run_at_startup: false,
             prewarm_keys: true,
             local_keys: Vec::new(),
@@ -498,6 +512,32 @@ impl Config {
         fs::write(&tmp, pretty.as_bytes())?;
         fs::rename(&tmp, path)?;
         Ok(())
+    }
+
+    /// Persist a freshly generated [`Config::install_id`] with the lightest
+    /// possible touch: when the on-disk file still has the template's empty
+    /// `"install_id": ""` slot, fill it in place — leaving the user's key
+    /// ordering, grouping, and hand edits byte-for-byte intact (this write
+    /// happens in the background at startup; it must not reformat a file the
+    /// user curates). Files without the slot (settings.json from an older
+    /// version) fall back to a normal [`Config::save`] — the same full
+    /// rewrite the Settings window already does on every save.
+    pub fn save_install_id(&self, path: &Path) -> anyhow::Result<()> {
+        const EMPTY_SLOT: &str = "\"install_id\": \"\"";
+        if let Ok(text) = fs::read_to_string(path) {
+            if text.contains(EMPTY_SLOT) {
+                let filled = text.replace(
+                    EMPTY_SLOT,
+                    &format!("\"install_id\": \"{}\"", self.install_id),
+                );
+                // Same write-then-rename idiom as save().
+                let tmp = path.with_extension("json.tmp");
+                fs::write(&tmp, filled.as_bytes())?;
+                fs::rename(&tmp, path)?;
+                return Ok(());
+            }
+        }
+        self.save(path)
     }
 
     pub fn is_hold_mode(&self) -> bool {
@@ -704,6 +744,81 @@ mod tests {
         // The template baked into the exe must always deserialize.
         let c: Config = serde_json::from_str(EXAMPLE_JSON).unwrap();
         assert!(!c.stt_provider.is_empty());
+    }
+
+    // ---- Anonymous install id ----------------------------------------------
+
+    #[test]
+    fn install_id_defaults_empty_and_round_trips() {
+        assert!(Config::default().install_id.is_empty());
+        // Older settings.json files without the key parse to "not generated".
+        let c: Config = serde_json::from_str("{}").unwrap();
+        assert!(c.install_id.is_empty());
+        let c: Config = serde_json::from_str(r#"{ "install_id": "abc-123" }"#).unwrap();
+        assert_eq!(c.install_id, "abc-123");
+    }
+
+    #[test]
+    fn bundled_example_json_has_an_empty_install_id_slot() {
+        // The first-run flow depends on filling this slot in place
+        // (save_install_id) so the freshly written template keeps its
+        // curated formatting.
+        assert!(EXAMPLE_JSON.contains("\"install_id\": \"\""));
+        let c: Config = serde_json::from_str(EXAMPLE_JSON).unwrap();
+        assert!(c.install_id.is_empty());
+    }
+
+    #[test]
+    fn save_install_id_fills_the_template_slot_in_place() {
+        let path = std::env::temp_dir().join(format!(
+            "qd-test-install-id-slot-{}.json",
+            std::process::id()
+        ));
+        let original = "{\n  \"mode\": \"toggle\",\n\n  \"install_id\": \"\",\n  \"update_auto_check\": true\n}\n";
+        fs::write(&path, original).unwrap();
+
+        let c = Config {
+            install_id: "11111111-2222-4333-8444-555555555555".into(),
+            ..Config::default()
+        };
+        c.save_install_id(&path).unwrap();
+
+        // The slot got filled and the rest of the file — ordering, grouping,
+        // even the blank line — is byte-for-byte untouched.
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text,
+            original.replace(
+                "\"install_id\": \"\"",
+                "\"install_id\": \"11111111-2222-4333-8444-555555555555\""
+            )
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_install_id_falls_back_to_full_save_without_a_slot() {
+        let path = std::env::temp_dir().join(format!(
+            "qd-test-install-id-fallback-{}.json",
+            std::process::id()
+        ));
+        // An older settings.json with no install_id key at all.
+        fs::write(&path, "{ \"mode\": \"hold\" }").unwrap();
+
+        let c = Config {
+            mode: "hold".into(),
+            install_id: "11111111-2222-4333-8444-555555555555".into(),
+            ..Config::default()
+        };
+        c.save_install_id(&path).unwrap();
+
+        let reloaded: Config = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            reloaded.install_id,
+            "11111111-2222-4333-8444-555555555555"
+        );
+        assert_eq!(reloaded.mode, "hold");
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

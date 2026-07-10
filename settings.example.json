@@ -33,6 +33,7 @@
   "stt_model": null,
   "dashscope_intl": false,
   "update_auto_check": true,
+  "install_id": "",
   "run_at_startup": false,
   "prewarm_keys": true,
 
