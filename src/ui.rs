@@ -5,7 +5,7 @@
 //! circle (and anti-aliased text) -- the previous `Ellipse` + `LWA_COLORKEY`
 //! approach could only produce 1-bit alpha, which read as a chunky octagon.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,10 +27,10 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::HMENU;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCursorPos, LoadCursorW, PeekMessageW,
-    PostQuitMessage, RegisterClassExW, ShowWindow, TranslateMessage, UpdateLayeredWindow,
-    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, IDC_ARROW, MSG, PM_REMOVE, SW_HIDE, SW_SHOWNA,
-    ULW_ALPHA, WM_DESTROY, WM_QUIT, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, ShowWindow, TranslateMessage,
+    UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, IDC_ARROW, MSG, PM_REMOVE, SW_HIDE,
+    SW_SHOWNA, ULW_ALPHA, WM_DESTROY, WM_QUIT, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 use crate::state::{App, Status};
@@ -38,6 +38,47 @@ use crate::state::{App, Status};
 const PIP_SIZE: i32 = 48;
 const PIP_OFFSET_X: i32 = 18;
 const PIP_OFFSET_Y: i32 = 18;
+
+/// Class name of the hidden overlay window -- also the target `main.rs`'s
+/// single-instance guard looks up via `FindWindowW` to reach a running
+/// instance (the overlay is the only always-alive top-level window we own).
+pub const OVERLAY_CLASS_NAME: &str = "QuickDictateOverlay";
+
+/// Registered-message string a second launch uses to ask the running instance
+/// to reveal Settings. Resolved to a numeric id via `RegisterWindowMessageW`
+/// (guaranteed unique system-wide, no collision risk with any `WM_*`
+/// constant) both here, in `overlay_wnd_proc`, and by the launching instance
+/// in `main.rs`.
+pub const ACTIVATE_MESSAGE_NAME: &str = "QuickDictate.ShowSettings";
+
+/// Cached result of `RegisterWindowMessageW(ACTIVATE_MESSAGE_NAME)`. `0` means
+/// "not yet registered" (`RegisterWindowMessageW` never returns 0 on success).
+static ACTIVATE_MESSAGE_ID: AtomicU32 = AtomicU32::new(0);
+
+/// Set by `overlay_wnd_proc` when it receives the activate message from a
+/// second launch; polled and cleared by the 16ms loop in [`run`], which then
+/// calls the exact same `settings_ui::show_settings` path the tray's
+/// "Settings…" menu item uses.
+static SHOW_SETTINGS_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Registers (once) and returns the numeric id of the cross-instance activate
+/// message. Safe to call from any thread; `RegisterWindowMessageW` itself is
+/// thread-safe and idempotent for a given string.
+fn activate_message_id() -> u32 {
+    let cached = ACTIVATE_MESSAGE_ID.load(Ordering::Acquire);
+    if cached != 0 {
+        return cached;
+    }
+    let wide: Vec<u16> = ACTIVATE_MESSAGE_NAME
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let id = unsafe { RegisterWindowMessageW(PCWSTR(wide.as_ptr())) };
+    if id != 0 {
+        ACTIVATE_MESSAGE_ID.store(id, Ordering::Release);
+    }
+    id
+}
 
 pub fn spawn(app: Arc<App>) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
@@ -53,6 +94,22 @@ pub fn spawn(app: Arc<App>) -> std::thread::JoinHandle<()> {
 fn run(app: Arc<App>) -> Result<()> {
     let tray_state = build_tray()?;
     let menu_rx = MenuEvent::receiver();
+
+    // Register the cross-instance "show Settings" message before the overlay
+    // window (whose wnd_proc handles it) is created, so there's no window
+    // that could receive WM_CREATE etc. before the id is known. Idempotent.
+    let _ = activate_message_id();
+
+    // Apply the persisted hide-tray-icon setting immediately, before the
+    // window is ever shown -- otherwise the icon would flash visible for one
+    // frame on every launch. Live changes are picked up below in the poll
+    // loop.
+    let mut last_hide_tray_icon = app.config.load().hide_tray_icon;
+    if last_hide_tray_icon {
+        if let Err(e) = tray_state.tray.set_visible(false) {
+            tracing::warn!("tray: initial set_visible(false) failed: {e}");
+        }
+    }
 
     let overlay = unsafe { Overlay::create(PIP_SIZE)? };
     tracing::info!("overlay hwnd={:?}", overlay.hwnd.0);
@@ -143,6 +200,26 @@ fn run(app: Arc<App>) -> Result<()> {
         let target_count = app.word_count.load(Ordering::Acquire) as f32;
         let want_visible = cfg.mouse_follower_enabled && status != Status::Idle;
 
+        // Live-apply the hide-tray-icon setting whenever it changes -- no
+        // restart needed. tray-icon 0.19's set_visible is a thin wrapper over
+        // Shell_NotifyIconW(NIM_MODIFY) on Windows, so this is cheap enough
+        // to check every tick.
+        if cfg.hide_tray_icon != last_hide_tray_icon {
+            if let Err(e) = tray_state.tray.set_visible(!cfg.hide_tray_icon) {
+                tracing::warn!("tray: set_visible({}) failed: {e}", !cfg.hide_tray_icon);
+            }
+            last_hide_tray_icon = cfg.hide_tray_icon;
+        }
+
+        // A second launch (blocked by the single-instance mutex in `main.rs`)
+        // posted the activate message to the overlay window, which set this
+        // flag from `overlay_wnd_proc`. Reveal Settings via the same path the
+        // tray menu's "Settings…" item uses -- this is the guaranteed way
+        // back in even when the tray icon itself is hidden.
+        if SHOW_SETTINGS_REQUESTED.swap(false, Ordering::AcqRel) {
+            crate::settings_ui::show_settings(Arc::clone(&app));
+        }
+
         // Smooth the counter toward the live word count. Asymmetric lerp:
         // fast counting up (responsive), slow counting down (damps STT
         // partial-transcript revision jitter so the pip doesn't snap back).
@@ -195,7 +272,7 @@ fn run(app: Arc<App>) -> Result<()> {
 // ===== Tray =====
 
 struct TrayState {
-    _tray: TrayIcon,
+    tray: TrayIcon,
     history_menu: Submenu,
 }
 
@@ -293,10 +370,7 @@ fn build_tray() -> Result<TrayState> {
         .with_icon(icon)
         .with_menu(Box::new(menu))
         .build()?;
-    Ok(TrayState {
-        _tray: tray,
-        history_menu,
-    })
+    Ok(TrayState { tray, history_menu })
 }
 
 fn make_icon() -> tray_icon::Icon {
@@ -323,7 +397,10 @@ struct Overlay {
 
 impl Overlay {
     unsafe fn create(size: i32) -> Result<Self> {
-        let class_name: Vec<u16> = "QuickDictateOverlay\0".encode_utf16().collect();
+        let class_name: Vec<u16> = OVERLAY_CLASS_NAME
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
         let h_module = GetModuleHandleW(PCWSTR::null())?;
         let h_instance = HINSTANCE(h_module.0);
 
@@ -572,6 +649,15 @@ unsafe extern "system" fn overlay_wnd_proc(
     match msg {
         WM_DESTROY => {
             PostQuitMessage(0);
+            LRESULT(0)
+        }
+        // A second QuickDictate launch found us via FindWindowW (see
+        // `main.rs`'s single-instance guard) and posted the registered
+        // activate message. We can't thread the `App`/`Arc` through a raw
+        // wnd_proc, so just flip a flag the 16ms poll loop in `run` picks up
+        // and acts on via the normal `settings_ui::show_settings` path.
+        m if m == activate_message_id() => {
+            SHOW_SETTINGS_REQUESTED.store(true, Ordering::Release);
             LRESULT(0)
         }
         // No WM_PAINT handler: UpdateLayeredWindow drives all visuals.

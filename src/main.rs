@@ -30,7 +30,12 @@ use anyhow::Result;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
-use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_ICONWARNING, MB_OK};
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, LPARAM, WPARAM};
+use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::UI::WindowsAndMessaging::{
+    FindWindowW, PostMessageW, RegisterWindowMessageW, MB_ICONERROR, MB_ICONWARNING, MB_OK,
+};
 
 use crate::audio::AudioSource;
 use crate::config::Config;
@@ -38,6 +43,82 @@ use crate::hotkeys::{HotkeyEvent, HotkeyManager};
 use crate::keys::KeyPool;
 use crate::state::{App, Status};
 use crate::stt::SttHandle;
+
+/// Name of the named mutex that guards against a second QuickDictate process.
+/// Held for the whole process lifetime (see `main`) -- a second launch that
+/// finds this already taken signals the running instance to reveal Settings
+/// (see `single_instance_guard`) instead of starting a duplicate. Fixed,
+/// process-wide name so it's stable across versions and install locations.
+const SINGLE_INSTANCE_MUTEX_NAME: &str = "QuickDictate.SingleInstance";
+
+/// How long a second launch retries `FindWindowW` for before giving up. Only
+/// matters if the first instance is still mid-boot (overlay window not yet
+/// created) when the second one is spawned.
+const ACTIVATE_RETRY_ATTEMPTS: u32 = 10;
+const ACTIVATE_RETRY_INTERVAL: Duration = Duration::from_millis(200);
+
+fn wide_z(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Claims the single-instance named mutex. If another QuickDictate process
+/// already holds it, asks that instance to reveal its Settings window (the
+/// guaranteed way back in, including when the tray icon is hidden -- see
+/// `Config::hide_tray_icon`) and returns `false`, meaning the caller must
+/// exit immediately without touching audio, hotkeys, tray, or logging.
+///
+/// On success (`true`), the mutex is held for the whole process lifetime with
+/// no explicit cleanup needed: windows-rs's `HANDLE` is a bare `Copy` wrapper
+/// around the raw handle value with no `Drop` impl, so it is never closed by
+/// us -- Windows closes it (and releases the mutex) automatically when the
+/// process exits, however it exits.
+fn single_instance_guard() -> bool {
+    let name = wide_z(SINGLE_INSTANCE_MUTEX_NAME);
+    // SAFETY: FFI call with a valid, nul-terminated wide string and no
+    // security attributes (default security descriptor).
+    let handle = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) };
+    if let Err(e) = handle {
+        // Couldn't even ask the question -- fail open rather than block the
+        // user from launching QuickDictate at all.
+        tracing::warn!("single-instance: CreateMutexW failed: {e}; continuing anyway");
+        return true;
+    }
+    let already_running =
+        unsafe { windows::Win32::Foundation::GetLastError() } == ERROR_ALREADY_EXISTS;
+    if !already_running {
+        // We own the mutex now; see doc comment above re: no cleanup needed.
+        return true;
+    }
+
+    // Another instance is already running. Find its overlay window (the one
+    // always-alive top-level window QuickDictate owns) and ask it to reveal
+    // Settings, exactly like the tray menu's "Settings…" item would.
+    let class_name = wide_z(crate::ui::OVERLAY_CLASS_NAME);
+    let msg_name = wide_z(crate::ui::ACTIVATE_MESSAGE_NAME);
+    let msg_id = unsafe { RegisterWindowMessageW(PCWSTR(msg_name.as_ptr())) };
+
+    for attempt in 0..ACTIVATE_RETRY_ATTEMPTS {
+        let found = unsafe { FindWindowW(PCWSTR(class_name.as_ptr()), PCWSTR::null()) };
+        if let Ok(hwnd) = found {
+            if !hwnd.0.is_null() && msg_id != 0 {
+                let post = unsafe { PostMessageW(hwnd, msg_id, WPARAM(0), LPARAM(0)) };
+                if let Err(e) = post {
+                    tracing::warn!("single-instance: PostMessageW failed: {e}");
+                }
+                return false;
+            }
+        }
+        // First instance may still be mid-boot (overlay not created yet).
+        if attempt + 1 < ACTIVATE_RETRY_ATTEMPTS {
+            std::thread::sleep(ACTIVATE_RETRY_INTERVAL);
+        }
+    }
+    tracing::warn!(
+        "single-instance: another instance is running but its window was not found after {}ms; exiting anyway",
+        ACTIVATE_RETRY_ATTEMPTS as u64 * ACTIVATE_RETRY_INTERVAL.as_millis() as u64
+    );
+    false
+}
 
 /// Returns the directory the log file lives in (also returned so callers can
 /// surface it to the user). Falls back to cwd if exe dir cannot be located.
@@ -168,6 +249,17 @@ fn init_logging(
 }
 
 fn main() -> Result<()> {
+    // Single-instance guard: claims a named mutex before anything else
+    // (settings.json load, logging, audio, hotkeys, tray). If another
+    // QuickDictate is already running, this asks it to reveal Settings and
+    // exits immediately -- no audio/hotkey/tray/logging side effects at all
+    // for the second launch. This is also the guaranteed way back in when
+    // `hide_tray_icon` has hidden the notification-area icon: launching the
+    // exe again always reaches a running instance's Settings window.
+    if !single_instance_guard() {
+        std::process::exit(0);
+    }
+
     // Load (and possibly generate) settings.json before initializing tracing,
     // because `enable_logging` is read out of the config.
     let (mut cfg, diags) = Config::load_or_create();

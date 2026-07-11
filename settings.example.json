@@ -35,6 +35,7 @@
   "update_auto_check": true,
   "install_id": "",
   "run_at_startup": false,
+  "hide_tray_icon": false,
   "prewarm_keys": true,
 
   "enable_text_replacements": true,

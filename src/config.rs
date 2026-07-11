@@ -257,6 +257,16 @@ pub struct Config {
     #[serde(default = "default_false")]
     pub run_at_startup: bool,
 
+    /// Hide the tray/notification-area icon. The app keeps running in the
+    /// background either way -- this only controls whether the icon is
+    /// drawn. Applied live (no restart needed) by the UI poll loop. Because
+    /// hiding the icon also hides the "Settings…" menu item, the guaranteed
+    /// way back in is launching QuickDictate again: the single-instance guard
+    /// detects the already-running process and asks it to reveal Settings
+    /// instead of starting a second copy (see `main.rs`).
+    #[serde(default = "default_false")]
+    pub hide_tray_icon: bool,
+
     /// Probe the active provider's keys at startup (in the background) so dead
     /// or limited keys are known before the first dictation and a working key
     /// is queued up ready to go. Key health lives in memory only — a fresh
@@ -375,6 +385,7 @@ impl Default for Config {
             update_auto_check: true,
             install_id: String::new(),
             run_at_startup: false,
+            hide_tray_icon: false,
             prewarm_keys: true,
             local_keys: Vec::new(),
             enable_logging: false,
@@ -813,10 +824,7 @@ mod tests {
         c.save_install_id(&path).unwrap();
 
         let reloaded: Config = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(
-            reloaded.install_id,
-            "11111111-2222-4333-8444-555555555555"
-        );
+        assert_eq!(reloaded.install_id, "11111111-2222-4333-8444-555555555555");
         assert_eq!(reloaded.mode, "hold");
         let _ = fs::remove_file(&path);
     }

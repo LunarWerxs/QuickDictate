@@ -17,6 +17,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
 
+use eframe::egui::containers::menu;
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke};
 
 use crate::config::Config;
@@ -556,15 +557,26 @@ const TIP_LISTEN_TAIL: &str = "After you stop talking, QuickDictate keeps listen
 
 /// Filled brand-blue primary button.
 fn accent_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    accent_button_rounded(ui, label, CornerRadius::same(ROUND))
+}
+
+/// Same as [`accent_button`] but with an explicit corner rounding — used to
+/// build the Save split button, where the Save segment is rounded only on
+/// its left corners (square where it meets the dropdown segment).
+fn accent_button_rounded(
+    ui: &mut egui::Ui,
+    label: &str,
+    corner_radius: CornerRadius,
+) -> egui::Response {
     let btn = egui::Button::new(RichText::new(label).color(Color32::WHITE))
         .fill(accent())
-        .corner_radius(CornerRadius::same(ROUND))
+        .corner_radius(corner_radius)
         .stroke(Stroke::NONE);
     let resp = ui.add(btn);
     if resp.hovered() {
         let r = resp.rect;
         ui.painter()
-            .rect_filled(r, CornerRadius::same(ROUND), Color32::from_white_alpha(10));
+            .rect_filled(r, corner_radius, Color32::from_white_alpha(10));
     }
     resp
 }
@@ -574,21 +586,29 @@ fn accent_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
 /// renders in the global menu style (it's a separate `Area`), so this local
 /// visuals tweak only colors the trigger, not the items. Returns the trigger's
 /// `Response` (for `.on_hover_text`).
+///
+/// `corner_radius` lets the caller square off the edge that abuts the other
+/// half of a split button (see the Save/▾ control), so the pair reads as one
+/// unified control with a single outer rounding rather than two separate
+/// pill-shaped buttons.
 fn accent_menu_button<R>(
     ui: &mut egui::Ui,
     label: RichText,
+    corner_radius: CornerRadius,
     add: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::Response {
     ui.scope(|ui| {
         let w = &mut ui.visuals_mut().widgets;
         for state in [&mut w.inactive, &mut w.hovered, &mut w.active, &mut w.open] {
             state.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+            state.corner_radius = corner_radius;
         }
         w.inactive.weak_bg_fill = accent();
         w.hovered.weak_bg_fill = accent_hot();
         w.active.weak_bg_fill = accent_press();
         w.open.weak_bg_fill = accent_press();
-        ui.menu_button(label, add).response
+        let button = egui::Button::new(label).corner_radius(corner_radius);
+        menu::MenuButton::from_button(button).ui(ui, add).0
     })
     .inner
 }
@@ -607,6 +627,58 @@ fn chip(ui: &mut egui::Ui, label: &str, color: Color32) {
             ui.label(RichText::new(label).size(12.0).color(color));
         });
     });
+}
+
+/// A small rounded-square count badge — a bordered chip with a number inside,
+/// no fill (so it reads as an outline "pill" rather than a status dot). Used
+/// next to a button label to show a live count (e.g. text replacements)
+/// without spelling the number out in the label text itself.
+fn count_badge(ui: &mut egui::Ui, count: usize) {
+    egui::Frame::new()
+        .stroke(Stroke::new(1.0, muted()))
+        .corner_radius(CornerRadius::same(5))
+        .inner_margin(Margin::symmetric(6, 1))
+        .show(ui, |ui| {
+            ui.label(RichText::new(count.to_string()).size(11.5).color(muted()));
+        });
+}
+
+/// The "Text replacements" button: a normal button frame (matching plain
+/// `ui.button` styling) with the live rule count rendered as a [`count_badge`]
+/// beside the label instead of spelled out in parentheses. The whole frame is
+/// one click target — the badge is purely visual, not a nested widget.
+fn text_replacements_button(ui: &mut egui::Ui, count: usize) -> egui::Response {
+    let frame = egui::Frame::new()
+        .fill(ui.visuals().widgets.inactive.bg_fill)
+        .stroke(ui.visuals().widgets.inactive.bg_stroke)
+        .corner_radius(ui.visuals().widgets.inactive.corner_radius)
+        .inner_margin(Margin::symmetric(12, CTRL_PAD));
+    let mut prepared = frame.begin(ui);
+    prepared.content_ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.label(RichText::new("Text replacements").color(text()));
+        count_badge(ui, count);
+    });
+    // Allocate first so we know hover/press state, then repaint the frame
+    // with the matching widget-state colors before it's actually drawn (the
+    // background shape is a placeholder until `paint` fills it in).
+    let resp = prepared
+        .allocate_space(ui)
+        .interact(egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let visuals = if resp.is_pointer_button_down_on() {
+        &ui.visuals().widgets.active
+    } else if resp.hovered() {
+        &ui.visuals().widgets.hovered
+    } else {
+        &ui.visuals().widgets.inactive
+    };
+    prepared.frame = prepared
+        .frame
+        .fill(visuals.bg_fill)
+        .stroke(visuals.bg_stroke);
+    prepared.paint(ui);
+    resp
 }
 
 /// Card section: surface fill, hairline border, rounded, padded.
@@ -1071,6 +1143,42 @@ impl SettingsApp {
         }
     }
 
+    /// "Default settings" (⋯ overflow menu): reset every editable preference
+    /// back to [`Config::default`] and persist immediately, refreshing the UI
+    /// on the spot.
+    ///
+    /// Deliberately carries a few fields *forward* rather than blanking them,
+    /// because they aren't really "settings" a user means to reset:
+    ///   * API keys (`*_keys` / `local_keys`) — QuickDictate is
+    ///     bring-your-own-key; wiping these would break dictation entirely
+    ///     and force re-onboarding, which isn't what "reset to defaults" implies.
+    ///   * `install_id` — a machine identity for update checks, not a
+    ///     preference (see `Config::install_id`'s doc comment).
+    ///   * `window_width/height/x/y` — machine-local window geometry, same
+    ///     category `sync.rs` already excludes from portable settings.
+    fn reset_to_defaults(&mut self) {
+        let keep = &self.draft;
+        self.draft = Config {
+            elevenlabs_keys: keep.elevenlabs_keys.clone(),
+            deepgram_keys: keep.deepgram_keys.clone(),
+            openai_keys: keep.openai_keys.clone(),
+            assemblyai_keys: keep.assemblyai_keys.clone(),
+            dashscope_keys: keep.dashscope_keys.clone(),
+            google_keys: keep.google_keys.clone(),
+            local_keys: keep.local_keys.clone(),
+            install_id: keep.install_id.clone(),
+            window_width: keep.window_width,
+            window_height: keep.window_height,
+            window_x: keep.window_x,
+            window_y: keep.window_y,
+            ..Config::default()
+        };
+        self.recording = None;
+        if self.save() {
+            self.status = "Settings reset to defaults.".into();
+        }
+    }
+
     fn save_and_restart(&mut self) {
         if !self.save() {
             return;
@@ -1351,6 +1459,7 @@ impl eframe::App for SettingsApp {
         let mut do_about = false;
         let mut do_save = false;
         let mut do_save_restart = false;
+        let mut do_default_settings = false;
         egui::Panel::bottom("qd_actions")
             .frame(egui::Frame::new().fill(bg()).inner_margin(Margin {
                 left: 16,
@@ -1378,26 +1487,53 @@ impl eframe::App for SettingsApp {
                             let path = Config::settings_path();
                             let _ = std::process::Command::new("notepad.exe").arg(&path).spawn();
                         }
+                        ui.separator();
+                        if ui
+                            .button("Default settings")
+                            .on_hover_text(
+                                "Reset every setting back to its default. Your API keys are kept.",
+                            )
+                            .clicked()
+                        {
+                            do_default_settings = true;
+                        }
                     })
                     .response
                     .on_hover_text("More: check for updates, open the log, edit settings.json");
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Tighter spacing so Save + its dropdown read as one split
-                        // button: [ Save ][▾]. The arrow reveals "Save and restart".
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        accent_menu_button(ui, chevron_down_glyph(), |ui| {
+                        // Zero spacing + complementary corner rounding so Save and
+                        // its dropdown paint as one unified split button: [ Save |▾ ]
+                        // with a single shared outer rounding and a square seam
+                        // where the two segments meet. The arrow half reveals "Save
+                        // and restart".
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        let arrow_round = CornerRadius {
+                            nw: 0,
+                            ne: ROUND,
+                            sw: 0,
+                            se: ROUND,
+                        };
+                        accent_menu_button(ui, chevron_down_glyph(), arrow_round, |ui| {
                             ui.set_min_width(150.0);
                             if ui.button("Save and restart").clicked() {
                                 do_save_restart = true;
                             }
                         })
                         .on_hover_text("More save options");
-                        if accent_button(ui, "Save").clicked() {
+                        let save_round = CornerRadius {
+                            nw: ROUND,
+                            ne: 0,
+                            sw: ROUND,
+                            se: 0,
+                        };
+                        if accent_button_rounded(ui, "Save", save_round).clicked() {
                             do_save = true;
                         }
-                        // Save status fills the gap between the menu and Save.
+                        // Save status fills the gap between the menu and Save. Restore
+                        // normal spacing here since the split button above needed 0.
                         if !self.status.is_empty() {
+                            ui.spacing_mut().item_spacing.x = 4.0;
                             ui.add_space(6.0);
                             ui.label(RichText::new(self.status.clone()).color(muted()));
                         }
@@ -1439,6 +1575,9 @@ impl eframe::App for SettingsApp {
         // Act on pinned-bar clicks with a clean &mut self.
         if do_about {
             crate::about::show_about();
+        }
+        if do_default_settings {
+            self.reset_to_defaults();
         }
         if do_save_restart {
             self.save_and_restart();
@@ -1582,8 +1721,11 @@ impl SettingsApp {
     /// right edge (instead of a separate wide button). Click the dot to arm
     /// capture — the next keypress fills the field; click again (or Esc) to
     /// cancel. Armed = a solid accent dot; the field greys while listening so
-    /// the keypress can't also land in the text well.
-    fn hotkey_field_ui(&mut self, ui: &mut egui::Ui, field: HotkeyField) {
+    /// the keypress can't also land in the text well. `width` matches this
+    /// field to the control directly above it (Language / Mode) so the 2×2
+    /// block reads as two clean columns instead of the hotkey wells jutting
+    /// out wider.
+    fn hotkey_field_ui(&mut self, ui: &mut egui::Ui, field: HotkeyField, width: f32) {
         let recording = self.recording == Some(field);
         let value = match field {
             HotkeyField::Toggle => &mut self.draft.toggle_hotkey,
@@ -1593,7 +1735,7 @@ impl SettingsApp {
         // the well keeps typed text from sliding under it.
         let resp = ui.add_enabled(
             !recording,
-            styled_input(value).desired_width(140.0).margin(Margin {
+            styled_input(value).desired_width(width).margin(Margin {
                 left: 6,
                 // Right padding reserves room for the record dot so typed text
                 // (even a long combo) never slides under it.
@@ -1668,7 +1810,7 @@ impl SettingsApp {
                             .on_hover_text(TIP_LANGUAGE);
                         ui.end_row();
                         ui.label("Toggle hotkey").on_hover_text(TIP_TOGGLE_HOTKEY);
-                        self.hotkey_field_ui(ui, HotkeyField::Toggle);
+                        self.hotkey_field_ui(ui, HotkeyField::Toggle, 130.0);
                         ui.end_row();
                     });
                 egui::Grid::new("dict_right")
@@ -1691,7 +1833,7 @@ impl SettingsApp {
                             .on_hover_text(TIP_MODE);
                         ui.end_row();
                         ui.label("Hold hotkey").on_hover_text(TIP_HOLD_HOTKEY);
-                        self.hotkey_field_ui(ui, HotkeyField::Hold);
+                        self.hotkey_field_ui(ui, HotkeyField::Hold, 120.0);
                         ui.end_row();
                     });
             });
@@ -1730,7 +1872,7 @@ impl SettingsApp {
                     .num_columns(2)
                     .spacing([10.0, 10.0])
                     .show(&mut cols[1], |ui| {
-                        ui.label("Keep listening after you stop")
+                        ui.label("Keep listening after")
                             .on_hover_text(TIP_LISTEN_TAIL);
                         secs_input(ui, &mut self.draft.listen_tail_ms, 0.3..=3.0, "listen_tail")
                             .on_hover_text(TIP_LISTEN_TAIL);
@@ -1798,8 +1940,7 @@ impl SettingsApp {
                 // its content instead.
                 let mut open = false;
                 right.horizontal(|ui| {
-                    if ui
-                        .button(format!("Text replacements\u{2026} ({repl_count})"))
+                    if text_replacements_button(ui, repl_count)
                         .on_hover_text("Edit your misheard-phrase \u{2192} replacement rules.")
                         .clicked()
                     {
@@ -1816,7 +1957,7 @@ impl SettingsApp {
     fn application_card(&mut self, ui: &mut egui::Ui) {
         card(ui, |ui| {
             section_title(ui, "\u{E713}", "Application");
-            // Seven toggles split across two columns. The wordiest options are
+            // Eight toggles split across two columns. The wordiest options are
             // trimmed to short labels with the detail moved into their hover
             // tooltips. "Enable per-app profiles" lives here too — it used to
             // sit in its own near-empty card.
@@ -1832,6 +1973,12 @@ impl SettingsApp {
                     .on_hover_text(
                         "Launch QuickDictate automatically when you sign in to Windows.",
                     );
+                blue_check(left, &mut self.draft.hide_tray_icon, "Hide tray icon").on_hover_text(
+                    "QuickDictate keeps running in the background with no icon shown. \
+                         To get back in, launch QuickDictate again -- it will reopen this \
+                         Settings window instead of starting a second copy, and you can \
+                         re-enable the icon here.",
+                );
                 blue_check(
                     left,
                     &mut self.draft.update_auto_check,

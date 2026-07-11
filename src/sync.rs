@@ -73,6 +73,9 @@ fn sync_guard() -> std::sync::MutexGuard<'static, ()> {
 ///   * every `*_keys` / `local_keys` array — **secrets, never synced**;
 ///   * `window_width/height/x/y` — machine-local window geometry;
 ///   * `run_at_startup` — per-machine registry (Run key) behavior;
+///   * `hide_tray_icon` — per-machine, like `run_at_startup`: whether the
+///     notification-area icon is shown is a property of this install, not a
+///     portable preference, so it never travels with the synced settings;
 ///   * `enable_logging` — a local diagnostics toggle.
 ///
 /// Only portable preferences travel. Names match `Config`'s serde field names
