@@ -13,6 +13,12 @@
 //! egui's viewport screenshot a few frames after opening, writing the PNG to
 //! that path (`QUICKDICTATE_UI_OPEN=keys|replacements` first opens a modal).
 //! `scripts/ui_shot.ps1` wraps the whole loop.
+//!
+//! ## Changing the window size or the Save button?
+//! Read `docs/SETTINGS_WINDOW.md` first. This window runs at 0.9 zoom (so three
+//! coordinate systems are in play), auto-fits its height to its content, and the
+//! Save split button has a border/height gotcha. That doc captures the traps so
+//! an edit does not turn into a long debugging session.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
@@ -540,6 +546,12 @@ fn styled_input(value: &mut String) -> egui::TextEdit<'_> {
 /// and `apply_style`'s `button_padding.y`), so their heights match.
 const CTRL_PAD: i8 = 6;
 
+/// Shared height for the Save split button's two halves. Set at/above the Save
+/// text button's natural height so BOTH halves clamp to exactly this value —
+/// otherwise Save renders at its (taller) natural height while the slim chevron
+/// half sits shorter, so the pair looks mismatched. Pins them equal.
+const SPLIT_BTN_H: f32 = 30.0;
+
 // Hover-tooltip copy shared between a grid label and its control (and, for the
 // hotkeys, the `hotkey_field_ui` helper) so both surfaces explain the same item.
 const TIP_LANGUAGE: &str = "BCP-47 language tag for transcription, e.g. en-US, es-ES, or fr-FR.";
@@ -557,20 +569,23 @@ const TIP_LISTEN_TAIL: &str = "After you stop talking, QuickDictate keeps listen
 
 /// Filled brand-blue primary button.
 fn accent_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    accent_button_rounded(ui, label, CornerRadius::same(ROUND))
+    accent_button_rounded(ui, label, CornerRadius::same(ROUND), egui::Vec2::ZERO)
 }
 
-/// Same as [`accent_button`] but with an explicit corner rounding — used to
-/// build the Save split button, where the Save segment is rounded only on
-/// its left corners (square where it meets the dropdown segment).
+/// Same as [`accent_button`] but with an explicit corner rounding and minimum
+/// size — used to build the Save split button, where the Save segment is
+/// rounded only on its left corners (square where it meets the dropdown
+/// segment) and pinned to [`SPLIT_BTN_H`] so it matches the chevron half.
 fn accent_button_rounded(
     ui: &mut egui::Ui,
     label: &str,
     corner_radius: CornerRadius,
+    min_size: egui::Vec2,
 ) -> egui::Response {
     let btn = egui::Button::new(RichText::new(label).color(Color32::WHITE))
         .fill(accent())
         .corner_radius(corner_radius)
+        .min_size(min_size)
         .stroke(Stroke::NONE);
     let resp = ui.add(btn);
     if resp.hovered() {
@@ -602,12 +617,25 @@ fn accent_menu_button<R>(
         for state in [&mut w.inactive, &mut w.hovered, &mut w.active, &mut w.open] {
             state.fg_stroke = Stroke::new(1.0, Color32::WHITE);
             state.corner_radius = corner_radius;
+            // Drop the inherited hairline border so the accent fill reaches the
+            // button edges — matching the Save half (which is drawn with
+            // Stroke::NONE). With the border in place the chevron's fill was
+            // inset ~1px top and bottom, so it read ~2px shorter than Save.
+            state.bg_stroke = Stroke::NONE;
         }
         w.inactive.weak_bg_fill = accent();
         w.hovered.weak_bg_fill = accent_hot();
         w.active.weak_bg_fill = accent_press();
         w.open.weak_bg_fill = accent_press();
-        let button = egui::Button::new(label).corner_radius(corner_radius);
+        // Narrow the chevron half — the global 12px h-padding is far too wide for
+        // a single glyph — and pin its height to SPLIT_BTN_H so it matches the
+        // Save half (the icon-font chevron's galley is otherwise taller). The
+        // slimmer v-padding leaves the tall glyph room to center within that
+        // fixed height rather than forcing the button taller.
+        ui.spacing_mut().button_padding = egui::vec2(7.0, 3.0);
+        let button = egui::Button::new(label)
+            .corner_radius(corner_radius)
+            .min_size(egui::vec2(0.0, SPLIT_BTN_H));
         menu::MenuButton::from_button(button).ui(ui, add).0
     })
     .inner
@@ -652,7 +680,9 @@ fn text_replacements_button(ui: &mut egui::Ui, count: usize) -> egui::Response {
         .fill(ui.visuals().widgets.inactive.bg_fill)
         .stroke(ui.visuals().widgets.inactive.bg_stroke)
         .corner_radius(ui.visuals().widgets.inactive.corner_radius)
-        .inner_margin(Margin::symmetric(12, CTRL_PAD));
+        // Shorter than a full control (CTRL_PAD): this button sits among the
+        // checkbox rows, so a tighter vertical pad keeps it compact and aligned.
+        .inner_margin(Margin::symmetric(12, 3));
     let mut prepared = frame.begin(ui);
     prepared.content_ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
@@ -782,7 +812,9 @@ pub fn show_settings(app: Arc<App>) {
         .spawn(move || {
             let options = eframe::NativeOptions {
                 viewport: egui::ViewportBuilder::default()
-                    .with_inner_size([600.0, 772.0])
+                    // Opening height is a close estimate; `ui`'s auto-fit trims
+                    // it to the exact content height on the first frame.
+                    .with_inner_size([600.0, 760.0])
                     .with_min_inner_size([520.0, 480.0])
                     .with_icon(Arc::new(icon_data())),
                 // The tray thread owns the "main" loop; winit on Windows is
@@ -878,6 +910,13 @@ struct SettingsApp {
     shot_path: Option<String>,
     frames: u32,
     shot_requested: bool,
+    /// Last window inner height (logical pts) we requested via the auto-fit in
+    /// `ui`. The window is sized to its content each frame so it can never
+    /// scroll and is never taller than needed; this cache gates the resize so we
+    /// only issue a viewport command when the content height actually changes
+    /// (winit applies `InnerSize` a frame late, so resending every frame would
+    /// oscillate). 0.0 forces the first measured frame to apply.
+    last_fit_h: f32,
 }
 
 impl SettingsApp {
@@ -914,6 +953,7 @@ impl SettingsApp {
             shot_path: std::env::var("QUICKDICTATE_UI_SHOT").ok(),
             frames: 0,
             shot_requested: false,
+            last_fit_h: 0.0,
         }
     }
 
@@ -1460,7 +1500,7 @@ impl eframe::App for SettingsApp {
         let mut do_save = false;
         let mut do_save_restart = false;
         let mut do_default_settings = false;
-        egui::Panel::bottom("qd_actions")
+        let bottom_bar = egui::Panel::bottom("qd_actions")
             .frame(egui::Frame::new().fill(bg()).inner_margin(Margin {
                 left: 16,
                 right: 16,
@@ -1527,7 +1567,14 @@ impl eframe::App for SettingsApp {
                             sw: ROUND,
                             se: 0,
                         };
-                        if accent_button_rounded(ui, "Save", save_round).clicked() {
+                        if accent_button_rounded(
+                            ui,
+                            "Save",
+                            save_round,
+                            egui::vec2(0.0, SPLIT_BTN_H),
+                        )
+                        .clicked()
+                        {
                             do_save = true;
                         }
                         // Save status fills the gap between the menu and Save. Restore
@@ -1542,7 +1589,7 @@ impl eframe::App for SettingsApp {
             });
 
         // ---- Scrollable settings body ---------------------------------------
-        egui::CentralPanel::default()
+        let body = egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(bg()).inner_margin(Margin {
                 left: 16,
                 right: 16,
@@ -1569,8 +1616,61 @@ impl eframe::App for SettingsApp {
                         ui.add_space(10.0);
                         self.sync_card(ui, &ctx);
                         ui.add_space(12.0);
-                    });
+                    })
             });
+
+        // ---- Auto-fit the window height to its content ----------------------
+        // Size the OS window to exactly hold the bottom bar + the settings body,
+        // so it can never scroll (window height >= content) and is never taller
+        // than needed (window height == content). The scroll area's content_size
+        // is the body's *natural* height; with the width held fixed it does not
+        // depend on the window height, so this settles in one frame rather than
+        // oscillating. `last_fit_h` gates the resize because winit applies
+        // InnerSize a frame late; resending an unchanged height would fight that.
+        //
+        // Units: content_h / bottom_h / the panel rects are all egui points
+        // (i.e. scaled by the app's 0.9 zoom), and ViewportCommand::InnerSize is
+        // interpreted in those same egui points — so every value here is in one
+        // consistent unit. (Do NOT pull the width from ViewportInfo.inner_rect:
+        // that is in *native* points, and feeding it back through InnerSize —
+        // which re-applies the zoom — shrinks the window by the zoom factor on
+        // every resize.)
+        let content_h = body.inner.content_size.y;
+        let bottom_h = bottom_bar.response.rect.height();
+        // 16 + 4 = the CentralPanel's top/bottom inner_margin; + 2 absorbs
+        // sub-pixel rounding so a stray pixel never re-triggers the scrollbar.
+        let desired_h = (bottom_h + content_h + 16.0 + 4.0).ceil() + 2.0;
+        // Never request a window taller than the monitor. monitor_size is in
+        // native points, so convert it into the egui points desired_h uses
+        // before comparing; leave a margin for the taskbar/title bar (egui
+        // exposes no work area). If content genuinely can't fit, the scroll area
+        // is the fallback.
+        let native_ppp = ctx
+            .input(|i| i.viewport().native_pixels_per_point)
+            .unwrap_or(1.0);
+        let egui_ppp = ctx.pixels_per_point().max(0.1);
+        let max_h = ctx
+            .input(|i| i.viewport().monitor_size)
+            .map_or(f32::INFINITY, |m| {
+                (m.y * native_ppp / egui_ppp - 80.0).max(480.0)
+            });
+        let desired_h = desired_h.clamp(480.0, max_h);
+        if (desired_h - self.last_fit_h).abs() > 1.0 {
+            self.last_fit_h = desired_h;
+            // Reproduce the current width so we only ever drive the height (and
+            // honour a user-widened window). inner_rect is in native points but
+            // InnerSize expects egui (zoom-scaled) points, so convert by
+            // native_ppp/egui_ppp — feeding the native value in raw would resize
+            // the window by the zoom factor on every frame.
+            let width = ctx
+                .input(|i| i.viewport().inner_rect.map(|r| r.width()))
+                .unwrap_or(600.0)
+                * native_ppp
+                / egui_ppp;
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                width, desired_h,
+            )));
+        }
 
         // Act on pinned-bar clicks with a clean &mut self.
         if do_about {
@@ -1839,9 +1939,8 @@ impl SettingsApp {
             });
 
             // No separator here: the timing row sits snug under the 2×2 block
-            // above (same 10px inter-row gap the grids use) so it reads as one
-            // group and the card stays short.
-            ui.add_space(10.0);
+            // above so it reads as one group and the card stays short.
+            ui.add_space(4.0);
 
             // ---- Timing levers ------------------------------------------
             // Two "how long" knobs users asked to tune (both stored in ms),
@@ -1985,15 +2084,6 @@ impl SettingsApp {
                     "Check for updates daily",
                 )
                 .on_hover_text("Automatically check for a newer QuickDictate release once a day.");
-                blue_check(
-                    left,
-                    &mut self.draft.profiles_enabled,
-                    "Enable per-app profiles",
-                )
-                .on_hover_text(
-                    "Apply per-application overrides for punctuation, spacing, and \
-                     replacements based on the app you're typing into.",
-                );
 
                 let right = &mut cols[1];
                 blue_check(
@@ -2018,6 +2108,15 @@ impl SettingsApp {
                 )
                 .on_hover_text(
                     "Say \u{201c}scratch that\u{201d} to automatically undo your last paste.",
+                );
+                blue_check(
+                    right,
+                    &mut self.draft.profiles_enabled,
+                    "Enable per-app profiles",
+                )
+                .on_hover_text(
+                    "Apply per-application overrides for punctuation, spacing, and \
+                     replacements based on the app you're typing into.",
                 );
             });
 

@@ -9,6 +9,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 
 - **The update check now goes through LunarWerx's own endpoint and doubles as an anonymous install count.** The daily check asks `studio.connections.icu` (which relays GitHub's release info verbatim) instead of GitHub directly, carrying a crypto-random install id, the app version, and — via the CDN — an approximate region; never your IP or any direct identifier, with 90-day retention. Exactly **one** anonymous row per check: the install step reuses the response from the check you just approved instead of fetching again. Turning off *Check for updates daily* stops the ping entirely. Release binaries still download straight from GitHub. Full disclosure: `SECURITY.md`.
+- **Settings layout tidied.** "Enable per-app profiles" now sits in the right column of the Application card, the "Text replacements" button is more compact, and the gap above the timing row is tighter so it reads as one group.
+
+### Fixed
+
+- **The Settings window no longer scrolls or leaves dead space.** It now sizes its own height to fit its content exactly, so the whole form is visible without a scrollbar and with no extra empty padding, whatever the app zoom or window state (for example the first-run "add a key" banner).
+- **The Save split button's dropdown matches the Save button.** The ▾ half is now the same height as **Save** and a narrower tab, so the pair reads as one clean control.
 
 ## [0.3.0] - 2026-07-09
 
