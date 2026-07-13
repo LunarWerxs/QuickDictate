@@ -54,6 +54,14 @@ impl SttProvider for ElevenLabsProvider {
         }
     }
 
+    /// Scribe's LM prior finalizes a trailing question into a phantom short
+    /// "answer" ("Yes.") at end-of-stream. Enable the runner's guard so those
+    /// zero-speech post-release commits are dropped instead of pasted. See
+    /// `SCRIBE_HALLUCINATION_HANDOFF.md`.
+    fn suppress_phantom_finalization(&self) -> bool {
+        true
+    }
+
     async fn connect(
         &self,
         key: &str,
@@ -127,6 +135,23 @@ impl ProviderSink for ElevenLabsSink {
         .to_string();
         self.sink
             .send(Message::Text(commit))
+            .await
+            .map_err(|e| SendError(e.to_string()))
+    }
+
+    async fn keepalive(&mut self) -> Result<(), SendError> {
+        // An empty audio chunk with NO commit: zero samples (so nothing to
+        // transcribe and no VAD trigger) but a real message on the audio channel,
+        // which resets the server's idle timer. Same envelope the server already
+        // accepts for `commit`, minus the samples and the commit flag.
+        let ka = json!({
+            "message_type": "input_audio_chunk",
+            "audio_base_64": "",
+            "sample_rate": self.sample_rate,
+        })
+        .to_string();
+        self.sink
+            .send(Message::Text(ka))
             .await
             .map_err(|e| SendError(e.to_string()))
     }

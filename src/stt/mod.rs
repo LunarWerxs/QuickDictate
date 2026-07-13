@@ -21,7 +21,7 @@ mod live_test;
 #[cfg(test)]
 mod mock;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -59,6 +59,14 @@ const TAIL_MAX_HEADROOM: Duration = Duration::from_millis(1000);
 /// at normal volume is well over 2000; high-gain mics idle as high as ~1100
 /// from room hum. 1500 sits above that ambient floor.
 const SILENCE_RMS: i32 = 1500;
+
+/// During the post-release tail we hold back trailing silence (see
+/// [`TailSilenceGate`]), so on a long quiet tail no real audio frame goes out
+/// for a while. If we stay silent this long, send a provider keepalive so an
+/// idle server doesn't close the session mid-tail. Well under any realistic WS
+/// idle timeout, and far longer than the default ~1.8 s tail, so for normal use
+/// it never fires at all -- it only matters for deliberately long tails.
+const TAIL_KEEPALIVE_AFTER: Duration = Duration::from_secs(5);
 
 /// Keys we try per "round" of attempts before pausing to let a refresh land.
 const MAX_KEY_ATTEMPTS: u32 = 3;
@@ -339,6 +347,66 @@ async fn ship(sink: &mut Box<dyn ProviderSink>, chunk: &[i16], dead: &mut bool) 
     }
 }
 
+/// Ship a batch of chunks in order, stopping early (and leaving `dead` set) if
+/// the socket dies mid-batch. Returns how many were actually sent. Used by the
+/// tail phases below, which forward held-back audio in a burst the moment
+/// speech resumes (see [`TailSilenceGate`]).
+async fn ship_all(sink: &mut Box<dyn ProviderSink>, chunks: &[Vec<i16>], dead: &mut bool) -> usize {
+    let mut n = 0;
+    for chunk in chunks {
+        if !ship(sink, chunk, dead).await {
+            break;
+        }
+        n += 1;
+    }
+    n
+}
+
+/// Trims the trailing run of silence from the audio forwarded to the provider
+/// during the post-release tail.
+///
+/// A streaming STT model (notably ElevenLabs Scribe) will "finalize" a stretch
+/// of dead room-tone into a hallucinated short answer -- ask a question, stop,
+/// and it appends "Yes." -- because its language-model prior completes your
+/// sentence out of the silence. QuickDictate then pastes that as if you'd said
+/// it. The cure is to never send it the trailing silence in the first place.
+///
+/// Silent chunks are buffered rather than sent; the instant real speech resumes
+/// the whole held run is flushed in order (so a genuine mid-utterance pause is
+/// preserved verbatim and words after it still reach the provider), and only the
+/// final silence that is *never* followed by more speech is dropped. This lets a
+/// user keep an arbitrarily long "keep listening" tail without inviting
+/// hallucinations -- we trim by content, not by clamping the tail's length.
+#[derive(Default)]
+struct TailSilenceGate {
+    /// Silent chunks captured since the last speech chunk, awaiting either a
+    /// flush (speech resumed) or a discard (tail ended still-silent).
+    pending: Vec<Vec<i16>>,
+}
+
+impl TailSilenceGate {
+    /// Offer one captured chunk with the caller's speech/silence verdict (RMS
+    /// vs the silence floor). Returns the chunks to forward to the provider
+    /// *now*, in order: empty while we're inside a silent stretch, or the held
+    /// pause followed by this chunk the moment speech resumes.
+    fn offer(&mut self, chunk: Vec<i16>, is_speech: bool) -> Vec<Vec<i16>> {
+        if is_speech {
+            let mut out = std::mem::take(&mut self.pending);
+            out.push(chunk);
+            out
+        } else {
+            self.pending.push(chunk);
+            Vec::new()
+        }
+    }
+
+    /// How many trailing silent chunks are currently held back (and, once the
+    /// tail ends still-silent, discarded). For the log lines only.
+    fn held(&self) -> usize {
+        self.pending.len()
+    }
+}
+
 async fn run_session(
     app: Arc<App>,
     keys: Arc<KeyPool>,
@@ -373,6 +441,10 @@ async fn run_session(
     let provider = make_provider(&cfg);
     let provider_id = provider.id();
     let finalize_timeout = provider.finalize_timeout();
+    // Whether this provider needs the phantom-finalization guard (ElevenLabs
+    // Scribe completes a question into a hallucinated short "answer" at
+    // end-of-stream). Read once here so the recv task captures a plain bool.
+    let suppress_phantom = provider.suppress_phantom_finalization();
 
     let key = match keys.acquire() {
         Some(k) => k,
@@ -465,6 +537,18 @@ async fn run_session(
     let release_pending = Arc::new(AtomicBool::new(false));
     let release_pending_send = Arc::clone(&release_pending);
     let flusher_send = flusher.clone();
+
+    // Running count of speech-bearing chunks (RMS >= SILENCE_RMS) actually
+    // shipped to the provider this session, for the phantom-finalization guard.
+    // The send task bumps it per speech chunk across all phases; the recv task
+    // snapshots it at each commit. A post-release commit whose snapshot equals
+    // the previous commit's snapshot carried NO new speech -- that is Scribe
+    // finalizing dead air into a hallucinated "answer" (see the Committed arm
+    // and `is_phantom_finalization`). Counting only speech (not the inter-word
+    // silence the live phase also ships) is what makes the equality meaningful.
+    let speech_shipped = Arc::new(AtomicU64::new(0));
+    let speech_shipped_send = Arc::clone(&speech_shipped);
+    let speech_shipped_recv = Arc::clone(&speech_shipped);
     let send_task: tokio::task::JoinHandle<usize> = tokio::spawn(async move {
         let mut sink = sink;
         let mut chunks_sent: usize = 0;
@@ -481,27 +565,50 @@ async fn run_session(
             };
             match chunk_opt {
                 Some(chunk) => {
+                    // Classify before shipping so the phantom-finalization guard
+                    // (recv task) can tell a commit backed by real speech from one
+                    // conjured out of the trailing silence the live phase also
+                    // forwards. Only speech advances `speech_shipped`.
+                    let is_speech = rms_i16(&chunk) >= SILENCE_RMS;
                     if !ship(&mut sink, &chunk, &mut ws_dead).await {
                         break;
                     }
                     chunks_sent += 1;
+                    if is_speech {
+                        speech_shipped_send.fetch_add(1, Ordering::Release);
+                    }
                 }
                 None => break,
             }
         }
 
         // === Phase 2: dynamic tail ===
+        //
+        // We keep *listening* for the full user-configured tail, but we do NOT
+        // forward its trailing silence to the provider: a streaming model would
+        // hallucinate a short answer out of that dead air (see TailSilenceGate).
+        // The gate holds silent chunks back and flushes them only when speech
+        // resumes, so a real mid-utterance pause is preserved and only the final
+        // never-followed-by-speech silence is dropped. Endpointing below
+        // (peak_rms / last_speech / the quiet window) is unchanged -- it still
+        // sees every chunk; the gate only decides what actually goes on the wire.
+        let mut gate = TailSilenceGate::default();
         let tail_start = tokio::time::Instant::now();
         let mut last_speech = tail_start;
+        // Last time a real audio frame (or a keepalive) actually went out. While
+        // we're trimming a long silent stretch nothing ships, so this drives the
+        // keepalive that stops an idle server from closing the session mid-tail.
+        let mut last_send = tail_start;
         let mut tail_chunks: usize = 0;
         let mut peak_rms: i32 = 0;
         while !ws_dead {
             let elapsed = tail_start.elapsed();
             if elapsed >= tail_max {
                 tracing::info!(
-                    "session tail: hit tail_max ({:.0} ms) after {:.0} ms (peak_rms={peak_rms})",
+                    "session tail: hit tail_max ({:.0} ms) after {:.0} ms (peak_rms={peak_rms}, {} silent chunk(s) trimmed)",
                     tail_max.as_secs_f64() * 1000.0,
-                    elapsed.as_secs_f64() * 1000.0
+                    elapsed.as_secs_f64() * 1000.0,
+                    gate.held(),
                 );
                 break;
             }
@@ -514,20 +621,45 @@ async fn run_session(
                 if rms > peak_rms {
                     peak_rms = rms;
                 }
-                if rms >= SILENCE_RMS {
+                let is_speech = rms >= SILENCE_RMS;
+                if is_speech {
                     last_speech = tokio::time::Instant::now();
                 }
-                if !ship(&mut sink, &chunk, &mut ws_dead).await {
+                // Ship speech now (flushing any held pause first); buffer silence.
+                let n = ship_all(&mut sink, &gate.offer(chunk, is_speech), &mut ws_dead).await;
+                chunks_sent += n;
+                tail_chunks += n;
+                if n > 0 {
+                    last_send = tokio::time::Instant::now();
+                    // A speech-bearing tail chunk went out: a genuinely-spoken
+                    // trailing word. Count it so its commit isn't mistaken for a
+                    // phantom (this is what preserves a real trailing "Yes.").
+                    if is_speech {
+                        speech_shipped_send.fetch_add(1, Ordering::Release);
+                    }
+                }
+                if ws_dead {
                     break;
                 }
-                chunks_sent += 1;
-                tail_chunks += 1;
+            }
+            // Long quiet tail: no audio has gone out for a while (we're trimming
+            // silence). Send a content-free keepalive so the server keeps the
+            // session open. Never fires on a normal-length tail.
+            if last_send.elapsed() >= TAIL_KEEPALIVE_AFTER {
+                if let Err(e) = sink.keepalive().await {
+                    tracing::debug!("session tail: keepalive failed (socket likely dead): {e}");
+                    ws_dead = true;
+                    break;
+                }
+                last_send = tokio::time::Instant::now();
+                tracing::debug!("session tail: sent keepalive during long silent tail");
             }
             if elapsed >= TAIL_MIN && last_speech.elapsed() >= tail_quiet {
                 tracing::info!(
-                    "session tail: ended after {:.0} ms ({} tail chunks, peak_rms={peak_rms}, quiet ={:.0} ms)",
+                    "session tail: ended after {:.0} ms ({} tail chunk(s) shipped, {} silent chunk(s) trimmed, peak_rms={peak_rms}, quiet ={:.0} ms)",
                     elapsed.as_secs_f64() * 1000.0,
                     tail_chunks,
+                    gate.held(),
                     last_speech.elapsed().as_secs_f64() * 1000.0
                 );
                 break;
@@ -535,6 +667,11 @@ async fn run_session(
         }
 
         // === Phase 3: flush the session's resampler tail, then drain ===
+        //
+        // Same silence gate as the tail: the resampler's flushed fragment and any
+        // last mic chunks are forwarded only if they carry speech, so we never
+        // re-introduce trailing silence for the provider to hallucinate on in the
+        // instant before we commit.
         flusher_send.flush_tail();
         let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(300);
         while !ws_dead {
@@ -544,13 +681,24 @@ async fn run_session(
             };
             match chunk_opt {
                 Some(chunk) => {
-                    if !ship(&mut sink, &chunk, &mut ws_dead).await {
+                    let is_speech = rms_i16(&chunk) >= SILENCE_RMS;
+                    let n = ship_all(&mut sink, &gate.offer(chunk, is_speech), &mut ws_dead).await;
+                    chunks_sent += n;
+                    if is_speech && n > 0 {
+                        speech_shipped_send.fetch_add(1, Ordering::Release);
+                    }
+                    if ws_dead {
                         break;
                     }
-                    chunks_sent += 1;
                 }
                 None => break,
             }
+        }
+        if gate.held() > 0 {
+            tracing::debug!(
+                "session tail: dropped {} trailing silent chunk(s) before commit -- never sent, so the model can't finalize silence into a hallucinated answer",
+                gate.held(),
+            );
         }
 
         // === Phase 4: commit + close (only if the socket is still alive) ===
@@ -589,6 +737,11 @@ async fn run_session(
     let recv_task = tokio::spawn(async move {
         let mut events: usize = 0;
         let mut committed_words: u32 = 0;
+        // Snapshot of `speech_shipped` taken at the last *kept* commit. Compared
+        // against the live count at each new commit to spot a phantom (equal =>
+        // no speech shipped in between). Starts at 0, so the very first real
+        // commit -- always backed by shipped speech -- is never mistaken for one.
+        let mut last_commit_speech: u64 = 0;
         #[allow(unused_assignments)]
         let mut partial_words = 0u32;
         loop {
@@ -618,8 +771,6 @@ async fn run_session(
                     *last_partial_for_task.lock() = t;
                 }
                 SttEvent::Committed(final_text) => {
-                    committed_for_task.store(true, Ordering::Release);
-
                     // Drop the chunk entirely if a NEWER session has taken over.
                     if recv_app.current_session_epoch() != epoch {
                         tracing::debug!(
@@ -627,6 +778,51 @@ async fn run_session(
                         );
                         continue;
                     }
+
+                    let released = release_pending_recv.load(Ordering::Acquire);
+                    let speech_now = speech_shipped_recv.load(Ordering::Acquire);
+
+                    // Phantom-finalization guard (ElevenLabs Scribe). A commit
+                    // that lands AFTER release with no speech-bearing audio shipped
+                    // since the previous commit -- AND whose text is a short
+                    // answer-shaped interjection -- is the model's LM prior
+                    // "answering" the question out of dead air ("Yes.", "No."),
+                    // not anything the user said. A genuinely-spoken trailing word
+                    // ships speech first, bumping `speech_now`, so it survives;
+                    // pre-release VAD commits have `released == false` and survive
+                    // too. The short-text gate bounds a residual race: `speech_now`
+                    // counts chunks shipped, not chunks attributable to *this*
+                    // commit, so a slow VAD commit that delivers a REAL segment
+                    // post-release (after the counter already advanced past it)
+                    // could look phantom -- but we then only ever risk dropping a
+                    // plausible answer, never a full sentence. See
+                    // `is_phantom_finalization`, `looks_like_short_answer`, and
+                    // SCRIBE_HALLUCINATION_HANDOFF.md §10.
+                    if suppress_phantom
+                        && is_phantom_finalization(released, speech_now, last_commit_speech)
+                        && looks_like_short_answer(&final_text)
+                    {
+                        if log_transcripts {
+                            tracing::info!(
+                                "session[{epoch}] dropped phantom finalization (no speech since last commit): {final_text}"
+                            );
+                        } else {
+                            tracing::info!(
+                                "session[{epoch}] dropped phantom finalization (no speech since last commit): {} char(s)",
+                                final_text.chars().count()
+                            );
+                        }
+                        continue;
+                    }
+
+                    // A transcript we're keeping. Mark that we have durable
+                    // committed text (disarms the last-partial fallback) and
+                    // advance the speech baseline for the next phantom check.
+                    // Set ONLY for kept commits: a dropped phantom must not trip
+                    // this, or a session whose only real content arrived as a
+                    // partial would lose its promotion fallback.
+                    committed_for_task.store(true, Ordering::Release);
+                    last_commit_speech = speech_now;
 
                     let chunk_words = final_text.split_whitespace().count() as u32;
                     committed_words = committed_words.saturating_add(chunk_words);
@@ -638,7 +834,6 @@ async fn run_session(
                     //   before release              -> HOLD (accumulate)
                     //   after release               -> LIVE (paste each chunk)
                     //   delay_until_release = false -> LIVE throughout
-                    let released = release_pending_recv.load(Ordering::Acquire);
                     if delay_until_release && !released {
                         if log_transcripts {
                             tracing::info!(
@@ -830,6 +1025,46 @@ async fn run_session(
     Ok(())
 }
 
+/// True when a committed transcript is a hallucinated end-of-stream
+/// finalization rather than something the user actually said.
+///
+/// ElevenLabs Scribe (`scribe_v2_realtime`, `commit_strategy=vad`) will, when an
+/// utterance is finalized, occasionally emit its language-model prior "answer"
+/// to the preceding question as a fresh `committed_transcript` -- ask "should we
+/// do X?", stop, and it commits "Yes." -- even when we send it no trailing audio
+/// at all. The tell is that **no speech-bearing audio was shipped to the
+/// provider between the previous commit and this one**: `speech_now` (the running
+/// speech-chunk count) still equals `speech_at_last_commit` (its value at the
+/// last kept commit).
+///
+/// We only judge this **after release** (`released`): before release, mid-
+/// utterance VAD commits are held/accumulated and must always be kept. And
+/// because a genuinely-spoken trailing word ships speech first (advancing
+/// `speech_now`), a real "Yes." is never mistaken for the phantom -- only a
+/// commit conjured out of silence is dropped.
+#[inline]
+fn is_phantom_finalization(released: bool, speech_now: u64, speech_at_last_commit: u64) -> bool {
+    released && speech_now == speech_at_last_commit
+}
+
+/// Upper bounds on what the phantom guard is willing to drop. The hallucinated
+/// "answer" is always a tiny interjection ("Yes.", "No.", "Okay.", "Like...",
+/// "Absolutely."); real dictation flushed at finalize is a fuller clause.
+const PHANTOM_MAX_WORDS: usize = 4;
+const PHANTOM_MAX_CHARS: usize = 24;
+
+/// Secondary gate on the phantom drop (the primary being "no speech shipped
+/// since the last commit"): is `text` short enough to *be* a phantom answer
+/// rather than real dictated content? This bounds the count/commit attribution
+/// race (a slow VAD commit delivering a real segment post-release could look
+/// phantom by count alone) so the guard can never silently eat a real sentence
+/// -- only ever a plausible answer. See the Committed arm.
+#[inline]
+fn looks_like_short_answer(text: &str) -> bool {
+    let t = text.trim();
+    t.chars().count() <= PHANTOM_MAX_CHARS && t.split_whitespace().count() <= PHANTOM_MAX_WORDS
+}
+
 /// Root-mean-square amplitude of an i16 buffer. Cheap (one pass, integer math
 /// + one sqrt). Distinguishes "still talking" from "ambient noise" in the tail.
 #[inline]
@@ -844,4 +1079,129 @@ fn rms_i16(samples: &[i16]) -> i32 {
     }
     let mean = sum / samples.len() as i64;
     (mean as f64).sqrt() as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_phantom_finalization, looks_like_short_answer, TailSilenceGate};
+
+    #[test]
+    fn short_answer_detector_matches_observed_phantoms() {
+        // Every phantom seen in the wild (SCRIBE_HALLUCINATION_HANDOFF.md §1-2).
+        for p in [
+            "Yes.",
+            "No.",
+            "Yeah.",
+            "Okay.",
+            "Sure.",
+            "Like...",
+            "Absolutely.",
+            "I think so.",
+        ] {
+            assert!(
+                looks_like_short_answer(p),
+                "{p:?} should read as a phantom answer"
+            );
+        }
+    }
+
+    #[test]
+    fn short_answer_detector_spares_real_sentences() {
+        // A real trailing clause a slow VAD commit might deliver post-release
+        // must never be eaten, even if the count-based check misfires.
+        assert!(!looks_like_short_answer(
+            "Can we make them properly sized instead of super wide?"
+        ));
+        assert!(!looks_like_short_answer(
+            "please refactor this whole function"
+        ));
+    }
+
+    #[test]
+    fn phantom_guard_drops_post_release_commit_with_no_new_speech() {
+        // The bug: question committed pre-release at speech=15; release; the tail
+        // ships nothing; Scribe finalizes "Yes." while the count is still 15.
+        assert!(is_phantom_finalization(true, 15, 15));
+    }
+
+    #[test]
+    fn phantom_guard_keeps_a_genuinely_spoken_trailing_word() {
+        // A real trailing "Yes." ships at least one speech chunk first (16 > 15),
+        // so it must NOT be dropped.
+        assert!(!is_phantom_finalization(true, 16, 15));
+    }
+
+    #[test]
+    fn phantom_guard_never_touches_pre_release_commits() {
+        // Before release, mid-utterance VAD commits are held and always kept,
+        // regardless of the speech counts.
+        assert!(!is_phantom_finalization(false, 15, 15));
+        assert!(!is_phantom_finalization(false, 0, 0));
+    }
+
+    #[test]
+    fn phantom_guard_keeps_words_flushed_by_a_mid_sentence_release() {
+        // Released mid-sentence: the final real words shipped in the live phase
+        // (speech=20) but VAD never committed them (last commit still at 0). The
+        // manual commit flushes them post-release; new speech since the last
+        // commit means this is real, not a phantom.
+        assert!(!is_phantom_finalization(true, 20, 0));
+    }
+
+    #[test]
+    fn speech_with_no_held_pause_ships_immediately_and_alone() {
+        let mut g = TailSilenceGate::default();
+        let out = g.offer(vec![9000; 4], true);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0][0], 9000);
+        assert_eq!(g.held(), 0);
+    }
+
+    #[test]
+    fn silence_is_held_back_not_shipped() {
+        let mut g = TailSilenceGate::default();
+        assert!(g.offer(vec![0; 4], false).is_empty());
+        assert!(g.offer(vec![1; 4], false).is_empty());
+        assert_eq!(g.held(), 2);
+    }
+
+    #[test]
+    fn resumed_speech_flushes_the_held_pause_in_order_then_the_speech() {
+        // A genuine mid-utterance pause must reach the provider verbatim so the
+        // words after it aren't spliced onto the words before it.
+        let mut g = TailSilenceGate::default();
+        g.offer(vec![10; 1], false); // pause chunk A
+        g.offer(vec![20; 1], false); // pause chunk B
+        let out = g.offer(vec![9000; 1], true); // speech resumes
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0][0], 10); // A first
+        assert_eq!(out[1][0], 20); // then B
+        assert_eq!(out[2][0], 9000); // then the speech chunk
+        assert_eq!(g.held(), 0); // buffer drained on flush
+    }
+
+    #[test]
+    fn trailing_silence_never_followed_by_speech_is_never_emitted() {
+        // This is the whole point: the run of silence after the last real word
+        // stays held, so the caller discards it and the model never sees dead
+        // air to finalize into a hallucinated "Yes."
+        let mut g = TailSilenceGate::default();
+        assert_eq!(g.offer(vec![9000; 1], true).len(), 1); // last real word ships
+        assert!(g.offer(vec![0; 1], false).is_empty());
+        assert!(g.offer(vec![0; 1], false).is_empty());
+        assert!(g.offer(vec![0; 1], false).is_empty());
+        assert_eq!(g.held(), 3); // all held; caller drops them, none sent
+    }
+
+    #[test]
+    fn alternating_speech_resets_the_held_run_each_time() {
+        let mut g = TailSilenceGate::default();
+        g.offer(vec![9000; 1], true); // speech -> ships, nothing held
+        assert_eq!(g.held(), 0);
+        g.offer(vec![0; 1], false); // 1 held
+        assert_eq!(g.held(), 1);
+        let out = g.offer(vec![9000; 1], true); // speech again -> flush 1 + speech
+        assert_eq!(out.len(), 2);
+        assert_eq!(g.held(), 0);
+    }
 }

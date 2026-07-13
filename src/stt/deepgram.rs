@@ -102,6 +102,16 @@ impl ProviderSink for DeepgramSink {
             .map_err(|e| SendError(e.to_string()))
     }
 
+    async fn keepalive(&mut self) -> Result<(), SendError> {
+        // Deepgram closes a stream after ~10 s with no audio (NET-0001). This is
+        // its documented keepalive: resets that timer without adding any audio.
+        // A transport ping does NOT prevent that close, so it must be this JSON.
+        self.sink
+            .send(Message::Text("{\"type\":\"KeepAlive\"}".into()))
+            .await
+            .map_err(|e| SendError(e.to_string()))
+    }
+
     async fn close(&mut self) -> Result<(), SendError> {
         // No-op: CloseStream already initiates the server-side close. Sending a
         // client Close here would race Deepgram's final-results flush.

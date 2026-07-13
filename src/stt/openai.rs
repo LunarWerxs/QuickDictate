@@ -125,6 +125,16 @@ impl ProviderSink for OpenAiSink {
             .map_err(|e| SendError(e.to_string()))
     }
 
+    async fn keepalive(&mut self) -> Result<(), SendError> {
+        // The realtime socket has no short audio-idle close, but a transport WS
+        // ping keeps any connection idle timer from firing during a long silent
+        // tail. The recv side ignores the Pong reply.
+        self.sink
+            .send(Message::Ping(Vec::new()))
+            .await
+            .map_err(|e| SendError(e.to_string()))
+    }
+
     async fn close(&mut self) -> Result<(), SendError> {
         // No-op: after `input_audio_buffer.commit`, OpenAI streams the
         // transcription deltas + `.completed`. Sending a WS Close here would

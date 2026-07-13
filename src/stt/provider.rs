@@ -133,6 +133,22 @@ pub trait SttProvider: Send + Sync {
         Duration::from_millis(2400)
     }
 
+    /// Whether this provider occasionally emits a hallucinated short "answer"
+    /// (e.g. "Yes.", "No.") as an extra committed transcript when an utterance is
+    /// finalized at end-of-stream -- its language-model prior "completing" the
+    /// preceding question out of nothing, even with no trailing audio. ElevenLabs
+    /// Scribe (`scribe_v2_realtime`, `commit_strategy=vad`) does this.
+    ///
+    /// When true, the runner drops a **post-release** committed transcript that
+    /// had **no speech-bearing audio shipped since the previous commit** (see
+    /// `crate::stt::is_phantom_finalization`). Default false: well-behaved
+    /// providers only finalize real speech, and batch providers (Google) legibly
+    /// return several final segments after a single up-front upload, which this
+    /// guard must not touch.
+    fn suppress_phantom_finalization(&self) -> bool {
+        false
+    }
+
     /// Open a session for `key`. Returns a split sink+stream on success.
     async fn connect(
         &self,
@@ -150,6 +166,15 @@ pub trait ProviderSink: Send {
     /// No-op for VAD-only providers; for batch providers this is where the
     /// single network round-trip happens.
     async fn commit(&mut self) -> Result<(), SendError>;
+    /// Nudge the transport so an idle server doesn't close the session during a
+    /// stretch where we deliberately forward no audio (the runner trims trailing
+    /// silence from the post-release tail, so a long quiet tail can go seconds
+    /// without a real audio frame). Must add **nothing** the model could
+    /// transcribe. Default: no-op — for providers that never idle-close or don't
+    /// need it. Streaming providers that do should override this.
+    async fn keepalive(&mut self) -> Result<(), SendError> {
+        Ok(())
+    }
     /// Tear the transport down cleanly.
     async fn close(&mut self) -> Result<(), SendError>;
 }

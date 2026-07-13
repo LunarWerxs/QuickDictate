@@ -6,13 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-13
+
 ### Changed
 
-- **The update check now goes through LunarWerx's own endpoint and doubles as an anonymous install count.** The daily check asks `studio.connections.icu` (which relays GitHub's release info verbatim) instead of GitHub directly, carrying a crypto-random install id, the app version, and — via the CDN — an approximate region; never your IP or any direct identifier, with 90-day retention. Exactly **one** anonymous row per check: the install step reuses the response from the check you just approved instead of fetching again. Turning off *Check for updates daily* stops the ping entirely. Release binaries still download straight from GitHub. Full disclosure: `SECURITY.md`.
+- **The update check now goes through LunarWerx's own endpoint.** The daily check asks `studio.connections.icu` (which relays GitHub's release info verbatim) instead of GitHub directly. Turning off *Check for updates daily* stops the check entirely. Release binaries still download straight from GitHub. Full disclosure: `SECURITY.md`.
 - **Settings layout tidied.** "Enable per-app profiles" now sits in the right column of the Application card, the "Text replacements" button is more compact, and the gap above the timing row is tighter so it reads as one group.
+- **Streaming providers now send a keep-alive during long silent tails.** Because trailing silence is no longer streamed (see the hallucination fix below), a very long "keep listening" window could otherwise let a provider drop the session for inactivity. Each streaming provider now sends a lightweight keep-alive while the tail is quiet (Deepgram's documented KeepAlive message; a WebSocket ping for OpenAI, AssemblyAI, and DashScope), so a long quiet tail stays connected. It never fires on a normal-length tail.
 
 ### Fixed
 
+- **Dictation no longer tacks on a short answer you never said.** After you stop talking, QuickDictate keeps listening for a moment (the "dynamic tail") to catch trailing words. It used to keep streaming that trailing silence to the speech provider, and some models (notably ElevenLabs Scribe) would "complete" the dead air by hallucinating a brief reply to what you just said: you would ask "should we do this?", stop, and get "Yes." appended. QuickDictate now trims the trailing silence, holding silent audio back during the tail and forwarding it only if you actually resume speaking, so the model never receives silence to finish. A genuine mid-sentence pause is preserved verbatim, and this works for any tail length, so you can keep a long "keep listening" window without inviting it.
 - **The Settings window no longer scrolls or leaves dead space.** It now sizes its own height to fit its content exactly, so the whole form is visible without a scrollbar and with no extra empty padding, whatever the app zoom or window state (for example the first-run "add a key" banner).
 - **The Save split button's dropdown matches the Save button.** The ▾ half is now the same height as **Save** and a narrower tab, so the pair reads as one clean control.
 

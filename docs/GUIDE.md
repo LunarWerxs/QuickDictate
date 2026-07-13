@@ -35,7 +35,7 @@ See the [changelog](../CHANGELOG.md) for what's changed release to release.
 - **Text streams in as you speak** — for the streaming providers, words paste back live instead of waiting for you to finish.
 - **Fix the words it always mishears** — a small replacement table turns "Chat GPT" into "ChatGPT", "Github" into "GitHub", and whatever else your accent and your provider disagree on.
 - **Updates itself, only if you let it** — an optional once-a-day check against LunarWerx's update endpoint, which relays GitHub's release info (plus a button in Settings; the download itself still comes from GitHub). Downloads are verified by size **and** SHA-256, and nothing installs until you say yes.
-- **One anonymous ping, nothing else** — the daily update check doubles as an anonymous install count: a random id, the app version, and an approximate IP-derived region (never the IP itself or any direct identifier), 90-day retention (details in [SECURITY.md](../.github/SECURITY.md)). Turn off *Check for updates daily* and even that stops. Beyond it, nothing leaves your machine except your dictation audio (to the provider you chose) and — only if you opt in — Connections settings sync (preferences only, never keys/audio).
+- **Nothing else leaves your machine** — turn off *Check for updates daily* and even that check stops. Beyond it, nothing leaves your machine except your dictation audio (to the provider you chose) and — only if you opt in — Connections settings sync (preferences only, never keys/audio).
 
 That replacement table, since it's the fiddly-but-lovely part:
 
@@ -93,8 +93,8 @@ Everything lives in `settings.json` (copied from `settings.example.json`). The f
 | `enable_logging` | Write `quickdictate.log` next to the exe (bool) |
 | `log_transcripts` | Also log your full dictated text, not just summaries (bool, default `false`; deep debugging only) |
 | `max_log_mb` | Log-file rotation cap, in MB, before `quickdictate.log` is rolled over (default `5`) |
-| `update_auto_check` | Check for a newer release at startup, at most once/day (bool, default `true`); goes to LunarWerx's update endpoint and doubles as an anonymous install ping (see [SECURITY.md](../.github/SECURITY.md)); installing always asks first |
-| `install_id` | Anonymous random id sent with update checks so installs can be counted (string, generated on first launch; never derived from your machine or identity — clear it for a fresh one) |
+| `update_auto_check` | Check for a newer release at startup, at most once/day (bool, default `true`); goes to LunarWerx's update endpoint (see [SECURITY.md](../.github/SECURITY.md)); installing always asks first |
+| `install_id` | Random id sent with update checks (string, generated on first launch; never derived from your machine or identity — clear it for a fresh one) |
 | `run_at_startup` | Start QuickDictate at Windows login via the per-user Run key (bool, default `false`) |
 | `prewarm_keys` | Probe the active provider's keys at startup and queue a validated one (bool, default `true`) |
 | `text_replacements` | JSON object mapping misheard phrases to corrections |
@@ -182,7 +182,7 @@ The binary lands at `target\release\quickdictate.exe`. Put `settings.example.jso
 
 ## Privacy
 
-QuickDictate streams your microphone audio to the **one third-party STT provider you select** — and only that one. Your API keys and your audio never touch the QuickDictate maintainer. The only thing the app itself reports anywhere is the **optional daily update check**, which goes to LunarWerx's update endpoint and doubles as an anonymous install count — a random `install_id`, the app version, and an approximate IP-derived region (never the IP itself or any direct identifier), 90-day retention; the full disclosure is in [SECURITY.md](../.github/SECURITY.md), and turning off *Check for updates daily* stops it entirely. Beyond that, nothing leaves your machine except your dictation audio (to the provider you chose) and — only if you opt in — Connections settings sync, which syncs preferences only (mode, language, hotkeys, STT provider/model, etc.) and never your API keys, audio, or transcripts. See [docs/SETTINGS_SYNC.md](SETTINGS_SYNC.md) for details, including how to turn it off. Locally, it only uses the OS clipboard and keystroke APIs to paste text into your focused window.
+QuickDictate streams your microphone audio to the **one third-party STT provider you select** — and only that one. Your API keys and your audio never touch the QuickDictate maintainer. The only thing the app itself reports anywhere is the **optional daily update check**, which goes to LunarWerx's update endpoint; the full disclosure is in [SECURITY.md](../.github/SECURITY.md), and turning off *Check for updates daily* stops it entirely. Beyond that, nothing leaves your machine except your dictation audio (to the provider you chose) and — only if you opt in — Connections settings sync, which syncs preferences only (mode, language, hotkeys, STT provider/model, etc.) and never your API keys, audio, or transcripts. See [docs/SETTINGS_SYNC.md](SETTINGS_SYNC.md) for details, including how to turn it off. Locally, it only uses the OS clipboard and keystroke APIs to paste text into your focused window.
 
 Local logging (`enable_logging`) writes event summaries — not your recognized text — to `quickdictate.log` next to the exe. A separate `log_transcripts` setting, off by default, opts into logging the full dictated text for deep debugging; nothing written locally is ever sent anywhere.
 

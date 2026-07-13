@@ -154,6 +154,37 @@ fn run(app: Arc<App>) -> Result<()> {
             } else if ev.id() == &MenuId::new("quit") {
                 tracing::info!("Quit selected from tray menu");
                 app.shutdown.store(true, Ordering::Release);
+            } else if ev.id() == &MenuId::new("history:copyall") {
+                // "Copy all (N)": concatenate every recent transcription and put
+                // the whole batch on the clipboard in one go. Joined oldest-first
+                // so the newest lands at the bottom (the way a transcript reads
+                // and where the eye naturally goes), even though the menu itself
+                // lists them newest-first. A blank line between entries keeps each
+                // dictation a distinct paragraph when pasted.
+                let all: Vec<String> = app
+                    .history
+                    .lock()
+                    .snapshot()
+                    .into_iter()
+                    .rev() // newest-first snapshot -> oldest-first output
+                    .map(|e| e.text)
+                    .filter(|t| !t.is_empty())
+                    .collect();
+                if all.is_empty() {
+                    tracing::warn!("Recent transcriptions: 'Copy all' with nothing to copy");
+                } else {
+                    let joined = all.join("\n\n");
+                    let n = all.len();
+                    match crate::output::copy_to_clipboard(&joined) {
+                        Ok(()) => tracing::info!(
+                            "Recent transcriptions: copied all {n} entries ({} chars) to clipboard",
+                            joined.chars().count()
+                        ),
+                        Err(e) => tracing::warn!(
+                            "Recent transcriptions: 'Copy all' clipboard copy failed: {e:#}"
+                        ),
+                    }
+                }
             } else if let Some(idx) = id.strip_prefix("history:") {
                 match idx.parse::<usize>() {
                     Ok(i) => {
@@ -298,6 +329,19 @@ impl TrayState {
             let _ = self.history_menu.append(&placeholder);
             return;
         }
+
+        // Aggregate action pinned to the top: copy every recent transcription
+        // to the clipboard at once. A separator sets it apart from the tappable
+        // per-entry rows below (which each copy just themselves). Newest-first,
+        // matching the order the entries are listed.
+        let copy_all = MenuItem::with_id(
+            MenuId::new("history:copyall"),
+            format!("Copy all ({})", entries.len()),
+            true,
+            None,
+        );
+        let _ = self.history_menu.append(&copy_all);
+        let _ = self.history_menu.append(&PredefinedMenuItem::separator());
 
         for (i, entry) in entries.iter().enumerate() {
             let age = time_ago(entry.when);

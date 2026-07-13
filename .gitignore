@@ -11,6 +11,7 @@ quickdictate.log
 quickdictate-panic.log
 quickdictate-dev-port.txt
 quickdictate-update.txt
+key-health.json
 
 # Connections settings-sync: DPAPI-sealed refresh token (machine+user bound).
 # Never plaintext, never committed.
@@ -52,3 +53,7 @@ ui-*.png
 **/*.rs.bk
 **/*.rs.b4
 *~
+
+# Local investigation / handoff notes (not for the repo).
+*_HANDOFF.md
+SCRIBE_HALLUCINATION_HANDOFF.md

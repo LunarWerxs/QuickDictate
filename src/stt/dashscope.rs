@@ -192,6 +192,16 @@ impl ProviderSink for DashScopeSink {
             .map_err(|e| SendError(e.to_string()))
     }
 
+    async fn keepalive(&mut self) -> Result<(), SendError> {
+        // No documented no-audio keepalive, so use a transport-level WS ping: a
+        // harmless standard control frame that resets idle timers. The recv side
+        // ignores the Pong reply.
+        self.sink
+            .send(Message::Ping(Vec::new()))
+            .await
+            .map_err(|e| SendError(e.to_string()))
+    }
+
     async fn close(&mut self) -> Result<(), SendError> {
         // No-op: finish-task drives the server-side close after task-finished.
         Ok(())

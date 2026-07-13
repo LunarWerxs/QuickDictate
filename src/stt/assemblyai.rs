@@ -97,6 +97,16 @@ impl ProviderSink for AssemblyAiSink {
             .map_err(|e| SendError(e.to_string()))
     }
 
+    async fn keepalive(&mut self) -> Result<(), SendError> {
+        // No documented no-audio keepalive for the streaming API, so use a
+        // transport-level WS ping: a harmless standard control frame that resets
+        // connection idle timers. The recv side ignores the Pong reply.
+        self.sink
+            .send(Message::Ping(Vec::new()))
+            .await
+            .map_err(|e| SendError(e.to_string()))
+    }
+
     async fn close(&mut self) -> Result<(), SendError> {
         // No-op: Terminate already initiates the server-side close.
         Ok(())
