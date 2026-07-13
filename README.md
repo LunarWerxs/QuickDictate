@@ -50,7 +50,7 @@ a terminal, any web text field. It runs on <i>your own</i> speech-to-text API ke
 | ✋ **Hold or tap** | Hold a key while you talk, or tap to start and stop. Both are configurable. |
 | 💬 **Streams as you speak** | Words appear live as you talk on the streaming providers. |
 | 🪄 **Little touches that add up** | A fix-list for words it mishears, per-app profiles, and a *"scratch that"* voice command. |
-| 🔒 **Your data stays yours** | Nothing leaves your machine except your dictation audio (to the provider you picked), the optional daily check against GitHub Releases for a newer version (details in [SECURITY.md](.github/SECURITY.md)), and, only if you opt in, Connections settings sync (preferences only, never keys/audio). Toggle *Check for updates daily* off any time. |
+| 🔒 **Your data stays yours** | Your dictation audio goes only to the speech provider you pick — nothing else is uploaded. Optional settings sync, only if you turn it on. |
 
 ## 🚀 Quick start
 

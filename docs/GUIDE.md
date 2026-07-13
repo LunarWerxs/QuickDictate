@@ -34,7 +34,7 @@ See the [changelog](../CHANGELOG.md) for what's changed release to release.
 - **Hold or toggle — your call** — hold a key while you talk, or tap once to start and once to stop. Both hotkeys are configurable.
 - **Text streams in as you speak** — for the streaming providers, words paste back live instead of waiting for you to finish.
 - **Fix the words it always mishears** — a small replacement table turns "Chat GPT" into "ChatGPT", "Github" into "GitHub", and whatever else your accent and your provider disagree on.
-- **Updates itself, only if you let it** — an optional once-a-day check against LunarWerx's update endpoint, which relays GitHub's release info (plus a button in Settings; the download itself still comes from GitHub). Downloads are verified by size **and** SHA-256, and nothing installs until you say yes.
+- **Updates itself, only if you let it** — an optional once-a-day check for a newer release (plus a button in Settings). Downloads are verified by size **and** SHA-256, and nothing installs until you say yes.
 - **Nothing else leaves your machine** — turn off *Check for updates daily* and even that check stops. Beyond it, nothing leaves your machine except your dictation audio (to the provider you chose) and — only if you opt in — Connections settings sync (preferences only, never keys/audio).
 
 That replacement table, since it's the fiddly-but-lovely part:
@@ -93,7 +93,7 @@ Everything lives in `settings.json` (copied from `settings.example.json`). The f
 | `enable_logging` | Write `quickdictate.log` next to the exe (bool) |
 | `log_transcripts` | Also log your full dictated text, not just summaries (bool, default `false`; deep debugging only) |
 | `max_log_mb` | Log-file rotation cap, in MB, before `quickdictate.log` is rolled over (default `5`) |
-| `update_auto_check` | Check for a newer release at startup, at most once/day (bool, default `true`); goes to LunarWerx's update endpoint (see [SECURITY.md](../.github/SECURITY.md)); installing always asks first |
+| `update_auto_check` | Check for a newer release at startup, at most once/day (bool, default `true`); installing always asks first |
 | `install_id` | Random id sent with update checks (string, generated on first launch; never derived from your machine or identity — clear it for a fresh one) |
 | `run_at_startup` | Start QuickDictate at Windows login via the per-user Run key (bool, default `false`) |
 | `prewarm_keys` | Probe the active provider's keys at startup and queue a validated one (bool, default `true`) |
