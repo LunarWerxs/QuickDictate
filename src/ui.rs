@@ -33,7 +33,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
-use crate::state::{App, Status};
+use crate::state::{App, ErrorKind, Status};
 
 const PIP_SIZE: i32 = 48;
 const PIP_OFFSET_X: i32 = 18;
@@ -115,9 +115,18 @@ fn run(app: Arc<App>) -> Result<()> {
     tracing::info!("overlay hwnd={:?}", overlay.hwnd.0);
 
     let mut last_status = Status::Idle;
+    let mut last_error_kind = ErrorKind::Generic;
     let mut last_pos: Option<POINT> = None;
     let mut last_word_count: u32 = u32::MAX;
     let mut msg = MSG::default();
+
+    // Tray-tooltip explanation for a dead-keys failure. The 2s error pip clears
+    // fast, so this persists the "why" on the tray icon's hover text until a
+    // dictation actually connects again (or the app restarts).
+    const DEAD_KEYS_TOOLTIP: &str =
+        "QuickDictate: your API keys were rejected. Open Settings to update them.";
+    let default_tooltip = format!("QuickDictate v{}", env!("CARGO_PKG_VERSION"));
+    let mut dead_keys_tooltip_active = false;
     // Rebuild the "Recent transcriptions" submenu only when the history has
     // actually changed since we last drew it (cheap version counter, see
     // `TranscriptHistory::version`), not on every poll tick.
@@ -227,9 +236,23 @@ fn run(app: Arc<App>) -> Result<()> {
         }
 
         let status = app.status();
+        let error_kind = app.error_kind();
         let cfg = app.config.load();
         let target_count = app.word_count.load(Ordering::Acquire) as f32;
         let want_visible = cfg.mouse_follower_enabled && status != Status::Idle;
+
+        // Surface a dead-keys failure on the tray tooltip, and keep it there
+        // until a session actually connects (Listening) so the explanation
+        // outlives the brief error pip.
+        if status == Status::Error && error_kind == ErrorKind::DeadKeys {
+            if !dead_keys_tooltip_active {
+                let _ = tray_state.tray.set_tooltip(Some(DEAD_KEYS_TOOLTIP));
+                dead_keys_tooltip_active = true;
+            }
+        } else if dead_keys_tooltip_active && status == Status::Listening {
+            let _ = tray_state.tray.set_tooltip(Some(&default_tooltip));
+            dead_keys_tooltip_active = false;
+        }
 
         // Live-apply the hide-tray-icon setting whenever it changes -- no
         // restart needed. tray-icon 0.19's set_visible is a thin wrapper over
@@ -274,18 +297,24 @@ fn run(app: Arc<App>) -> Result<()> {
                         !matches!(last_pos, Some(prev) if prev.x == p.x && prev.y == p.y);
                     let status_changed = status != last_status;
                     let count_changed = smooth_count != last_word_count;
+                    // The error glyph depends on the kind, so a kind flip while
+                    // the status stays Error must still repaint (two back-to-back
+                    // errors of different kinds within the 2s pip window).
+                    let kind_changed = error_kind != last_error_kind;
                     // Render whenever anything changes — the smoothed counter
                     // changes most frames during active dictation, giving a
                     // fluid animation.
-                    if pos_changed || status_changed || count_changed {
+                    if pos_changed || status_changed || count_changed || kind_changed {
                         overlay.render(
                             status,
+                            error_kind,
                             smooth_count,
                             p.x + PIP_OFFSET_X,
                             p.y + PIP_OFFSET_Y,
                         );
                         last_pos = Some(p);
                         last_word_count = smooth_count;
+                        last_error_kind = error_kind;
                     }
                 }
             } else if last_status != Status::Idle || last_pos.is_some() {
@@ -533,7 +562,14 @@ impl Overlay {
     /// Software-render the disc + word count into the DIB, then ship it to
     /// the screen via UpdateLayeredWindow. Pixels are premultiplied BGRA as
     /// required by ULW_ALPHA.
-    unsafe fn render(&self, status: Status, word_count: u32, screen_x: i32, screen_y: i32) {
+    unsafe fn render(
+        &self,
+        status: Status,
+        error_kind: ErrorKind,
+        word_count: u32,
+        screen_x: i32,
+        screen_y: i32,
+    ) {
         let total = (self.size * self.size) as usize;
         let pixels = std::slice::from_raw_parts_mut(self.pixels, total);
         // Clear to fully transparent.
@@ -576,16 +612,24 @@ impl Overlay {
             }
         }
 
-        // Draw the word count text on top. GDI doesn't touch the alpha channel,
-        // but the disc region we draw on already has alpha=255 in the interior,
-        // so the text inherits full opacity wherever a glyph hits the disc.
-        let label = match status {
-            Status::Error => "!".to_string(),
-            _ => format!("{word_count}"),
+        // Draw the label on top. GDI doesn't touch the alpha channel, but the
+        // disc region we draw on already has alpha=255 in the interior, so the
+        // text inherits full opacity wherever a glyph hits the disc.
+        //
+        // A dead-keys error swaps the bare "!" for the Windows icon-font "key"
+        // glyph (MDL2/Fluent "Permissions", U+E8D7) so the pip says *why* it's
+        // red. "Segoe MDL2 Assets" ships on Win10 and Win11 and carries that PUA
+        // codepoint; every other state keeps Segoe UI text ("!" or the count).
+        let (label, face_name, height_factor) = match status {
+            Status::Error if error_kind == ErrorKind::DeadKeys => {
+                ("\u{E8D7}".to_string(), "Segoe MDL2 Assets\0", 0.52)
+            }
+            Status::Error => ("!".to_string(), "Segoe UI\0", 0.45),
+            _ => (format!("{word_count}"), "Segoe UI\0", 0.45),
         };
         let mut label_utf16: Vec<u16> = label.encode_utf16().collect();
-        let font_height = (self.size as f32 * 0.45) as i32;
-        let face: Vec<u16> = "Segoe UI\0".encode_utf16().collect();
+        let font_height = (self.size as f32 * height_factor) as i32;
+        let face: Vec<u16> = face_name.encode_utf16().collect();
         let font = CreateFontW(
             -font_height,
             0,

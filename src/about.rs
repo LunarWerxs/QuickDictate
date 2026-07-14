@@ -5,7 +5,9 @@
 //! bottom-left, and the clickable LunarWerx Studios wordmark in the
 //! bottom-right. The update check runs on a worker thread when the box opens
 //! and again whenever the user clicks the status pill, so the chip is never
-//! stale. Theme-aware (dark/light) and per-monitor-DPI scaled.
+//! stale. When a newer release is waiting, clicking the pill installs it
+//! **in-app** (download → verify → swap → relaunch via [`update`]) rather than
+//! opening the browser. Theme-aware (dark/light) and per-monitor-DPI scaled.
 
 use core::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -54,6 +56,12 @@ const ID_COPYRIGHT: i32 = 1205;
 /// `LPARAM` = a `Box<String>` (the newer tag) when WPARAM==1 — the handler reclaims it.
 const WM_ABOUT_CHECKED: u32 = WM_APP + 1;
 
+/// Posted from the in-app install worker when the update **failed** (on success
+/// the process relaunches and this window dies with it). `LPARAM` = a
+/// `Box<String>` (the tag) — the handler reclaims it and restores the pill to
+/// "Update to <tag>" so the user can retry; the worker already showed the error.
+const WM_ABOUT_UPDATE_FAILED: u32 = WM_APP + 2;
+
 /// Timer that spins the "Checking…" arc while a check is in flight.
 const SPINNER_TIMER: usize = 1;
 /// Spinner repaint cadence (ms) and per-tick rotation (degrees).
@@ -96,6 +104,9 @@ enum Status {
     Checking,
     UpToDate,
     Available(String),
+    /// The user clicked "Update to <tag>" and the in-app install is running
+    /// (download → verify → swap → relaunch). Shows the spinner + "Updating…".
+    Updating,
     Failed,
 }
 
@@ -569,6 +580,7 @@ unsafe fn build_about(hwnd: HWND) {
     let ver_w = 14 + ICON + 7 + text_width(&ver) + 14;
     let cand = [
         "Checking\u{2026}".to_string(),
+        "Updating\u{2026}".to_string(),
         "Up to date".to_string(),
         "Check failed".to_string(),
         "Update to 99.99.99".to_string(),
@@ -661,12 +673,19 @@ unsafe fn start_check(hwnd: HWND) {
             update::UpdateCheck::Failed => (2usize, 0isize),
         };
         unsafe {
-            let _ = PostMessageW(
+            // If the window was torn down before the post landed, reclaim the
+            // boxed tag (only the Available case carries one — lp != 0).
+            if PostMessageW(
                 HWND(raw as *mut c_void),
                 WM_ABOUT_CHECKED,
                 WPARAM(code),
                 LPARAM(lp),
-            );
+            )
+            .is_err()
+                && lp != 0
+            {
+                drop(Box::from_raw(lp as *mut String));
+            }
         }
     });
 }
@@ -678,15 +697,25 @@ unsafe fn invalidate_status(hwnd: HWND) {
     }
 }
 
-/// Status-pill click: open the releases page when an update is waiting,
-/// otherwise re-run the check (unless one is already in flight).
+/// Status-pill click: when an update is waiting, install it in-app (download →
+/// verify → swap → relaunch) — the click is the consent, so no browser and no
+/// extra prompt. Otherwise re-run the check (unless one is already in flight).
 unsafe fn on_status_click(hwnd: HWND) {
     let st = about_state(hwnd);
     if st.is_null() {
         return;
     }
-    if let Status::Available(_) = (*st).status {
-        open_url(update::RELEASES_URL);
+    if let Status::Available(tag) = &(*st).status {
+        let tag = tag.clone();
+        // Show the spinner as "Updating…" and block further clicks while the
+        // install runs; on failure the worker posts WM_ABOUT_UPDATE_FAILED,
+        // which restores the "Update to <tag>" pill.
+        (*st).checking = true;
+        (*st).status = Status::Updating;
+        (*st).spinner_angle = 0;
+        let _ = SetTimer(hwnd, SPINNER_TIMER, SPINNER_INTERVAL_MS, None);
+        invalidate_status(hwnd);
+        start_install(hwnd, tag);
         return;
     }
     if (*st).checking {
@@ -696,6 +725,44 @@ unsafe fn on_status_click(hwnd: HWND) {
     (*st).status = Status::Checking;
     invalidate_status(hwnd);
     start_check(hwnd);
+}
+
+/// Run the in-app update on a worker thread. On success the process relaunches
+/// into the new exe (this window goes away with it). On failure, show the error
+/// (with the manual-download link) and post [`WM_ABOUT_UPDATE_FAILED`] so the
+/// pill drops back to "Update to <tag>" for a retry.
+unsafe fn start_install(hwnd: HWND, tag: String) {
+    let raw = hwnd.0 as isize;
+    std::thread::spawn(move || {
+        if let Err(e) = update::download_and_install_now(&tag) {
+            tracing::error!("update: {e}");
+            update::msg_box(
+                "QuickDictate update failed",
+                &format!(
+                    "{e}\n\nYou can download the update manually from:\n{}",
+                    update::RELEASES_URL
+                ),
+                MB_OK | MB_ICONERROR,
+            );
+            unsafe {
+                // Reclaim the box if the post fails — PostMessageW to an
+                // already-destroyed window fails synchronously, so this is
+                // race-free: the handler consumes the tag on success, we free it
+                // here on failure (About closed mid-download).
+                let boxed = Box::into_raw(Box::new(tag));
+                if PostMessageW(
+                    HWND(raw as *mut c_void),
+                    WM_ABOUT_UPDATE_FAILED,
+                    WPARAM(0),
+                    LPARAM(boxed as isize),
+                )
+                .is_err()
+                {
+                    drop(Box::from_raw(boxed));
+                }
+            }
+        }
+    });
 }
 
 // ---- Owner-draw ---------------------------------------------------------
@@ -798,6 +865,8 @@ unsafe fn status_display(st: *mut About) -> (COLORREF, String) {
         Status::Checking => (rgb(150, 150, 150), "Checking\u{2026}".to_string()),
         Status::UpToDate => (rgb(63, 185, 80), "Up to date".to_string()),
         Status::Available(tag) => (rgb(210, 153, 34), format!("Update to {tag}")),
+        // Spinner colour (the dot is replaced by the arc while updating).
+        Status::Updating => (rgb(74, 144, 245), "Updating\u{2026}".to_string()),
         Status::Failed => (rgb(190, 110, 110), "Check failed".to_string()),
     }
 }
@@ -834,7 +903,7 @@ unsafe fn draw_status_pill(hwnd: HWND, d: &DRAWITEMSTRUCT) {
 
     let st = about_state(hwnd);
     let (dot, text) = status_display(st);
-    let checking = !st.is_null() && matches!((*st).status, Status::Checking);
+    let checking = !st.is_null() && matches!((*st).status, Status::Checking | Status::Updating);
     let dotd = s(hwnd, 10);
     let gap = s(hwnd, 8);
     SelectObject(hdc, gui_font_for(hwnd));
@@ -910,11 +979,11 @@ extern "system" fn about_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             }
             WM_TIMER if wparam.0 == SPINNER_TIMER => {
                 let st = about_state(hwnd);
-                if !st.is_null() && matches!((*st).status, Status::Checking) {
+                if !st.is_null() && matches!((*st).status, Status::Checking | Status::Updating) {
                     (*st).spinner_angle = ((*st).spinner_angle + SPINNER_STEP_DEG) % 360;
                     invalidate_status(hwnd);
                 } else {
-                    // No longer checking — stop animating.
+                    // No longer checking / updating — stop animating.
                     let _ = KillTimer(hwnd, SPINNER_TIMER);
                 }
                 LRESULT(0)
@@ -939,6 +1008,24 @@ extern "system" fn about_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                 } else if lparam.0 != 0 {
                     // Window torn down between post and dispatch — reclaim the tag.
                     drop(Box::from_raw(lparam.0 as *mut String));
+                }
+                invalidate_status(hwnd);
+                LRESULT(0)
+            }
+            WM_ABOUT_UPDATE_FAILED => {
+                let _ = KillTimer(hwnd, SPINNER_TIMER);
+                // Reclaim the tag the worker boxed (dropped harmlessly if the
+                // window is already gone).
+                let tag = if lparam.0 != 0 {
+                    *Box::from_raw(lparam.0 as *mut String)
+                } else {
+                    String::new()
+                };
+                let st = about_state(hwnd);
+                if !st.is_null() {
+                    (*st).checking = false;
+                    // Restore the actionable pill so the user can retry.
+                    (*st).status = Status::Available(tag);
                 }
                 invalidate_status(hwnd);
                 LRESULT(0)

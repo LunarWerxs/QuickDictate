@@ -67,6 +67,12 @@ fn wide_z(s: &str) -> Vec<u16> {
 /// `Config::hide_tray_icon`) and returns `false`, meaning the caller must
 /// exit immediately without touching audio, hotkeys, tray, or logging.
 ///
+/// Exception: when this process was launched as a deliberate self-respawn --
+/// the self-updater's relaunch (`--updated <tag>`) or Settings' "Save &
+/// Restart" (`--relaunch`) -- a held mutex means the old version is mid-shutdown
+/// to hand off to us, so we take over (return `true`) instead of bailing --
+/// otherwise the hand-off would leave zero instances running.
+///
 /// On success (`true`), the mutex is held for the whole process lifetime with
 /// no explicit cleanup needed: windows-rs's `HANDLE` is a bare `Copy` wrapper
 /// around the raw handle value with no `Drop` impl, so it is never closed by
@@ -87,6 +93,24 @@ fn single_instance_guard() -> bool {
         unsafe { windows::Win32::Foundation::GetLastError() } == ERROR_ALREADY_EXISTS;
     if !already_running {
         // We own the mutex now; see doc comment above re: no cleanup needed.
+        return true;
+    }
+
+    // A deliberate self-respawn — the self-updater's relaunch
+    // (`update::relaunch` → `<exe> --updated <tag>`) or Settings' "Save &
+    // Restart" (`<exe> --relaunch`) — is a hand-off: the "other instance" is the
+    // OLD process, already latched to shut down to make way for us. If we bailed
+    // here (reveal-and-quit) we'd leave ZERO instances the moment the old one
+    // finishes exiting — the respawn would just kill the app. So take over
+    // instead: we already hold a fresh handle to the named object (`CreateMutexW`
+    // above), which keeps the single-instance guard alive for later launches
+    // once the old process releases its handle on exit. The overlap is safe —
+    // the hotkey layer already retries registration across exactly this hand-off
+    // (see `hotkeys::register_initial`).
+    if std::env::args().any(|a| a == "--updated" || a == "--relaunch") {
+        tracing::info!(
+            "single-instance: deliberate respawn (--updated/--relaunch); taking over from the exiting old instance"
+        );
         return true;
     }
 
@@ -373,6 +397,11 @@ fn main() -> Result<()> {
     // tray/About manual path, which has no App handle and reads the cached
     // value from update::INSTALL_ID.
     update::init_install_id(&app);
+
+    // Publish the App handle so the manual update path (the About window, on its
+    // own thread) can signal a clean shutdown when it relaunches into a new
+    // version. Must precede the UI (and hence any manual install) coming up.
+    update::set_app_handle(&app);
 
     // First-run / empty-key onboarding (§6): if no provider has a usable key,
     // open the Settings window straight away so the user lands directly on the

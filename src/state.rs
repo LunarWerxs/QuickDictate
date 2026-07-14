@@ -121,9 +121,35 @@ impl Status {
     }
 }
 
+/// Why the pip is currently showing [`Status::Error`]. Read by the cursor pip
+/// so a dead/unauthorized-key failure can show a key glyph (and a clearer tray
+/// tooltip) instead of a bare "!". Only meaningful while the status is `Error`.
+#[repr(u8)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum ErrorKind {
+    /// Any failure without a more specific cause (network, provider, mic, ...).
+    Generic = 0,
+    /// Every configured API key for the active provider was rejected as
+    /// invalid/unauthorized this run (see `keys::KeyPool::all_dead`).
+    DeadKeys = 1,
+}
+
+impl ErrorKind {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => ErrorKind::DeadKeys,
+            _ => ErrorKind::Generic,
+        }
+    }
+}
+
 pub struct App {
     pub config: ArcSwap<Config>,
     status: AtomicU8,
+    /// Why the last [`Status::Error`] was raised (an [`ErrorKind`]). Read by the
+    /// pip; only meaningful while `status == Error`. Always set alongside the
+    /// error status via [`App::raise_error`] so the pip never sees a stale cause.
+    error_kind: AtomicU8,
     pub shutdown: AtomicBool,
     pub session_epoch: parking_lot::Mutex<u64>,
     pub rt: TokioHandle,
@@ -160,6 +186,7 @@ impl App {
         Arc::new(Self {
             config: ArcSwap::from_pointee(config),
             status: AtomicU8::new(Status::Idle as u8),
+            error_kind: AtomicU8::new(ErrorKind::Generic as u8),
             shutdown: AtomicBool::new(false),
             session_epoch: Mutex::new(0),
             rt,
@@ -185,6 +212,20 @@ impl App {
         if prev != s as u8 {
             let _ = self.status_tx.send(s);
         }
+    }
+
+    /// The cause of the current [`Status::Error`]. Only meaningful while the
+    /// status is `Error`.
+    pub fn error_kind(&self) -> ErrorKind {
+        ErrorKind::from_u8(self.error_kind.load(Ordering::Acquire))
+    }
+
+    /// Record why we're erroring, then flip the status to [`Status::Error`].
+    /// The kind is stored first so a poller that reads status→kind never sees a
+    /// stale cause for the new error.
+    pub fn raise_error(&self, kind: ErrorKind) {
+        self.error_kind.store(kind as u8, Ordering::Release);
+        self.set_status(Status::Error);
     }
 
     pub fn clear_status_if(&self, current: Status, next: Status) -> bool {

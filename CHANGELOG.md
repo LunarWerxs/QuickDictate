@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-13
+
+### Changed
+
+- **Updates now install themselves, silently.** When a newer release is found, QuickDictate downloads it, verifies it (executable header, size, and SHA-256), swaps the exe in place, and relaunches into the new version with no prompt. The background check keeps its once-a-day throttle, and if you're mid-dictation the relaunch waits until you're idle (the new version applies on your next restart) so an update never interrupts you. After a manual update from the About window it reopens About on the new version (instead of a pop-up notice); a silent background update stays fully silent.
+
+### Added
+
+- **The error pip now explains a dead-key failure.** When a dictation fails because every configured API key was rejected (invalid or unauthorized), the red pip shows a key glyph instead of a bare "!", and the tray icon's hover text says your API keys were rejected and to open Settings to update them, staying until dictation works again.
+
+### Fixed
+
+- **The About window's update chip now updates the app instead of opening GitHub.** When an update is waiting, clicking the "Update to …" pill downloads and installs it in-app (the same verified swap-and-relaunch as the background updater) rather than sending you to the releases page.
+- **A self-update or "Save & Restart" can no longer leave QuickDictate closed.** When the app relaunches itself, the incoming process now reliably takes over from the outgoing one instead of occasionally mistaking it for a duplicate launch and exiting, which in a timing-dependent race could shut the app down entirely.
+
 ## [0.4.0] - 2026-07-13
 
 ### Fixed

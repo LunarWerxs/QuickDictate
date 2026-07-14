@@ -93,7 +93,7 @@ Everything lives in `settings.json` (copied from `settings.example.json`). The f
 | `enable_logging` | Write `quickdictate.log` next to the exe (bool) |
 | `log_transcripts` | Also log your full dictated text, not just summaries (bool, default `false`; deep debugging only) |
 | `max_log_mb` | Log-file rotation cap, in MB, before `quickdictate.log` is rolled over (default `5`) |
-| `update_auto_check` | Check for a newer release at startup, at most once/day (bool, default `true`); installing always asks first |
+| `update_auto_check` | Check for a newer release at startup, at most once/day (bool, default `true`); a newer release installs silently (download, verify, swap, relaunch when idle) |
 | `install_id` | Random id sent with update checks (string, generated on first launch; never derived from your machine or identity — clear it for a fresh one) |
 | `run_at_startup` | Start QuickDictate at Windows login via the per-user Run key (bool, default `false`) |
 | `prewarm_keys` | Probe the active provider's keys at startup and queue a validated one (bool, default `true`) |

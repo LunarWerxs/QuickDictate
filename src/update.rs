@@ -12,24 +12,26 @@
 //!
 //! Trigger points:
 //!   * startup auto-check (gated by `update_auto_check` in settings, default
-//!     on; throttled to one network hit per 24 h via the cache file)
-//!   * tray menu "Check for Updates…" (always available, ignores throttle)
-//!   * the About window's status pill calls [`check`] directly.
+//!     on; throttled to one network hit per 24 h via the cache file). When a
+//!     newer release exists it installs **silently** — download, verify, swap,
+//!     relaunch — with no prompt. The relaunch is deferred to the next restart
+//!     if a dictation is in progress, so a silent update never interrupts you.
+//!   * the About window (Settings → About, or its "Check for updates" item):
+//!     the status pill checks on open and on click, and when an update is
+//!     waiting, clicking the pill installs it in-app via
+//!     [`download_and_install_now`] — it no longer opens the browser.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::HWND;
-use windows::Win32::UI::WindowsAndMessaging::{
-    MessageBoxW, IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_TOPMOST,
-    MB_YESNO,
-};
+use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_TOPMOST};
 
 use crate::config::Config;
-use crate::state::App;
+use crate::state::{App, Status};
 
 /// "Latest release" endpoint: the Connections Studio proxy, which relays
 /// GitHub's `releases/latest` JSON for LunarWerxs/QuickDictate **verbatim**
@@ -69,6 +71,20 @@ static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 /// at startup by [`init_install_id`]; unset (RNG or persist failure) simply
 /// means the header is omitted.
 static INSTALL_ID: OnceLock<String> = OnceLock::new();
+
+/// The shared [`App`], published at startup so the **manual** update path — the
+/// About window, which runs on its own thread with no `App` reference — can
+/// signal a clean shutdown when it relaunches into the freshly-swapped exe. The
+/// main loop polls `app.shutdown` every 50 ms and exits, handing off to the new
+/// process. Unset before [`set_app_handle`] runs (only `download_and_swap` can
+/// even be reached that early, and it never touches this).
+static APP_HANDLE: OnceLock<Arc<App>> = OnceLock::new();
+
+/// Publish the shared [`App`] handle for the manual update path. Called once
+/// from `main()`, before the UI (hence any manual install) can come up.
+pub fn set_app_handle(app: &Arc<App>) {
+    let _ = APP_HANDLE.set(Arc::clone(app));
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UpdateCheck {
@@ -342,9 +358,15 @@ fn verify_exe_bytes(bytes: &[u8], asset: &Asset) -> bool {
     true
 }
 
-/// Download the new exe, verify it, swap it into place, relaunch, and signal
-/// shutdown. Returns a user-facing error string on failure.
-fn download_and_install(app: &App, tag: &str) -> Result<(), String> {
+/// Download the new exe, verify it, and swap it into place. Returns the path to
+/// the now-current exe on success. Deliberately does **not** relaunch — the
+/// caller decides when: the manual path relaunches immediately (see
+/// [`download_and_install_now`]), the auto path defers if a dictation is live
+/// (see [`spawn_startup_check`]). Because a swapped exe already takes effect on
+/// the next launch, deferring costs nothing. A user-facing error string on
+/// failure. The caller must serialize calls (via `IN_FLIGHT`) — the `.new` /
+/// `.old` scratch names are fixed, so two swaps at once would race.
+fn download_and_swap(tag: &str) -> Result<PathBuf, String> {
     let (asset_tag, asset) = latest_exe_asset().ok_or("could not resolve a release .exe asset")?;
     if asset_tag != tag {
         tracing::info!("update: release moved while prompting ({tag} -> {asset_tag}); continuing");
@@ -390,14 +412,57 @@ fn download_and_install(app: &App, tag: &str) -> Result<(), String> {
         let _ = std::fs::rename(&old, &exe);
         return Err(format!("swap in new exe: {e}"));
     }
+    Ok(exe)
+}
 
+/// Launch the freshly-swapped `exe` with `--updated <tag>` and signal the
+/// running instance to shut down cleanly. Shutdown goes through the global
+/// [`APP_HANDLE`] so both the auto path (which holds an `Arc<App>`) and the
+/// manual About path (which does not) share one relaunch routine.
+///
+/// `reopen_about` adds `--show-about` so the new process reopens the About
+/// window (see [`handle_startup_artifacts`]). Only the **manual** update (the
+/// user clicked the About pill) sets it; a silent background auto-update stays
+/// silent — no window pops up unprompted.
+fn relaunch(exe: &Path, tag: &str, reopen_about: bool) -> Result<(), String> {
     tracing::info!("update: swapped to v{tag}; relaunching");
-    std::process::Command::new(&exe)
-        .args(["--updated", tag])
-        .spawn()
-        .map_err(|e| format!("relaunch: {e}"))?;
-    app.shutdown.store(true, Ordering::Release);
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["--updated", tag]);
+    if reopen_about {
+        cmd.arg("--show-about");
+    }
+    cmd.spawn().map_err(|e| format!("relaunch: {e}"))?;
+    if let Some(app) = APP_HANDLE.get() {
+        app.shutdown.store(true, Ordering::Release);
+    } else {
+        // No handle published (shouldn't happen post-startup): the new process
+        // is already up, so fall back to exiting this one directly rather than
+        // leaving two instances running.
+        tracing::warn!("update: no App handle for clean shutdown; exiting directly");
+        std::process::exit(0);
+    }
     Ok(())
+}
+
+/// Manual "update now" — the About window's status pill when a newer release is
+/// waiting. Download + verify + swap the release, then relaunch immediately:
+/// the user clicked the pill, so the click is the consent (no extra Yes/No).
+/// Serialized against the auto-check via `IN_FLIGHT`. Returns an error string
+/// on failure (the About worker surfaces it, with the manual-download link); on
+/// success the process relaunches and this instance begins shutting down.
+pub fn download_and_install_now(tag: &str) -> Result<(), String> {
+    if IN_FLIGHT.swap(true, Ordering::AcqRel) {
+        return Err("an update is already in progress".into());
+    }
+    // Manual install from the About window → reopen About after the relaunch so
+    // the user lands back where they were and sees the new version.
+    let result = download_and_swap(tag).and_then(|exe| relaunch(&exe, tag, true));
+    if result.is_err() {
+        // Free the lock so a later retry can run. On success we intentionally
+        // leave it set — the process is on its way out.
+        IN_FLIGHT.store(false, Ordering::Release);
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -421,32 +486,47 @@ pub(crate) fn msg_box(
     }
 }
 
-fn prompt_and_install(app: &App, tag: &str) {
-    let cur = env!("CARGO_PKG_VERSION");
-    let body = format!(
-        "QuickDictate v{tag} is available (you have v{cur}).\n\n\
-         Download and update now? QuickDictate will restart itself."
-    );
-    if msg_box("QuickDictate update", &body, MB_YESNO | MB_ICONQUESTION) != IDYES {
-        return;
+/// Silently install `tag` on the auto path: download + verify + swap, then
+/// relaunch **only if idle**. If a dictation is in progress the swap is left
+/// staged — the new exe already takes effect on the next launch — so a silent
+/// background update never yanks the app out from under an active session.
+/// Any failure is logged and swallowed (offline / no release yet is not the
+/// user's problem). `IN_FLIGHT` is already held by [`spawn_startup_check`].
+///
+/// Returns `true` iff it actually relaunched — the caller must then leave
+/// `IN_FLIGHT` set (the process is exiting), just as [`download_and_install_now`]
+/// does, so a stray About-pill click during the ~100 ms shutdown window can't
+/// kick off a second concurrent relaunch.
+fn install_silently(app: &App, tag: &str) -> bool {
+    let exe = match download_and_swap(tag) {
+        Ok(exe) => exe,
+        Err(e) => {
+            tracing::info!("update: silent install failed (silent): {e}");
+            return false;
+        }
+    };
+    if app.status() == Status::Idle {
+        // Silent background update: relaunch WITHOUT reopening About — no window
+        // pops up unprompted (that would defeat "silent").
+        match relaunch(&exe, tag, false) {
+            Ok(()) => return true, // relaunched; process on its way out
+            Err(e) => tracing::error!("update: {e}"),
+        }
+    } else {
+        tracing::info!("update: staged v{tag}; applies on next restart (dictation active)");
     }
-    if let Err(e) = download_and_install(app, tag) {
-        tracing::error!("update: {e}");
-        msg_box(
-            "QuickDictate update failed",
-            &format!("{e}\n\nYou can download the update manually from:\n{RELEASES_URL}"),
-            MB_OK | MB_ICONERROR,
-        );
-    }
+    false
 }
 
 /// Startup auto-check (settings `update_auto_check`, default on). Throttled to
-/// one network hit per 24 h; silent unless an update is actually available.
+/// one network hit per 24 h; silent throughout — when an update exists it is
+/// installed with no prompt (see [`install_silently`]).
 pub fn spawn_startup_check(app: Arc<App>) {
     if IN_FLIGHT.swap(true, Ordering::AcqRel) {
         return;
     }
     std::thread::spawn(move || {
+        let mut relaunching = false;
         let fresh = read_cache()
             .map(|(ts, _)| now_secs().saturating_sub(ts) < CHECK_INTERVAL_SECS)
             .unwrap_or(false);
@@ -456,8 +536,8 @@ pub fn spawn_startup_check(app: Arc<App>) {
             match check() {
                 UpdateCheck::Available(tag) => {
                     write_cache(&tag);
-                    tracing::info!("update: v{tag} available");
-                    prompt_and_install(&app, &tag);
+                    tracing::info!("update: v{tag} available; installing silently");
+                    relaunching = install_silently(&app, &tag);
                 }
                 UpdateCheck::UpToDate => {
                     write_cache(env!("CARGO_PKG_VERSION"));
@@ -469,12 +549,18 @@ pub fn spawn_startup_check(app: Arc<App>) {
                 }
             }
         }
-        IN_FLIGHT.store(false, Ordering::Release);
+        // Leave the lock held if we relaunched (the process is exiting) so a
+        // concurrent manual install can't spawn a second child; otherwise free
+        // it for the next check.
+        if !relaunching {
+            IN_FLIGHT.store(false, Ordering::Release);
+        }
     });
 }
 
 /// Startup housekeeping: delete the `.old` exe left by a previous self-update,
-/// and show the post-update notice when relaunched with `--updated <ver>`.
+/// and — when relaunched with `--updated <ver>` — reopen the About window so
+/// the user lands back where they were and sees the new version.
 pub fn handle_startup_artifacts() {
     if let Ok(exe) = std::env::current_exe() {
         let old = exe.with_extension("exe.old");
@@ -490,14 +576,15 @@ pub fn handle_startup_artifacts() {
     if let Some(i) = args.iter().position(|a| a == "--updated") {
         let ver = args.get(i + 1).cloned().unwrap_or_default();
         tracing::info!("update: relaunched after update to v{ver}");
-        // Non-blocking equivalent of SageThumbs' post-update tray toast.
-        std::thread::spawn(move || {
-            msg_box(
-                "QuickDictate updated",
-                &format!("You're now on version {ver}."),
-                MB_OK | MB_ICONINFORMATION,
-            );
-        });
+        // Reopen the About window only after a *manual* update (the user clicked
+        // the About pill → relaunch carries `--show-about`), so they land back
+        // where they were and see the new version on its pill. A silent
+        // background auto-update carries no `--show-about` and stays silent — no
+        // modal notice, no window popping up unprompted. show_about() runs on
+        // its own thread, so startup isn't blocked.
+        if args.iter().any(|a| a == "--show-about") {
+            crate::about::show_about();
+        }
     }
 }
 

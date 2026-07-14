@@ -235,9 +235,10 @@ pub struct Config {
     /// per day). The check goes to LunarWerx's update endpoint (see
     /// `update::RELEASES_API`), which relays GitHub's release info and also
     /// counts the hit as one anonymous install ping — details in SECURITY.md.
-    /// Checking is silent unless an update exists; downloading and installing
-    /// always asks first. The tray's "Check for Updates…" works regardless of
-    /// this flag.
+    /// When a newer release exists it installs silently (download, verify, swap,
+    /// relaunch), deferring the relaunch until you're idle so it never interrupts
+    /// a dictation. Settings → About "Check for updates" works regardless of this
+    /// flag, and there the update installs as soon as you click the pill.
     #[serde(default = "default_true")]
     pub update_auto_check: bool,
 

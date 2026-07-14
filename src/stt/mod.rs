@@ -312,7 +312,16 @@ pub fn start_session(app: Arc<App>, keys: Arc<KeyPool>) -> SttHandle {
                 tracing::error!("session error: {e:#}");
             }
             if app2.current_session_epoch() == epoch {
-                app2.set_status(Status::Error);
+                // Distinguish "all your keys are dead/unauthorized" so the pip
+                // shows a key glyph and the tray tooltip explains it, instead of
+                // a bare "!". `keys.all_dead()` is true only when every key was
+                // rejected as invalid this run (not a transient/network failure).
+                let kind = if keys.all_dead() {
+                    crate::state::ErrorKind::DeadKeys
+                } else {
+                    crate::state::ErrorKind::Generic
+                };
+                app2.raise_error(kind);
                 let app_for_clear = Arc::clone(&app2);
                 app2.rt.spawn(async move {
                     tokio::time::sleep(ERROR_PIP_VISIBLE).await;
@@ -425,7 +434,8 @@ async fn run_session(
             "session[{epoch}] aborted: audio capture is not running (microphone lost?) — device reopen is retried automatically"
         );
         if app.current_session_epoch() == epoch {
-            app.set_status(Status::Error);
+            // A lost mic is a generic error (the "!" pip), not a key problem.
+            app.raise_error(crate::state::ErrorKind::Generic);
             let app_for_clear = Arc::clone(&app);
             app.rt.spawn(async move {
                 tokio::time::sleep(ERROR_PIP_VISIBLE).await;

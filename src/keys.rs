@@ -130,6 +130,18 @@ impl KeyPool {
         self.available_key_count() > 0
     }
 
+    /// True if the pool has keys and **every** one is currently marked
+    /// [`KeyHealthStatus::Dead`] — i.e. all of the active provider's keys were
+    /// rejected as invalid/unauthorized (a 401/403 this run), as opposed to a
+    /// transient, rate-limit, or quota failure. Drives the pip's dead-key glyph
+    /// and the "keys were rejected" tray tooltip so the error explains itself.
+    /// (Status-based, unlike `has_usable_key`, which is cooldown-based — a Dead
+    /// key past its cooldown is still "usable" but is still Dead here.)
+    pub fn all_dead(&self) -> bool {
+        let inner = self.inner.read();
+        !inner.keys.is_empty() && inner.keys.iter().all(|e| e.status == KeyHealthStatus::Dead)
+    }
+
     fn available_key_count(&self) -> usize {
         let now = Instant::now();
         self.inner

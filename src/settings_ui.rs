@@ -1235,7 +1235,11 @@ impl SettingsApp {
             let _ = rx.recv_timeout(std::time::Duration::from_secs(6));
         }
         if let Ok(exe) = std::env::current_exe() {
-            let _ = std::process::Command::new(exe).spawn();
+            // `--relaunch` marks this as a deliberate hand-off so the new process
+            // takes over the single-instance mutex instead of seeing the
+            // still-exiting old instance, bailing, and leaving zero instances
+            // running (see `single_instance_guard`).
+            let _ = std::process::Command::new(exe).arg("--relaunch").spawn();
         }
         self.app.shutdown.store(true, Ordering::Release);
     }
