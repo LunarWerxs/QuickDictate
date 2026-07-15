@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-07-15
+
+### Added
+
+- **"Hide tray icon" is now in the tray's right-click menu.** Tucking QuickDictate out of sight no longer means opening Settings to find the checkbox. It asks for confirmation first and spells out the way back (launch QuickDictate again and Settings reopens), since hiding the icon also hides the menu you'd use to unhide it.
+
 ## [0.4.1] - 2026-07-13
 
 ### Changed

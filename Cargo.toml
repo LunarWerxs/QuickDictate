@@ -1,6 +1,6 @@
 [package]
 name = "quickdictate"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 description = "Ultra-low-latency bring-your-own-key dictation (multi-provider STT)"
 license = "MIT"

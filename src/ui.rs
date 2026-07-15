@@ -28,9 +28,9 @@ use windows::Win32::UI::WindowsAndMessaging::HMENU;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCursorPos, LoadCursorW, PeekMessageW,
     PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, ShowWindow, TranslateMessage,
-    UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, IDC_ARROW, MSG, PM_REMOVE, SW_HIDE,
-    SW_SHOWNA, ULW_ALPHA, WM_DESTROY, WM_QUIT, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, IDC_ARROW, IDYES, MB_ICONQUESTION,
+    MB_YESNO, MSG, PM_REMOVE, SW_HIDE, SW_SHOWNA, ULW_ALPHA, WM_DESTROY, WM_QUIT, WNDCLASSEXW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 use crate::state::{App, ErrorKind, Status};
@@ -154,12 +154,36 @@ fn run(app: Arc<App>) -> Result<()> {
         }
 
         while let Ok(ev) = menu_rx.try_recv() {
-            // The tray is intentionally minimal — Settings, Recent
-            // transcriptions, and Quit. About / updates / log / JSON editing
-            // all live inside the Settings window now.
+            // The tray is intentionally minimal — Settings, Hide tray icon,
+            // Recent transcriptions, and Quit. About / updates / log / JSON
+            // editing all live inside the Settings window now.
             let id = ev.id().as_ref();
             if ev.id() == &MenuId::new("settings") {
                 crate::settings_ui::show_settings(Arc::clone(&app));
+            } else if ev.id() == &MenuId::new("hide_tray") {
+                // Confirm first: this removes the only *visible* way back into
+                // Settings, so the dialog is the one place we can spell out the
+                // way back (the tray-icon crate has no per-item tooltip, unlike
+                // the Settings checkbox this mirrors). Runs on its own thread so
+                // the modal doesn't stall the 16ms poll loop below and freeze
+                // the pip mid-dictation.
+                let app = Arc::clone(&app);
+                std::thread::spawn(move || {
+                    let answer = crate::update::msg_box(
+                        "QuickDictate",
+                        "Hide the tray icon?\n\n\
+                         QuickDictate keeps running in the background and your \
+                         dictation hotkeys keep working; only the notification-area \
+                         icon goes away.\n\n\
+                         To get it back, launch QuickDictate again: it reopens \
+                         Settings instead of starting a second copy, and you can \
+                         untick \"Hide tray icon\" there.",
+                        MB_YESNO | MB_ICONQUESTION,
+                    );
+                    if answer == IDYES {
+                        set_hide_tray_icon(&app, true);
+                    }
+                });
             } else if ev.id() == &MenuId::new("quit") {
                 tracing::info!("Quit selected from tray menu");
                 app.shutdown.store(true, Ordering::Release);
@@ -331,6 +355,36 @@ fn run(app: Arc<App>) -> Result<()> {
 
 // ===== Tray =====
 
+/// Persist `hide_tray_icon` and hot-store it — the same write-then-`config.store`
+/// the Settings window's Save does, so both entry points leave settings.json and
+/// the live config in exactly one state. Nothing here touches the tray itself:
+/// the poll loop in [`run`] sees the changed value on its next tick and calls
+/// `set_visible`, which is also what makes the Settings checkbox apply live.
+///
+/// Caveat, narrower than it first looks: only a *currently visible* Settings
+/// window can clobber this, because its `draft` predates our write and its Save
+/// writes the whole draft back. A hidden one can't — `reseed_for_reopen` re-clones
+/// the draft from live config on every reveal, which is what makes the documented
+/// way back in (relaunch -> Settings reopens with this box correctly ticked) work.
+/// So the residual race needs someone to ignore the checkbox sitting in front of
+/// them, hide from the tray instead, then Save — and even that self-heals on the
+/// next close/reopen. Not worth live-syncing one field into a deliberately
+/// draft-then-Save window.
+fn set_hide_tray_icon(app: &App, hide: bool) {
+    let mut cfg = (**app.config.load()).clone();
+    if cfg.hide_tray_icon == hide {
+        return;
+    }
+    cfg.hide_tray_icon = hide;
+    match cfg.save(&crate::config::Config::settings_path()) {
+        Ok(()) => {
+            app.config.store(Arc::new(cfg));
+            tracing::info!("tray: hide_tray_icon set to {hide} from the tray menu");
+        }
+        Err(e) => tracing::warn!("tray: could not persist hide_tray_icon ({e})"),
+    }
+}
+
 struct TrayState {
     tray: TrayIcon,
     history_menu: Submenu,
@@ -420,6 +474,12 @@ fn build_tray() -> Result<TrayState> {
 
     let menu = Menu::new();
     let settings = MenuItem::with_id(MenuId::new("settings"), "Settings…", true, None);
+    // Grouped with "Settings…" (it's a preference, not an app action) and kept
+    // clear of "Quit" so a misclick can't cost you a running session. There's
+    // deliberately no checked state: hiding the icon takes this menu with it,
+    // so the item can only ever be ticked *on* from here -- unhiding is the
+    // Settings checkbox's job.
+    let hide_icon = MenuItem::with_id(MenuId::new("hide_tray"), "Hide tray icon", true, None);
     let history_menu = Submenu::new("Recent transcriptions", true);
     let placeholder = MenuItem::with_id(
         MenuId::new("history:none"),
@@ -432,6 +492,7 @@ fn build_tray() -> Result<TrayState> {
     let separator2 = PredefinedMenuItem::separator();
     let quit = MenuItem::with_id(MenuId::new("quit"), "Quit QuickDictate", true, None);
     menu.append(&settings)?;
+    menu.append(&hide_icon)?;
     menu.append(&separator)?;
     menu.append(&history_menu)?;
     menu.append(&separator2)?;
