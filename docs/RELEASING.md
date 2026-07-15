@@ -26,4 +26,23 @@ Cargo.toml — this list exists so none of them drift (SECURITY.md sat on
 ## 4. Tag and publish
 
 - [ ] Commit, tag `vX.Y.Z`, push the tag.
-- [ ] Publish the GitHub release with the release notes (the CHANGELOG section for this version) and the built `quickdictate.exe`. The in-app update check relays GitHub's release info, so the update prompt goes live as soon as the release is published.
+- [ ] **Rebuild the asset explicitly with default features:**
+
+  ```powershell
+  cargo build --release        # NOT --features google
+  ```
+
+  Read this even if `check.ps1 -Full` just passed. Its last gate is
+  `cargo build --release --features google`, so it leaves the **google** build
+  sitting in `target/release\quickdictate.exe` — uploading "whatever's in
+  target/release" ships a binary that contradicts
+  [providers.md](providers.md), which tells users the Google provider is
+  source-only. That is exactly how `v0.4.1` shipped google-enabled while
+  `v0.3.0` / `v0.4.0` did not. To confirm what you're about to upload:
+
+  ```powershell
+  # expect NO match for a default build
+  Select-String -Path target\release\quickdictate.exe -Pattern 'speech.googleapis.com'
+  ```
+
+- [ ] Publish the GitHub release with the release notes (the CHANGELOG section for this version) and that `quickdictate.exe`. The in-app update check relays GitHub's release info, so the update prompt goes live as soon as the release is published — and since updates now install **silently**, shipping the wrong variant changes what's on users' machines without them noticing.
