@@ -26,19 +26,13 @@ jobs:
       - name: Format check
         run: cargo fmt --all --check
 
-      - name: Clippy (default features)
+      - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Clippy (google feature)
-        run: cargo clippy --all-targets --features google -- -D warnings
-
-      - name: Build release (default)
+      - name: Build release
         run: cargo build --release
-
-      - name: Build release (google feature)
-        run: cargo build --release --features google
 
       # Unit tests only. The live provider tests are #[ignore] — they need real
       # API keys + network and are run locally, never in CI.
       - name: Test
-        run: cargo test --features google
+        run: cargo test

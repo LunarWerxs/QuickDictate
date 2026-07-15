@@ -263,7 +263,6 @@ async fn live_openai() {
     run_live("openai", Box::new(super::openai::OpenAiProvider)).await;
 }
 
-#[cfg(feature = "google")]
 #[tokio::test]
 #[ignore = "live network + real key"]
 async fn live_google() {

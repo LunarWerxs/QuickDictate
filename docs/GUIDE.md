@@ -66,7 +66,7 @@ That replacement table, since it's the fiddly-but-lovely part:
 | Google Cloud Speech-to-Text (v1 batch) | `google` | Batch (record-then-send, no live word count, ~60s per request) | [console.cloud.google.com/apis/credentials](https://console.cloud.google.com/apis/credentials) |
 
 A couple of gotchas:
-- **Google** is the only non-streaming one. The prebuilt releases include it; if you're building yourself, turn it on with `cargo build --release --features google`.
+- **Google** is the only non-streaming one: it records, then sends, so there's no live word count and a request takes about 60s.
 - **DashScope is region-sensitive.** It defaults to the mainland-China host; set `"dashscope_intl": true` for the International host. A key from the wrong region just won't connect.
 
 Full per-provider setup notes live in [docs/providers.md](providers.md).
@@ -171,11 +171,8 @@ One nice touch: the global hotkeys re-register themselves every minute, so dicta
 ```sh
 # Install Rust first: https://rustup.rs
 
-# Standard build (the five streaming providers)
+# Builds every provider, same as the released binary
 cargo build --release
-
-# Add the Google Cloud batch provider
-cargo build --release --features google
 ```
 
 The binary lands at `target\release\quickdictate.exe`. Put `settings.example.json` next to it, rename it to `settings.json`, and add your key(s).

@@ -24,13 +24,11 @@ function Step($name, [scriptblock] $cmd) {
 }
 
 try {
-    Step 'fmt --check'                 { cargo fmt --all --check }
-    Step 'clippy (default)'            { cargo clippy --all-targets -- -D warnings }
-    Step 'clippy (--features google)'  { cargo clippy --all-targets --features google -- -D warnings }
-    Step 'test (--features google)'    { cargo test --features google }
+    Step 'fmt --check'  { cargo fmt --all --check }
+    Step 'clippy'       { cargo clippy --all-targets -- -D warnings }
+    Step 'test'         { cargo test }
     if ($Full) {
-        Step 'build --release'                 { cargo build --release }
-        Step 'build --release --features google' { cargo build --release --features google }
+        Step 'build --release' { cargo build --release }
     }
 }
 finally {

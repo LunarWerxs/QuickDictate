@@ -1,6 +1,6 @@
 [package]
 name = "quickdictate"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 description = "Ultra-low-latency bring-your-own-key dictation (multi-provider STT)"
 license = "MIT"
@@ -11,10 +11,6 @@ path = "src/main.rs"
 
 [features]
 default = []
-# Gates the Google Cloud STT batch provider module. (reqwest itself is now an
-# unconditional dependency — the check-for-update feature needs HTTPS in every
-# build — so this feature only toggles the provider code.)
-google = []
 
 [build-dependencies]
 embed-resource = "2"
@@ -85,8 +81,8 @@ eframe = { version = "0.35", default-features = false, features = [
 # Must match eframe 0.35's winit (for EventLoopBuilderExtWindows so the settings
 # window can run on a non-main thread).
 winit = "0.30"
-# HTTPS client: check-for-update (all builds, blocking API on worker threads)
-# + the Google batch provider (async, behind `--features google`).
+# HTTPS client: check-for-update (blocking API on worker threads) + the Google
+# batch provider (async).
 # TLS backend: native-tls → schannel (the OS's own TLS, already resident on
 # Windows, uses the system cert store). Shares the one stack tokio-tungstenite
 # already pulls, so we avoid bundling a second full rustls + ring + webpki-roots

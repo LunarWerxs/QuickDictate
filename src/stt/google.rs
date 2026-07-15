@@ -8,8 +8,11 @@
 //! than ~55 s), emitting one `Committed` per segment through an internal channel
 //! that the stream half drains.
 //!
-//! Feature-gated (`--features google`) because it re-introduces an HTTPS client
-//! (`reqwest`); the default streaming-only build stays lean.
+//! Compiled into every build, like the other five providers. This used to sit
+//! behind a `--features google` gate to keep `reqwest` out of a streaming-only
+//! build; the update checker made `reqwest` unconditional, which left the gate
+//! buying ~39 KB while letting one source tree produce two different exes under
+//! one filename. That shipped the wrong binary more than once, so the gate went.
 
 use std::time::Duration;
 

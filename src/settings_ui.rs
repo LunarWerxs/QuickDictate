@@ -107,17 +107,14 @@ const ROUND: u8 = 6;
 /// (id, label) for the provider dropdown. Google only exists in builds with
 /// the `google` feature (the published binaries have it).
 fn providers() -> Vec<(&'static str, &'static str)> {
-    let mut v = vec![
+    vec![
         ("elevenlabs", "ElevenLabs"),
         ("deepgram", "Deepgram"),
         ("openai", "OpenAI"),
         ("assemblyai", "AssemblyAI"),
         ("dashscope", "DashScope (Alibaba)"),
-    ];
-    if cfg!(feature = "google") {
-        v.push(("google", "Google (batch)"));
-    }
-    v
+        ("google", "Google (batch)"),
+    ]
 }
 
 fn provider_label(id: &str) -> &str {

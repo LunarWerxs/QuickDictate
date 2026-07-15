@@ -11,7 +11,6 @@ mod assemblyai;
 mod dashscope;
 mod deepgram;
 mod elevenlabs;
-#[cfg(feature = "google")]
 mod google;
 mod openai;
 pub mod provider;
@@ -100,20 +99,7 @@ fn make_provider(cfg: &Config) -> Box<dyn SttProvider> {
             intl: cfg.dashscope_intl,
         }),
         "openai" => Box::new(openai::OpenAiProvider),
-        "google" => {
-            #[cfg(feature = "google")]
-            {
-                Box::new(google::GoogleProvider)
-            }
-            #[cfg(not(feature = "google"))]
-            {
-                tracing::error!(
-                    "stt_provider=google requires a build with --features google; \
-                     falling back to elevenlabs"
-                );
-                Box::new(elevenlabs::ElevenLabsProvider)
-            }
-        }
+        "google" => Box::new(google::GoogleProvider),
         other => {
             tracing::warn!("unknown stt_provider '{other}', falling back to elevenlabs");
             Box::new(elevenlabs::ElevenLabsProvider)

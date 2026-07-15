@@ -158,13 +158,6 @@ tops out around 60 seconds of audio).
 5. Create an API key under **Credentials** and copy it.
 6. Paste it into `google_keys` in `settings.json`.
 
-**Build requirement:** the Google provider is gated behind a Cargo feature and
-is **not** included in a default build. You must build with:
-
-```
-cargo build --release --features google
-```
-
 **Model note:** QuickDictate talks to the v1 endpoint and only supports v1
 models (`latest_long` / `default`). Newer v2/Chirp models reject plain API-key
 auth, so they are out of scope here — don't set `stt_model` to a v2/Chirp

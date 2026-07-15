@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-07-15
+
+### Changed
+
+- **Google Cloud Speech-to-Text is now in every build.** It used to sit behind a `--features google` build switch, so the Google provider only existed if you compiled it in yourself. It's now always included, like the other five providers, and the Settings provider list always offers it. Nothing to enable: paste a key into `google_keys` and pick Google.
+- **`0.4.2` accidentally shipped without the Google provider.** The switch meant one source tree could produce two different `quickdictate.exe` files, and the wrong one was published. If you use Google and updated to `0.4.2`, this release restores it. Removing the switch retires that whole class of mistake: there is only one binary now.
+
 ## [0.4.2] - 2026-07-15
 
 ### Added

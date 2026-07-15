@@ -18,10 +18,10 @@ $built = Join-Path $projectRoot 'target\release\quickdictate.exe'
 $dest  = Join-Path $projectRoot 'quickdictate.exe'
 
 if (-not $SkipBuild) {
-    Write-Host '[refresh] cargo build --release --features google'
+    Write-Host '[refresh] cargo build --release'
     Push-Location $projectRoot
     try {
-        cargo build --release --features google
+        cargo build --release
         if ($LASTEXITCODE -ne 0) { throw "cargo build failed ($LASTEXITCODE)" }
     } finally {
         Pop-Location
