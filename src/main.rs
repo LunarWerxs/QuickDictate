@@ -398,6 +398,14 @@ fn refresh_key_pool(app: &Arc<App>, keys: &mut Arc<KeyPool>) {
     }
 }
 
+fn status_after_release(provider: &str) -> Status {
+    if provider.eq_ignore_ascii_case("local") {
+        Status::Processing
+    } else {
+        Status::Idle
+    }
+}
+
 fn main() -> Result<()> {
     // Single-instance guard: claims a named mutex before anything else
     // (settings.json load, logging, audio, hotkeys, tray). If another
@@ -554,6 +562,12 @@ fn main() -> Result<()> {
     if app.config.load().prewarm_keys {
         stt::spawn_prewarm(Arc::clone(&app), Arc::clone(&keys));
     }
+    {
+        let cfg = app.config.load();
+        if cfg.stt_provider.eq_ignore_ascii_case("local") {
+            local_stt::request_prewarm(&cfg.local_model);
+        }
+    }
 
     // Output (clipboard paste) worker.
     let _output_join = output::spawn(Arc::clone(&app));
@@ -596,10 +610,16 @@ fn main() -> Result<()> {
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         };
         tracing::info!("hotkey event: {evt:?} (status={:?})", app.status());
-        // Main owns the visible status. Sessions are allowed to keep running
-        // in the background while a new one starts -- they each have their
-        // own audio thread, WS connection, and finalize independently. The
-        // user perceives an instant "ready for next dictation."
+        if app.status() == Status::Processing && !matches!(evt, HotkeyEvent::ToggleLongPressed) {
+            tracing::info!(
+                "ignoring hotkey while the local model is finishing the previous dictation"
+            );
+            continue;
+        }
+        // Main owns the visible status. Streaming sessions may keep finalizing
+        // while a newer one starts. Local batch inference is deliberately
+        // serialized above: starting another epoch would make the generic
+        // late-result guard discard the still-running local transcript.
         //
         // `active` tracks the *most recent* session. A handle whose `done`
         // flag is set means the session terminated on its own (clean or
@@ -608,11 +628,11 @@ fn main() -> Result<()> {
         match evt {
             HotkeyEvent::TogglePressed => {
                 if has_live {
+                    app.set_status(status_after_release(&app.config.load().stt_provider));
                     if let Some(h) = active.take() {
                         tracing::info!("Stopping session (toggle off)");
                         h.stop();
                     }
-                    app.set_status(Status::Idle);
                 } else {
                     // Drop any prior completed handle without touching its
                     // shared state; the background task will finish on its own.
@@ -647,11 +667,16 @@ fn main() -> Result<()> {
                 }
             }
             HotkeyEvent::HoldReleased => {
-                if let Some(h) = active.take() {
-                    tracing::info!("Stopping session (hold release)");
-                    h.stop();
+                if has_live {
+                    app.set_status(status_after_release(&app.config.load().stt_provider));
+                    if let Some(h) = active.take() {
+                        tracing::info!("Stopping session (hold release)");
+                        h.stop();
+                    }
+                } else {
+                    let _ = active.take();
+                    app.set_status(Status::Idle);
                 }
-                app.set_status(Status::Idle);
             }
         }
     }
@@ -697,5 +722,12 @@ mod logging_tests {
             b"abcd"
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn local_release_stays_visible_while_batch_inference_finishes() {
+        assert_eq!(status_after_release("local"), Status::Processing);
+        assert_eq!(status_after_release("LOCAL"), Status::Processing);
+        assert_eq!(status_after_release("elevenlabs"), Status::Idle);
     }
 }

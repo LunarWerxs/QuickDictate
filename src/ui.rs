@@ -120,6 +120,8 @@ fn run(app: Arc<App>) -> Result<()> {
     let mut last_error_kind = ErrorKind::Generic;
     let mut last_pos: Option<POINT> = None;
     let mut last_word_count: u32 = u32::MAX;
+    let mut last_spinner = false;
+    let mut spinner_angle = 0.0_f32;
     let mut msg = MSG::default();
 
     // Tray-tooltip explanation for a dead-keys failure. The 2s error pip clears
@@ -266,6 +268,16 @@ fn run(app: Arc<App>) -> Result<()> {
         let cfg = app.config.load();
         let target_count = app.word_count.load(Ordering::Acquire) as f32;
         let want_visible = cfg.mouse_follower_enabled && status != Status::Idle;
+        let show_spinner = cfg.stt_provider.eq_ignore_ascii_case("local")
+            && matches!(
+                status,
+                Status::Starting | Status::Listening | Status::Processing
+            );
+        if show_spinner {
+            spinner_angle = (spinner_angle + std::f32::consts::TAU / 48.0) % std::f32::consts::TAU;
+        } else {
+            spinner_angle = 0.0;
+        }
 
         // Surface a dead-keys failure on the tray tooltip, and keep it there
         // until a session actually connects (Listening) so the explanation
@@ -303,7 +315,7 @@ fn run(app: Arc<App>) -> Result<()> {
         // Smooth the counter toward the live word count. Asymmetric lerp:
         // fast counting up (responsive), slow counting down (damps STT
         // partial-transcript revision jitter so the pip doesn't snap back).
-        if want_visible {
+        if want_visible && !show_spinner {
             let rate = if target_count > display_count {
                 0.50
             } else {
@@ -323,6 +335,7 @@ fn run(app: Arc<App>) -> Result<()> {
                         !matches!(last_pos, Some(prev) if prev.x == p.x && prev.y == p.y);
                     let status_changed = status != last_status;
                     let count_changed = smooth_count != last_word_count;
+                    let spinner_changed = show_spinner != last_spinner;
                     // The error glyph depends on the kind, so a kind flip while
                     // the status stays Error must still repaint (two back-to-back
                     // errors of different kinds within the 2s pip window).
@@ -330,11 +343,18 @@ fn run(app: Arc<App>) -> Result<()> {
                     // Render whenever anything changes — the smoothed counter
                     // changes most frames during active dictation, giving a
                     // fluid animation.
-                    if pos_changed || status_changed || count_changed || kind_changed {
+                    if pos_changed
+                        || status_changed
+                        || count_changed
+                        || kind_changed
+                        || spinner_changed
+                        || show_spinner
+                    {
                         overlay.render(
                             status,
                             error_kind,
                             smooth_count,
+                            show_spinner.then_some(spinner_angle),
                             p.x + PIP_OFFSET_X,
                             p.y + PIP_OFFSET_Y,
                         );
@@ -350,6 +370,7 @@ fn run(app: Arc<App>) -> Result<()> {
             }
         }
         last_status = status;
+        last_spinner = show_spinner;
         std::thread::sleep(if want_visible {
             ACTIVE_POLL_INTERVAL
         } else {
@@ -634,6 +655,7 @@ impl Overlay {
         status: Status,
         error_kind: ErrorKind,
         word_count: u32,
+        spinner_angle: Option<f32>,
         screen_x: i32,
         screen_y: i32,
     ) {
@@ -649,6 +671,7 @@ impl Overlay {
             Status::Idle => return, // window will be hidden; nothing to draw
             Status::Starting => (0xFA, 0xB0, 0x05), // amber
             Status::Listening => (0x22, 0xC5, 0x5E), // green
+            Status::Processing => (0x4A, 0x90, 0xF5), // blue
             Status::Error => (0xEF, 0x44, 0x44), // red
         };
         let cx = (self.size as f32 - 1.0) / 2.0;
@@ -679,73 +702,104 @@ impl Overlay {
             }
         }
 
-        // Draw the label on top. GDI doesn't touch the alpha channel, but the
-        // disc region we draw on already has alpha=255 in the interior, so the
-        // text inherits full opacity wherever a glyph hits the disc.
-        //
-        // A dead-keys error swaps the bare "!" for the Windows icon-font "key"
-        // glyph (MDL2/Fluent "Permissions", U+E8D7) so the pip says *why* it's
-        // red. "Segoe MDL2 Assets" ships on Win10 and Win11 and carries that PUA
-        // codepoint; every other state keeps Segoe UI text ("!" or the count).
-        let (label, face_name, height_factor) = match status {
-            Status::Error if error_kind == ErrorKind::DeadKeys => {
-                ("\u{E8D7}".to_string(), "Segoe MDL2 Assets\0", 0.52)
+        if let Some(start_angle) = spinner_angle {
+            // Local providers are batch-only, so a word count sits at zero
+            // until the final transcript. Draw a rotating 270° ring instead.
+            // Blend it directly into the already-opaque disc so the layered
+            // window keeps correct premultiplied alpha at antialiased edges.
+            let ring_radius = self.size as f32 * 0.22;
+            let ring_half_width = self.size as f32 * 0.034;
+            let sweep = std::f32::consts::TAU * 0.75;
+            for y in 0..self.size {
+                for x in 0..self.size {
+                    let dx = x as f32 - cx;
+                    let dy = y as f32 - cy;
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    let radial =
+                        (ring_half_width + 0.8 - (dist - ring_radius).abs()).clamp(0.0, 1.0);
+                    if radial == 0.0 {
+                        continue;
+                    }
+                    let around = (dy.atan2(dx) - start_angle).rem_euclid(std::f32::consts::TAU);
+                    if around > sweep {
+                        continue;
+                    }
+                    let tip = (around.min(sweep - around) / 0.16).clamp(0.0, 1.0);
+                    let coverage = radial * tip;
+                    let idx = (y * self.size + x) as usize;
+                    let old = pixels[idx];
+                    let blend = |channel: u32| -> u32 {
+                        (channel as f32 + (255.0 - channel as f32) * coverage + 0.5) as u32
+                    };
+                    let red = blend((old >> 16) & 0xff);
+                    let green = blend((old >> 8) & 0xff);
+                    let blue = blend(old & 0xff);
+                    pixels[idx] = (old & 0xff00_0000) | (red << 16) | (green << 8) | blue;
+                }
             }
-            Status::Error => ("!".to_string(), "Segoe UI\0", 0.45),
-            _ => (format!("{word_count}"), "Segoe UI\0", 0.45),
-        };
-        let mut label_utf16: Vec<u16> = label.encode_utf16().collect();
-        let font_height = (self.size as f32 * height_factor) as i32;
-        let face: Vec<u16> = face_name.encode_utf16().collect();
-        let font = CreateFontW(
-            -font_height,
-            0,
-            0,
-            0,
-            FW_BOLD.0 as i32,
-            0u32,
-            0u32,
-            0u32,
-            DEFAULT_CHARSET.0 as u32,
-            OUT_DEFAULT_PRECIS.0 as u32,
-            CLIP_DEFAULT_PRECIS.0 as u32,
-            ANTIALIASED_QUALITY.0 as u32,
-            (VARIABLE_PITCH.0 as u32) | (FF_DONTCARE.0 as u32),
-            PCWSTR(face.as_ptr()),
-        );
-        let old_font = SelectObject(self.mem_dc, font);
-        let _ = SetBkMode(self.mem_dc, TRANSPARENT);
+        } else {
+            // Draw the label on top. GDI doesn't touch the alpha channel, but
+            // the disc interior already has alpha=255, so text stays opaque.
+            let (label, face_name, height_factor) = match status {
+                Status::Error if error_kind == ErrorKind::DeadKeys => {
+                    ("\u{E8D7}".to_string(), "Segoe MDL2 Assets\0", 0.52)
+                }
+                Status::Error => ("!".to_string(), "Segoe UI\0", 0.45),
+                _ => (format!("{word_count}"), "Segoe UI\0", 0.45),
+            };
+            let mut label_utf16: Vec<u16> = label.encode_utf16().collect();
+            let font_height = (self.size as f32 * height_factor) as i32;
+            let face: Vec<u16> = face_name.encode_utf16().collect();
+            let font = CreateFontW(
+                -font_height,
+                0,
+                0,
+                0,
+                FW_BOLD.0 as i32,
+                0u32,
+                0u32,
+                0u32,
+                DEFAULT_CHARSET.0 as u32,
+                OUT_DEFAULT_PRECIS.0 as u32,
+                CLIP_DEFAULT_PRECIS.0 as u32,
+                ANTIALIASED_QUALITY.0 as u32,
+                (VARIABLE_PITCH.0 as u32) | (FF_DONTCARE.0 as u32),
+                PCWSTR(face.as_ptr()),
+            );
+            let old_font = SelectObject(self.mem_dc, font);
+            let _ = SetBkMode(self.mem_dc, TRANSPARENT);
 
-        // Drop shadow: 1 px down-right, black.
-        let _ = SetTextColor(self.mem_dc, COLORREF(0x00000000));
-        let mut shadow_rect = RECT {
-            left: 1,
-            top: 1,
-            right: self.size + 1,
-            bottom: self.size + 1,
-        };
-        DrawTextW(
-            self.mem_dc,
-            &mut label_utf16,
-            &mut shadow_rect,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-        );
-        // Main text: white.
-        let _ = SetTextColor(self.mem_dc, COLORREF(0x00FFFFFF));
-        let mut text_rect = RECT {
-            left: 0,
-            top: 0,
-            right: self.size,
-            bottom: self.size,
-        };
-        DrawTextW(
-            self.mem_dc,
-            &mut label_utf16,
-            &mut text_rect,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-        );
-        SelectObject(self.mem_dc, old_font);
-        let _ = DeleteObject(font);
+            // Drop shadow: 1 px down-right, black.
+            let _ = SetTextColor(self.mem_dc, COLORREF(0x00000000));
+            let mut shadow_rect = RECT {
+                left: 1,
+                top: 1,
+                right: self.size + 1,
+                bottom: self.size + 1,
+            };
+            DrawTextW(
+                self.mem_dc,
+                &mut label_utf16,
+                &mut shadow_rect,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            );
+            // Main text: white.
+            let _ = SetTextColor(self.mem_dc, COLORREF(0x00FFFFFF));
+            let mut text_rect = RECT {
+                left: 0,
+                top: 0,
+                right: self.size,
+                bottom: self.size,
+            };
+            DrawTextW(
+                self.mem_dc,
+                &mut label_utf16,
+                &mut text_rect,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            );
+            SelectObject(self.mem_dc, old_font);
+            let _ = DeleteObject(font);
+        }
 
         // Ship the bitmap to the screen, also moving the window.
         // UpdateLayeredWindow won't reveal a hidden window -- it only updates

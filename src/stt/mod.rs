@@ -323,6 +323,8 @@ pub fn start_session(app: Arc<App>, keys: Arc<KeyPool>) -> SttHandle {
                     }
                 });
             }
+        } else if app2.current_session_epoch() == epoch {
+            app2.clear_status_if(Status::Processing, Status::Idle);
         }
         done.store(true, Ordering::Release);
     });

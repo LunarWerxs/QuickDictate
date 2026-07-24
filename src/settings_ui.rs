@@ -1175,9 +1175,8 @@ impl SettingsApp {
             return false;
         }
         let previous = self.app.config.load_full();
-        let unload_local = previous.stt_provider.eq_ignore_ascii_case("local")
-            && (!self.draft.stt_provider.eq_ignore_ascii_case("local")
-                || previous.local_model != self.draft.local_model);
+        let leaving_local = previous.stt_provider.eq_ignore_ascii_case("local")
+            && !self.draft.stt_provider.eq_ignore_ascii_case("local");
         let path = Config::settings_path();
         match self.draft.save(&path) {
             Ok(()) => {
@@ -1185,8 +1184,10 @@ impl SettingsApp {
                 // keys, replacements) apply immediately; hotkeys and logging
                 // initialization still need a restart.
                 self.app.config.store(Arc::new(self.draft.clone()));
-                if unload_local {
+                if leaving_local {
                     crate::local_stt::request_unload();
+                } else if self.draft.stt_provider.eq_ignore_ascii_case("local") {
+                    crate::local_stt::request_prewarm(&self.draft.local_model);
                 }
                 crate::autostart::reconcile(self.draft.run_at_startup);
                 self.status = "Saved. Hotkey and logging changes apply after restart.".into();
@@ -1817,7 +1818,8 @@ impl SettingsApp {
                 ui.label(
                     RichText::new(
                         "Runs fully offline after installation. Models are stored in Local AppData, \
-                         not in QuickDictate or this repository.",
+                         not in QuickDictate or this repository. The selected model stays warmed in \
+                         memory while Local is active; switching providers releases it.",
                     )
                     .size(12.0)
                     .color(muted()),

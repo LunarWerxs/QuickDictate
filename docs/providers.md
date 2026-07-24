@@ -192,12 +192,17 @@ install and immediately discards its `.part` file; files left by a forced exit
 are discarded on the next attempt. The trash button deletes that model's
 directory; the small shared runtime stays available for other models.
 
-The model remains loaded briefly between dictations for speed, switches
-automatically when you select another model, unloads when you switch away from
-Local, and unloads after five idle minutes. Vulkan is preferred when available;
-CPU is the automatic fallback. Raw audio passes directly from QuickDictate's
-16 kHz pipeline to the native runtime—there is no temporary WAV file or
-Python/PyTorch environment.
+When Local is selected, QuickDictate loads and prewarms the selected model in
+the background, then keeps it resident between dictations. This intentionally
+uses RAM/VRAM to avoid repeating model-load and Vulkan-pipeline startup on later
+dictations. It switches automatically when you select another model and unloads
+when you switch away from Local. The cursor indicator uses a spinner instead of
+a live word count because local transcription runs as one batch after release;
+another dictation waits until that batch finishes so a valid result cannot be
+superseded and discarded. Vulkan is preferred when available; CPU is the
+automatic fallback. Raw audio passes directly from QuickDictate's 16 kHz
+pipeline to the native runtime—there is no temporary WAV file or Python/PyTorch
+environment.
 
 Local packs come from:
 

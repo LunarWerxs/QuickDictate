@@ -13,7 +13,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use flate2::read::GzDecoder;
 use libloading::os::windows::{
@@ -918,6 +918,7 @@ struct Job {
 
 enum WorkerCommand {
     Transcribe(Job),
+    Prewarm(String),
     Unload,
 }
 
@@ -968,8 +969,32 @@ pub async fn transcribe(
         .map_err(|_| "local STT worker stopped".to_string())?
 }
 
+/// Load the selected model and execute one short silent inference in the
+/// background. Model loading alone does not compile every Vulkan pipeline;
+/// the silent run pays that one-time driver cost before the user's first
+/// dictation instead of making the first result appear to hang.
+pub fn request_prewarm(model_id: &str) {
+    if !is_installed(model_id) {
+        return;
+    }
+    let command = WorkerCommand::Prewarm(model_id.to_string());
+    match worker() {
+        Ok(worker) => match worker.try_send(command) {
+            Ok(()) => tracing::info!("local STT prewarm queued for '{model_id}'"),
+            Err(mpsc::TrySendError::Full(_)) => {
+                tracing::debug!("local STT prewarm skipped because the worker is busy")
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                tracing::warn!("local STT prewarm skipped because the worker stopped")
+            }
+        },
+        Err(e) => tracing::warn!("local STT prewarm could not start: {e}"),
+    }
+}
+
 /// Drop a cached multi-gigabyte model when Settings switches away from Local
-/// (or changes local models). The worker also unloads after five idle minutes.
+/// (or changes local models). While Local remains selected, keeping the model
+/// resident avoids repeatedly paying model-load and Vulkan-pipeline warmup.
 pub fn request_unload() {
     if let Some(Ok(worker)) = WORKER.get() {
         UNLOAD_REQUESTED.store(true, Ordering::Release);
@@ -979,44 +1004,71 @@ pub fn request_unload() {
 
 fn worker_loop(rx: mpsc::Receiver<WorkerCommand>) {
     let mut engine: Option<NativeEngine> = None;
-    loop {
-        let command = match rx.recv_timeout(Duration::from_secs(5 * 60)) {
-            Ok(command) => command,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
+    while let Ok(command) = rx.recv() {
+        match command {
+            WorkerCommand::Unload => {
+                UNLOAD_REQUESTED.store(false, Ordering::Release);
                 if engine.take().is_some() {
-                    tracing::info!("local STT model unloaded after five idle minutes");
+                    tracing::info!("local STT model unloaded after provider/model change");
                 }
-                continue;
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        };
-        let WorkerCommand::Transcribe(job) = command else {
-            UNLOAD_REQUESTED.store(false, Ordering::Release);
-            if engine.take().is_some() {
-                tracing::info!("local STT model unloaded after provider/model change");
+            WorkerCommand::Prewarm(model_id) => {
+                let started = Instant::now();
+                let result = (|| {
+                    if !is_installed(&model_id) {
+                        return Err(format!("local model '{model_id}' is not installed"));
+                    }
+                    if engine.is_none() {
+                        engine = Some(unsafe { NativeEngine::load()? });
+                    }
+                    unsafe {
+                        engine
+                            .as_mut()
+                            .expect("initialized above")
+                            .prewarm(&model_id)
+                    }
+                })();
+                match result {
+                    Ok(warmed) if warmed => tracing::info!(
+                        "local STT prewarmed '{model_id}' in {:.2}s",
+                        started.elapsed().as_secs_f32()
+                    ),
+                    Ok(_) => tracing::debug!("local STT '{model_id}' was already warm"),
+                    Err(e) => tracing::warn!(
+                        "local STT prewarm for '{model_id}' failed after {:.2}s: {e}",
+                        started.elapsed().as_secs_f32()
+                    ),
+                }
             }
-            continue;
-        };
-        let result = (|| {
-            if !is_installed(&job.model_id) {
-                return Err(format!(
-                    "local model '{}' is not installed; install it in Settings",
-                    job.model_id
-                ));
+            WorkerCommand::Transcribe(job) => {
+                let started = Instant::now();
+                let audio_seconds = job.pcm.len() as f32 / 16_000.0;
+                let result = (|| {
+                    if !is_installed(&job.model_id) {
+                        return Err(format!(
+                            "local model '{}' is not installed; install it in Settings",
+                            job.model_id
+                        ));
+                    }
+                    if engine.is_none() {
+                        engine = Some(unsafe { NativeEngine::load()? });
+                    }
+                    unsafe {
+                        engine.as_mut().expect("initialized above").run(
+                            &job.model_id,
+                            &job.language,
+                            &job.pcm,
+                            &job.cancel,
+                        )
+                    }
+                })();
+                tracing::info!(
+                    "local STT processed {audio_seconds:.1}s of audio in {:.2}s",
+                    started.elapsed().as_secs_f32()
+                );
+                let _ = job.result.send(result);
             }
-            if engine.is_none() {
-                engine = Some(unsafe { NativeEngine::load()? });
-            }
-            unsafe {
-                engine.as_mut().expect("initialized above").run(
-                    &job.model_id,
-                    &job.language,
-                    &job.pcm,
-                    &job.cancel,
-                )
-            }
-        })();
-        let _ = job.result.send(result);
+        }
         if UNLOAD_REQUESTED.swap(false, Ordering::AcqRel) && engine.take().is_some() {
             tracing::info!("local STT model unloaded after provider/model change");
         }
@@ -1086,6 +1138,7 @@ struct Loaded {
     model_id: String,
     session: *mut Session,
     cpu_only: bool,
+    warmed: bool,
 }
 
 struct NativeEngine {
@@ -1189,8 +1242,20 @@ impl NativeEngine {
             model_id: model_id.to_string(),
             session,
             cpu_only,
+            warmed: false,
         });
         Ok(())
+    }
+
+    unsafe fn prewarm(&mut self, model_id: &str) -> Result<bool, String> {
+        self.ensure_model(model_id, false)?;
+        if self.loaded.as_ref().is_some_and(|loaded| loaded.warmed) {
+            return Ok(false);
+        }
+        let silence = vec![0i16; 16_000];
+        let cancel = Arc::new(AtomicBool::new(false));
+        let _ = unsafe { self.run(model_id, "en", &silence, &cancel)? };
+        Ok(true)
     }
 
     unsafe fn run(
@@ -1253,6 +1318,9 @@ impl NativeEngine {
                 "local transcription failed: {}",
                 c_string(unsafe { (self.api.status_string)(status) })
             ));
+        }
+        if let Some(loaded) = self.loaded.as_mut() {
+            loaded.warmed = true;
         }
         let text = c_string(unsafe { (self.api.full_text)(session) });
         let text = text.trim().to_string();
@@ -1521,5 +1589,45 @@ mod tests {
             let _ = fs::remove_dir_all(&root);
         }
         result.unwrap();
+    }
+
+    #[test]
+    #[ignore = "loads the user's installed 1.65 GiB Cohere model and runs real native inference"]
+    fn live_installed_cohere_prewarm_and_transcribe() {
+        let spec = model("cohere-q5").unwrap();
+        assert!(
+            is_installed(spec.id),
+            "install '{}' in QuickDictate Settings before running this test",
+            spec.label
+        );
+
+        let mut reader = hound::WavReader::open("tests/fixtures/speech_16k.wav").unwrap();
+        assert_eq!(reader.spec().sample_rate, 16_000);
+        assert_eq!(reader.spec().channels, 1);
+        let pcm = reader
+            .samples::<i16>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut engine = unsafe { NativeEngine::load().unwrap() };
+
+        let prewarm_started = Instant::now();
+        assert!(unsafe { engine.prewarm(spec.id).unwrap() });
+        eprintln!(
+            "Cohere prewarm completed in {:.2}s",
+            prewarm_started.elapsed().as_secs_f32()
+        );
+
+        let inference_started = Instant::now();
+        let transcript =
+            unsafe { engine.run(spec.id, "en", &pcm, &cancel).unwrap() }.unwrap_or_default();
+        eprintln!(
+            "Cohere fixture inference completed in {:.2}s: {transcript}",
+            inference_started.elapsed().as_secs_f32()
+        );
+        assert!(
+            !transcript.trim().is_empty(),
+            "real Cohere inference returned an empty transcript"
+        );
     }
 }

@@ -108,6 +108,9 @@ pub enum Status {
     Listening = 2,
     /// The most recent session failed before audio could stream. Pip shown in red.
     Error = 3,
+    /// Recording has stopped and a batch/local provider is producing the final
+    /// transcript. Pip remains visible with a spinner so this never looks hung.
+    Processing = 4,
 }
 
 impl Status {
@@ -116,6 +119,7 @@ impl Status {
             1 => Status::Starting,
             2 => Status::Listening,
             3 => Status::Error,
+            4 => Status::Processing,
             _ => Status::Idle,
         }
     }
