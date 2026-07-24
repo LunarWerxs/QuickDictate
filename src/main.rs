@@ -22,6 +22,8 @@ mod ui;
 mod update;
 mod voice_commands;
 
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -56,6 +58,10 @@ const SINGLE_INSTANCE_MUTEX_NAME: &str = "QuickDictate.SingleInstance";
 /// created) when the second one is spawned.
 const ACTIVATE_RETRY_ATTEMPTS: u32 = 10;
 const ACTIVATE_RETRY_INTERVAL: Duration = Duration::from_millis(200);
+/// Enough headroom for bursts without letting verbose logging retain a large
+/// amount of formatted text in memory. The appender is deliberately lossy:
+/// diagnostics must never back-pressure microphone or UI work.
+const LOG_QUEUE_LINE_LIMIT: usize = 4_096;
 
 fn wide_z(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -211,24 +217,105 @@ fn install_panic_hook() {
 /// The stdout layer is always attached -- it's cheap and shows up in debug
 /// builds with a console attached; under `windows_subsystem = "windows"` it
 /// silently goes nowhere.
-/// Rotate `quickdictate.log` aside if it already exceeds `max_log_mb`, keeping
-/// one previous generation as `quickdictate.log.old`. `max_log_mb == 0`
-/// disables the cap. Runs before the appender opens the file (in append mode),
-/// so after a rotation logging starts fresh. Best-effort: any filesystem error
-/// just leaves the existing file in place.
-fn rotate_log_if_needed(dir: &std::path::Path, max_log_mb: u64) {
-    if max_log_mb == 0 {
-        return;
+/// Single-file writer with one rotated generation. Unlike a startup-only
+/// check, this keeps a long-running process bounded too. It is owned by
+/// tracing-appender's one background worker, so no extra synchronization is
+/// needed here.
+struct SizeCappedLogWriter {
+    file: Option<std::fs::File>,
+    path: PathBuf,
+    old_path: PathBuf,
+    max_bytes: u64,
+    bytes_written: u64,
+}
+
+impl SizeCappedLogWriter {
+    fn open(dir: &Path, max_log_mb: u64) -> io::Result<Self> {
+        Self::open_with_max_bytes(dir, max_log_mb.saturating_mul(1024 * 1024))
     }
-    let path = dir.join("quickdictate.log");
-    let max_bytes = max_log_mb.saturating_mul(1024 * 1024);
-    match std::fs::metadata(&path) {
-        Ok(meta) if meta.len() > max_bytes => {
-            let old = dir.join("quickdictate.log.old");
-            let _ = std::fs::remove_file(&old);
-            let _ = std::fs::rename(&path, &old);
+
+    fn open_with_max_bytes(dir: &Path, max_bytes: u64) -> io::Result<Self> {
+        let path = dir.join("quickdictate.log");
+        let old_path = dir.join("quickdictate.log.old");
+
+        // Preserve the previous startup behavior as well as rotating during
+        // this run. Rotation is diagnostic-only and best-effort: if an old log
+        // is locked, keep appending rather than preventing QuickDictate launch.
+        if max_bytes != 0
+            && std::fs::metadata(&path)
+                .map(|meta| meta.len() > max_bytes)
+                .unwrap_or(false)
+        {
+            let _ = std::fs::remove_file(&old_path);
+            let _ = std::fs::rename(&path, &old_path);
         }
-        _ => {}
+
+        let file = Self::open_file(&path)?;
+        let bytes_written = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+        Ok(Self {
+            file: Some(file),
+            path,
+            old_path,
+            max_bytes,
+            bytes_written,
+        })
+    }
+
+    fn open_file(path: &Path) -> io::Result<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+    }
+
+    fn rotate(&mut self) -> io::Result<()> {
+        if let Some(mut file) = self.file.take() {
+            let _ = file.flush();
+        }
+
+        let rotation_result = (|| -> io::Result<()> {
+            match std::fs::remove_file(&self.old_path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            std::fs::rename(&self.path, &self.old_path)
+        })();
+
+        // Always try to restore a usable writer. If rotation itself failed
+        // (for example an antivirus briefly locked the file), disable further
+        // attempts for this run so every subsequent log line does not repeat
+        // filesystem work. The next launch gets another chance.
+        let file = Self::open_file(&self.path)?;
+        self.bytes_written = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+        self.file = Some(file);
+        if rotation_result.is_err() {
+            self.max_bytes = 0;
+        }
+        Ok(())
+    }
+}
+
+impl Write for SizeCappedLogWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.max_bytes != 0
+            && self.bytes_written != 0
+            && self.bytes_written.saturating_add(buf.len() as u64) > self.max_bytes
+        {
+            self.rotate()?;
+        }
+
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| io::Error::other("log file is not open"))?;
+        let written = file.write(buf)?;
+        self.bytes_written = self.bytes_written.saturating_add(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.as_mut().map_or(Ok(()), std::io::Write::flush)
     }
 }
 
@@ -248,24 +335,44 @@ fn init_logging(
 
     if file_logging {
         let dir = log_dir();
-        rotate_log_if_needed(&dir, max_log_mb);
-        let file_appender = tracing_appender::rolling::never(&dir, "quickdictate.log");
-        let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
-        let file_layer = tracing_subscriber::fmt::layer()
-            .with_target(false)
-            .with_thread_names(true)
-            .with_ansi(false)
-            .with_writer(file_writer);
-        let _ = tracing_subscriber::registry()
-            .with(filter)
-            .with(stdout_layer)
-            .with(file_layer)
-            .try_init();
-        tracing::info!(
-            "File logging enabled at {}\\quickdictate.log",
-            dir.display()
-        );
-        Some(guard)
+        match SizeCappedLogWriter::open(&dir, max_log_mb) {
+            Ok(file_appender) => {
+                let (file_writer, guard) =
+                    tracing_appender::non_blocking::NonBlockingBuilder::default()
+                        .buffered_lines_limit(LOG_QUEUE_LINE_LIMIT)
+                        .lossy(true)
+                        .thread_name("qd-log-writer")
+                        .finish(file_appender);
+                let file_layer = tracing_subscriber::fmt::layer()
+                    .with_target(false)
+                    .with_thread_names(true)
+                    .with_ansi(false)
+                    .with_writer(file_writer);
+                let _ = tracing_subscriber::registry()
+                    .with(filter)
+                    .with(stdout_layer)
+                    .with(file_layer)
+                    .try_init();
+                tracing::info!(
+                    "File logging enabled at {}\\quickdictate.log ({} MiB cap, {} queued lines max)",
+                    dir.display(),
+                    max_log_mb,
+                    LOG_QUEUE_LINE_LIMIT,
+                );
+                Some(guard)
+            }
+            Err(e) => {
+                let _ = tracing_subscriber::registry()
+                    .with(filter)
+                    .with(stdout_layer)
+                    .try_init();
+                tracing::warn!(
+                    "File logging requested but {}\\quickdictate.log could not be opened: {e}",
+                    dir.display()
+                );
+                None
+            }
+        }
     } else {
         let _ = tracing_subscriber::registry()
             .with(filter)
@@ -556,4 +663,38 @@ fn main() -> Result<()> {
     // Give in-flight pastes a moment to finish.
     std::thread::sleep(Duration::from_millis(50));
     Ok(())
+}
+
+#[cfg(test)]
+mod logging_tests {
+    use super::*;
+
+    #[test]
+    fn log_writer_rotates_during_a_long_run() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "quickdictate-log-test-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut writer = SizeCappedLogWriter::open_with_max_bytes(&dir, 10).unwrap();
+        writer.write_all(b"12345678").unwrap();
+        writer.write_all(b"abcd").unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        assert_eq!(
+            std::fs::read(dir.join("quickdictate.log.old")).unwrap(),
+            b"12345678"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("quickdictate.log")).unwrap(),
+            b"abcd"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

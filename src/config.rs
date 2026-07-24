@@ -289,13 +289,11 @@ pub struct Config {
     #[serde(default = "default_false")]
     pub enable_logging: bool,
 
-    /// Soft size cap for `quickdictate.log`, in **megabytes**. Because the log
-    /// is a single file appended across every launch, it grows without bound;
-    /// at startup, if it already exceeds this cap it's rotated aside to
-    /// `quickdictate.log.old` (one generation kept) and a fresh file is
-    /// started. `0` disables the cap (unbounded — the old behavior). Note this
-    /// bounds growth *across runs*; a single very long run isn't truncated
-    /// mid-flight. Machine-local (like `enable_logging`), so it is not synced.
+    /// Soft size cap for `quickdictate.log`, in **megabytes**. The writer
+    /// rotates at startup and during a long run, keeping one previous
+    /// generation as `quickdictate.log.old`. `0` disables the cap (unbounded —
+    /// the old behavior). Machine-local (like `enable_logging`), so it is not
+    /// synced.
     #[serde(default = "default_max_log_mb")]
     pub max_log_mb: u64,
 

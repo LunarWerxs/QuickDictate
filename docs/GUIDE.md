@@ -63,10 +63,10 @@ That replacement table, since it's the fiddly-but-lovely part:
 | OpenAI (gpt-4o-transcribe, Realtime API) | `openai` | Streaming | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) |
 | AssemblyAI (Universal-Streaming v3) | `assemblyai` | Streaming | [assemblyai.com/dashboard/signup](https://www.assemblyai.com/dashboard/signup) |
 | DashScope (Alibaba Cloud Paraformer realtime-v2) | `dashscope` | Streaming | [dashscope.console.aliyun.com/apiKey](https://dashscope.console.aliyun.com/apiKey) |
-| Google Cloud Speech-to-Text (v1 batch) | `google` | Batch (record-then-send, no live word count, ~60s per request) | [console.cloud.google.com/apis/credentials](https://console.cloud.google.com/apis/credentials) |
+| Google Cloud Speech-to-Text (v1 batch) | `google` | Batch (bounded ~55s uploads, results on release, no live word count) | [console.cloud.google.com/apis/credentials](https://console.cloud.google.com/apis/credentials) |
 
 A couple of gotchas:
-- **Google** is the only non-streaming one: it records, then sends, so there's no live word count and a request takes about 60s.
+- **Google** is the only non-streaming one: long dictations upload in bounded ~55-second batches, but all results are held until release, so there is no live word count.
 - **DashScope is region-sensitive.** It defaults to the mainland-China host; set `"dashscope_intl": true` for the International host. A key from the wrong region just won't connect.
 
 Full per-provider setup notes live in [docs/providers.md](providers.md).

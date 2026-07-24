@@ -38,6 +38,8 @@ use crate::state::{App, ErrorKind, Status};
 const PIP_SIZE: i32 = 48;
 const PIP_OFFSET_X: i32 = 18;
 const PIP_OFFSET_Y: i32 = 18;
+const ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(16);
+const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Class name of the hidden overlay window -- also the target `main.rs`'s
 /// single-instance guard looks up via `FindWindowW` to reach a running
@@ -56,9 +58,9 @@ pub const ACTIVATE_MESSAGE_NAME: &str = "QuickDictate.ShowSettings";
 static ACTIVATE_MESSAGE_ID: AtomicU32 = AtomicU32::new(0);
 
 /// Set by `overlay_wnd_proc` when it receives the activate message from a
-/// second launch; polled and cleared by the 16ms loop in [`run`], which then
-/// calls the exact same `settings_ui::show_settings` path the tray's
-/// "Settings…" menu item uses.
+/// second launch; polled and cleared by [`run`], which then calls the exact
+/// same `settings_ui::show_settings` path the tray's "Settings…" menu item
+/// uses.
 static SHOW_SETTINGS_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Registers (once) and returns the numeric id of the cross-instance activate
@@ -165,8 +167,8 @@ fn run(app: Arc<App>) -> Result<()> {
                 // Settings, so the dialog is the one place we can spell out the
                 // way back (the tray-icon crate has no per-item tooltip, unlike
                 // the Settings checkbox this mirrors). Runs on its own thread so
-                // the modal doesn't stall the 16ms poll loop below and freeze
-                // the pip mid-dictation.
+                // the modal doesn't stall the active poll loop below and
+                // freeze the pip mid-dictation.
                 let app = Arc::clone(&app);
                 std::thread::spawn(move || {
                     let answer = crate::update::msg_box(
@@ -348,7 +350,11 @@ fn run(app: Arc<App>) -> Result<()> {
             }
         }
         last_status = status;
-        std::thread::sleep(Duration::from_millis(16));
+        std::thread::sleep(if want_visible {
+            ACTIVE_POLL_INTERVAL
+        } else {
+            IDLE_POLL_INTERVAL
+        });
     }
     Ok(())
 }
@@ -397,7 +403,7 @@ const HISTORY_LABEL_CHARS: usize = 40;
 impl TrayState {
     /// Rebuild the "Recent transcriptions" submenu's items from a fresh
     /// snapshot. Called only when the history's version counter changes, so
-    /// this isn't on the hot 16ms UI-poll path in the common case.
+    /// this isn't on the hot active UI-poll path in the common case.
     fn rebuild_history_menu(&self, entries: &[crate::state::HistoryEntry]) {
         // Clear whatever's there now (placeholder or stale entries).
         while self.history_menu.remove_at(0).is_some() {}
@@ -803,8 +809,8 @@ unsafe extern "system" fn overlay_wnd_proc(
         // A second QuickDictate launch found us via FindWindowW (see
         // `main.rs`'s single-instance guard) and posted the registered
         // activate message. We can't thread the `App`/`Arc` through a raw
-        // wnd_proc, so just flip a flag the 16ms poll loop in `run` picks up
-        // and acts on via the normal `settings_ui::show_settings` path.
+        // wnd_proc, so just flip a flag the poll loop in `run` picks up and
+        // acts on via the normal `settings_ui::show_settings` path.
         m if m == activate_message_id() => {
             SHOW_SETTINGS_REQUESTED.store(true, Ordering::Release);
             LRESULT(0)

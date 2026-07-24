@@ -109,8 +109,8 @@ pub trait SttProvider: Send + Sync {
 
     /// How long the runner waits for the send task (final audio flush + commit
     /// + close) to complete after hotkey release. Streaming providers finish
-    /// within the dynamic-tail window; **batch** providers (Google) do their
-    /// single network round-trip inside `commit()` and need much longer.
+    /// within the dynamic-tail window; **batch** providers (Google) may still
+    /// be draining one or more HTTPS requests and need much longer.
     ///
     /// This is only a **lower bound**: the dynamic tail is now user-configurable
     /// (`Config::listen_tail_ms`), so `run_session` always floors the real
@@ -152,8 +152,8 @@ pub trait ProviderSink: Send {
     /// Send one chunk of PCM (`required_audio_format` sample rate, mono i16).
     async fn send_audio(&mut self, pcm: &[i16]) -> Result<(), SendError>;
     /// Signal end-of-utterance so the provider flushes a final transcript.
-    /// No-op for VAD-only providers; for batch providers this is where the
-    /// single network round-trip happens.
+    /// No-op for VAD-only providers; batch providers use this to queue/drain
+    /// their final request(s).
     async fn commit(&mut self) -> Result<(), SendError>;
     /// Nudge the transport so an idle server doesn't close the session during a
     /// stretch where we deliberately forward no audio (the runner trims trailing

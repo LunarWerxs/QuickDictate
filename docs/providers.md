@@ -142,11 +142,12 @@ offerings.
 - **Key array:** `"google_keys"`
 - **Engine:** Google Cloud Speech-to-Text, **batch** v1 (`speech:recognize` REST endpoint, plain API key via `?key=`)
 
-**This provider is different from the other five:** it's record-then-send
-batch recognition, not a live stream. There is **no live word count while
-you're speaking** — QuickDictate records your utterance, sends it once you
-stop, and the transcript comes back roughly a request at a time (each request
-tops out around 60 seconds of audio).
+**This provider is different from the other five:** it uses batch recognition,
+not a live stream. There is **no live word count while you're speaking**.
+QuickDictate uploads completed 55-second blocks in the background during an
+unusually long dictation so audio memory stays bounded, then sends the final
+partial block when you stop. All results remain withheld until release and
+arrive together, in order.
 
 **Getting a key:**
 1. Go to <https://console.cloud.google.com/apis/credentials>.
@@ -173,12 +174,12 @@ current rates and free-tier limits; both drift over time.
 ElevenLabs, Deepgram, OpenAI, AssemblyAI, and DashScope are all **streaming**
 providers: audio goes out over a WebSocket as you talk and you see your words
 appear live, word by word. **Google** is the odd one out — it's **batch**
-(record-then-send over HTTPS), so you speak, then pause, and the whole
-transcript for that utterance arrives at once with no live word count in
-between. If you want the most immediate, "watch it type as I talk" feel, pick
-one of the five streaming providers; pick Google only if you specifically want
-Google's recognition quality/language coverage and can live without live
-word-by-word feedback.
+(bounded HTTPS segments), so you speak, then pause, and the whole transcript
+for that utterance arrives at once with no live word count in between. If you
+want the most immediate, "watch it type as I talk" feel, pick one of the five
+streaming providers; pick Google only if you specifically want Google's
+recognition quality/language coverage and can live without live word-by-word
+feedback.
 
 Whichever you choose, remember: your audio and API keys go only to the
 provider you select, never to the QuickDictate maintainer. (The only thing the

@@ -2,11 +2,11 @@
 //!
 //! Google's streaming path needs a service-account + OAuth (no pasteable key),
 //! so we ship the batch `v1/speech:recognize` REST endpoint instead: a plain
-//! API key (`?key=`), record-then-send, no live partials, ~60 s per request.
-//! It fits the streaming trait by *buffering*: `send_audio` appends to memory,
-//! and `commit()` does the single HTTPS round-trip (segmenting audio longer
-//! than ~55 s), emitting one `Committed` per segment through an internal channel
-//! that the stream half drains.
+//! API key (`?key=`), no live partials, ~60 s per request. It fits the streaming
+//! trait by buffering up to one 55 s segment and handing each completed segment
+//! to a single background worker. This bounds raw-audio memory during long
+//! dictations while preserving ordered, release-time-only transcript events.
+//! `commit()` queues the final partial segment and waits for all requests.
 //!
 //! Compiled into every build, like the other five providers. This used to sit
 //! behind a `--features google` gate to keep `reqwest` out of a streaming-only
@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use super::provider::{
     classify_by_substring, i16_slice_as_bytes, AudioFormat, ConnectError, ProviderSession,
@@ -53,8 +53,8 @@ impl SttProvider for GoogleProvider {
         configured.to_string()
     }
 
-    /// Batch: the POST happens in `commit()`, so the runner must wait longer
-    /// than the streaming tail budget.
+    /// Batch: the final POST(s) are drained in `commit()`, so the runner must
+    /// wait longer than the streaming tail budget.
     fn finalize_timeout(&self) -> Duration {
         Duration::from_secs(45)
     }
@@ -64,9 +64,12 @@ impl SttProvider for GoogleProvider {
         key: &str,
         opts: &SttSessionOpts,
     ) -> Result<ProviderSession, ConnectError> {
-        // No socket — just wire up the buffering sink and its event channel.
-        let (tx, rx) = mpsc::unbounded_channel();
-        let sink = GoogleSink {
+        // One segment may wait behind the request in flight. Combined with the
+        // sink's current partial segment, raw PCM stays bounded to roughly
+        // three 55-second blocks even if Google's endpoint stalls.
+        let (work_tx, work_rx) = mpsc::channel(1);
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let worker = GoogleWorker {
             client: reqwest::Client::new(),
             key: key.to_string(),
             language: opts.language.clone(),
@@ -75,27 +78,43 @@ impl SttProvider for GoogleProvider {
                 .clone()
                 .unwrap_or_else(|| DEFAULT_MODEL.to_string()),
             sample_rate: opts.sample_rate,
+        };
+        let worker_task = tokio::spawn(worker.run(work_rx, event_tx));
+
+        let sink = GoogleSink {
+            sample_rate: opts.sample_rate,
             buffer: Vec::new(),
-            tx,
+            work_tx: Some(work_tx),
+            worker_task: Some(worker_task),
         };
         Ok(ProviderSession {
             sink: Box::new(sink),
-            stream: Box::new(GoogleStream { rx }),
+            stream: Box::new(GoogleStream { rx: event_rx }),
         })
     }
 }
 
 struct GoogleSink {
+    sample_rate: u32,
+    buffer: Vec<i16>,
+    work_tx: Option<mpsc::Sender<GoogleCommand>>,
+    worker_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+enum GoogleCommand {
+    Segment(Vec<i16>),
+    Finish(oneshot::Sender<()>),
+}
+
+struct GoogleWorker {
     client: reqwest::Client,
     key: String,
     language: String,
     model: String,
     sample_rate: u32,
-    buffer: Vec<i16>,
-    tx: mpsc::UnboundedSender<SttEvent>,
 }
 
-impl GoogleSink {
+impl GoogleWorker {
     async fn recognize(&self, pcm: &[i16]) -> Result<Option<String>, FailKind> {
         let content = base64::engine::general_purpose::STANDARD.encode(i16_slice_as_bytes(pcm));
         let body = json!({
@@ -128,40 +147,124 @@ impl GoogleSink {
         }
         parse_transcript(&text)
     }
+
+    async fn run(
+        self,
+        mut work_rx: mpsc::Receiver<GoogleCommand>,
+        event_tx: mpsc::UnboundedSender<SttEvent>,
+    ) {
+        // Hold results until Finish so Google retains its documented batch
+        // behavior: even hour-long dictations never paste while the hotkey is
+        // still held. Transcript text is tiny compared with the audio it
+        // replaces (one event per 55 seconds).
+        let mut pending_events = Vec::new();
+        let mut failed = false;
+
+        while let Some(command) = work_rx.recv().await {
+            match command {
+                GoogleCommand::Segment(pcm) => {
+                    if failed {
+                        continue;
+                    }
+                    match self.recognize(&pcm).await {
+                        Ok(Some(text)) => pending_events.push(SttEvent::Committed(text)),
+                        Ok(None) => {}
+                        Err(kind) => {
+                            pending_events.push(SttEvent::KeyFailure(kind));
+                            failed = true;
+                        }
+                    }
+                }
+                GoogleCommand::Finish(done) => {
+                    for event in pending_events {
+                        let _ = event_tx.send(event);
+                    }
+                    let _ = done.send(());
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Move one complete prefix out without copying that 55-second prefix. Only
+/// the small tail after the split is copied into a fresh allocation.
+fn take_full_segment(buffer: &mut Vec<i16>, segment_samples: usize) -> Option<Vec<i16>> {
+    if segment_samples == 0 || buffer.len() < segment_samples {
+        return None;
+    }
+    let tail = buffer.split_off(segment_samples);
+    Some(std::mem::replace(buffer, tail))
+}
+
+impl GoogleSink {
+    async fn finish_worker(&mut self) -> Result<(), SendError> {
+        let Some(work_tx) = self.work_tx.take() else {
+            return Ok(());
+        };
+
+        let final_segment = std::mem::take(&mut self.buffer);
+        if !final_segment.is_empty() {
+            work_tx
+                .send(GoogleCommand::Segment(final_segment))
+                .await
+                .map_err(|_| SendError("Google recognition worker stopped".into()))?;
+        }
+
+        let (done_tx, done_rx) = oneshot::channel();
+        work_tx
+            .send(GoogleCommand::Finish(done_tx))
+            .await
+            .map_err(|_| SendError("Google recognition worker stopped".into()))?;
+        done_rx
+            .await
+            .map_err(|_| SendError("Google recognition worker stopped".into()))?;
+        if let Some(worker_task) = self.worker_task.take() {
+            worker_task
+                .await
+                .map_err(|e| SendError(format!("Google recognition worker failed: {e}")))?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for GoogleSink {
+    fn drop(&mut self) {
+        // The runner can time out and abort its send task while reqwest is
+        // awaiting a stalled endpoint. Keep the worker strictly session-owned
+        // so that cancellation also releases its queued PCM and HTTP future.
+        if let Some(worker_task) = self.worker_task.take() {
+            worker_task.abort();
+        }
+    }
 }
 
 #[async_trait]
 impl ProviderSink for GoogleSink {
     async fn send_audio(&mut self, pcm: &[i16]) -> Result<(), SendError> {
-        // Pure buffering — no network, no partials.
+        let work_tx = self
+            .work_tx
+            .clone()
+            .ok_or_else(|| SendError("Google recognition session is already finished".into()))?;
         self.buffer.extend_from_slice(pcm);
+        let segment_samples = (self.sample_rate as usize) * SEGMENT_SECS;
+        while let Some(segment) = take_full_segment(&mut self.buffer, segment_samples) {
+            work_tx
+                .send(GoogleCommand::Segment(segment))
+                .await
+                .map_err(|_| SendError("Google recognition worker stopped".into()))?;
+        }
         Ok(())
     }
 
     async fn commit(&mut self) -> Result<(), SendError> {
-        let buffer = std::mem::take(&mut self.buffer);
-        if buffer.is_empty() {
-            return Ok(());
-        }
-        let seg = (self.sample_rate as usize) * SEGMENT_SECS;
-        for segment in buffer.chunks(seg) {
-            match self.recognize(segment).await {
-                Ok(Some(t)) => {
-                    let _ = self.tx.send(SttEvent::Committed(t));
-                }
-                Ok(None) => {} // empty result for this segment
-                Err(kind) => {
-                    let _ = self.tx.send(SttEvent::KeyFailure(kind));
-                    break;
-                }
-            }
-        }
-        Ok(())
+        self.finish_worker().await
     }
 
     async fn close(&mut self) -> Result<(), SendError> {
-        // No-op: dropping the sink drops `tx`, which ends the stream.
-        Ok(())
+        // Normally commit already finished the worker. This also makes an
+        // unusual close-without-commit drain safely instead of abandoning PCM.
+        self.finish_worker().await
     }
 }
 
@@ -256,5 +359,14 @@ mod tests {
         let quota =
             r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"Quota exceeded"}}"#;
         assert!(matches!(parse_transcript(quota), Err(FailKind::Exhausted)));
+    }
+
+    #[test]
+    fn completed_segments_are_removed_and_tail_is_preserved() {
+        let mut buffer: Vec<i16> = (0..12).collect();
+        assert_eq!(take_full_segment(&mut buffer, 5), Some(vec![0, 1, 2, 3, 4]));
+        assert_eq!(take_full_segment(&mut buffer, 5), Some(vec![5, 6, 7, 8, 9]));
+        assert_eq!(take_full_segment(&mut buffer, 5), None);
+        assert_eq!(buffer, vec![10, 11]);
     }
 }

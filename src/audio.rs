@@ -300,13 +300,13 @@ fn stream_until_failure(
         }
         cpal::SampleFormat::I16 => {
             let sessions = Arc::clone(sessions);
-            let mut scratch: Vec<i16> = Vec::new();
             device.build_input_stream(
                 &config,
                 move |data: &[i16], _| {
-                    scratch.clear();
-                    scratch.extend_from_slice(data);
-                    feed_sessions(&sessions, &scratch);
+                    // WASAPI already gave us the exact representation the
+                    // resamplers consume, so avoid copying every callback into
+                    // an otherwise-identical scratch buffer.
+                    feed_sessions(&sessions, data);
                 },
                 make_err_fn(),
                 None,
@@ -399,22 +399,25 @@ impl Drop for SessionFlusher {
 /// Called from the cpal callback. Feeds every active session's resampler.
 /// Dead senders (session dropped without cleanup) are pruned lazily.
 fn feed_sessions(sessions: &parking_lot::RwLock<Vec<SessionEntry>>, data: &[i16]) {
-    // Fast path: no sessions → nothing to do.
-    if sessions.read().is_empty() {
+    // Normal path takes only a shared lock. A write lock is needed solely when
+    // a session disappeared without its normal flusher cleanup.
+    let mut list = sessions.read();
+    if list.is_empty() {
         return;
     }
 
-    // Prune dead entries (receiver dropped) under write lock. This is rare
-    // so the write-lock cost is acceptable.
-    {
-        let mut list = sessions.write();
-        if list.iter().any(|e| e.tx.is_closed()) {
-            list.retain(|e| !e.tx.is_closed());
+    if list.iter().any(|entry| entry.tx.is_closed()) {
+        drop(list);
+        {
+            let mut writable = sessions.write();
+            writable.retain(|entry| !entry.tx.is_closed());
+        }
+        list = sessions.read();
+        if list.is_empty() {
+            return;
         }
     }
 
-    // Feed all remaining sessions under read lock.
-    let list = sessions.read();
     for entry in list.iter() {
         // Feed this callback buffer exactly once, drain every complete chunk,
         // then unlock before touching the channel. Re-feeding `data` inside the
