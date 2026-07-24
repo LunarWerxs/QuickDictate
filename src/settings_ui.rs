@@ -114,6 +114,7 @@ fn providers() -> Vec<(&'static str, &'static str)> {
         ("assemblyai", "AssemblyAI"),
         ("dashscope", "DashScope (Alibaba)"),
         ("google", "Google (batch)"),
+        ("local", "Local (offline)"),
     ]
 }
 
@@ -1163,6 +1164,10 @@ impl SettingsApp {
             self.status = format!("Not saved — {e}");
             return false;
         }
+        let previous = self.app.config.load_full();
+        let unload_local = previous.stt_provider.eq_ignore_ascii_case("local")
+            && (!self.draft.stt_provider.eq_ignore_ascii_case("local")
+                || previous.local_model != self.draft.local_model);
         let path = Config::settings_path();
         match self.draft.save(&path) {
             Ok(()) => {
@@ -1170,6 +1175,9 @@ impl SettingsApp {
                 // keys, replacements) apply immediately; hotkeys and logging
                 // initialization still need a restart.
                 self.app.config.store(Arc::new(self.draft.clone()));
+                if unload_local {
+                    crate::local_stt::request_unload();
+                }
                 crate::autostart::reconcile(self.draft.run_at_startup);
                 self.status = "Saved. Hotkey and logging changes apply after restart.".into();
                 tracing::info!("settings saved via UI to {}", path.display());
@@ -1709,7 +1717,9 @@ impl SettingsApp {
     /// first action obvious instead of leaving the user to guess. It reads the
     /// live draft, so it vanishes the instant a key is saved into any provider.
     fn onboarding_banner(&mut self, ui: &mut egui::Ui) {
-        if !self.draft.providers_with_keys().is_empty() {
+        if self.draft.stt_provider.eq_ignore_ascii_case("local")
+            || !self.draft.providers_with_keys().is_empty()
+        {
             return;
         }
         let acc = accent();
@@ -1772,21 +1782,130 @@ impl SettingsApp {
                         "Which speech-to-text service transcribes your dictation. Add its \
                          API keys with Manage keys.",
                     );
-                if accent_button(ui, "Manage keys\u{2026}")
-                    .on_hover_text("Add, remove, or paste API keys for the selected provider.")
-                    .clicked()
-                {
-                    self.open_keys_modal();
-                }
-                if ui
-                    .add_enabled(!testing, egui::Button::new("Test all keys"))
-                    .on_hover_text("Check every saved key for this provider against its live API.")
-                    .clicked()
-                {
-                    let keys = self.active_keys();
-                    self.start_key_test(ctx, keys);
+                if self.draft.stt_provider != "local" {
+                    if accent_button(ui, "Manage keys\u{2026}")
+                        .on_hover_text("Add, remove, or paste API keys for the selected provider.")
+                        .clicked()
+                    {
+                        self.open_keys_modal();
+                    }
+                    if ui
+                        .add_enabled(!testing, egui::Button::new("Test all keys"))
+                        .on_hover_text(
+                            "Check every saved key for this provider against its live API.",
+                        )
+                        .clicked()
+                    {
+                        let keys = self.active_keys();
+                        self.start_key_test(ctx, keys);
+                    }
                 }
             });
+
+            if self.draft.stt_provider == "local" {
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(
+                        "Runs fully offline after installation. Models are stored in Local AppData, \
+                         not in QuickDictate or this repository.",
+                    )
+                    .size(12.0)
+                    .color(muted()),
+                );
+                ui.add_space(7.0);
+                ui.horizontal(|ui| {
+                    ui.label("Active model");
+                    egui::ComboBox::from_id_salt("local_model")
+                        .width(260.0)
+                        .selected_text(
+                            crate::local_stt::model(&self.draft.local_model)
+                                .map(|m| m.label)
+                                .unwrap_or("Unknown"),
+                        )
+                        .show_ui(ui, |ui| {
+                            for spec in crate::local_stt::MODELS {
+                                ui.selectable_value(
+                                    &mut self.draft.local_model,
+                                    spec.id.to_string(),
+                                    spec.label,
+                                )
+                                .on_hover_text(spec.detail);
+                            }
+                        });
+                });
+                ui.add_space(7.0);
+                for spec in crate::local_stt::MODELS {
+                    let snapshot = crate::local_stt::install_snapshot(spec.id);
+                    if snapshot.busy() {
+                        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                    }
+                    ui.horizontal(|ui| {
+                        let selected = self.draft.local_model == spec.id;
+                        if selected {
+                            chip(ui, "selected", accent());
+                        } else if ui.small_button("Use").clicked() {
+                            self.draft.local_model = spec.id.to_string();
+                        }
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new(spec.label).color(text()));
+                            ui.label(RichText::new(spec.detail).size(11.5).color(muted()));
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            match &snapshot.phase {
+                                crate::local_stt::InstallPhase::Installed => {
+                                    if ui.button("Remove").clicked() {
+                                        if let Err(e) = crate::local_stt::start_remove(spec.id) {
+                                            self.status = e;
+                                        }
+                                    }
+                                }
+                                crate::local_stt::InstallPhase::NotInstalled
+                                | crate::local_stt::InstallPhase::Failed(_) => {
+                                    if accent_button(ui, "Install").clicked() {
+                                        if let Err(e) = crate::local_stt::start_install(spec.id) {
+                                            self.status = e;
+                                        }
+                                    }
+                                }
+                                crate::local_stt::InstallPhase::DownloadingRuntime
+                                | crate::local_stt::InstallPhase::DownloadingModel => {
+                                    let pct = snapshot
+                                        .downloaded
+                                        .saturating_mul(100)
+                                        .checked_div(snapshot.total)
+                                        .unwrap_or(0);
+                                    ui.label(
+                                        RichText::new(format!("{pct}%")).size(12.0).color(muted()),
+                                    );
+                                    ui.add(egui::Spinner::new().size(14.0));
+                                }
+                                crate::local_stt::InstallPhase::InstallingRuntime => {
+                                    ui.label(
+                                        RichText::new("installing runtime\u{2026}")
+                                            .size(12.0)
+                                            .color(muted()),
+                                    );
+                                    ui.add(egui::Spinner::new().size(14.0));
+                                }
+                                crate::local_stt::InstallPhase::Removing => {
+                                    ui.label(
+                                        RichText::new("removing\u{2026}").size(12.0).color(muted()),
+                                    );
+                                    ui.add(egui::Spinner::new().size(14.0));
+                                }
+                            }
+                        });
+                    });
+                    if let crate::local_stt::InstallPhase::Failed(message) = &snapshot.phase {
+                        ui.label(
+                            RichText::new(format!("Install problem: {message}"))
+                                .size(11.5)
+                                .color(bad()),
+                        );
+                    }
+                    ui.add_space(4.0);
+                }
+            }
 
             // DashScope's region toggle only applies to that provider, so it
             // sits on its own line and only when DashScope is selected.

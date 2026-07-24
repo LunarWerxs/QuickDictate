@@ -40,6 +40,9 @@ fn default_language() -> String {
 fn default_provider() -> String {
     "elevenlabs".into()
 }
+fn default_local_model() -> String {
+    crate::local_stt::default_model_id()
+}
 fn default_mode() -> String {
     "toggle".into()
 }
@@ -199,7 +202,8 @@ pub struct Config {
     pub spinner_type: String,
 
     /// Which STT backend to use:
-    /// "elevenlabs" | "deepgram" | "openai" | "assemblyai" | "dashscope" | "google".
+    /// "elevenlabs" | "deepgram" | "openai" | "assemblyai" | "dashscope" |
+    /// "google" | "local".
     /// (google = batch/non-streaming.)
     #[serde(default = "default_provider")]
     pub stt_provider: String,
@@ -224,6 +228,12 @@ pub struct Config {
     /// Optional per-provider model override (else the provider's default).
     #[serde(default)]
     pub stt_model: Option<String>,
+
+    /// Download-on-demand model used by the keyless local provider. The model
+    /// weights themselves live in Local AppData and are never part of config,
+    /// settings sync, the repository, or the QuickDictate executable.
+    #[serde(default = "default_local_model")]
+    pub local_model: String,
 
     /// DashScope region: `false` = mainland-China host (default),
     /// `true` = the `-intl` host for International accounts. A key from the
@@ -380,6 +390,7 @@ impl Default for Config {
             dashscope_keys: Vec::new(),
             google_keys: Vec::new(),
             stt_model: None,
+            local_model: default_local_model(),
             dashscope_intl: false,
             update_auto_check: true,
             install_id: String::new(),
@@ -568,6 +579,7 @@ impl Config {
     /// into elevenlabs). Same back-compat rule as [`Config::active_keys`].
     pub fn keys_for(&self, provider: &str) -> &[String] {
         match provider.trim().to_ascii_lowercase().as_str() {
+            "local" => &[],
             "deepgram" => &self.deepgram_keys,
             "openai" => &self.openai_keys,
             "assemblyai" => &self.assemblyai_keys,
@@ -605,6 +617,9 @@ impl Config {
     /// pasted, say, Google keys opens straight into Google). `None` when no
     /// provider has any keys. Does not mutate self.
     pub fn resolve_provider(&self) -> Option<String> {
+        if self.stt_provider.trim().eq_ignore_ascii_case("local") {
+            return Some("local".into());
+        }
         if !self.active_keys().is_empty() {
             return Some(self.stt_provider.clone());
         }
@@ -747,6 +762,17 @@ mod tests {
         let c = Config::default();
         assert!(c.resolve_provider().is_none());
         assert!(c.providers_with_keys().is_empty());
+    }
+
+    #[test]
+    fn selected_local_provider_needs_no_api_key() {
+        let c = Config {
+            stt_provider: "LOCAL".into(),
+            ..Config::default()
+        };
+        assert!(c.active_keys().is_empty());
+        assert_eq!(c.resolve_provider().as_deref(), Some("local"));
+        assert_eq!(c.local_model, "cohere-q5");
     }
 
     #[test]

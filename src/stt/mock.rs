@@ -109,6 +109,7 @@ mod tests {
                 }
                 SttEvent::Partial(t) => last_partial = t,
                 SttEvent::KeyFailure(k) => fail = Some(k),
+                SttEvent::ProviderFailure(_) => {}
                 SttEvent::Closed(_) => break,
                 SttEvent::SessionStarted => {}
             }

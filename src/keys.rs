@@ -89,6 +89,12 @@ fn key_suffix(key: &str) -> String {
 }
 
 fn configured_keys(cfg: &Config) -> Vec<String> {
+    // The local provider uses the same session runner but has no credential.
+    // A private sentinel keeps the generic pool/startup readiness plumbing
+    // usable without storing or exposing a fake key in settings.json.
+    if cfg.stt_provider.trim().eq_ignore_ascii_case("local") {
+        return vec!["local".into()];
+    }
     cfg.active_keys()
         .iter()
         .map(|v| v.trim())
@@ -361,6 +367,17 @@ mod tests {
         let p = pool_with(&[]);
         assert!(!p.has_usable_key());
         assert!(p.acquire().is_none());
+    }
+
+    #[test]
+    fn local_provider_uses_an_internal_keyless_sentinel() {
+        let cfg = Config {
+            stt_provider: "local".into(),
+            ..Config::default()
+        };
+        let pool = KeyPool::new(&cfg);
+        assert!(pool.has_usable_key());
+        assert_eq!(pool.acquire().as_deref(), Some("local"));
     }
 
     #[test]

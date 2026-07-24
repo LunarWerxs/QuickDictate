@@ -12,6 +12,7 @@ mod dashscope;
 mod deepgram;
 mod elevenlabs;
 mod google;
+mod local;
 mod openai;
 pub mod provider;
 
@@ -100,6 +101,9 @@ fn make_provider(cfg: &Config) -> Box<dyn SttProvider> {
         }),
         "openai" => Box::new(openai::OpenAiProvider),
         "google" => Box::new(google::GoogleProvider),
+        "local" => Box::new(local::LocalProvider {
+            model_id: cfg.local_model.clone(),
+        }),
         other => {
             tracing::warn!("unknown stt_provider '{other}', falling back to elevenlabs");
             Box::new(elevenlabs::ElevenLabsProvider)
@@ -117,6 +121,9 @@ pub fn spawn_prewarm(app: Arc<App>, keys: Arc<KeyPool>) {
     app.rt.clone().spawn(async move {
         let cfg = app.config.load_full();
         let provider = make_provider(&cfg);
+        if !provider.requires_api_key() {
+            return;
+        }
         let provider_id = provider.id();
         let fmt = provider.required_audio_format();
         let opts = SttSessionOpts {
@@ -436,21 +443,26 @@ async fn run_session(
     let cfg = app.config.load_full();
     let provider = make_provider(&cfg);
     let provider_id = provider.id();
+    let requires_api_key = provider.requires_api_key();
     let finalize_timeout = provider.finalize_timeout();
     // Whether this provider needs the phantom-finalization guard (ElevenLabs
     // Scribe completes a question into a hallucinated short "answer" at
     // end-of-stream). Read once here so the recv task captures a plain bool.
     let suppress_phantom = provider.suppress_phantom_finalization();
 
-    let key = match keys.acquire() {
-        Some(k) => k,
-        None => {
-            tracing::info!("session[{epoch}] pool empty; waiting up to 1.5 s for refresh");
-            if !keys.wait_until_ready(Duration::from_millis(1500)).await {
-                anyhow::bail!("no API key available");
+    let key = if requires_api_key {
+        match keys.acquire() {
+            Some(k) => k,
+            None => {
+                tracing::info!("session[{epoch}] pool empty; waiting up to 1.5 s for refresh");
+                if !keys.wait_until_ready(Duration::from_millis(1500)).await {
+                    anyhow::bail!("no API key available");
+                }
+                keys.acquire().ok_or_else(|| anyhow!("no API key"))?
             }
-            keys.acquire().ok_or_else(|| anyhow!("no API key"))?
         }
+    } else {
+        String::new()
     };
     let key_suffix: String = key
         .chars()
@@ -460,8 +472,13 @@ async fn run_session(
         .into_iter()
         .rev()
         .collect();
-    tracing::info!("session[{epoch}] provider={provider_id} using key ...{key_suffix}");
-    *app.current_key.lock() = Some(key.clone());
+    if requires_api_key {
+        tracing::info!("session[{epoch}] provider={provider_id} using key ...{key_suffix}");
+        *app.current_key.lock() = Some(key.clone());
+    } else {
+        tracing::info!("session[{epoch}] provider={provider_id} (no API key)");
+        *app.current_key.lock() = None;
+    }
 
     let fmt = provider.required_audio_format();
     let opts = SttSessionOpts {
@@ -485,6 +502,9 @@ async fn run_session(
     {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
+            if !requires_api_key {
+                return Err(anyhow!("{provider_id} connect failed: {e}"));
+            }
             // A connect-stage failure is (almost always) a per-key problem —
             // bad credential, arrears, quota — so signal the retry shell to
             // rotate to the next key instead of giving up on the whole press.
@@ -497,6 +517,11 @@ async fn run_session(
             return Err(anyhow!(EXHAUSTED_SIGNAL));
         }
         Err(_) => {
+            if !requires_api_key {
+                return Err(anyhow!(
+                    "{provider_id} connect timed out after {CONNECT_TIMEOUT:?}"
+                ));
+            }
             // Exceeded CONNECT_TIMEOUT: a stalled handshake, not a bad key.
             // Treat it as transient and rotate rather than hang the press.
             keys.mark_failed(&key, FailKind::Transient);
@@ -722,10 +747,13 @@ async fn run_session(
     let committed_flag = Arc::new(AtomicBool::new(false));
     let key_fail_kind: Arc<parking_lot::Mutex<Option<FailKind>>> =
         Arc::new(parking_lot::Mutex::new(None));
+    let provider_failure: Arc<parking_lot::Mutex<Option<String>>> =
+        Arc::new(parking_lot::Mutex::new(None));
     let chunks_for_task = Arc::clone(&chunks_buf);
     let last_partial_for_task = Arc::clone(&last_partial_buf);
     let committed_for_task = Arc::clone(&committed_flag);
     let key_fail_for_task = Arc::clone(&key_fail_kind);
+    let provider_failure_for_task = Arc::clone(&provider_failure);
     let release_pending_recv = Arc::clone(&release_pending);
 
     // Reset the live word counter at the start of every session.
@@ -859,6 +887,10 @@ async fn run_session(
                     *key_fail_for_task.lock() = Some(kind);
                     // Don't break: the outer wait loop observes key_fail_kind and
                     // tears the session down / rotates keys.
+                }
+                SttEvent::ProviderFailure(message) => {
+                    tracing::error!("session[{epoch}] {provider_id} failed: {message}");
+                    *provider_failure_for_task.lock() = Some(message);
                 }
                 SttEvent::Closed(reason) => {
                     match reason {
@@ -1009,12 +1041,17 @@ async fn run_session(
         keys.mark_failed(&key, kind);
         tracing::warn!("session[{epoch}] ended with FAILED key ({kind:?}); pool will rotate");
     } else {
-        keys.mark_success(&key, chunks_sent.saturating_mul(100) as u64);
+        if requires_api_key {
+            keys.mark_success(&key, chunks_sent.saturating_mul(100) as u64);
+        }
     }
     crate::sound::play_stop(cfg.enable_sound);
     tracing::info!("session[{epoch}] ended");
     if key_failure.is_some() {
         return Err(anyhow!(EXHAUSTED_SIGNAL));
+    }
+    if let Some(message) = provider_failure.lock().take() {
+        return Err(anyhow!(message));
     }
     Ok(())
 }

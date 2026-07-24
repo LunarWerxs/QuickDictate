@@ -30,6 +30,10 @@ pub enum SttEvent {
     Committed(String),
     /// The provider told us the credential is bad / exhausted / rate-limited.
     KeyFailure(FailKind),
+    /// A non-credential provider failure (for example, a local model/runtime
+    /// load or inference error). This surfaces a generic error without
+    /// poisoning or rotating the user's API-key pool.
+    ProviderFailure(String),
     /// Transport closed; reason string if the peer gave one.
     Closed(Option<String>),
 }
@@ -88,6 +92,12 @@ pub trait SttProvider: Send + Sync {
     /// PCM format this provider needs on the wire. The runner subscribes the
     /// audio pipeline at this rate.
     fn required_audio_format(&self) -> AudioFormat;
+
+    /// Cloud providers use the key pool. A fully local provider overrides this
+    /// so connection/runtime failures are not misclassified as dead API keys.
+    fn requires_api_key(&self) -> bool {
+        true
+    }
 
     /// Map the app's configured `language` (e.g. `"en-US"`) to the exact string
     /// this provider expects. Default: strip the region (`en-US` -> `en`),

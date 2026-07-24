@@ -6,7 +6,7 @@ The full documentation for QuickDictate. For the short version, see the [README]
 
 **Press a key, talk, and your words land wherever your cursor already is.**
 
-That's the whole idea. QuickDictate is a small Windows app that sits in your tray, listens while you hold (or tap) a global hotkey, and types the transcript straight into whatever window has focus — your editor, a chat box, an email, a terminal, a text field on some website. It uses *your own* speech-to-text API key, so there's no subscription to us, no account to create, and no server of ours sitting between you and your words.
+That's the whole idea. QuickDictate is a small Windows app that sits in your tray, listens while you hold (or tap) a global hotkey, and types the transcript straight into whatever window has focus — your editor, a chat box, an email, a terminal, a text field on some website. It uses *your own* speech-to-text API key or an optional local model, so there's no subscription to us and no QuickDictate account to create.
 
 <p align="center">
   <img src="images/settings.png" alt="The QuickDictate settings window" width="470">
@@ -28,7 +28,7 @@ See the [changelog](../CHANGELOG.md) for what's changed release to release.
 
 ## What you get
 
-- **Six speech providers, your pick** — ElevenLabs, Deepgram, OpenAI, AssemblyAI, DashScope, and Google Cloud Speech-to-Text. Switch whenever you want.
+- **Seven speech providers, your pick** — six cloud services plus a fully offline Local provider with three downloadable model choices. Switch whenever you want.
 - **Bring your own key** — your keys, your account, your usage. Add more than one key per provider and QuickDictate round-robins between them with per-key health tracking (alive / quota / dead) and cooldown backoff. Hit a dead key mid-sentence? It rotates to the next one automatically, without dropping your press.
 - **Keys are checked before you need them** — on startup the active provider's keys get probed in the background, so a dead or rate-limited key is flagged before your first dictation and a good one is already queued. Health lives in memory only — a provider having a bad five minutes never permanently brands a key as dead; every launch re-checks.
 - **Hold or toggle — your call** — hold a key while you talk, or tap once to start and once to stop. Both hotkeys are configurable.
@@ -64,9 +64,11 @@ That replacement table, since it's the fiddly-but-lovely part:
 | AssemblyAI (Universal-Streaming v3) | `assemblyai` | Streaming | [assemblyai.com/dashboard/signup](https://www.assemblyai.com/dashboard/signup) |
 | DashScope (Alibaba Cloud Paraformer realtime-v2) | `dashscope` | Streaming | [dashscope.console.aliyun.com/apiKey](https://dashscope.console.aliyun.com/apiKey) |
 | Google Cloud Speech-to-Text (v1 batch) | `google` | Batch (bounded ~55s uploads, results on release, no live word count) | [console.cloud.google.com/apis/credentials](https://console.cloud.google.com/apis/credentials) |
+| Local (Cohere Transcribe or Whisper) | `local` | Offline batch (results on release) | No key; install a model in Settings |
 
 A couple of gotchas:
 - **Google** is the only non-streaming one: long dictations upload in bounded ~55-second batches, but all results are held until release, so there is no live word count.
+- **Local** is also non-streaming, but uploads nothing. It buffers bounded 16 kHz PCM in memory and transcribes when you release the hotkey.
 - **DashScope is region-sensitive.** It defaults to the mainland-China host; set `"dashscope_intl": true` for the International host. A key from the wrong region just won't connect.
 
 Full per-provider setup notes live in [docs/providers.md](providers.md).
@@ -77,9 +79,10 @@ Everything lives in `settings.json` (copied from `settings.example.json`). The f
 
 | Field | Purpose |
 |---|---|
-| `stt_provider` | `"elevenlabs"` \| `"deepgram"` \| `"openai"` \| `"assemblyai"` \| `"dashscope"` \| `"google"` |
+| `stt_provider` | `"elevenlabs"` \| `"deepgram"` \| `"openai"` \| `"assemblyai"` \| `"dashscope"` \| `"google"` \| `"local"` |
 | `elevenlabs_keys`, `deepgram_keys`, `openai_keys`, `assemblyai_keys`, `dashscope_keys`, `google_keys` | Per-provider arrays of API keys; add more than one to enable round-robin + health tracking |
 | `stt_model` | Optional model-override string (`null` = provider default) |
+| `local_model` | Local model id: `"cohere-bf16"`, `"cohere-q5"` (default), or `"whisper-turbo-q5"` |
 | `dashscope_intl` | `false` = mainland-China host (default), `true` = International host |
 | `language` | BCP-47 language tag, e.g. `"en-US"` |
 | `mode` | `"toggle"` or `"hold"` |

@@ -101,6 +101,7 @@ pub const SYNCED_KEYS: &[&str] = &[
     "spinner_type",
     "stt_provider",
     "stt_model",
+    "local_model",
     "dashscope_intl",
     "update_auto_check",
     "prewarm_keys",

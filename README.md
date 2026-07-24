@@ -11,8 +11,8 @@
 <p>
 A tiny Windows tray app for voice dictation. Hold or tap a global hotkey, speak, and the
 transcript types straight into whatever window has focus — your editor, a chat box, an email,
-a terminal, any web text field. It runs on <i>your own</i> speech-to-text API key, so there's
-<b>no subscription and no account</b>.
+a terminal, any web text field. Use <i>your own</i> speech-to-text API key, or install an
+optional local model for fully offline transcription — <b>no QuickDictate subscription or account</b>.
 </p>
 
 <p>
@@ -45,12 +45,12 @@ a terminal, any web text field. It runs on <i>your own</i> speech-to-text API ke
 
 | | |
 | :-- | :-- |
-| 🔑 **Bring your own key** | Six providers to pick from — **ElevenLabs, Deepgram, OpenAI, AssemblyAI, DashScope, Google**. Add more than one and it round-robins with per-key health checks. |
+| 🔑 **Cloud or fully local** | Six bring-your-own-key services plus an offline **Local** provider with three one-click model choices. |
 | ⌨️ **Types into any window** | Whatever has focus — your editor, a chat box, a terminal, or a web form. |
 | ✋ **Hold or tap** | Hold a key while you talk, or tap to start and stop. Both are configurable. |
 | 💬 **Streams as you speak** | Words appear live as you talk on the streaming providers. |
 | 🪄 **Little touches that add up** | A fix-list for words it mishears, per-app profiles, and a *"scratch that"* voice command. |
-| 🔒 **Your data stays yours** | Your dictation audio goes only to the speech provider you pick — nothing else is uploaded. Optional settings sync, only if you turn it on. |
+| 🔒 **Your data stays yours** | Cloud audio goes only to the provider you pick; Local audio never leaves the PC. Optional settings sync is opt-in. |
 
 ## 🚀 Quick start
 
@@ -64,11 +64,14 @@ a terminal, any web text field. It runs on <i>your own</i> speech-to-text API ke
 > First launch with no key? QuickDictate opens Settings for you, with a one-click **Manage keys…**
 > button to paste a key and get going.
 
+Prefer offline? Choose **Local (offline)** in Settings, pick a model, and click **Install**.
+Weights download to `%LOCALAPPDATA%\QuickDictate\local-stt` rather than the app/repository.
+
 ## 📚 Learn more
 
 Every setting, per-provider setup, and the privacy details live in the
 **[complete guide](docs/GUIDE.md)** — with provider-specific notes in
-**[docs/providers.md](docs/providers.md)**.
+**[docs/providers.md](docs/providers.md)**, including local model and storage details.
 
 ## 📄 License
 

@@ -9,6 +9,7 @@ mod focus;
 mod hotkeys;
 mod icon;
 mod keys;
+mod local_stt;
 mod onboarding;
 mod output;
 mod settings_ui;

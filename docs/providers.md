@@ -1,9 +1,7 @@
 # Provider Setup Guide
 
-QuickDictate is bring-your-own-key: you supply your own API key(s) for whichever
-cloud speech-to-text (STT) provider you want to use, and QuickDictate streams
-your microphone audio to that provider to get a transcript back. This guide
-walks through getting a key and configuring each of the six supported
+QuickDictate supports bring-your-own-key cloud speech-to-text (STT), or an
+optional local model that keeps audio offline. This guide covers all seven
 providers.
 
 > **As of 2026-07.** Provider endpoints, consoles, model names, and pricing
@@ -23,8 +21,8 @@ providers.
    e.g. a personal key plus a work key).
 4. Save and restart QuickDictate for the change to take effect.
 
-Only the key array for your active `stt_provider` needs to be filled in; the
-others can stay empty.
+Only the key array for your active cloud `stt_provider` needs to be filled in;
+the others can stay empty. The Local provider needs no key.
 
 ---
 
@@ -169,17 +167,57 @@ current rates and free-tier limits; both drift over time.
 
 ---
 
+## Local (offline)
+
+- **`stt_provider` value:** `"local"`
+- **Key array:** none
+- **Mode:** offline batch; the transcript arrives after hotkey release
+- **Runtime:** pinned `transcribe.cpp` 0.1.3 CPU/Vulkan package
+
+Choose **Local (offline)** in Settings. Pick any model, click **Install**, wait
+for the verified download, then Save. You can install one model or all three:
+
+| `local_model` | Model | Download | Intended tradeoff |
+|---|---|---:|---|
+| `cohere-bf16` | Cohere Transcribe 03-2026 BF16 | 3.82 GiB | Highest numeric fidelity |
+| `cohere-q5` | Cohere Transcribe 03-2026 Q5_K_M | 1.65 GiB | Default; near-lossless accuracy/size balance |
+| `whisper-turbo-q5` | Whisper Large v3 Turbo Q5_K_M | 591 MiB | Smallest and broadest language coverage |
+
+The executable contains none of these weights. Downloads go under
+`%LOCALAPPDATA%\QuickDictate\local-stt`; a shared runtime adds roughly 80 MiB
+once. Every artifact is pinned to an immutable upstream revision and verified
+by exact byte count plus SHA-256 before an atomic rename makes it usable.
+Interrupted downloads remain `.part` files and are discarded on the next
+attempt. **Remove** deletes that model's directory; the small shared runtime
+stays available for other models.
+
+The model remains loaded briefly between dictations for speed, switches
+automatically when you select another model, unloads when you switch away from
+Local, and unloads after five idle minutes. Vulkan is preferred when available;
+CPU is the automatic fallback. Raw audio passes directly from QuickDictate's
+16 kHz pipeline to the native runtime—there is no temporary WAV file or
+Python/PyTorch environment.
+
+Local packs come from:
+
+- [handy-computer/transcribe.cpp](https://github.com/handy-computer/transcribe.cpp) (MIT)
+- [Cohere Transcribe GGUF](https://huggingface.co/handy-computer/cohere-transcribe-03-2026-gguf) (Apache-2.0 model)
+- [Whisper Large v3 Turbo GGUF](https://huggingface.co/handy-computer/whisper-large-v3-turbo-gguf) (MIT model)
+
+---
+
 ## Choosing a provider
 
 ElevenLabs, Deepgram, OpenAI, AssemblyAI, and DashScope are all **streaming**
 providers: audio goes out over a WebSocket as you talk and you see your words
-appear live, word by word. **Google** is the odd one out — it's **batch**
+appear live, word by word. **Google** is a cloud **batch**
 (bounded HTTPS segments), so you speak, then pause, and the whole transcript
 for that utterance arrives at once with no live word count in between. If you
 want the most immediate, "watch it type as I talk" feel, pick one of the five
 streaming providers; pick Google only if you specifically want Google's
 recognition quality/language coverage and can live without live word-by-word
-feedback.
+feedback. Pick **Local** when privacy/offline use matters most and your machine
+has enough RAM/disk for the selected model; it also returns results on release.
 
 Whichever you choose, remember: your audio and API keys go only to the
 provider you select, never to the QuickDictate maintainer. (The only thing the

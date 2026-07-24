@@ -113,6 +113,9 @@ async fn probe(provider: &dyn SttProvider, key: &str, samples: Vec<i16>) -> anyh
             Ok(Some(SttEvent::KeyFailure(k))) => {
                 return Err(anyhow::anyhow!("provider signaled key failure: {k:?}"))
             }
+            Ok(Some(SttEvent::ProviderFailure(e))) => {
+                return Err(anyhow::anyhow!("provider failed: {e}"))
+            }
             Ok(Some(SttEvent::Closed(_))) | Ok(None) => break,
             Ok(Some(SttEvent::SessionStarted)) => {}
             Err(e) => {
