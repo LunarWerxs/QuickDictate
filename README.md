@@ -41,31 +41,54 @@ optional local model for fully offline transcription — <b>no QuickDictate subs
   <sub><i>Everything lives in one small settings window — providers, keys, hotkeys, and toggles.</i></sub>
 </div>
 
+## 🆕 New in v0.5.0: fully offline dictation
+
+Choose **Local (offline)** in Settings and QuickDictate can transcribe without an API
+key or an internet connection. Microphone audio stays on your PC.
+
+| Model | Download | Best fit |
+| :-- | --: | :-- |
+| **Cohere Transcribe 03-2026 Q5_K_M** | 1.65 GiB | Accuracy-first default |
+| **Whisper Large v3 Turbo Q5_K_M** | 591 MiB | Smaller install and broader language coverage |
+
+- **Manage everything in Settings:** install, select, cancel a download, or delete
+  either model without hunting through folders.
+- **Small app, on-demand models:** weights are not bundled in the executable or
+  repository. They download to `%LOCALAPPDATA%\QuickDictate\local-stt`, use up to
+  eight parallel connections when supported, and are size- and SHA-256-verified
+  before use. The first install also adds a shared runtime of roughly 80 MiB.
+- **Less waiting after setup:** the selected local model prewarms in the background
+  and stays ready between dictations. QuickDictate shows a spinner during final
+  local processing, queues an early next hotkey press, switches models automatically,
+  and releases the model's RAM/VRAM when you return to a cloud provider.
+- **Lighter long sessions:** audio, logging, clipboard, update, and network buffers
+  are bounded; long Google recordings upload in ordered chunks; idle polling is
+  reduced; and v0.5 fixes duplicate audio, non-BMP characters such as emoji, cold
+  local results, and **Save & Restart** now returning to Settings.
+
 ## ✨ What you get
 
 | | |
 | :-- | :-- |
-| 🔑 **Cloud or fully local** | Six bring-your-own-key services plus an offline **Local** provider with two one-click model choices. |
+| 🔑 **Cloud or fully local** | Six bring-your-own-key services plus two optional offline models. Switch whenever you like. |
 | ⌨️ **Types into any window** | Whatever has focus — your editor, a chat box, a terminal, or a web form. |
 | ✋ **Hold or tap** | Hold a key while you talk, or tap to start and stop. Both are configurable. |
-| 💬 **Streams as you speak** | Words appear live as you talk on the streaming providers. |
+| 💬 **Clear live feedback** | Five cloud providers stream words as you talk; batch and Local modes show when the final result is processing. |
 | 🪄 **Little touches that add up** | A fix-list for words it mishears, per-app profiles, and a *"scratch that"* voice command. |
 | 🔒 **Your data stays yours** | Cloud audio goes only to the provider you pick; Local audio never leaves the PC. Optional settings sync is opt-in. |
 
 ## 🚀 Quick start
 
 1. Grab the **[latest release](https://github.com/LunarWerxs/QuickDictate/releases/latest)** (or [build from source](docs/GUIDE.md#build-from-source)).
-2. Copy `settings.example.json` to `settings.json`, next to `quickdictate.exe`.
-3. Set `"stt_provider"` (say `"deepgram"`) and paste your key into that provider's array.
-4. Run `quickdictate.exe`.
-5. Press the hotkey — **F13** to hold, **F14** to toggle, by default — and start talking.
+2. Run `quickdictate.exe`. With no provider configured, Settings opens for you.
+3. Pick how you want to transcribe:
+   - **Cloud:** choose one of the six services and use **Manage keys…** to paste your API key.
+   - **Offline:** choose **Local (offline)**, select Cohere or Whisper, and click **Install**.
+4. Click **Save**, then press **F13** to hold or **F14** to toggle and start talking.
 
 > [!TIP]
-> First launch with no key? QuickDictate opens Settings for you, with a one-click **Manage keys…**
-> button to paste a key and get going.
-
-Prefer offline? Choose **Local (offline)** in Settings, pick a model, and click **Install**.
-Weights download to `%LOCALAPPDATA%\QuickDictate\local-stt` rather than the app/repository.
+> Prefer files to forms? QuickDictate still keeps one readable `settings.json` next
+> to the executable. Start from `settings.example.json` or edit the generated file.
 
 ## 📚 Learn more
 
