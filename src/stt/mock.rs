@@ -13,8 +13,8 @@ use std::collections::VecDeque;
 use async_trait::async_trait;
 
 use super::provider::{
-    AudioFormat, ConnectError, Encoding, ProviderSession, ProviderSink, ProviderStream, RecvError,
-    SendError, SttEvent, SttProvider, SttSessionOpts,
+    AudioFormat, ConnectError, ProviderSession, ProviderSink, ProviderStream, RecvError, SendError,
+    SttEvent, SttProvider, SttSessionOpts,
 };
 
 /// A provider that replays a scripted event sequence. `send_audio`/`commit`/
@@ -33,7 +33,6 @@ impl SttProvider for MockProvider {
     fn required_audio_format(&self) -> AudioFormat {
         AudioFormat {
             sample_rate: 16_000,
-            encoding: Encoding::Pcm16Le,
         }
     }
 

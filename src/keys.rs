@@ -25,11 +25,9 @@ pub enum KeyHealthStatus {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)] // LowBalance is reserved for a future live-balance probe.
 pub enum FailKind {
     Invalid,
     Exhausted,
-    LowBalance,
     Transient,
     RateLimit,
 }
@@ -42,7 +40,6 @@ impl FailKind {
     fn cooldown(self) -> Duration {
         match self {
             FailKind::Invalid | FailKind::Exhausted => Duration::from_secs(6 * 3600),
-            FailKind::LowBalance => Duration::from_secs(15 * 60),
             FailKind::RateLimit => Duration::from_secs(60),
             FailKind::Transient => Duration::from_secs(30),
         }
@@ -51,7 +48,7 @@ impl FailKind {
     fn status(self) -> Option<KeyHealthStatus> {
         match self {
             FailKind::Invalid => Some(KeyHealthStatus::Dead),
-            FailKind::Exhausted | FailKind::LowBalance => Some(KeyHealthStatus::Quota),
+            FailKind::Exhausted => Some(KeyHealthStatus::Quota),
             FailKind::Transient | FailKind::RateLimit => None,
         }
     }
@@ -69,6 +66,7 @@ struct KeyEntry {
 }
 
 struct Inner {
+    provider_id: String,
     keys: Vec<KeyEntry>,
     /// The key we intend to use next — either the last one that carried a real
     /// session, or the first one the prewarm probe validated. `acquire`
@@ -90,15 +88,21 @@ fn key_suffix(key: &str) -> String {
         .collect()
 }
 
+fn configured_keys(cfg: &Config) -> Vec<String> {
+    cfg.active_keys()
+        .iter()
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 impl KeyPool {
     pub fn new(cfg: &Config) -> Arc<Self> {
-        let keys = cfg
-            .active_keys()
-            .iter()
-            .map(|v| v.trim())
-            .filter(|v| !v.is_empty())
-            .map(|v| KeyEntry {
-                value: v.to_string(),
+        let keys = configured_keys(cfg)
+            .into_iter()
+            .map(|value| KeyEntry {
+                value,
                 status: KeyHealthStatus::Untested,
                 cooldown_until: None,
                 last_success: None,
@@ -109,10 +113,24 @@ impl KeyPool {
             .collect();
         Arc::new(Self {
             inner: RwLock::new(Inner {
+                provider_id: cfg.stt_provider.trim().to_ascii_lowercase(),
                 keys,
                 last_good: None,
             }),
         })
+    }
+
+    /// Whether this pool still represents the provider and keys in the latest
+    /// config. Settings are hot-swapped, so the main loop checks this before a
+    /// new session and replaces the pool when the user changed credentials.
+    pub fn matches_config(&self, cfg: &Config) -> bool {
+        let inner = self.inner.read();
+        inner.provider_id == cfg.stt_provider.trim().to_ascii_lowercase()
+            && inner
+                .keys
+                .iter()
+                .map(|entry| entry.value.as_str())
+                .eq(configured_keys(cfg).iter().map(String::as_str))
     }
 
     /// Every key in config order — the prewarm probe walks this list.
@@ -343,5 +361,23 @@ mod tests {
         let p = pool_with(&[]);
         assert!(!p.has_usable_key());
         assert!(p.acquire().is_none());
+    }
+
+    #[test]
+    fn pool_detects_provider_and_key_config_changes() {
+        let mut cfg = Config {
+            stt_provider: "deepgram".into(),
+            deepgram_keys: vec![" one ".into(), "two".into()],
+            ..Config::default()
+        };
+        let pool = KeyPool::new(&cfg);
+        assert!(pool.matches_config(&cfg));
+
+        cfg.deepgram_keys.push("three".into());
+        assert!(!pool.matches_config(&cfg));
+        cfg.deepgram_keys.pop();
+        cfg.stt_provider = "openai".into();
+        cfg.openai_keys = vec!["one".into(), "two".into()];
+        assert!(!pool.matches_config(&cfg));
     }
 }

@@ -3,7 +3,7 @@
 //! app's lifetime. Sessions subscribe to get a dedicated resampler feed,
 //! eliminating per-session mic initialization latency.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -11,12 +11,13 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
-/// Default streaming target rate; OpenAI Realtime overrides to 24 kHz via
-/// `subscribe(target_rate)`.
-#[allow(dead_code)]
-pub const TARGET_RATE: u32 = 16_000;
 /// Frame size sent to ElevenLabs (100 ms at 16 kHz).
 pub const CHUNK_SAMPLES: usize = 1600;
+/// Cap queued microphone audio per session so a stalled network connection
+/// cannot grow memory without bound. This is about 4–6 seconds, depending on
+/// whether the provider consumes 24 kHz or 16 kHz audio.
+const AUDIO_QUEUE_CAPACITY: usize = 64;
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 // ---------------------------------------------------------------------------
 // Global audio source — one WASAPI stream, many session resamplers
@@ -29,7 +30,6 @@ pub struct AudioSource {
     /// session start/stop briefly takes the write lock.
     sessions: Arc<parking_lot::RwLock<Vec<SessionEntry>>>,
     /// Set when the app is shutting down; tells the capture thread to exit.
-    #[allow(dead_code)]
     stop: Arc<AtomicBool>,
     /// Device sample rate (Hz), stored so sessions can init their resamplers.
     /// Atomic because a device-reopen after a stream error may land on a
@@ -49,11 +49,14 @@ pub struct AudioSource {
 }
 
 struct SessionEntry {
+    id: u64,
     /// Sends 16 kHz mono i16 chunks to the session's send task.
-    tx: mpsc::UnboundedSender<Vec<i16>>,
+    tx: mpsc::Sender<Vec<i16>>,
     /// Per-session resampler + pending buffer. Locked briefly by the cpal
     /// callback; never held across a channel send.
     inner: Mutex<SessionResampler>,
+    /// Prevent a backed-up consumer from producing one warning per audio frame.
+    queue_full_reported: AtomicBool,
 }
 
 struct SessionResampler {
@@ -135,23 +138,25 @@ impl AudioSource {
     pub fn subscribe(
         self: &Arc<Self>,
         target_rate: u32,
-    ) -> (mpsc::UnboundedReceiver<Vec<i16>>, SessionFlusher) {
+    ) -> (mpsc::Receiver<Vec<i16>>, SessionFlusher) {
         let step = self.device_rate.load(Ordering::Acquire) as f64 / target_rate as f64;
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(AUDIO_QUEUE_CAPACITY);
+        let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
         let entry = SessionEntry {
-            tx: tx.clone(),
+            id: session_id,
+            tx,
             inner: Mutex::new(SessionResampler {
                 resampler: LinearResampler::new(step, self.channels.load(Ordering::Acquire)),
                 pending: Vec::with_capacity(CHUNK_SAMPLES * 2),
             }),
+            queue_full_reported: AtomicBool::new(false),
         };
-        let addr = tx_addr(&tx);
         self.sessions.write().push(entry);
         (
             rx,
             SessionFlusher {
                 sessions: Arc::clone(&self.sessions),
-                sender_addr: addr,
+                session_id,
             },
         )
     }
@@ -354,8 +359,7 @@ fn stream_until_failure(
 #[derive(Clone)]
 pub struct SessionFlusher {
     sessions: Arc<parking_lot::RwLock<Vec<SessionEntry>>>,
-    /// Address of our sender, used to remove the correct entry on drop.
-    sender_addr: usize,
+    session_id: u64,
 }
 
 impl SessionFlusher {
@@ -365,12 +369,14 @@ impl SessionFlusher {
     pub fn flush_tail(&self) {
         let sessions = self.sessions.read();
         for entry in sessions.iter() {
-            if tx_addr(&entry.tx) == self.sender_addr {
+            if entry.id == self.session_id {
                 let mut inner = entry.inner.lock();
                 let pending = std::mem::take(&mut inner.pending);
                 if !pending.is_empty() {
                     tracing::debug!("audio: flushing {} tail samples", pending.len());
-                    let _ = entry.tx.send(pending);
+                    if entry.tx.try_send(pending).is_err() {
+                        tracing::warn!("audio: could not enqueue resampler tail");
+                    }
                 }
                 break;
             }
@@ -382,14 +388,8 @@ impl Drop for SessionFlusher {
     fn drop(&mut self) {
         // Final flush, then unregister.
         self.flush_tail();
-        self.sessions
-            .write()
-            .retain(|e| tx_addr(&e.tx) != self.sender_addr);
+        self.sessions.write().retain(|e| e.id != self.session_id);
     }
-}
-
-fn tx_addr(tx: &mpsc::UnboundedSender<Vec<i16>>) -> usize {
-    std::ptr::from_ref(tx).addr()
 }
 
 // ---------------------------------------------------------------------------
@@ -416,26 +416,36 @@ fn feed_sessions(sessions: &parking_lot::RwLock<Vec<SessionEntry>>, data: &[i16]
     // Feed all remaining sessions under read lock.
     let list = sessions.read();
     for entry in list.iter() {
-        // Lock, drain any full chunks, unlock, then send. Never hold the
-        // resampler lock across a channel send.
-        loop {
-            let chunk: Option<Vec<i16>> = {
-                let mut inner = entry.inner.lock();
-                let SessionResampler { resampler, pending } = &mut *inner;
-                resampler.feed_and_emit(data, pending);
-                if pending.len() >= CHUNK_SAMPLES {
-                    Some(pending.drain(..CHUNK_SAMPLES).collect())
-                } else {
-                    None
-                }
-            }; // lock released here
-            match chunk {
-                Some(c) => {
-                    if entry.tx.send(c).is_err() {
-                        return; // receiver gone
+        // Feed this callback buffer exactly once, drain every complete chunk,
+        // then unlock before touching the channel. Re-feeding `data` inside the
+        // drain loop duplicates microphone audio whenever a callback crosses a
+        // chunk boundary.
+        let chunks = {
+            let mut inner = entry.inner.lock();
+            let SessionResampler { resampler, pending } = &mut *inner;
+            resampler.feed_and_emit(data, pending);
+            let mut chunks = Vec::with_capacity(pending.len() / CHUNK_SAMPLES);
+            while pending.len() >= CHUNK_SAMPLES {
+                let tail = pending.split_off(CHUNK_SAMPLES);
+                chunks.push(std::mem::replace(pending, tail));
+            }
+            chunks
+        };
+        for chunk in chunks {
+            match entry.tx.try_send(chunk) {
+                Ok(()) => {
+                    if entry.queue_full_reported.swap(false, Ordering::Relaxed) {
+                        tracing::info!("audio: session queue recovered");
                     }
                 }
-                None => break,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    if !entry.queue_full_reported.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(
+                            "audio: session queue full; dropping audio to keep latency bounded"
+                        );
+                    }
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => break,
             }
         }
     }
@@ -524,5 +534,59 @@ impl LinearResampler {
 
         self.last_frame_mono = Some(mono(frames - 1));
         self.consumed = frame_end;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_entry(id: u64, tx: mpsc::Sender<Vec<i16>>) -> SessionEntry {
+        SessionEntry {
+            id,
+            tx,
+            inner: Mutex::new(SessionResampler {
+                resampler: LinearResampler::new(1.0, 1),
+                pending: Vec::new(),
+            }),
+            queue_full_reported: AtomicBool::new(false),
+        }
+    }
+
+    #[test]
+    fn feed_sessions_processes_each_input_buffer_once() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let sessions = parking_lot::RwLock::new(vec![test_entry(1, tx)]);
+        let input = vec![123_i16; CHUNK_SAMPLES + 1];
+
+        feed_sessions(&sessions, &input);
+
+        let chunk = rx.try_recv().expect("one complete audio chunk");
+        assert_eq!(chunk.len(), CHUNK_SAMPLES);
+        assert!(rx.try_recv().is_err(), "input buffer was duplicated");
+        assert_eq!(sessions.read()[0].inner.lock().pending.len(), 1);
+    }
+
+    #[test]
+    fn session_flusher_targets_and_unregisters_by_stable_id() {
+        let (tx1, mut rx1) = mpsc::channel(4);
+        let (tx2, mut rx2) = mpsc::channel(4);
+        let mut first = test_entry(11, tx1);
+        first.inner.get_mut().pending.push(1);
+        let mut second = test_entry(22, tx2);
+        second.inner.get_mut().pending.push(2);
+        let sessions = Arc::new(parking_lot::RwLock::new(vec![first, second]));
+        let flusher = SessionFlusher {
+            sessions: Arc::clone(&sessions),
+            session_id: 22,
+        };
+
+        flusher.flush_tail();
+        assert!(rx1.try_recv().is_err());
+        assert_eq!(rx2.try_recv().expect("target session tail"), vec![2]);
+
+        drop(flusher);
+        let remaining: Vec<u64> = sessions.read().iter().map(|entry| entry.id).collect();
+        assert_eq!(remaining, vec![11]);
     }
 }

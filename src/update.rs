@@ -4,7 +4,7 @@
 //! JSON (reached via LunarWerx's Studio proxy — see [`RELEASES_API`]),
 //! lenient `vX.Y.Z` tag parsing with a plain tuple compare, a daily-throttled
 //! on-disk cache so we hit the network at most once per day, and a
-//! MZ-header + size + SHA-256 verified download. The install step differs
+//! trusted GitHub URL + MZ-header + size + SHA-256 verified download. The install step differs
 //! because QuickDictate is a **portable single exe** (no Inno Setup): instead
 //! of launching a `/SILENT` installer we swap the exe in place —
 //! `quickdictate.exe` → `quickdictate.exe.old`, new file in, relaunch with
@@ -21,6 +21,7 @@
 //!     waiting, clicking the pill installs it in-app via
 //!     [`download_and_install_now`] — it no longer opens the browser.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -274,7 +275,20 @@ fn write_cache(tag: &str) {
 struct Asset {
     url: String,
     size: u64,
-    sha256: Option<String>,
+    sha256: String,
+}
+
+fn trusted_asset_url(raw: &str) -> bool {
+    let Ok(url) = url::Url::parse(raw) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.host_str() == Some("github.com")
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url
+            .path()
+            .starts_with("/LunarWerxs/QuickDictate/releases/download/")
 }
 
 /// Pick the release's exe asset. Prefers a name containing "quickdictate";
@@ -309,11 +323,17 @@ fn latest_exe_asset() -> Option<(String, Asset)> {
         .get("digest")
         .and_then(|d| d.as_str())
         .and_then(|d| d.strip_prefix("sha256:"))
-        .map(|h| h.to_ascii_lowercase());
+        .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_ascii_lowercase)?;
+    let url = asset.get("browser_download_url")?.as_str()?;
+    if !trusted_asset_url(url) {
+        tracing::warn!("update: refusing an unexpected release asset URL");
+        return None;
+    }
     Some((
         tag,
         Asset {
-            url: asset.get("browser_download_url")?.as_str()?.to_string(),
+            url: url.to_string(),
             size: asset.get("size").and_then(|s| s.as_u64()).unwrap_or(0),
             sha256,
         },
@@ -333,7 +353,7 @@ fn sha256_hex(bytes: &[u8]) -> Option<String> {
     }
 }
 
-/// MZ header + exact size + (when the release carried a digest) SHA-256.
+/// MZ header + exact size + mandatory GitHub-provided SHA-256.
 fn verify_exe_bytes(bytes: &[u8], asset: &Asset) -> bool {
     if bytes.len() < 2 || &bytes[..2] != b"MZ" {
         tracing::warn!("update: downloaded file is not a Windows executable");
@@ -347,13 +367,9 @@ fn verify_exe_bytes(bytes: &[u8], asset: &Asset) -> bool {
         );
         return false;
     }
-    if let Some(want) = &asset.sha256 {
-        if sha256_hex(bytes).as_deref() != Some(want.as_str()) {
-            tracing::warn!("update: sha256 mismatch — refusing to install");
-            return false;
-        }
-    } else {
-        tracing::warn!("update: release had no sha256 digest; verified MZ + size only");
+    if sha256_hex(bytes).as_deref() != Some(asset.sha256.as_str()) {
+        tracing::warn!("update: sha256 mismatch — refusing to install");
+        return false;
     }
     true
 }
@@ -376,7 +392,7 @@ fn download_and_swap(tag: &str) -> Result<PathBuf, String> {
     }
 
     tracing::info!("update: downloading {}", asset.url);
-    let resp = client()
+    let mut resp = client()
         .ok_or("http client init failed")?
         .get(&asset.url)
         .send()
@@ -384,7 +400,14 @@ fn download_and_swap(tag: &str) -> Result<PathBuf, String> {
     if !resp.status().is_success() {
         return Err(format!("download failed: HTTP {}", resp.status()));
     }
-    let bytes = resp.bytes().map_err(|e| format!("download failed: {e}"))?;
+    if resp.content_length().is_some_and(|n| n > MAX_EXE_BYTES) {
+        return Err("downloaded file exceeds the size cap".into());
+    }
+    let mut bytes = Vec::with_capacity(asset.size.min(MAX_EXE_BYTES) as usize);
+    resp.by_ref()
+        .take(MAX_EXE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("download failed: {e}"))?;
     if bytes.len() as u64 > MAX_EXE_BYTES {
         return Err("downloaded file exceeds the size cap".into());
     }
@@ -680,24 +703,41 @@ mod tests {
 
     #[test]
     fn verify_rejects_bad_bytes() {
+        let good_hash = sha256_hex(b"MZ\x90\x00").expect("system SHA-256");
         let asset = Asset {
             url: String::new(),
             size: 4,
-            sha256: None,
+            sha256: good_hash,
         };
         assert!(!verify_exe_bytes(b"PK\x03\x04", &asset)); // not MZ
         assert!(verify_exe_bytes(b"MZ\x90\x00", &asset)); // MZ + right size
         let wrong_size = Asset {
             url: String::new(),
             size: 5,
-            sha256: None,
+            sha256: sha256_hex(b"MZ\x90\x00").expect("system SHA-256"),
         };
         assert!(!verify_exe_bytes(b"MZ\x90\x00", &wrong_size));
         let bad_hash = Asset {
             url: String::new(),
             size: 4,
-            sha256: Some("00".repeat(32)),
+            sha256: "00".repeat(32),
         };
         assert!(!verify_exe_bytes(b"MZ\x90\x00", &bad_hash));
+    }
+
+    #[test]
+    fn updater_accepts_only_this_projects_github_release_assets() {
+        assert!(trusted_asset_url(
+            "https://github.com/LunarWerxs/QuickDictate/releases/download/v0.4.3/quickdictate.exe"
+        ));
+        assert!(!trusted_asset_url(
+            "https://example.com/LunarWerxs/QuickDictate/quickdictate.exe"
+        ));
+        assert!(!trusted_asset_url(
+            "http://github.com/LunarWerxs/QuickDictate/releases/download/v0.4.3/quickdictate.exe"
+        ));
+        assert!(!trusted_asset_url(
+            "https://github.com/OtherOwner/QuickDictate/releases/download/v0.4.3/quickdictate.exe"
+        ));
     }
 }

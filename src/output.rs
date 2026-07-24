@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use windows::Win32::Foundation::{HANDLE, HWND};
+use windows::Win32::Foundation::{GlobalFree, HANDLE, HWND};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber,
     IsClipboardFormatAvailable, OpenClipboard, SetClipboardData,
@@ -34,6 +34,7 @@ const VK_V: VIRTUAL_KEY = VIRTUAL_KEY(0x56);
 /// Threshold (chars) above which we use clipboard paste instead of keystrokes.
 /// Below this, character-by-character typing is imperceptible.
 const CLIPBOARD_THRESHOLD: usize = 80;
+const MAX_SAVED_CLIPBOARD_BYTES: usize = 16 * 1024 * 1024;
 
 pub fn spawn(app: Arc<App>) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
@@ -297,11 +298,11 @@ pub fn paste(text: &str, restore_delay_ms: u64) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn send_unicode_text(text: &str) -> Result<()> {
-    let chars: Vec<char> = text.chars().collect();
-    let mut inputs: Vec<INPUT> = Vec::with_capacity(chars.len() * 2);
-    for &c in &chars {
-        inputs.push(unicode_key_input(c, false));
-        inputs.push(unicode_key_input(c, true));
+    let units = unicode_code_units(text);
+    let mut inputs: Vec<INPUT> = Vec::with_capacity(units.len() * 2);
+    for unit in units {
+        inputs.push(unicode_key_input(unit, false));
+        inputs.push(unicode_key_input(unit, true));
     }
     for chunk in inputs.chunks(4096) {
         unsafe {
@@ -314,7 +315,11 @@ fn send_unicode_text(text: &str) -> Result<()> {
     Ok(())
 }
 
-fn unicode_key_input(c: char, keyup: bool) -> INPUT {
+fn unicode_code_units(text: &str) -> Vec<u16> {
+    text.encode_utf16().collect()
+}
+
+fn unicode_key_input(unit: u16, keyup: bool) -> INPUT {
     let mut flags = KEYEVENTF_UNICODE;
     if keyup {
         flags |= KEYEVENTF_KEYUP;
@@ -324,7 +329,7 @@ fn unicode_key_input(c: char, keyup: bool) -> INPUT {
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
                 wVk: VIRTUAL_KEY(0),
-                wScan: c as u16,
+                wScan: unit,
                 dwFlags: flags,
                 time: 0,
                 dwExtraInfo: 0,
@@ -423,7 +428,7 @@ fn saved_clipboard_text() -> Option<String> {
             }
             let hglob = windows::Win32::Foundation::HGLOBAL(h.0);
             let byte_size = GlobalSize(hglob);
-            if byte_size == 0 {
+            if byte_size == 0 || byte_size > MAX_SAVED_CLIPBOARD_BYTES {
                 return None;
             }
             let src = GlobalLock(hglob) as *const u16;
@@ -463,6 +468,7 @@ fn set_clipboard_unicode(text: &str) -> Result<()> {
             }
             let dst = GlobalLock(hglob) as *mut u16;
             if dst.is_null() {
+                let _ = GlobalFree(hglob);
                 return Err(anyhow!("GlobalLock null"));
             }
             std::ptr::copy_nonoverlapping(utf16.as_ptr(), dst, utf16.len());
@@ -470,7 +476,10 @@ fn set_clipboard_unicode(text: &str) -> Result<()> {
             let h = HANDLE(hglob.0);
             match SetClipboardData(CF_UNICODETEXT.0 as u32, h) {
                 Ok(_) => Ok(()),
-                Err(_) => Err(anyhow!("SetClipboardData failed")),
+                Err(_) => {
+                    let _ = GlobalFree(hglob);
+                    Err(anyhow!("SetClipboardData failed"))
+                }
             }
         }
     })();
@@ -537,5 +546,18 @@ fn keybd_input(vk: VIRTUAL_KEY, flags: KEYBD_EVENT_FLAGS) -> INPUT {
                 dwExtraInfo: 0,
             },
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unicode_code_units;
+
+    #[test]
+    fn unicode_input_preserves_non_bmp_characters_as_surrogate_pairs() {
+        assert_eq!(
+            unicode_code_units("A😀Z"),
+            vec![0x0041, 0xD83D, 0xDE00, 0x005A]
+        );
     }
 }

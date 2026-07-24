@@ -18,8 +18,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use super::provider::{
-    AudioFormat, ConnectError, Encoding, ProviderSession, ProviderSink, ProviderStream, RecvError,
-    SendError, SttEvent, SttProvider, SttSessionOpts,
+    AudioFormat, ConnectError, ProviderSession, ProviderSink, ProviderStream, RecvError, SendError,
+    SttEvent, SttProvider, SttSessionOpts,
 };
 use crate::keys::FailKind;
 
@@ -50,14 +50,13 @@ impl SttProvider for ElevenLabsProvider {
     fn required_audio_format(&self) -> AudioFormat {
         AudioFormat {
             sample_rate: 16_000,
-            encoding: Encoding::Pcm16Le,
         }
     }
 
     /// Scribe's LM prior finalizes a trailing question into a phantom short
     /// "answer" ("Yes.") at end-of-stream. Enable the runner's guard so those
     /// zero-speech post-release commits are dropped instead of pasted. See
-    /// `SCRIBE_HALLUCINATION_HANDOFF.md`.
+    /// the phantom-finalization regression tests in `stt::tests`.
     fn suppress_phantom_finalization(&self) -> bool {
         true
     }
@@ -218,8 +217,6 @@ struct Incoming {
     message_type: Option<String>,
     text: Option<String>,
     committed_transcript: Option<String>,
-    #[allow(dead_code)]
-    session_id: Option<String>,
 }
 
 /// Pure text-frame → event mapping. Returns `None` for frames the runner should

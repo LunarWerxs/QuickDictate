@@ -15,8 +15,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use super::provider::{
-    i16_slice_as_bytes, AudioFormat, ConnectError, Encoding, ProviderSession, ProviderSink,
-    ProviderStream, RecvError, SendError, SttEvent, SttProvider, SttSessionOpts,
+    i16_slice_as_bytes, AudioFormat, ConnectError, ProviderSession, ProviderSink, ProviderStream,
+    RecvError, SendError, SttEvent, SttProvider, SttSessionOpts,
 };
 
 const WS_URL: &str = "wss://streaming.assemblyai.com/v3/ws";
@@ -39,7 +39,6 @@ impl SttProvider for AssemblyAiProvider {
     fn required_audio_format(&self) -> AudioFormat {
         AudioFormat {
             sample_rate: 16_000,
-            encoding: Encoding::Pcm16Le,
         }
     }
 

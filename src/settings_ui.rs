@@ -1167,9 +1167,11 @@ impl SettingsApp {
         match self.draft.save(&path) {
             Ok(()) => {
                 // Hot-store so per-session settings (paste policy, provider,
-                // replacements) apply immediately; hotkeys/prewarm need restart.
+                // keys, replacements) apply immediately; hotkeys and logging
+                // initialization still need a restart.
                 self.app.config.store(Arc::new(self.draft.clone()));
-                self.status = "Saved. Hotkey and key changes apply after restart.".into();
+                crate::autostart::reconcile(self.draft.run_at_startup);
+                self.status = "Saved. Hotkey and logging changes apply after restart.".into();
                 tracing::info!("settings saved via UI to {}", path.display());
                 true
             }

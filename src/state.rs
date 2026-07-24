@@ -153,9 +153,6 @@ pub struct App {
     pub shutdown: AtomicBool,
     pub session_epoch: parking_lot::Mutex<u64>,
     pub rt: TokioHandle,
-    pub status_tx: crossbeam_channel::Sender<Status>,
-    #[allow(dead_code)]
-    pub status_rx: crossbeam_channel::Receiver<Status>,
     pub transcript_tx: crossbeam_channel::Sender<String>,
     pub transcript_rx: crossbeam_channel::Receiver<String>,
     /// `None` = replay the most recent transcription (the original
@@ -180,7 +177,6 @@ pub struct App {
 
 impl App {
     pub fn new(config: Config, rt: TokioHandle, audio: Arc<AudioSource>) -> Arc<Self> {
-        let (status_tx, status_rx) = crossbeam_channel::unbounded();
         let (transcript_tx, transcript_rx) = crossbeam_channel::bounded(64);
         let (replay_tx, replay_rx) = crossbeam_channel::bounded(8);
         Arc::new(Self {
@@ -190,8 +186,6 @@ impl App {
             shutdown: AtomicBool::new(false),
             session_epoch: Mutex::new(0),
             rt,
-            status_tx,
-            status_rx,
             transcript_tx,
             transcript_rx,
             replay_tx,
@@ -208,10 +202,7 @@ impl App {
     }
 
     pub fn set_status(&self, s: Status) {
-        let prev = self.status.swap(s as u8, Ordering::AcqRel);
-        if prev != s as u8 {
-            let _ = self.status_tx.send(s);
-        }
+        self.status.store(s as u8, Ordering::Release);
     }
 
     /// The cause of the current [`Status::Error`]. Only meaningful while the
@@ -236,11 +227,7 @@ impl App {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .map(|_| {
-                let _ = self.status_tx.send(next);
-                true
-            })
-            .unwrap_or(false)
+            .is_ok()
     }
 
     /// Atomically transition Starting -> Listening. No-op if main has already
@@ -255,11 +242,7 @@ impl App {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .map(|_| {
-                let _ = self.status_tx.send(Status::Listening);
-                true
-            })
-            .unwrap_or(false)
+            .is_ok()
     }
 
     pub fn next_session_epoch(&self) -> u64 {

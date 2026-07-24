@@ -23,7 +23,6 @@ use super::provider::{ProviderSession, SttEvent, SttProvider, SttSessionOpts};
 
 const KEYS_ENV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/my.keys.env");
 const WAV_16K: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/speech_16k.wav");
-#[allow(dead_code)] // used by the OpenAI 24 kHz live test
 const WAV_24K: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/speech_24k.wav");
 
 /// Read the comma-separated keys for a provider out of `my.keys.env`. Returns

@@ -738,8 +738,6 @@ async fn run_session(
         // no speech shipped in between). Starts at 0, so the very first real
         // commit -- always backed by shipped speech -- is never mistaken for one.
         let mut last_commit_speech: u64 = 0;
-        #[allow(unused_assignments)]
-        let mut partial_words = 0u32;
         loop {
             let ev = match stream.recv_event().await {
                 Ok(Some(ev)) => ev,
@@ -760,7 +758,7 @@ async fn run_session(
                     } else {
                         tracing::debug!("session[{epoch}] partial: {} char(s)", t.chars().count());
                     }
-                    partial_words = t.split_whitespace().count() as u32;
+                    let partial_words = t.split_whitespace().count() as u32;
                     recv_app
                         .word_count
                         .store(committed_words + partial_words, Ordering::Release);
@@ -793,7 +791,7 @@ async fn run_session(
                     // could look phantom -- but we then only ever risk dropping a
                     // plausible answer, never a full sentence. See
                     // `is_phantom_finalization`, `looks_like_short_answer`, and
-                    // SCRIBE_HALLUCINATION_HANDOFF.md §10.
+                    // the phantom-finalization regression tests below.
                     if suppress_phantom
                         && is_phantom_finalization(released, speech_now, last_commit_speech)
                         && looks_like_short_answer(&final_text)
@@ -1083,7 +1081,7 @@ mod tests {
 
     #[test]
     fn short_answer_detector_matches_observed_phantoms() {
-        // Every phantom seen in the wild (SCRIBE_HALLUCINATION_HANDOFF.md §1-2).
+        // Every phantom shape observed during the original Scribe investigation.
         for p in [
             "Yes.",
             "No.",

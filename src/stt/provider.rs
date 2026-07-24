@@ -34,22 +34,11 @@ pub enum SttEvent {
     Closed(Option<String>),
 }
 
-/// PCM wire-encoding a provider wants. Beta1 providers are all 16-bit
-/// little-endian PCM; only the sample rate varies (16 kHz default; OpenAI
-/// Realtime wants 24 kHz).
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum Encoding {
-    Pcm16Le,
-}
-
 #[derive(Copy, Clone, Debug)]
 pub struct AudioFormat {
+    /// Every current provider consumes little-endian PCM16; only the sample
+    /// rate varies (16 kHz normally, 24 kHz for OpenAI Realtime).
     pub sample_rate: u32,
-    /// Reserved: every Beta1 provider is PCM16LE, so the runner doesn't branch
-    /// on this yet. Kept in the format contract for providers that later want a
-    /// different wire encoding (e.g. mu-law).
-    #[allow(dead_code)]
-    pub encoding: Encoding,
 }
 
 /// Per-session options negotiated by the runner and handed to `connect`.

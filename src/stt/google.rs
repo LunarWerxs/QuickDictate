@@ -23,9 +23,8 @@ use serde_json::json;
 use tokio::sync::mpsc;
 
 use super::provider::{
-    classify_by_substring, i16_slice_as_bytes, AudioFormat, ConnectError, Encoding,
-    ProviderSession, ProviderSink, ProviderStream, RecvError, SendError, SttEvent, SttProvider,
-    SttSessionOpts,
+    classify_by_substring, i16_slice_as_bytes, AudioFormat, ConnectError, ProviderSession,
+    ProviderSink, ProviderStream, RecvError, SendError, SttEvent, SttProvider, SttSessionOpts,
 };
 use crate::keys::FailKind;
 
@@ -45,7 +44,6 @@ impl SttProvider for GoogleProvider {
     fn required_audio_format(&self) -> AudioFormat {
         AudioFormat {
             sample_rate: 16_000,
-            encoding: Encoding::Pcm16Le,
         }
     }
 

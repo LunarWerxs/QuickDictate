@@ -237,7 +237,10 @@ fn init_logging(
     max_log_mb: u64,
 ) -> Option<tracing_appender::non_blocking::WorkerGuard> {
     let filter = EnvFilter::try_from_env("QUICKDICTATE_LOG")
-        .unwrap_or_else(|_| EnvFilter::new("info,quickdictate=debug"));
+        // File logging is a user-facing diagnostic, so keep the default at
+        // summaries. Developers can opt into verbose per-frame/per-partial
+        // detail with QUICKDICTATE_LOG=info,quickdictate=debug.
+        .unwrap_or_else(|_| EnvFilter::new("info"));
 
     let stdout_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
@@ -272,6 +275,21 @@ fn init_logging(
     }
 }
 
+fn refresh_key_pool(app: &Arc<App>, keys: &mut Arc<KeyPool>) {
+    let cfg = app.config.load();
+    if keys.matches_config(&cfg) {
+        return;
+    }
+    tracing::info!(
+        "provider or keys changed; rebuilding the '{}' key pool",
+        cfg.stt_provider
+    );
+    *keys = KeyPool::new(&cfg);
+    if cfg.prewarm_keys {
+        stt::spawn_prewarm(Arc::clone(app), Arc::clone(keys));
+    }
+}
+
 fn main() -> Result<()> {
     // Single-instance guard: claims a named mutex before anything else
     // (settings.json load, logging, audio, hotkeys, tray). If another
@@ -288,9 +306,8 @@ fn main() -> Result<()> {
     // because `enable_logging` is read out of the config.
     let (mut cfg, diags) = Config::load_or_create();
 
-    // `--provider <id>` overrides settings.json's stt_provider for this run —
-    // the per-provider launcher .bat files at the repo root use this so one
-    // settings.json (with all the keys) can serve every provider.
+    // `--provider <id>` overrides settings.json's stt_provider for this run,
+    // which is useful for local provider testing and automation.
     let args: Vec<String> = std::env::args().collect();
     let explicit_provider = args.iter().any(|a| a == "--provider");
     if let Some(i) = args.iter().position(|a| a == "--provider") {
@@ -389,7 +406,7 @@ fn main() -> Result<()> {
     };
 
     let app = App::new((*cfg_arc).clone(), rt_handle.clone(), Arc::clone(&audio));
-    let keys = KeyPool::new(&app.config.load());
+    let mut keys = KeyPool::new(&app.config.load());
 
     // Resolve (or first-generate + persist) the anonymous install id that
     // update checks send as X-Install-Id (see SECURITY.md). Must run before
@@ -492,6 +509,7 @@ fn main() -> Result<()> {
                     // Drop any prior completed handle without touching its
                     // shared state; the background task will finish on its own.
                     let _ = active.take();
+                    refresh_key_pool(&app, &mut keys);
                     tracing::info!("Starting session (toggle on)");
                     app.set_status(Status::Starting);
                     active = Some(stt::start_session(Arc::clone(&app), Arc::clone(&keys)));
@@ -514,6 +532,7 @@ fn main() -> Result<()> {
             HotkeyEvent::HoldPressed => {
                 if !has_live {
                     let _ = active.take();
+                    refresh_key_pool(&app, &mut keys);
                     tracing::info!("Starting session (hold press)");
                     app.set_status(Status::Starting);
                     active = Some(stt::start_session(Arc::clone(&app), Arc::clone(&keys)));

@@ -52,6 +52,8 @@ const USER_AGENT: &str = concat!("QuickDictate/", env!("CARGO_PKG_VERSION"));
 
 /// How long we wait for the user to complete sign-in in their browser.
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(180);
+const MAX_AVATAR_BYTES: u64 = 5 * 1024 * 1024;
+const MAX_AVATAR_DIMENSION: u32 = 2048;
 
 /// Serializes the refresh-token-using operations (`resume_and_pull`,
 /// `push_now`, `disconnect`). Without it, a Settings-open resume racing a
@@ -494,12 +496,35 @@ pub fn fetch_avatar(url: &str) -> Option<(u32, u32, Vec<u8>)> {
     if url.is_empty() {
         return None;
     }
+    let parsed = url::Url::parse(url).ok()?;
+    if parsed.scheme() != "https" || parsed.host_str().is_none() {
+        return None;
+    }
     let http = client().ok()?;
-    let resp = http.get(url).send().ok()?;
+    let mut resp = http.get(parsed).send().ok()?;
     if !resp.status().is_success() {
         return None;
     }
-    let bytes = resp.bytes().ok()?;
+    if resp.content_length().is_some_and(|n| n > MAX_AVATAR_BYTES) {
+        return None;
+    }
+    let mut bytes =
+        Vec::with_capacity(resp.content_length().unwrap_or(0).min(MAX_AVATAR_BYTES) as usize);
+    resp.by_ref()
+        .take(MAX_AVATAR_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_AVATAR_BYTES {
+        return None;
+    }
+    let dimensions = image::ImageReader::new(std::io::Cursor::new(&bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
+    if dimensions.0 > MAX_AVATAR_DIMENSION || dimensions.1 > MAX_AVATAR_DIMENSION {
+        return None;
+    }
     let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
     let (w, h) = (img.width(), img.height());
     Some((w, h, img.into_raw()))

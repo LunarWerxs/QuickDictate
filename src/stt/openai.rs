@@ -20,9 +20,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use super::provider::{
-    classify_by_substring, i16_slice_as_bytes, AudioFormat, ConnectError, Encoding,
-    ProviderSession, ProviderSink, ProviderStream, RecvError, SendError, SttEvent, SttProvider,
-    SttSessionOpts,
+    classify_by_substring, i16_slice_as_bytes, AudioFormat, ConnectError, ProviderSession,
+    ProviderSink, ProviderStream, RecvError, SendError, SttEvent, SttProvider, SttSessionOpts,
 };
 
 const WS_URL: &str = "wss://api.openai.com/v1/realtime?intent=transcription";
@@ -47,7 +46,6 @@ impl SttProvider for OpenAiProvider {
         // OpenAI Realtime expects 24 kHz PCM16.
         AudioFormat {
             sample_rate: 24_000,
-            encoding: Encoding::Pcm16Le,
         }
     }
 
