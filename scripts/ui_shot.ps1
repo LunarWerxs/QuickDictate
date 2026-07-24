@@ -3,15 +3,16 @@
 # Launches the exe with QUICKDICTATE_UI_SHOT (the window screenshots ITSELF via
 # egui's viewport-capture a few frames after opening and writes the PNG), opens
 # the Settings window over the dev-trigger UDP channel, waits for the PNG, and
-# kills the app. Use -Open keys|replacements to auto-open a modal first.
+# kills the app. Use -Open keys|keys-bulk|keys-test|replacements|
+# replacements-bulk|stats to auto-open a modal first.
 #
-# Usage: pwsh -File scripts\ui_shot.ps1 [-Shot out.png] [-Open keys] [-UseDebugBuild]
+# Usage: pwsh -File scripts\ui_shot.ps1 [-Shot out.png] [-Open keys-bulk] [-UseDebugBuild]
 [CmdletBinding()]
 param(
     [string] $Shot = '',
     # keys-test also presses "Test all" and captures once the parallel
     # verdicts land — a headless end-to-end probe test with real keys.
-    [ValidateSet('', 'keys', 'replacements', 'replacements-bulk', 'keys-test')]
+    [ValidateSet('', 'keys', 'keys-bulk', 'replacements', 'replacements-bulk', 'keys-test', 'stats')]
     [string] $Open = '',
     # Optional --provider override for the launched exe.
     [string] $Provider = '',

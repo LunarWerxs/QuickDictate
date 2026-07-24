@@ -2,8 +2,8 @@
 # the owner's local test binary (root quickdictate.exe is gitignored via *.exe).
 #
 # The root copy picks up the root settings.json (real keys) automatically via
-# Config::settings_path()'s exe-dir-first lookup, and writes its log /
-# update-cache files next to itself — all gitignored.
+# Config::settings_path()'s exe-dir-first lookup, and writes logs under its
+# dedicated logs subfolder — all gitignored.
 #
 # Usage:  pwsh -File scripts\refresh_test_exe.ps1 [-SkipBuild]
 [CmdletBinding()]

@@ -9,6 +9,7 @@ use tokio::runtime::Handle as TokioHandle;
 
 use crate::audio::AudioSource;
 use crate::config::Config;
+use crate::stats::StatsStore;
 
 /// Cap on how many past transcriptions [`TranscriptHistory`] keeps. Old
 /// enough entries just fall off the back -- there's no persistence, so this
@@ -174,6 +175,9 @@ pub struct App {
     /// pip can show how many words have been heard so far. Reset to 0 when
     /// a new session starts.
     pub word_count: AtomicU32,
+    /// Lifetime numeric-only transcription totals persisted separately from
+    /// settings so Settings/sync writes cannot clobber live counters.
+    pub stats: Arc<StatsStore>,
     /// Global pre-warmed audio source. Sessions subscribe to get an
     /// already-running audio feed instead of opening WASAPI per session.
     pub audio: Arc<AudioSource>,
@@ -197,6 +201,7 @@ impl App {
             current_key: Mutex::new(None),
             history: Mutex::new(TranscriptHistory::new()),
             word_count: AtomicU32::new(0),
+            stats: Arc::new(StatsStore::load()),
             audio,
         })
     }

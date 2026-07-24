@@ -49,6 +49,13 @@ impl SttProvider for OpenAiProvider {
         }
     }
 
+    fn final_transcript_timeout(&self) -> std::time::Duration {
+        // Realtime `.completed` has taken a little over two seconds in field
+        // logs. The socket intentionally remains open after commit, so give
+        // the server enough room to replace the last delta with its full final.
+        std::time::Duration::from_secs(5)
+    }
+
     async fn connect(
         &self,
         key: &str,
@@ -185,10 +192,16 @@ impl ProviderStream for OpenAiStream {
                 }
                 OaEvent::Completed(t) => {
                     self.accum.clear();
+                    // One QuickDictate socket carries one utterance. Mark the
+                    // inbound half drained so the generic receiver exits after
+                    // delivering this final instead of waiting for a WS close
+                    // that OpenAI does not send here.
+                    self.closed = true;
                     let t = t.trim();
                     if !t.is_empty() {
                         return Ok(Some(SttEvent::Committed(t.to_string())));
                     }
+                    return Ok(None);
                 }
                 OaEvent::Created => return Ok(Some(SttEvent::SessionStarted)),
                 OaEvent::Failure(k) => return Ok(Some(SttEvent::KeyFailure(k))),

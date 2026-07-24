@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
@@ -906,6 +907,272 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     fs::rename(&tmp, path).map_err(|e| format!("could not save {}: {e}", path.display()))
 }
 
+// Cohere's own long-form processor never sends the model more than 35 seconds
+// at once. It searches the final five seconds for a quiet boundary, then starts
+// a fresh decode. The native runtime accepts a much larger positional window,
+// but a multi-minute greedy decode can fall into a sentence loop long before
+// that hard limit (the supplied field log reproduced this at 240.9 seconds).
+const COHERE_CLIP_MAX_SECONDS: usize = 35;
+const COHERE_BOUNDARY_SEARCH_SECONDS: usize = 5;
+const COHERE_MIN_TAIL_SECONDS: usize = 5;
+const COHERE_ENERGY_WINDOW_MS: usize = 100;
+const COHERE_ENERGY_STEP_MS: usize = 10;
+const PATHOLOGICAL_SENTENCE_RUN: usize = 4;
+const PATHOLOGICAL_SENTENCES_TO_KEEP: usize = 2;
+const PATHOLOGICAL_CYCLE_RUN: usize = 4;
+const PATHOLOGICAL_CYCLES_TO_KEEP: usize = 2;
+const PATHOLOGICAL_MIN_REPEATED_TOKENS: usize = 8;
+const PATHOLOGICAL_MAX_CYCLE_TOKENS: usize = 24;
+
+fn cohere_chunk_ranges(pcm: &[i16], sample_rate: usize) -> Vec<Range<usize>> {
+    if pcm.is_empty() || sample_rate == 0 {
+        return Vec::new();
+    }
+    let max_clip = sample_rate.saturating_mul(COHERE_CLIP_MAX_SECONDS);
+    if pcm.len() <= max_clip {
+        return std::iter::once(0..pcm.len()).collect();
+    }
+
+    let search_span = sample_rate.saturating_mul(COHERE_BOUNDARY_SEARCH_SECONDS);
+    let min_tail = sample_rate.saturating_mul(COHERE_MIN_TAIL_SECONDS);
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    while pcm.len().saturating_sub(start) > max_clip {
+        let search_start = start + max_clip.saturating_sub(search_span);
+        // Avoid manufacturing a tiny final fragment for recordings only a
+        // little longer than 35 seconds.
+        let search_end = (start + max_clip).min(pcm.len().saturating_sub(min_tail));
+        let cut = quietest_cut(pcm, search_start, search_end, sample_rate)
+            .unwrap_or(search_end.max(search_start));
+        // Defensive progress guard; normal inputs always advance by >=30 s.
+        let cut = cut.clamp(start + 1, pcm.len());
+        ranges.push(start..cut);
+        start = cut;
+    }
+    if start < pcm.len() {
+        ranges.push(start..pcm.len());
+    }
+    ranges
+}
+
+/// Find the lowest-energy 100 ms window in `[start, end]` and return its
+/// midpoint. A 10 ms step is fine-grained enough to land between spoken words
+/// without doing meaningful work compared with inference.
+fn quietest_cut(pcm: &[i16], start: usize, end: usize, sample_rate: usize) -> Option<usize> {
+    if start >= end || end > pcm.len() || sample_rate == 0 {
+        return None;
+    }
+    let window = (sample_rate.saturating_mul(COHERE_ENERGY_WINDOW_MS) / 1_000).max(1);
+    let step = (sample_rate.saturating_mul(COHERE_ENERGY_STEP_MS) / 1_000).max(1);
+    let half = window / 2;
+    let first = start.saturating_add(half).min(end);
+    let last = end.saturating_sub(window.saturating_sub(half));
+    if first > last {
+        return Some(start + (end - start) / 2);
+    }
+
+    let mut best: Option<(u64, usize)> = None;
+    let mut cut = first;
+    while cut <= last {
+        let window_start = cut.saturating_sub(half);
+        let window_end = (window_start + window).min(pcm.len());
+        let energy = pcm[window_start..window_end]
+            .iter()
+            .map(|sample| i64::from(*sample).unsigned_abs())
+            .sum::<u64>();
+        if best
+            .map(|(best_energy, _)| energy < best_energy)
+            .unwrap_or(true)
+        {
+            best = Some((energy, cut));
+        }
+        let next = cut.saturating_add(step);
+        if next <= cut {
+            break;
+        }
+        cut = next;
+    }
+    best.map(|(_, cut)| cut)
+}
+
+fn sentence_units(text: &str) -> Vec<&str> {
+    let mut units = Vec::new();
+    let mut start = 0usize;
+    for (index, ch) in text.char_indices() {
+        if !matches!(ch, '.' | '!' | '?') {
+            continue;
+        }
+        let end = index + ch.len_utf8();
+        let next = text[end..].chars().next();
+        if next.is_none_or(char::is_whitespace) {
+            let unit = text[start..end].trim();
+            if !unit.is_empty() {
+                units.push(unit);
+            }
+            start = end;
+        }
+    }
+    let tail = text[start..].trim();
+    if !tail.is_empty() {
+        units.push(tail);
+    }
+    units
+}
+
+fn normalized_sentence(text: &str) -> String {
+    text.chars()
+        .filter_map(|ch| {
+            if ch.is_alphanumeric() || ch == '\'' {
+                Some(ch.to_ascii_lowercase())
+            } else if ch.is_whitespace() {
+                Some(' ')
+            } else {
+                None
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Conservative last line of defense for decoder degeneration. Only runs of
+/// four or more identical full sentences are touched, and two copies remain so
+/// deliberate emphasis is preserved.
+fn collapse_pathological_sentence_runs(text: &str) -> (String, usize) {
+    let units = sentence_units(text);
+    let mut output = Vec::with_capacity(units.len());
+    let mut dropped = 0usize;
+    let mut index = 0usize;
+    while index < units.len() {
+        let normalized = normalized_sentence(units[index]);
+        let mut end = index + 1;
+        while end < units.len()
+            && !normalized.is_empty()
+            && normalized_sentence(units[end]) == normalized
+        {
+            end += 1;
+        }
+        let run = end - index;
+        let keep = if run >= PATHOLOGICAL_SENTENCE_RUN {
+            dropped = dropped.saturating_add(run - PATHOLOGICAL_SENTENCES_TO_KEEP);
+            PATHOLOGICAL_SENTENCES_TO_KEEP
+        } else {
+            run
+        };
+        output.extend_from_slice(&units[index..index + keep]);
+        index = end;
+    }
+    (output.join(" "), dropped)
+}
+
+#[derive(Debug)]
+struct WordSpan {
+    normalized: String,
+    end: usize,
+}
+
+fn word_spans(text: &str) -> Vec<WordSpan> {
+    let mut spans = Vec::new();
+    let mut current: Option<String> = None;
+    for (index, ch) in text.char_indices() {
+        if ch.is_alphanumeric() {
+            let normalized = current.get_or_insert_with(String::new);
+            normalized.extend(ch.to_lowercase());
+        } else if let Some(normalized) = current.take() {
+            spans.push(WordSpan {
+                normalized,
+                end: index,
+            });
+        }
+    }
+    if let Some(normalized) = current {
+        spans.push(WordSpan {
+            normalized,
+            end: text.len(),
+        });
+    }
+    spans
+}
+
+/// Catch punctuation-free or alternating decoder cycles that the full-sentence
+/// guard cannot see (for example, "and here, and here, and here..."). Four
+/// cycles and at least eight repeated tokens are required; two cycles remain.
+fn collapse_pathological_token_cycles(text: &str) -> (String, usize) {
+    let tokens = word_spans(text);
+    if tokens.len() < PATHOLOGICAL_MIN_REPEATED_TOKENS {
+        return (text.to_string(), 0);
+    }
+
+    let mut removals = Vec::new();
+    let mut index = 0usize;
+    let mut dropped_tokens = 0usize;
+    while index < tokens.len() {
+        let max_cycle =
+            PATHOLOGICAL_MAX_CYCLE_TOKENS.min((tokens.len() - index) / PATHOLOGICAL_CYCLE_RUN);
+        let mut found = None;
+        for cycle_len in 1..=max_cycle {
+            let motif = &tokens[index..index + cycle_len];
+            let mut cycles = 1usize;
+            while index + (cycles + 1) * cycle_len <= tokens.len()
+                && tokens[index + cycles * cycle_len..index + (cycles + 1) * cycle_len]
+                    .iter()
+                    .map(|token| token.normalized.as_str())
+                    .eq(motif.iter().map(|token| token.normalized.as_str()))
+            {
+                cycles += 1;
+            }
+            if cycles >= PATHOLOGICAL_CYCLE_RUN
+                && cycles * cycle_len >= PATHOLOGICAL_MIN_REPEATED_TOKENS
+            {
+                found = Some((cycle_len, cycles));
+                break;
+            }
+        }
+
+        if let Some((cycle_len, cycles)) = found {
+            let keep_end = index + PATHOLOGICAL_CYCLES_TO_KEEP * cycle_len - 1;
+            let run_end = index + cycles * cycle_len - 1;
+            removals.push((tokens[keep_end].end, tokens[run_end].end));
+            dropped_tokens =
+                dropped_tokens.saturating_add((cycles - PATHOLOGICAL_CYCLES_TO_KEEP) * cycle_len);
+            index += cycles * cycle_len;
+        } else {
+            index += 1;
+        }
+    }
+
+    if removals.is_empty() {
+        return (text.to_string(), 0);
+    }
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    for (start, end) in removals {
+        output.push_str(&text[cursor..start]);
+        cursor = end;
+    }
+    output.push_str(&text[cursor..]);
+    (output, dropped_tokens)
+}
+
+fn collapse_pathological_repetitions(text: &str) -> (String, usize) {
+    let (sentences_cleaned, sentence_drops) = collapse_pathological_sentence_runs(text);
+    let (tokens_cleaned, token_drops) = collapse_pathological_token_cycles(&sentences_cleaned);
+    (tokens_cleaned, sentence_drops.saturating_add(token_drops))
+}
+
+fn join_transcript_parts(parts: impl IntoIterator<Item = String>) -> Option<String> {
+    let joined = parts
+        .into_iter()
+        .filter_map(|part| {
+            let part = part.trim().to_string();
+            (!part.is_empty()).then_some(part)
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!joined.is_empty()).then_some(joined)
+}
+
 // ---- Native transcribe.cpp worker -----------------------------------------
 
 struct Job {
@@ -1269,6 +1536,75 @@ impl NativeEngine {
             return Ok(None);
         }
         self.ensure_model(model_id, false)?;
+        let ranges = if model_id == "cohere-q5" {
+            cohere_chunk_ranges(pcm_i16, 16_000)
+        } else {
+            std::iter::once(0..pcm_i16.len()).collect()
+        };
+        if ranges.len() > 1 {
+            tracing::info!(
+                "local STT splitting {:.1}s Cohere audio into {} quiet-boundary clip(s)",
+                pcm_i16.len() as f32 / 16_000.0,
+                ranges.len()
+            );
+        }
+
+        let mut parts = Vec::with_capacity(ranges.len());
+        for (index, range) in ranges.into_iter().enumerate() {
+            if cancel.load(Ordering::Acquire) {
+                return Err("local transcription was cancelled".into());
+            }
+            let clip = &pcm_i16[range.clone()];
+            let mut text = unsafe { self.run_one(model_id, language, clip, cancel)? };
+
+            // If even a <=35 s clip loops, retry that clip as two smaller
+            // quiet-boundary decodes before resorting to the conservative
+            // sentence-run collapse below.
+            if model_id == "cohere-q5"
+                && text
+                    .as_deref()
+                    .is_some_and(|text| collapse_pathological_repetitions(text).1 > 0)
+                && clip.len() >= 16_000 * 10
+            {
+                let low = clip.len() * 2 / 5;
+                let high = clip.len() * 3 / 5;
+                let split = quietest_cut(clip, low, high, 16_000).unwrap_or(clip.len() / 2);
+                tracing::warn!(
+                    "local STT Cohere clip {} entered a repetition loop; retrying as two shorter clips",
+                    index + 1
+                );
+                text = join_transcript_parts([
+                    unsafe { self.run_one(model_id, language, &clip[..split], cancel)? }
+                        .unwrap_or_default(),
+                    unsafe { self.run_one(model_id, language, &clip[split..], cancel)? }
+                        .unwrap_or_default(),
+                ]);
+            }
+            if let Some(text) = text {
+                parts.push(text);
+            }
+        }
+
+        let Some(joined) = join_transcript_parts(parts) else {
+            return Ok(None);
+        };
+        let (cleaned, dropped) = collapse_pathological_repetitions(&joined);
+        if dropped > 0 {
+            tracing::warn!("local STT removed {dropped} repeated unit(s) from a decoder loop");
+        }
+        Ok((!cleaned.is_empty()).then_some(cleaned))
+    }
+
+    unsafe fn run_one(
+        &mut self,
+        model_id: &str,
+        language: &str,
+        pcm_i16: &[i16],
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<Option<String>, String> {
+        if pcm_i16.is_empty() {
+            return Ok(None);
+        }
         let pcm: Vec<f32> = pcm_i16.iter().map(|&v| v as f32 / 32768.0).collect();
         let language = if language.trim().is_empty() || language.eq_ignore_ascii_case("auto") {
             None
@@ -1458,6 +1794,66 @@ mod tests {
             assert!(!spec.url.contains("/resolve/main/"));
             assert!(spec.download_bytes > 500_000_000);
         }
+    }
+
+    #[test]
+    fn cohere_long_audio_uses_quiet_boundaries_under_35_seconds() {
+        let sample_rate = 1_000usize;
+        let mut pcm = vec![2_000i16; sample_rate * 80];
+        // Quiet gaps inside each 30–35 second search window.
+        pcm[sample_rate * 33..sample_rate * 33 + 200].fill(0);
+        pcm[sample_rate * 66..sample_rate * 66 + 200].fill(0);
+
+        let ranges = cohere_chunk_ranges(&pcm, sample_rate);
+        assert_eq!(ranges.first().unwrap().start, 0);
+        assert_eq!(ranges.last().unwrap().end, pcm.len());
+        assert!(ranges.windows(2).all(|pair| pair[0].end == pair[1].start));
+        assert!(ranges
+            .iter()
+            .all(|range| range.len() <= sample_rate * COHERE_CLIP_MAX_SECONDS));
+        assert!((32_900..=33_200).contains(&ranges[0].end));
+        assert!((65_900..=66_200).contains(&ranges[1].end));
+    }
+
+    #[test]
+    fn cohere_chunker_avoids_a_tiny_final_fragment() {
+        let sample_rate = 1_000usize;
+        let pcm = vec![1_000i16; sample_rate * 36];
+        let ranges = cohere_chunk_ranges(&pcm, sample_rate);
+        assert_eq!(ranges.len(), 2);
+        assert!(ranges[0].len() <= sample_rate * COHERE_CLIP_MAX_SECONDS);
+        assert!(ranges[1].len() >= sample_rate * COHERE_MIN_TAIL_SECONDS);
+    }
+
+    #[test]
+    fn decoder_loop_guard_is_conservative() {
+        let looped = "Useful start. And then there's a page. And then there's a page. \
+                      And then there's a page. And then there's a page. Useful end.";
+        let (cleaned, dropped) = collapse_pathological_sentence_runs(looped);
+        assert_eq!(dropped, 2);
+        assert_eq!(cleaned.matches("And then there's a page.").count(), 2);
+        assert!(cleaned.starts_with("Useful start."));
+        assert!(cleaned.ends_with("Useful end."));
+
+        let intentional = "Hello, hello, hello. Test. Test. Test.";
+        let (unchanged, dropped) = collapse_pathological_sentence_runs(intentional);
+        assert_eq!(dropped, 0);
+        assert_eq!(unchanged, intentional);
+
+        let comma_loop =
+            "Useful start, and here, and here, and here, and here, and here, useful end.";
+        let (cleaned, dropped) = collapse_pathological_repetitions(comma_loop);
+        assert_eq!(dropped, 6);
+        assert_eq!(cleaned.matches("and here").count(), 2);
+        assert!(cleaned.starts_with("Useful start"));
+        assert!(cleaned.ends_with("useful end."));
+
+        let alternating =
+            "Alpha one. Beta two. Alpha one. Beta two. Alpha one. Beta two. Alpha one. Beta two.";
+        let (cleaned, dropped) = collapse_pathological_repetitions(alternating);
+        assert_eq!(dropped, 8);
+        assert_eq!(cleaned.matches("Alpha one").count(), 2);
+        assert_eq!(cleaned.matches("Beta two").count(), 2);
     }
 
     #[test]

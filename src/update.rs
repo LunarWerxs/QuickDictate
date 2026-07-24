@@ -449,6 +449,9 @@ fn download_and_swap(tag: &str) -> Result<PathBuf, String> {
 /// silent — no window pops up unprompted.
 fn relaunch(exe: &Path, tag: &str, reopen_about: bool) -> Result<(), String> {
     tracing::info!("update: swapped to v{tag}; relaunching");
+    if let Some(app) = APP_HANDLE.get() {
+        app.stats.flush();
+    }
     let mut cmd = std::process::Command::new(exe);
     cmd.args(["--updated", tag]);
     if reopen_about {

@@ -11,7 +11,8 @@
 //! ## Headless screenshots (UI testing without screen control)
 //! Set `QUICKDICTATE_UI_SHOT=<path.png>` and the window captures *itself* via
 //! egui's viewport screenshot a few frames after opening, writing the PNG to
-//! that path (`QUICKDICTATE_UI_OPEN=keys|replacements` first opens a modal).
+//! that path (`QUICKDICTATE_UI_OPEN=keys|keys-bulk|keys-test|replacements|
+//! replacements-bulk|stats` first opens a modal).
 //! `scripts/ui_shot.ps1` wraps the whole loop.
 //!
 //! ## Changing the window size or the Save button?
@@ -20,6 +21,7 @@
 //! Save split button has a border/height gotcha. That doc captures the traps so
 //! an edit does not turn into a long debugging session.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
 
@@ -119,6 +121,9 @@ fn providers() -> Vec<(&'static str, &'static str)> {
 }
 
 fn provider_label(id: &str) -> &str {
+    if id.eq_ignore_ascii_case("mixed") {
+        return "Mixed providers";
+    }
     providers()
         .iter()
         .find(|(pid, _)| *pid == id)
@@ -140,8 +145,13 @@ fn keys_of<'a>(cfg: &'a mut Config, id: &str) -> &'a mut Vec<String> {
 /// `sk_c35a…dad4d0` — enough to recognize a key, never the whole secret.
 fn mask(key: &str) -> String {
     let chars: Vec<char> = key.chars().collect();
+    if chars.len() <= 4 {
+        return "\u{2022}".repeat(chars.len());
+    }
     if chars.len() <= 12 {
-        return key.to_string();
+        let head: String = chars[..2].iter().collect();
+        let tail: String = chars[chars.len() - 2..].iter().collect();
+        return format!("{head}\u{2026}{tail}");
     }
     let head: String = chars[..6].iter().collect();
     let tail: String = chars[chars.len() - 6..].iter().collect();
@@ -733,6 +743,46 @@ fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
         .inner
 }
 
+fn grouped_number(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn format_audio_time(audio_ms: u64) -> String {
+    let total_seconds = audio_ms / 1_000;
+    let hours = total_seconds / 3_600;
+    let minutes = (total_seconds % 3_600) / 60;
+    let seconds = total_seconds % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn stat_tile(ui: &mut egui::Ui, label: &str, value: String, detail: &str) {
+    egui::Frame::new()
+        .fill(input_bg())
+        .stroke(Stroke::new(1.0, border()))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::same(11))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(label).size(11.5).color(muted()));
+            ui.label(RichText::new(value).font(semibold(22.0)).color(text()));
+            ui.label(RichText::new(detail).size(10.5).color(muted()));
+        });
+}
+
 /// A section header: a small accent-blue icon glyph followed by the title.
 /// `icon` is a Segoe icon-font codepoint (see `apply_fonts`); it's skipped
 /// silently on machines where the icon font failed to load.
@@ -749,7 +799,7 @@ fn section_title(ui: &mut egui::Ui, icon: &str, title: &str) {
 
 // ---- State ----------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Verdict {
     Untested,
     Testing,
@@ -760,6 +810,59 @@ enum Verdict {
 struct KeyRow {
     value: String,
     verdict: Verdict,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KeyMergeSummary {
+    added: usize,
+    duplicates: usize,
+}
+
+/// Merge one-key-per-line text into the manager without ever echoing a secret.
+/// Validation is atomic: an invalid line leaves the existing rows untouched.
+fn merge_key_lines(rows: &mut Vec<KeyRow>, text: &str) -> Result<KeyMergeSummary, Vec<usize>> {
+    let mut candidates = Vec::new();
+    let mut invalid_lines = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let key = line.trim();
+        if key.is_empty() {
+            continue;
+        }
+        if key.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+            invalid_lines.push(index + 1);
+        } else {
+            candidates.push(key.to_string());
+        }
+    }
+    if !invalid_lines.is_empty() {
+        return Err(invalid_lines);
+    }
+
+    let mut seen: HashSet<String> = rows.iter().map(|row| row.value.clone()).collect();
+    let mut added = 0usize;
+    let mut duplicates = 0usize;
+    for key in candidates {
+        if seen.insert(key.clone()) {
+            rows.push(KeyRow {
+                value: key,
+                verdict: Verdict::Untested,
+            });
+            added += 1;
+        } else {
+            duplicates += 1;
+        }
+    }
+    Ok(KeyMergeSummary { added, duplicates })
+}
+
+fn deduped_key_values(rows: &[KeyRow]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    rows.iter()
+        .filter_map(|row| {
+            let value = row.value.trim();
+            (!value.is_empty() && seen.insert(value.to_string())).then(|| value.to_string())
+        })
+        .collect()
 }
 
 /// Which hotkey field a "Record" button is currently listening for.
@@ -773,6 +876,10 @@ enum Modal {
     Keys {
         rows: Vec<KeyRow>,
         add_text: String,
+        bulk: bool,
+        bulk_text: String,
+        bulk_note: String,
+        bulk_error: bool,
     },
     Replacements {
         rows: Vec<(String, String)>,
@@ -783,21 +890,14 @@ enum Modal {
         bulk: bool,
         bulk_text: String,
     },
+    Stats,
 }
 
-/// Open `quickdictate.log` next to the exe (or the exe folder if no log yet).
-/// Moved here from the tray menu.
-fn open_log_file() {
-    let dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let log = dir.join("quickdictate.log");
-    if log.exists() {
-        let _ = std::process::Command::new("notepad.exe").arg(&log).spawn();
-    } else {
-        let _ = std::process::Command::new("explorer.exe").arg(&dir).spawn();
-    }
+/// Reveal the dedicated diagnostics directory in Explorer.
+fn open_log_folder() {
+    let dir = crate::logs_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::process::Command::new("explorer.exe").arg(&dir).spawn();
 }
 
 pub fn show_settings(app: Arc<App>) {
@@ -1201,6 +1301,25 @@ impl SettingsApp {
         }
     }
 
+    fn save_and_sync(&mut self, ctx: &egui::Context) -> bool {
+        if !self.save() {
+            return false;
+        }
+        if self.sync.phase == SyncPhase::SignedIn {
+            if self.sync.rx.is_none() {
+                let snapshot = crate::sync::config_to_synced(&self.draft);
+                self.sync.note = "Saving to your Connections account\u{2026}".into();
+                self.sync.is_error = false;
+                self.spawn_sync(ctx, move || {
+                    SyncEvent::Pushed(crate::sync::push_now(snapshot).map_err(|e| e.to_string()))
+                });
+            } else {
+                self.sync.note = "Saved locally \u{2014} cloud sync busy, it'll catch up.".into();
+            }
+        }
+        true
+    }
+
     /// "Default settings" (⋯ overflow menu): reset every editable preference
     /// back to [`Config::default`] and persist immediately, refreshing the UI
     /// on the spot.
@@ -1252,6 +1371,7 @@ impl SettingsApp {
             });
             let _ = rx.recv_timeout(std::time::Duration::from_secs(6));
         }
+        self.app.stats.flush();
         let relaunch = std::env::current_exe()
             .map_err(|e| format!("Could not locate QuickDictate: {e}"))
             .and_then(|exe| {
@@ -1335,6 +1455,12 @@ impl SettingsApp {
         if self.frames == 5 {
             match mode.as_str() {
                 "keys" | "keys-test" => self.open_keys_modal(),
+                "keys-bulk" => {
+                    self.open_keys_modal();
+                    if let Some(Modal::Keys { bulk, .. }) = &mut self.modal {
+                        *bulk = true;
+                    }
+                }
                 "replacements" => self.open_replacements_modal(),
                 "replacements-bulk" => {
                     self.open_replacements_modal();
@@ -1349,6 +1475,7 @@ impl SettingsApp {
                         *bulk = true;
                     }
                 }
+                "stats" => self.modal = Some(Modal::Stats),
                 _ => {}
             }
         }
@@ -1410,6 +1537,10 @@ impl SettingsApp {
         self.modal = Some(Modal::Keys {
             rows,
             add_text: String::new(),
+            bulk: false,
+            bulk_text: String::new(),
+            bulk_note: String::new(),
+            bulk_error: false,
         });
     }
 
@@ -1457,9 +1588,11 @@ impl SettingsApp {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum ModalAction {
     None,
     Commit,
+    CommitAndSave,
     Cancel,
 }
 
@@ -1543,6 +1676,13 @@ impl eframe::App for SettingsApp {
                     if ui.button("About").clicked() {
                         do_about = true;
                     }
+                    if ui
+                        .button("Stats")
+                        .on_hover_text("View lifetime dictation words, time, and provider totals.")
+                        .clicked()
+                    {
+                        self.modal = Some(Modal::Stats);
+                    }
                     // Overflow menu (⋯): the less-used utilities that used to be a
                     // loose button row at the bottom of the settings body.
                     ui.menu_button(overflow_glyph(), |ui| {
@@ -1551,8 +1691,8 @@ impl eframe::App for SettingsApp {
                             // The About window runs the check and shows the result.
                             crate::about::show_about();
                         }
-                        if ui.button("Open log file").clicked() {
-                            open_log_file();
+                        if ui.button("Open log folder").clicked() {
+                            open_log_folder();
                         }
                         if ui.button("Edit settings.json").clicked() {
                             let path = Config::settings_path();
@@ -1570,7 +1710,7 @@ impl eframe::App for SettingsApp {
                         }
                     })
                     .response
-                    .on_hover_text("More: check for updates, open the log, edit settings.json");
+                    .on_hover_text("More: check for updates, open logs, edit settings.json");
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // Zero spacing + complementary corner rounding so Save and
@@ -1713,17 +1853,8 @@ impl eframe::App for SettingsApp {
         if do_save_restart {
             self.save_and_restart();
         }
-        if do_save && self.save() && self.sync.phase == SyncPhase::SignedIn {
-            if self.sync.rx.is_none() {
-                let snapshot = crate::sync::config_to_synced(&self.draft);
-                self.sync.note = "Saving to your Connections account\u{2026}".into();
-                self.sync.is_error = false;
-                self.spawn_sync(&ctx, move || {
-                    SyncEvent::Pushed(crate::sync::push_now(snapshot).map_err(|e| e.to_string()))
-                });
-            } else {
-                self.sync.note = "Saved locally \u{2014} cloud sync busy, it'll catch up.".into();
-            }
+        if do_save {
+            self.save_and_sync(&ctx);
         }
 
         self.render_modal(&ctx);
@@ -2264,7 +2395,7 @@ impl SettingsApp {
                     &mut self.draft.enable_logging,
                     "Write quickdictate.log",
                 )
-                .on_hover_text("Write a log file next to the app for troubleshooting.");
+                .on_hover_text("Write troubleshooting diagnostics in the app's logs folder.");
                 blue_check(
                     right,
                     &mut self.draft.log_transcripts,
@@ -2432,6 +2563,7 @@ impl SettingsApp {
     }
 
     fn render_modal(&mut self, ctx: &egui::Context) {
+        let stats_snapshot = self.app.stats.snapshot();
         let Some(modal) = &mut self.modal else {
             return;
         };
@@ -2439,74 +2571,134 @@ impl SettingsApp {
         let mut test_request: Option<Vec<String>> = None;
 
         match modal {
-            Modal::Keys { rows, add_text } => {
-                let title = format!("{} API keys", provider_label(&self.draft.stt_provider));
-                let backdrop = Self::modal_frame(ctx, &title, 460.0, |ui| {
-                    if rows.is_empty() {
-                        ui.label(RichText::new("No keys yet — paste one below.").color(muted()));
-                    }
-                    let mut remove: Option<usize> = None;
-                    for (i, row) in rows.iter_mut().enumerate() {
-                        ui.horizontal(|ui| {
+            Modal::Stats => {
+                let backdrop = Self::modal_frame(ctx, "Dictation stats", 500.0, |ui| {
+                    if stats_snapshot.total_dictations == 0 {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(10.0);
                             ui.label(
-                                RichText::new(mask(&row.value))
-                                    .monospace()
-                                    .size(13.0)
+                                RichText::new("Your first dictation will start the scoreboard.")
+                                    .font(semibold(14.0))
                                     .color(text()),
                             );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui.button("\u{00d7}").clicked() {
-                                        remove = Some(i);
-                                    }
-                                    match row.verdict {
-                                        Verdict::Untested => {
-                                            chip(ui, "untested", muted());
-                                        }
-                                        Verdict::Testing => {
-                                            ui.add(egui::Spinner::new().size(13.0));
-                                        }
-                                        Verdict::Ok => chip(ui, "working", good()),
-                                        Verdict::Fail => chip(ui, "failed", bad()),
-                                    }
-                                },
+                            ui.label(
+                                RichText::new(
+                                    "Words and processed audio time are tracked locally.",
+                                )
+                                .size(12.0)
+                                .color(muted()),
+                            );
+                            ui.add_space(10.0);
+                        });
+                    } else {
+                        let average_words =
+                            stats_snapshot.total_words / stats_snapshot.total_dictations.max(1);
+                        let pace = stats_snapshot
+                            .total_words
+                            .saturating_mul(60_000)
+                            .checked_div(stats_snapshot.total_audio_ms)
+                            .unwrap_or(0);
+
+                        ui.columns(2, |cols| {
+                            stat_tile(
+                                &mut cols[0],
+                                "WORDS TRANSCRIBED",
+                                grouped_number(stats_snapshot.total_words),
+                                "Lifetime recognized words",
+                            );
+                            stat_tile(
+                                &mut cols[1],
+                                "AUDIO PROCESSED",
+                                format_audio_time(stats_snapshot.total_audio_ms),
+                                "Trailing silence excluded",
                             );
                         });
-                    }
-                    if let Some(i) = remove {
-                        rows.remove(i);
-                    }
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        let edit = styled_input(add_text)
-                            .hint_text("paste a new key\u{2026}")
-                            .desired_width(ui.available_width() - 70.0)
-                            .font(egui::TextStyle::Monospace);
-                        let resp = ui.add(edit);
-                        let submitted =
-                            resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        if (ui.button("Add").clicked() || submitted) && !add_text.trim().is_empty()
-                        {
-                            rows.push(KeyRow {
-                                value: add_text.trim().to_string(),
-                                verdict: Verdict::Untested,
+                        ui.add_space(7.0);
+                        ui.columns(2, |cols| {
+                            stat_tile(
+                                &mut cols[0],
+                                "DICTATIONS",
+                                grouped_number(stats_snapshot.total_dictations),
+                                &format!("{average_words} words on average"),
+                            );
+                            stat_tile(
+                                &mut cols[1],
+                                "SPEAKING PACE",
+                                format!("{pace} wpm"),
+                                "Based on processed audio",
+                            );
+                        });
+
+                        ui.add_space(13.0);
+                        ui.label(
+                            RichText::new("LONGEST DICTATIONS")
+                                .font(semibold(11.5))
+                                .color(muted()),
+                        );
+                        ui.label(
+                            RichText::new(format!(
+                                "Most words: {} \u{00b7} Longest audio: {}",
+                                grouped_number(stats_snapshot.longest_dictation_words),
+                                format_audio_time(stats_snapshot.longest_dictation_audio_ms)
+                            ))
+                            .font(semibold(14.0))
+                            .color(text()),
+                        );
+
+                        if !stats_snapshot.providers.is_empty() {
+                            ui.add_space(13.0);
+                            ui.label(
+                                RichText::new("BY PROVIDER")
+                                    .font(semibold(11.5))
+                                    .color(muted()),
+                            );
+                            let mut providers = stats_snapshot.providers.iter().collect::<Vec<_>>();
+                            providers.sort_by(|left, right| {
+                                right
+                                    .1
+                                    .dictations
+                                    .cmp(&left.1.dictations)
+                                    .then_with(|| left.0.cmp(right.0))
                             });
-                            add_text.clear();
+                            for (id, totals) in providers {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(provider_label(id)).size(12.5).color(text()),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "{} words \u{00b7} {} \u{00b7} {} session{}",
+                                                    grouped_number(totals.words),
+                                                    format_audio_time(totals.audio_ms),
+                                                    grouped_number(totals.dictations),
+                                                    if totals.dictations == 1 { "" } else { "s" }
+                                                ))
+                                                .size(11.5)
+                                                .color(muted()),
+                                            );
+                                        },
+                                    );
+                                });
+                            }
                         }
-                    });
+                    }
+
                     ui.add_space(12.0);
                     ui.separator();
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        if accent_button(ui, "Test all").clicked() {
-                            test_request = Some(rows.iter().map(|r| r.value.clone()).collect());
-                        }
+                        ui.label(
+                            RichText::new(
+                                "Numeric totals only \u{2014} transcript text is never stored.",
+                            )
+                            .size(10.5)
+                            .color(muted()),
+                        );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if accent_button(ui, "Done").clicked() {
-                                action = ModalAction::Commit;
-                            }
-                            if ui.button("Cancel").clicked() {
                                 action = ModalAction::Cancel;
                             }
                         });
@@ -2514,6 +2706,200 @@ impl SettingsApp {
                 });
                 if backdrop || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                     action = ModalAction::Cancel;
+                }
+            }
+            Modal::Keys {
+                rows,
+                add_text,
+                bulk,
+                bulk_text,
+                bulk_note,
+                bulk_error,
+            } => {
+                let title = format!("{} API keys", provider_label(&self.draft.stt_provider));
+                let backdrop = Self::modal_frame(ctx, &title, 460.0, |ui| {
+                    if rows.is_empty() {
+                        ui.label(RichText::new("No keys yet — paste one below.").color(muted()));
+                    }
+                    let mut remove: Option<usize> = None;
+                    egui::ScrollArea::vertical()
+                        .id_salt("api_key_rows")
+                        .max_height(220.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            for (i, row) in rows.iter_mut().enumerate() {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(mask(&row.value))
+                                            .monospace()
+                                            .size(13.0)
+                                            .color(text()),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui.button("\u{00d7}").clicked() {
+                                                remove = Some(i);
+                                            }
+                                            match row.verdict {
+                                                Verdict::Untested => {
+                                                    chip(ui, "untested", muted());
+                                                }
+                                                Verdict::Testing => {
+                                                    ui.add(egui::Spinner::new().size(13.0));
+                                                }
+                                                Verdict::Ok => chip(ui, "working", good()),
+                                                Verdict::Fail => chip(ui, "failed", bad()),
+                                            }
+                                        },
+                                    );
+                                });
+                            }
+                        });
+                    if let Some(i) = remove {
+                        rows.remove(i);
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let edit = styled_input(add_text)
+                            .hint_text("paste a new key\u{2026}")
+                            .desired_width((ui.available_width() - 150.0).max(120.0))
+                            .font(egui::TextStyle::Monospace);
+                        let resp = ui.add(edit);
+                        let submitted =
+                            resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        let add = ui.button("Add").clicked() || submitted;
+                        if add && !add_text.trim().is_empty() {
+                            match merge_key_lines(rows, add_text) {
+                                Ok(summary) => {
+                                    *bulk_error = false;
+                                    *bulk_note = if summary.added == 0 {
+                                        "That key is already in the list.".into()
+                                    } else {
+                                        "Key added.".into()
+                                    };
+                                    add_text.clear();
+                                }
+                                Err(_) => {
+                                    *bulk_error = true;
+                                    *bulk_note =
+                                        "A key cannot contain spaces or control characters.".into();
+                                }
+                            }
+                        }
+                        if ui.button("Bulk add").clicked() {
+                            *bulk = !*bulk;
+                            bulk_note.clear();
+                            *bulk_error = false;
+                        }
+                    });
+                    if *bulk {
+                        ui.add_space(10.0);
+                        egui::Frame::new()
+                            .fill(input_bg())
+                            .stroke(Stroke::new(1.0, border()))
+                            .corner_radius(CornerRadius::same(8))
+                            .inner_margin(Margin::same(10))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new("One API key per line")
+                                        .font(semibold(13.0))
+                                        .color(text()),
+                                );
+                                ui.label(
+                                    RichText::new(
+                                        "Blank lines and keys already in the list are skipped.",
+                                    )
+                                    .size(11.5)
+                                    .color(muted()),
+                                );
+                                ui.add_space(6.0);
+                                ui.add(
+                                    egui::TextEdit::multiline(bulk_text)
+                                        .desired_width(f32::INFINITY)
+                                        .desired_rows(8)
+                                        .margin(Margin::symmetric(6, CTRL_PAD))
+                                        .font(egui::TextStyle::Monospace)
+                                        .hint_text(
+                                            "sk_example_key_1\nsk_example_key_2\nsk_example_key_3",
+                                        ),
+                                );
+                                ui.add_space(6.0);
+                                ui.horizontal(|ui| {
+                                    if ui.button("Cancel").clicked() {
+                                        *bulk = false;
+                                        bulk_text.clear();
+                                        bulk_note.clear();
+                                    }
+                                    if accent_button(ui, "Save").clicked() {
+                                        match merge_key_lines(rows, bulk_text) {
+                                            Ok(summary) => {
+                                                *bulk_error = false;
+                                                *bulk_note = format!(
+                                                    "{} added \u{00b7} {} duplicate{} skipped",
+                                                    summary.added,
+                                                    summary.duplicates,
+                                                    if summary.duplicates == 1 { "" } else { "s" }
+                                                );
+                                                bulk_text.clear();
+                                                *bulk = false;
+                                                action = ModalAction::CommitAndSave;
+                                            }
+                                            Err(lines) => {
+                                                *bulk_error = true;
+                                                *bulk_note = format!(
+                                                    "Nothing imported \u{2014} whitespace/control characters on line{} {}.",
+                                                    if lines.len() == 1 { "" } else { "s" },
+                                                    lines
+                                                        .iter()
+                                                        .map(usize::to_string)
+                                                        .collect::<Vec<_>>()
+                                                        .join(", ")
+                                                );
+                                            }
+                                        }
+                                    }
+                                });
+                            });
+                    }
+                    if !bulk_note.is_empty() {
+                        ui.add_space(5.0);
+                        ui.label(
+                            RichText::new(bulk_note.clone())
+                                .size(11.5)
+                                .color(if *bulk_error { bad() } else { muted() }),
+                        );
+                    }
+                    if !*bulk {
+                        ui.add_space(12.0);
+                        ui.separator();
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if accent_button(ui, "Test all").clicked() {
+                                test_request = Some(rows.iter().map(|r| r.value.clone()).collect());
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if accent_button(ui, "Done").clicked() {
+                                        action = ModalAction::Commit;
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        action = ModalAction::Cancel;
+                                    }
+                                },
+                            );
+                        });
+                    }
+                });
+                if backdrop || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    if *bulk {
+                        *bulk = false;
+                        bulk_text.clear();
+                        bulk_note.clear();
+                    } else {
+                        action = ModalAction::Cancel;
+                    }
                 }
             }
             Modal::Replacements {
@@ -2630,15 +3016,12 @@ impl SettingsApp {
             self.start_key_test(ctx, keys);
         }
 
+        let save_after_commit = matches!(action, ModalAction::CommitAndSave);
         match action {
-            ModalAction::Commit => match self.modal.take() {
+            ModalAction::Commit | ModalAction::CommitAndSave => match self.modal.take() {
                 Some(Modal::Keys { rows, .. }) => {
                     let id = self.draft.stt_provider.clone();
-                    *keys_of(&mut self.draft, &id) = rows
-                        .iter()
-                        .map(|r| r.value.clone())
-                        .filter(|v| !v.is_empty())
-                        .collect();
+                    *keys_of(&mut self.draft, &id) = deduped_key_values(&rows);
                 }
                 Some(Modal::Replacements {
                     rows,
@@ -2657,12 +3040,18 @@ impl SettingsApp {
                         .filter(|(f, _)| !f.trim().is_empty())
                         .collect();
                 }
+                Some(Modal::Stats) => {}
                 None => {}
             },
             ModalAction::Cancel => {
                 self.modal = None;
             }
             ModalAction::None => {}
+        }
+        if save_after_commit && !self.save_and_sync(ctx) {
+            // Keep the imported keys editable if validation or disk I/O made
+            // the requested save fail. The draft already contains them.
+            self.open_keys_modal();
         }
     }
 }
@@ -2709,5 +3098,66 @@ mod tests {
                 ("c".to_string(), "d".to_string())
             ]
         );
+    }
+
+    #[test]
+    fn bulk_keys_trim_skip_blanks_and_stably_dedupe() {
+        let mut rows = vec![KeyRow {
+            value: "existing-key".into(),
+            verdict: Verdict::Ok,
+        }];
+        let summary = merge_key_lines(
+            &mut rows,
+            " new-key-a \r\n\r\nexisting-key\nnew-key-b\nnew-key-a\n",
+        )
+        .unwrap();
+        assert_eq!(
+            summary,
+            KeyMergeSummary {
+                added: 2,
+                duplicates: 2,
+            }
+        );
+        assert_eq!(
+            deduped_key_values(&rows),
+            vec!["existing-key", "new-key-a", "new-key-b"]
+        );
+        assert_eq!(rows[0].verdict, Verdict::Ok);
+        assert_eq!(rows[1].verdict, Verdict::Untested);
+    }
+
+    #[test]
+    fn bulk_key_validation_is_atomic_and_keys_are_case_sensitive() {
+        let mut rows = vec![KeyRow {
+            value: "KeyABC".into(),
+            verdict: Verdict::Untested,
+        }];
+        let before = deduped_key_values(&rows);
+        assert_eq!(
+            merge_key_lines(&mut rows, "valid-key\nnot a key\nalso-valid"),
+            Err(vec![2])
+        );
+        assert_eq!(deduped_key_values(&rows), before);
+
+        let summary = merge_key_lines(&mut rows, "keyabc\nKeyABC").unwrap();
+        assert_eq!(summary.added, 1);
+        assert_eq!(summary.duplicates, 1);
+        assert_eq!(deduped_key_values(&rows), vec!["KeyABC", "keyabc"]);
+    }
+
+    #[test]
+    fn key_mask_never_displays_the_whole_secret() {
+        assert_eq!(mask("abcd"), "\u{2022}\u{2022}\u{2022}\u{2022}");
+        assert_eq!(mask("abcdef"), "ab\u{2026}ef");
+        assert_eq!(mask("abcdefghijklmnop"), "abcdef\u{2026}klmnop");
+    }
+
+    #[test]
+    fn stats_numbers_are_human_readable() {
+        assert_eq!(grouped_number(0), "0");
+        assert_eq!(grouped_number(1_234_567), "1,234,567");
+        assert_eq!(format_audio_time(42_900), "42s");
+        assert_eq!(format_audio_time(125_000), "2m 5s");
+        assert_eq!(format_audio_time(7_500_000), "2h 5m");
     }
 }

@@ -132,6 +132,14 @@ pub trait SttProvider: Send + Sync {
         Duration::from_millis(2400)
     }
 
+    /// How long the runner waits for the final inbound transcript after audio
+    /// commit/close finishes. Most providers answer almost immediately.
+    /// Adapters whose protocol deliberately leaves the socket open while a
+    /// slower final is computed can raise this without slowing the others.
+    fn final_transcript_timeout(&self) -> Duration {
+        Duration::from_millis(1500)
+    }
+
     /// Whether this provider occasionally emits a hallucinated short "answer"
     /// (e.g. "Yes.", "No.") as an extra committed transcript when an utterance is
     /// finalized at end-of-stream -- its language-model prior "completing" the

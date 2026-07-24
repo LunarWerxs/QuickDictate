@@ -363,22 +363,29 @@ pub struct SessionFlusher {
 }
 
 impl SessionFlusher {
-    /// Flush any partial samples sitting in this session's resampler
-    /// (the "tail" of the user's last syllable). Call this when the session's
-    /// dynamic tail phase ends to avoid clipping the utterance.
-    pub fn flush_tail(&self) {
-        let sessions = self.sessions.read();
-        for entry in sessions.iter() {
-            if entry.id == self.session_id {
-                let mut inner = entry.inner.lock();
-                let pending = std::mem::take(&mut inner.pending);
-                if !pending.is_empty() {
-                    tracing::debug!("audio: flushing {} tail samples", pending.len());
-                    if entry.tx.try_send(pending).is_err() {
-                        tracing::warn!("audio: could not enqueue resampler tail");
-                    }
+    /// Atomically unregister this session from future capture callbacks, then
+    /// enqueue the last pending resampler fragment while its receiver is still
+    /// alive. Consuming the handle makes end-of-session ordering explicit; any
+    /// other clones become harmless no-ops when dropped.
+    pub fn finish(self) {
+        self.flush_and_unregister();
+    }
+
+    fn flush_and_unregister(&self) {
+        let entry = {
+            let mut sessions = self.sessions.write();
+            sessions
+                .iter()
+                .position(|entry| entry.id == self.session_id)
+                .map(|index| sessions.remove(index))
+        };
+        if let Some(entry) = entry {
+            let pending = std::mem::take(&mut entry.inner.lock().pending);
+            if !pending.is_empty() {
+                tracing::debug!("audio: flushing {} final tail samples", pending.len());
+                if entry.tx.try_send(pending).is_err() {
+                    tracing::warn!("audio: could not enqueue final resampler tail");
                 }
-                break;
             }
         }
     }
@@ -386,9 +393,8 @@ impl SessionFlusher {
 
 impl Drop for SessionFlusher {
     fn drop(&mut self) {
-        // Final flush, then unregister.
-        self.flush_tail();
-        self.sessions.write().retain(|e| e.id != self.session_id);
+        // Best-effort cleanup when a caller exits without `finish()`.
+        self.flush_and_unregister();
     }
 }
 
@@ -584,12 +590,31 @@ mod tests {
             session_id: 22,
         };
 
-        flusher.flush_tail();
+        flusher.finish();
         assert!(rx1.try_recv().is_err());
         assert_eq!(rx2.try_recv().expect("target session tail"), vec![2]);
 
-        drop(flusher);
         let remaining: Vec<u64> = sessions.read().iter().map(|entry| entry.id).collect();
         assert_eq!(remaining, vec![11]);
+    }
+
+    #[test]
+    fn finish_flushes_before_unregistering_and_closing_the_receiver() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut entry = test_entry(33, tx);
+        entry.inner.get_mut().pending.extend([7, 8, 9]);
+        let sessions = Arc::new(parking_lot::RwLock::new(vec![entry]));
+        let flusher = SessionFlusher {
+            sessions: Arc::clone(&sessions),
+            session_id: 33,
+        };
+
+        flusher.finish();
+
+        assert!(sessions.read().is_empty());
+        assert_eq!(
+            rx.try_recv().expect("final pending fragment"),
+            vec![7, 8, 9]
+        );
     }
 }

@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-07-24
+
+### Added
+
+- **Private usage statistics.** A new **Stats** window shows lifetime words, dictated audio time, dictation count, speaking pace, longest dictations, and a provider breakdown. Only numeric aggregates are stored locally in `quickdictate-stats.json`; transcript text and API keys are never included.
+- **Bulk API-key import.** **Manage keys** now has a **Bulk add** button beside **Add**. Paste one key per line to trim blank lines, reject malformed entries, and import only new keys without disturbing the existing order.
+
+### Changed
+
+- **Diagnostics now have their own folder.** Active, rotated, and panic logs live under `logs\`, and the Settings overflow action is now **Open log folder**. Existing root-level logs are migrated to collision-safe legacy filenames instead of being overwritten.
+
+### Fixed
+
+- **Long Cohere dictations no longer collapse into repeated phrases.** Cohere audio is split at quiet boundaries into clips no longer than 35 seconds, with a shorter retry and conservative repetition guard if a clip still degenerates.
+- **Timed-out sessions cannot paste a second late result.** Provider-specific final-result grace periods preserve slower complete transcripts, finalization tasks are cancelled before a partial is promoted, and a dropped phantom final cannot return through the partial fallback.
+- **Local inference no longer leaves an unused microphone subscriber alive.** The final resampler fragment is flushed before the audio receiver closes, then the subscription is removed before batch inference begins.
+
 ## [0.5.0] - 2026-07-24
 
 ### Added

@@ -33,12 +33,6 @@ use crate::keys::{FailKind, KeyPool};
 use crate::state::{App, Status};
 use provider::{ProviderSession, ProviderSink, SttEvent, SttProvider, SttSessionOpts};
 
-/// How long we keep the recv task alive after the send task has wrapped up so
-/// we don't miss the provider's last committed transcript. 1.5 s comfortably
-/// covers typical post-commit processing and protects against the "occasional
-/// missing tail word" symptom on slower connections.
-const FINAL_TRANSCRIPT_WAIT: Duration = Duration::from_millis(1500);
-
 /// Minimum tail we always capture after hotkey release -- gives WASAPI's
 /// ~10-20 ms hardware buffer and the resampler's pending fragment time to
 /// reach us. Under this we don't even check audio energy.
@@ -243,7 +237,10 @@ pub fn start_session(app: Arc<App>, keys: Arc<KeyPool>) -> SttHandle {
     let done_ret = Arc::clone(&done);
     let epoch = app.next_session_epoch();
     let app2 = Arc::clone(&app);
+    let stats_session_guard = app.stats.session_guard();
     app.rt.spawn(async move {
+        let _stats_session_guard = stats_session_guard;
+        let session_usage = Arc::new(parking_lot::Mutex::new(SessionUsage::default()));
         // Retry shell: a session may fail fast with EXHAUSTED_SIGNAL, in which
         // case we rotate to the next of the user's keys. After a round of
         // MAX_KEY_ATTEMPTS failures we pause briefly (POOL_REFRESH_WAIT) in
@@ -260,8 +257,14 @@ pub fn start_session(app: Arc<App>, keys: Arc<KeyPool>) -> SttHandle {
             }
             attempts_in_round += 1;
             total_attempts += 1;
-            let attempt_res =
-                run_session(app2.clone(), Arc::clone(&keys), Arc::clone(&stop), epoch).await;
+            let attempt_res = run_session(
+                app2.clone(),
+                Arc::clone(&keys),
+                Arc::clone(&stop),
+                epoch,
+                Arc::clone(&session_usage),
+            )
+            .await;
             let is_exhausted =
                 matches!(&attempt_res, Err(e) if e.to_string() == EXHAUSTED_SIGNAL);
             if !is_exhausted {
@@ -295,6 +298,12 @@ pub fn start_session(app: Arc<App>, keys: Arc<KeyPool>) -> SttHandle {
                 round = rounds_done + 1
             );
             attempts_in_round = 0;
+        }
+        let usage = session_usage.lock().clone();
+        if usage.words > 0 {
+            app2
+                .stats
+                .record_dictation(&usage.provider, usage.words, usage.audio_ms);
         }
         if let Err(e) = final_res {
             if e.to_string() == EXHAUSTED_SIGNAL {
@@ -366,6 +375,56 @@ async fn ship_all(sink: &mut Box<dyn ProviderSink>, chunks: &[Vec<i16>], dead: &
     n
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SentAudio {
+    chunks: usize,
+    samples: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SessionUsage {
+    provider: String,
+    words: u64,
+    audio_ms: u64,
+}
+
+impl SessionUsage {
+    fn add_fragment(&mut self, provider: &str, words: u64, audio_ms: u64) {
+        if words == 0 {
+            return;
+        }
+        if self.provider.is_empty() {
+            self.provider = provider.to_string();
+        } else if self.provider != provider {
+            // A config edit during a retry is extraordinarily rare, but keep
+            // the aggregate honest rather than attributing it to either side.
+            self.provider = "mixed".to_string();
+        }
+        self.words = self.words.saturating_add(words);
+        self.audio_ms = self.audio_ms.saturating_add(audio_ms);
+    }
+}
+
+impl SentAudio {
+    fn record_chunk(&mut self, chunk: &[i16]) {
+        self.chunks = self.chunks.saturating_add(1);
+        self.samples = self.samples.saturating_add(chunk.len() as u64);
+    }
+
+    fn record_prefix(&mut self, chunks: &[Vec<i16>], count: usize) {
+        for chunk in chunks.iter().take(count) {
+            self.record_chunk(chunk);
+        }
+    }
+}
+
+fn audio_duration_ms(samples: u64, sample_rate: u32) -> u64 {
+    if sample_rate == 0 {
+        return 0;
+    }
+    samples.saturating_mul(1_000) / sample_rate as u64
+}
+
 /// Trims the trailing run of silence from the audio forwarded to the provider
 /// during the post-release tail.
 ///
@@ -416,6 +475,7 @@ async fn run_session(
     keys: Arc<KeyPool>,
     stop: Arc<AtomicBool>,
     epoch: u64,
+    session_usage: Arc<parking_lot::Mutex<SessionUsage>>,
 ) -> Result<()> {
     tracing::info!("session[{epoch}] starting");
 
@@ -447,6 +507,7 @@ async fn run_session(
     let provider_id = provider.id();
     let requires_api_key = provider.requires_api_key();
     let finalize_timeout = provider.finalize_timeout();
+    let final_transcript_timeout = provider.final_transcript_timeout();
     // Whether this provider needs the phantom-finalization guard (ElevenLabs
     // Scribe completes a question into a hallucinated short "answer" at
     // end-of-stream). Read once here so the recv task captures a plain bool.
@@ -572,9 +633,11 @@ async fn run_session(
     let speech_shipped = Arc::new(AtomicU64::new(0));
     let speech_shipped_send = Arc::clone(&speech_shipped);
     let speech_shipped_recv = Arc::clone(&speech_shipped);
-    let send_task: tokio::task::JoinHandle<usize> = tokio::spawn(async move {
+    let sent_progress = Arc::new(parking_lot::Mutex::new(SentAudio::default()));
+    let sent_progress_send = Arc::clone(&sent_progress);
+    let mut send_task: tokio::task::JoinHandle<SentAudio> = tokio::spawn(async move {
         let mut sink = sink;
-        let mut chunks_sent: usize = 0;
+        let mut sent = SentAudio::default();
         let mut ws_dead = false;
 
         // === Phase 1: live ===
@@ -596,7 +659,8 @@ async fn run_session(
                     if !ship(&mut sink, &chunk, &mut ws_dead).await {
                         break;
                     }
-                    chunks_sent += 1;
+                    sent.record_chunk(&chunk);
+                    *sent_progress_send.lock() = sent;
                     if is_speech {
                         speech_shipped_send.fetch_add(1, Ordering::Release);
                     }
@@ -649,8 +713,10 @@ async fn run_session(
                     last_speech = tokio::time::Instant::now();
                 }
                 // Ship speech now (flushing any held pause first); buffer silence.
-                let n = ship_all(&mut sink, &gate.offer(chunk, is_speech), &mut ws_dead).await;
-                chunks_sent += n;
+                let outgoing = gate.offer(chunk, is_speech);
+                let n = ship_all(&mut sink, &outgoing, &mut ws_dead).await;
+                sent.record_prefix(&outgoing, n);
+                *sent_progress_send.lock() = sent;
                 tail_chunks += n;
                 if n > 0 {
                     last_send = tokio::time::Instant::now();
@@ -695,7 +761,11 @@ async fn run_session(
         // last mic chunks are forwarded only if they carry speech, so we never
         // re-introduce trailing silence for the provider to hallucinate on in the
         // instant before we commit.
-        flusher_send.flush_tail();
+        // Stop the capture subscription first, atomically flushing its last
+        // resampler fragment while `samples_rx` is still alive. Then drain that
+        // fragment. Reversing these drops can clip it and log a false queue
+        // warning during slow local inference.
+        flusher_send.finish();
         let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(300);
         while !ws_dead {
             let chunk_opt = tokio::select! {
@@ -705,8 +775,10 @@ async fn run_session(
             match chunk_opt {
                 Some(chunk) => {
                     let is_speech = rms_i16(&chunk) >= SILENCE_RMS;
-                    let n = ship_all(&mut sink, &gate.offer(chunk, is_speech), &mut ws_dead).await;
-                    chunks_sent += n;
+                    let outgoing = gate.offer(chunk, is_speech);
+                    let n = ship_all(&mut sink, &outgoing, &mut ws_dead).await;
+                    sent.record_prefix(&outgoing, n);
+                    *sent_progress_send.lock() = sent;
                     if is_speech && n > 0 {
                         speech_shipped_send.fetch_add(1, Ordering::Release);
                     }
@@ -723,13 +795,17 @@ async fn run_session(
                 gate.held(),
             );
         }
+        // Batch/local commit can spend seconds or minutes in inference. Stop
+        // subscribing before awaiting it so the bounded audio queue does not
+        // fill with frames nobody will ever consume.
+        drop(samples_rx);
 
         // === Phase 4: commit + close (only if the socket is still alive) ===
         if !ws_dead {
             let _ = sink.commit().await;
             let _ = sink.close().await;
         }
-        chunks_sent
+        sent
     });
 
     let recv_app = Arc::clone(&app);
@@ -746,21 +822,26 @@ async fn run_session(
         Arc::new(parking_lot::Mutex::new(Vec::new()));
     let last_partial_buf: Arc<parking_lot::Mutex<String>> =
         Arc::new(parking_lot::Mutex::new(String::new()));
+    let dropped_phantom_buf: Arc<parking_lot::Mutex<Option<String>>> =
+        Arc::new(parking_lot::Mutex::new(None));
     let committed_flag = Arc::new(AtomicBool::new(false));
+    let transcribed_words = Arc::new(AtomicU64::new(0));
     let key_fail_kind: Arc<parking_lot::Mutex<Option<FailKind>>> =
         Arc::new(parking_lot::Mutex::new(None));
     let provider_failure: Arc<parking_lot::Mutex<Option<String>>> =
         Arc::new(parking_lot::Mutex::new(None));
     let chunks_for_task = Arc::clone(&chunks_buf);
     let last_partial_for_task = Arc::clone(&last_partial_buf);
+    let dropped_phantom_for_task = Arc::clone(&dropped_phantom_buf);
     let committed_for_task = Arc::clone(&committed_flag);
+    let transcribed_words_for_task = Arc::clone(&transcribed_words);
     let key_fail_for_task = Arc::clone(&key_fail_kind);
     let provider_failure_for_task = Arc::clone(&provider_failure);
     let release_pending_recv = Arc::clone(&release_pending);
 
     // Reset the live word counter at the start of every session.
     app.word_count.store(0, Ordering::Release);
-    let recv_task = tokio::spawn(async move {
+    let mut recv_task = tokio::spawn(async move {
         let mut events: usize = 0;
         let mut committed_words: u32 = 0;
         // Snapshot of `speech_shipped` taken at the last *kept* commit. Compared
@@ -826,6 +907,11 @@ async fn run_session(
                         && is_phantom_finalization(released, speech_now, last_commit_speech)
                         && looks_like_short_answer(&final_text)
                     {
+                        *dropped_phantom_for_task.lock() = Some(final_text.clone());
+                        let mut partial = last_partial_for_task.lock();
+                        if transcripts_equivalent(&partial, &final_text) {
+                            partial.clear();
+                        }
                         if log_transcripts {
                             tracing::info!(
                                 "session[{epoch}] dropped phantom finalization (no speech since last commit): {final_text}"
@@ -850,6 +936,7 @@ async fn run_session(
 
                     let chunk_words = final_text.split_whitespace().count() as u32;
                     committed_words = committed_words.saturating_add(chunk_words);
+                    transcribed_words_for_task.fetch_add(chunk_words as u64, Ordering::AcqRel);
                     recv_app
                         .word_count
                         .store(committed_words, Ordering::Release);
@@ -922,10 +1009,30 @@ async fn run_session(
 
     // Fast-fail: if the provider already told us the key is dead, skip the
     // entire finalize and hand back to the retry shell to rotate keys.
-    if let Some(kind) = *key_fail_kind.lock() {
+    let early_key_failure = *key_fail_kind.lock();
+    if let Some(kind) = early_key_failure {
         tracing::warn!(
             "session[{epoch}] aborting finalize early -- key ...{key_suffix} failed ({kind:?})"
         );
+        // Do not detach either half while the retry shell rotates keys. Besides
+        // retaining an obsolete audio subscription, a late receiver could paste
+        // into the replacement attempt. Preserve any words that were already
+        // live-pasted (delay=false) and the audio known to have been shipped.
+        send_task.abort();
+        recv_task.abort();
+        let _ = send_task.await;
+        let _ = recv_task.await;
+        if !delay_until_release {
+            let words = transcribed_words.load(Ordering::Acquire);
+            if words > 0 {
+                let sent = *sent_progress.lock();
+                session_usage.lock().add_fragment(
+                    provider_id,
+                    words,
+                    audio_duration_ms(sent.samples, fmt.sample_rate),
+                );
+            }
+        }
         keys.mark_failed(&key, kind);
         return Err(anyhow!(EXHAUSTED_SIGNAL));
     }
@@ -966,33 +1073,44 @@ async fn run_session(
     // and drop the final transcript. The provider's own timeout stays the
     // floor (Google's 45 s dwarfs any tail).
     let send_deadline = finalize_timeout.max(tail_max + Duration::from_millis(600));
-    let chunks_sent = match tokio::time::timeout(send_deadline, send_task).await {
-        Ok(Ok(n)) => n,
+    let sent = match tokio::time::timeout(send_deadline, &mut send_task).await {
+        Ok(Ok(sent)) => sent,
         Ok(Err(e)) => {
             tracing::warn!("session[{epoch}] send_task join error: {e}");
-            0
+            *sent_progress.lock()
         }
         Err(_) => {
-            tracing::warn!("session[{epoch}] send_task did not finish in {send_deadline:?}");
-            0
+            tracing::warn!(
+                "session[{epoch}] send_task did not finish in {send_deadline:?}; cancelling it"
+            );
+            send_task.abort();
+            let _ = send_task.await;
+            *sent_progress.lock()
         }
     };
+    let audio_ms = audio_duration_ms(sent.samples, fmt.sample_rate);
     tracing::info!(
-        "session[{epoch}] audio chunks sent = {chunks_sent} (~{} ms of audio)",
-        chunks_sent * 100
+        "session[{epoch}] audio chunks sent = {} ({} samples @ {} Hz, ~{} ms of audio)",
+        sent.chunks,
+        sent.samples,
+        fmt.sample_rate,
+        audio_ms
     );
 
-    // Wait up to FINAL_TRANSCRIPT_WAIT for recv to drain. If it doesn't finish
-    // we abandon the JoinHandle, but the SHARED accumulators stay alive on this
-    // stack, so anything already processed is still readable.
-    let recv_finished = tokio::time::timeout(FINAL_TRANSCRIPT_WAIT, recv_task)
+    // Wait for recv to drain. If it doesn't finish, cancel it before inspecting
+    // the shared accumulators so it cannot emit a second, late final after we
+    // promote the last partial. OpenAI uses a longer provider-specific grace
+    // because its complete result can arrive several seconds after commit.
+    let recv_finished = tokio::time::timeout(final_transcript_timeout, &mut recv_task)
         .await
         .is_ok();
     if !recv_finished {
         tracing::warn!(
-            "session[{epoch}] recv_task did not finish within {:?}; draining shared buffers anyway",
-            FINAL_TRANSCRIPT_WAIT
+            "session[{epoch}] recv_task did not finish within {:?}; cancelling it before promoting any partial",
+            final_transcript_timeout
         );
+        recv_task.abort();
+        let _ = recv_task.await;
     }
 
     let got_committed = committed_flag.load(Ordering::Acquire);
@@ -1000,6 +1118,7 @@ async fn run_session(
     // release_pending and taking the buffer.
     let held_chunks = std::mem::take(&mut *chunks_buf.lock());
     let last_partial = std::mem::take(&mut *last_partial_buf.lock());
+    let dropped_phantom = dropped_phantom_buf.lock().take();
 
     if !held_chunks.is_empty() {
         let joined = held_chunks.join(" ");
@@ -1018,7 +1137,18 @@ async fn run_session(
     }
 
     let had_partial = !last_partial.is_empty();
-    if !got_committed && had_partial && app.current_session_epoch() == epoch {
+    let partial_was_dropped_phantom = dropped_phantom
+        .as_deref()
+        .is_some_and(|phantom| transcripts_equivalent(phantom, &last_partial));
+    if !got_committed && had_partial && partial_was_dropped_phantom {
+        tracing::info!(
+            "session[{epoch}] suppressing last partial because it matches a dropped phantom finalization"
+        );
+    } else if !got_committed && had_partial && app.current_session_epoch() == epoch {
+        transcribed_words.fetch_add(
+            last_partial.split_whitespace().count() as u64,
+            Ordering::AcqRel,
+        );
         if log_transcripts {
             tracing::info!("session[{epoch}] promoting last partial: {last_partial}");
         } else {
@@ -1033,7 +1163,7 @@ async fn run_session(
             "session[{epoch}] skipping last partial because a newer action superseded it"
         );
     }
-    if !got_committed && !had_partial && chunks_sent == 0 {
+    if !got_committed && !had_partial && sent.chunks == 0 {
         tracing::warn!("session[{epoch}] produced no transcript (zero audio chunks sent -- session ended before mic was warm)");
     }
 
@@ -1044,8 +1174,14 @@ async fn run_session(
         tracing::warn!("session[{epoch}] ended with FAILED key ({kind:?}); pool will rotate");
     } else {
         if requires_api_key {
-            keys.mark_success(&key, chunks_sent.saturating_mul(100) as u64);
+            keys.mark_success(&key, audio_ms);
         }
+    }
+    let words = transcribed_words.load(Ordering::Acquire);
+    if words > 0 {
+        session_usage
+            .lock()
+            .add_fragment(provider_id, words, audio_ms);
     }
     crate::sound::play_stop(cfg.enable_sound);
     tracing::info!("session[{epoch}] ended");
@@ -1078,6 +1214,18 @@ async fn run_session(
 #[inline]
 fn is_phantom_finalization(released: bool, speech_now: u64, speech_at_last_commit: u64) -> bool {
     released && speech_now == speech_at_last_commit
+}
+
+fn transcripts_equivalent(left: &str, right: &str) -> bool {
+    fn normalized(text: &str) -> String {
+        text.chars()
+            .filter(|ch| ch.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect()
+    }
+
+    let left = normalized(left);
+    !left.is_empty() && left == normalized(right)
 }
 
 /// Upper bounds on what the phantom guard is willing to drop. The hallucinated
@@ -1116,7 +1264,10 @@ fn rms_i16(samples: &[i16]) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_phantom_finalization, looks_like_short_answer, TailSilenceGate};
+    use super::{
+        audio_duration_ms, is_phantom_finalization, looks_like_short_answer,
+        transcripts_equivalent, SentAudio, SessionUsage, TailSilenceGate,
+    };
 
     #[test]
     fn short_answer_detector_matches_observed_phantoms() {
@@ -1179,6 +1330,43 @@ mod tests {
         // manual commit flushes them post-release; new speech since the last
         // commit means this is real, not a phantom.
         assert!(!is_phantom_finalization(true, 20, 0));
+    }
+
+    #[test]
+    fn dropped_phantom_matches_its_partial_fallback() {
+        assert!(transcripts_equivalent(" 100%   Go. ", "100% go."));
+        assert!(transcripts_equivalent("Okay…", "OKAY!"));
+        assert!(!transcripts_equivalent("100% Go.", "100% Go. now"));
+        assert!(!transcripts_equivalent("...", ""));
+    }
+
+    #[test]
+    fn audio_duration_uses_samples_not_assumed_chunk_length() {
+        assert_eq!(audio_duration_ms(16_000, 16_000), 1_000);
+        assert_eq!(audio_duration_ms(24_000, 24_000), 1_000);
+        assert_eq!(audio_duration_ms(1_200, 24_000), 50);
+        assert_eq!(audio_duration_ms(1_200, 0), 0);
+
+        let mut sent = SentAudio::default();
+        sent.record_prefix(&[vec![0; 1_600], vec![0; 800]], 2);
+        assert_eq!(sent.chunks, 2);
+        assert_eq!(sent.samples, 2_400);
+        assert_eq!(audio_duration_ms(sent.samples, 16_000), 150);
+    }
+
+    #[test]
+    fn retry_fragments_form_one_physical_dictation_total() {
+        let mut usage = SessionUsage::default();
+        usage.add_fragment("openai", 40, 12_000);
+        usage.add_fragment("openai", 15, 4_000);
+        assert_eq!(
+            usage,
+            SessionUsage {
+                provider: "openai".into(),
+                words: 55,
+                audio_ms: 16_000,
+            }
+        );
     }
 
     #[test]

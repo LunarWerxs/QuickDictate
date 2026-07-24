@@ -36,7 +36,7 @@ A clear, concise description of what's wrong.
 
 ### quickdictate.log excerpt
 
-Set `"enable_logging": true` in `settings.json`, reproduce the issue, then paste the relevant excerpt from `quickdictate.log` (found next to the exe) below.
+Set `"enable_logging": true` in `settings.json`, reproduce the issue, then paste the relevant excerpt from `logs\quickdictate.log` (inside the dedicated `logs` folder beside the exe) below.
 
 **Before pasting, check the excerpt for API keys or other secrets and redact them.**
 
@@ -50,4 +50,4 @@ paste log excerpt here
 
 ### QuickDictate version
 
-<!-- e.g. v0.5.0, or the commit hash you built from -->
+<!-- e.g. v0.5.1, or the commit hash you built from -->

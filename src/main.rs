@@ -15,6 +15,7 @@ mod output;
 mod settings_ui;
 mod sound;
 mod state;
+mod stats;
 mod stt;
 mod sync;
 mod text;
@@ -34,8 +35,10 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, LPARAM, WPARAM};
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::Foundation::{
+    ERROR_ALREADY_EXISTS, LPARAM, WAIT_ABANDONED, WAIT_OBJECT_0, WPARAM,
+};
+use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject, INFINITE};
 use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowW, PostMessageW, RegisterWindowMessageW, MB_ICONERROR, MB_ICONWARNING, MB_OK,
 };
@@ -63,6 +66,18 @@ const ACTIVATE_RETRY_INTERVAL: Duration = Duration::from_millis(200);
 /// amount of formatted text in memory. The appender is deliberately lossy:
 /// diagnostics must never back-pressure microphone or UI work.
 const LOG_QUEUE_LINE_LIMIT: usize = 4_096;
+const LOGS_DIR_NAME: &str = "logs";
+const MAIN_LOG_NAME: &str = "quickdictate.log";
+const OLD_LOG_NAME: &str = "quickdictate.log.old";
+const PANIC_LOG_NAME: &str = "quickdictate-panic.log";
+/// Root-level diagnostic files written by older releases are kept separate
+/// from the active files. In particular, a future size rotation must never
+/// consume the only migrated copy of an old diagnostic.
+const LEGACY_LOG_MIGRATIONS: [(&str, &str); 3] = [
+    (MAIN_LOG_NAME, "quickdictate.legacy.log"),
+    (OLD_LOG_NAME, "quickdictate.legacy.log.old"),
+    (PANIC_LOG_NAME, "quickdictate-panic.legacy.log"),
+];
 
 fn wide_z(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -76,9 +91,9 @@ fn wide_z(s: &str) -> Vec<u16> {
 ///
 /// Exception: when this process was launched as a deliberate self-respawn --
 /// the self-updater's relaunch (`--updated <tag>`) or Settings' "Save &
-/// Restart" (`--relaunch`) -- a held mutex means the old version is mid-shutdown
-/// to hand off to us, so we take over (return `true`) instead of bailing --
-/// otherwise the hand-off would leave zero instances running.
+/// Restart" (`--relaunch`) -- it waits on the held mutex until the old process
+/// completes its clean shutdown. This serial hand-off prevents two instances
+/// from touching settings, stats, audio, or hotkeys at the same time.
 ///
 /// On success (`true`), the mutex is held for the whole process lifetime with
 /// no explicit cleanup needed: windows-rs's `HANDLE` is a bare `Copy` wrapper
@@ -89,13 +104,15 @@ fn single_instance_guard() -> bool {
     let name = wide_z(SINGLE_INSTANCE_MUTEX_NAME);
     // SAFETY: FFI call with a valid, nul-terminated wide string and no
     // security attributes (default security descriptor).
-    let handle = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) };
-    if let Err(e) = handle {
-        // Couldn't even ask the question -- fail open rather than block the
-        // user from launching QuickDictate at all.
-        tracing::warn!("single-instance: CreateMutexW failed: {e}; continuing anyway");
-        return true;
-    }
+    let handle = match unsafe { CreateMutexW(None, true, PCWSTR(name.as_ptr())) } {
+        Ok(handle) => handle,
+        Err(e) => {
+            // Couldn't even ask the question -- fail open rather than block the
+            // user from launching QuickDictate at all.
+            tracing::warn!("single-instance: CreateMutexW failed: {e}; continuing anyway");
+            return true;
+        }
+    };
     let already_running =
         unsafe { windows::Win32::Foundation::GetLastError() } == ERROR_ALREADY_EXISTS;
     if !already_running {
@@ -105,19 +122,23 @@ fn single_instance_guard() -> bool {
 
     // A deliberate self-respawn — the self-updater's relaunch
     // (`update::relaunch` → `<exe> --updated <tag>`) or Settings' "Save &
-    // Restart" (`<exe> --relaunch`) — is a hand-off: the "other instance" is the
-    // OLD process, already latched to shut down to make way for us. If we bailed
-    // here (reveal-and-quit) we'd leave ZERO instances the moment the old one
-    // finishes exiting — the respawn would just kill the app. So take over
-    // instead: we already hold a fresh handle to the named object (`CreateMutexW`
-    // above), which keeps the single-instance guard alive for later launches
-    // once the old process releases its handle on exit. The overlap is safe —
-    // the hotkey layer already retries registration across exactly this hand-off
-    // (see `hotkeys::register_initial`).
+    // Restart" (`<exe> --relaunch`) — is a serial hand-off: the other instance
+    // is the old process, already latched to shut down. Wait until Windows
+    // releases/abandons its owned mutex before loading any mutable app state.
+    // This also makes the stats flush a true boundary: no late old-process
+    // write can race a child that has already loaded an earlier snapshot.
     if std::env::args().any(|a| a == "--updated" || a == "--relaunch") {
-        tracing::info!(
-            "single-instance: deliberate respawn (--updated/--relaunch); taking over from the exiting old instance"
-        );
+        tracing::info!("single-instance: deliberate respawn waiting for old instance to exit");
+        let wait = unsafe { WaitForSingleObject(handle, INFINITE) };
+        if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
+            // INFINITE cannot time out. Fail open on the only remaining case
+            // (WAIT_FAILED) so a rare OS error cannot make the app disappear
+            // completely after the old process has already committed to exit.
+            tracing::error!(
+                "single-instance: respawn mutex wait failed ({wait:?}); continuing cautiously"
+            );
+        }
+        tracing::info!("single-instance: respawn hand-off complete");
         return true;
     }
 
@@ -151,20 +172,94 @@ fn single_instance_guard() -> bool {
     false
 }
 
-/// Returns the directory the log file lives in (also returned so callers can
-/// surface it to the user). Falls back to cwd if exe dir cannot be located.
-fn log_dir() -> std::path::PathBuf {
+/// Directory containing QuickDictate diagnostics. Settings opens this folder
+/// directly so the active, rotated, panic, and migrated logs are all visible.
+///
+/// Falls back to `./logs` if the executable directory cannot be located.
+pub(crate) fn logs_dir() -> PathBuf {
     std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(LOGS_DIR_NAME)
+}
+
+/// Path of the active application log. Kept alongside [`logs_dir`] so Settings
+/// does not need to duplicate the filename.
+pub(crate) fn main_log_path() -> PathBuf {
+    logs_dir().join(MAIN_LOG_NAME)
+}
+
+/// Pick a destination that cannot be touched by active-log rotation and does
+/// not collide with an earlier migration. The first collision gets `.1`, then
+/// `.2`, and so on; existing files are never removed or overwritten.
+fn available_legacy_path(logs_dir: &Path, preferred_name: &str) -> PathBuf {
+    let preferred = logs_dir.join(preferred_name);
+    if !preferred.exists() {
+        return preferred;
+    }
+
+    for suffix in 1u64.. {
+        let candidate = logs_dir.join(format!("{preferred_name}.{suffix}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!("the legacy-log suffix space is effectively unbounded")
+}
+
+/// Create the diagnostics folder and move root-level logs left by older
+/// releases into collision-safe legacy names. This is best-effort: a locked
+/// legacy file must not prevent QuickDictate from starting.
+///
+/// Returned messages are replayed after tracing is initialized so migration
+/// failures remain discoverable even though this runs before the logger opens.
+fn prepare_logs_dir_at(exe_dir: &Path, logs_dir: &Path) -> Vec<String> {
+    let mut diagnostics = Vec::new();
+    if let Err(e) = std::fs::create_dir_all(logs_dir) {
+        diagnostics.push(format!(
+            "WARN: could not create diagnostics folder {}: {e}",
+            logs_dir.display()
+        ));
+        return diagnostics;
+    }
+
+    for (root_name, legacy_name) in LEGACY_LOG_MIGRATIONS {
+        let source = exe_dir.join(root_name);
+        if !source.is_file() {
+            continue;
+        }
+        let destination = available_legacy_path(logs_dir, legacy_name);
+        match std::fs::rename(&source, &destination) {
+            Ok(()) => diagnostics.push(format!(
+                "INFO: moved legacy diagnostic {} to {}",
+                source.display(),
+                destination.display()
+            )),
+            Err(e) => diagnostics.push(format!(
+                "WARN: could not move legacy diagnostic {} to {}: {e}",
+                source.display(),
+                destination.display()
+            )),
+        }
+    }
+    diagnostics
+}
+
+fn prepare_logs_dir() -> Vec<String> {
+    let logs_dir = logs_dir();
+    let exe_dir = logs_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    prepare_logs_dir_at(&exe_dir, &logs_dir)
 }
 
 /// Install a panic hook that writes panic info to a dedicated unbuffered
 /// file (and via tracing, if it still works). Without this, panics in any
 /// background thread silently disappear under `windows_subsystem = "windows"`.
 fn install_panic_hook() {
-    let panic_path = log_dir().join("quickdictate-panic.log");
+    let panic_path = logs_dir().join(PANIC_LOG_NAME);
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let location = info
@@ -236,8 +331,8 @@ impl SizeCappedLogWriter {
     }
 
     fn open_with_max_bytes(dir: &Path, max_bytes: u64) -> io::Result<Self> {
-        let path = dir.join("quickdictate.log");
-        let old_path = dir.join("quickdictate.log.old");
+        let path = dir.join(MAIN_LOG_NAME);
+        let old_path = dir.join(OLD_LOG_NAME);
 
         // Preserve the previous startup behavior as well as rotating during
         // this run. Rotation is diagnostic-only and best-effort: if an old log
@@ -335,7 +430,8 @@ fn init_logging(
         .with_thread_names(true);
 
     if file_logging {
-        let dir = log_dir();
+        let dir = logs_dir();
+        let path = main_log_path();
         match SizeCappedLogWriter::open(&dir, max_log_mb) {
             Ok(file_appender) => {
                 let (file_writer, guard) =
@@ -355,8 +451,8 @@ fn init_logging(
                     .with(file_layer)
                     .try_init();
                 tracing::info!(
-                    "File logging enabled at {}\\quickdictate.log ({} MiB cap, {} queued lines max)",
-                    dir.display(),
+                    "File logging enabled at {} ({} MiB cap, {} queued lines max)",
+                    path.display(),
                     max_log_mb,
                     LOG_QUEUE_LINE_LIMIT,
                 );
@@ -368,8 +464,8 @@ fn init_logging(
                     .with(stdout_layer)
                     .try_init();
                 tracing::warn!(
-                    "File logging requested but {}\\quickdictate.log could not be opened: {e}",
-                    dir.display()
+                    "File logging requested but {} could not be opened: {e}",
+                    path.display()
                 );
                 None
             }
@@ -464,9 +560,14 @@ fn main() -> Result<()> {
         std::process::exit(0);
     }
 
+    // Prepare the diagnostics folder before either logger can open a file.
+    // Migration messages are replayed once tracing is initialized below.
+    let mut startup_diags = prepare_logs_dir();
+
     // Load (and possibly generate) settings.json before initializing tracing,
     // because `enable_logging` is read out of the config.
-    let (mut cfg, diags) = Config::load_or_create();
+    let (mut cfg, config_diags) = Config::load_or_create();
+    startup_diags.extend(config_diags);
 
     // `--provider <id>` overrides settings.json's stt_provider for this run,
     // which is useful for local provider testing and automation.
@@ -508,7 +609,7 @@ fn main() -> Result<()> {
     // with defaults) also get a message box — with windows_subsystem="windows"
     // a log line alone is invisible, and the user must learn their keys/prefs
     // were sidelined. Shown from a worker thread so startup isn't blocked.
-    for line in diags {
+    for line in startup_diags {
         if let Some(rest) = line.strip_prefix("INFO: ") {
             tracing::info!("{rest}");
         } else if let Some(rest) = line.strip_prefix("WARN: ") {
@@ -760,6 +861,10 @@ fn main() -> Result<()> {
         h.stop();
     }
     hotkeys.shutdown();
+    // A replacement process waits on our owned single-instance mutex. Keep the
+    // runtime alive until every physical dictation has finalized and its stats
+    // write is durable, then let process exit hand the mutex to the child.
+    app.stats.finish_sessions_and_flush();
     audio.shutdown();
     // Give in-flight pastes a moment to finish.
     std::thread::sleep(Duration::from_millis(50));
@@ -769,6 +874,86 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod logging_tests {
     use super::*;
+
+    fn temp_log_test_dir(label: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "quickdictate-{label}-test-{}-{unique}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn prepares_logs_folder_and_migrates_root_diagnostics() {
+        let exe_dir = temp_log_test_dir("migration");
+        let logs_dir = exe_dir.join(LOGS_DIR_NAME);
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::write(exe_dir.join(MAIN_LOG_NAME), b"current legacy").unwrap();
+        std::fs::write(exe_dir.join(OLD_LOG_NAME), b"older legacy").unwrap();
+        std::fs::write(exe_dir.join(PANIC_LOG_NAME), b"panic legacy").unwrap();
+
+        let diagnostics = prepare_logs_dir_at(&exe_dir, &logs_dir);
+
+        assert!(logs_dir.is_dir());
+        assert_eq!(diagnostics.len(), LEGACY_LOG_MIGRATIONS.len());
+        for (root_name, legacy_name) in LEGACY_LOG_MIGRATIONS {
+            assert!(!exe_dir.join(root_name).exists());
+            assert!(logs_dir.join(legacy_name).is_file());
+        }
+        assert_eq!(
+            std::fs::read(logs_dir.join("quickdictate.legacy.log")).unwrap(),
+            b"current legacy"
+        );
+        assert_eq!(
+            std::fs::read(logs_dir.join("quickdictate.legacy.log.old")).unwrap(),
+            b"older legacy"
+        );
+        assert_eq!(
+            std::fs::read(logs_dir.join("quickdictate-panic.legacy.log")).unwrap(),
+            b"panic legacy"
+        );
+        // Migrated files cannot be mistaken for either active rotation.
+        assert!(!logs_dir.join(MAIN_LOG_NAME).exists());
+        assert!(!logs_dir.join(OLD_LOG_NAME).exists());
+
+        std::fs::remove_dir_all(exe_dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_migration_never_overwrites_an_existing_destination() {
+        let exe_dir = temp_log_test_dir("migration-collision");
+        let logs_dir = exe_dir.join(LOGS_DIR_NAME);
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        std::fs::write(exe_dir.join(MAIN_LOG_NAME), b"root legacy").unwrap();
+        std::fs::write(logs_dir.join(MAIN_LOG_NAME), b"active").unwrap();
+        std::fs::write(logs_dir.join("quickdictate.legacy.log"), b"first migration").unwrap();
+
+        let diagnostics = prepare_logs_dir_at(&exe_dir, &logs_dir);
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            std::fs::read(logs_dir.join(MAIN_LOG_NAME)).unwrap(),
+            b"active"
+        );
+        assert_eq!(
+            std::fs::read(logs_dir.join("quickdictate.legacy.log")).unwrap(),
+            b"first migration"
+        );
+        assert_eq!(
+            std::fs::read(logs_dir.join("quickdictate.legacy.log.1")).unwrap(),
+            b"root legacy"
+        );
+        assert!(!exe_dir.join(MAIN_LOG_NAME).exists());
+
+        // With no root-level file left, a second startup is a no-op.
+        assert!(prepare_logs_dir_at(&exe_dir, &logs_dir).is_empty());
+        assert!(!logs_dir.join("quickdictate.legacy.log.2").exists());
+
+        std::fs::remove_dir_all(exe_dir).unwrap();
+    }
 
     #[test]
     fn log_writer_rotates_during_a_long_run() {

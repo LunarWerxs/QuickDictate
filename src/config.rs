@@ -293,7 +293,7 @@ pub struct Config {
     #[serde(default)]
     pub local_keys: Vec<String>,
 
-    /// When true, the app writes `quickdictate.log` next to the exe.
+    /// When true, the app writes `logs\quickdictate.log` beside the exe.
     /// Off by default; flip this on if you need to diagnose anything.
     /// (The env var `QUICKDICTATE_LOG` also forces it on.)
     #[serde(default = "default_false")]
@@ -301,9 +301,9 @@ pub struct Config {
 
     /// Soft size cap for `quickdictate.log`, in **megabytes**. The writer
     /// rotates at startup and during a long run, keeping one previous
-    /// generation as `quickdictate.log.old`. `0` disables the cap (unbounded —
-    /// the old behavior). Machine-local (like `enable_logging`), so it is not
-    /// synced.
+    /// generation as `logs\quickdictate.log.old`. `0` disables the cap
+    /// (unbounded — the old behavior). Machine-local (like `enable_logging`),
+    /// so it is not synced.
     #[serde(default = "default_max_log_mb")]
     pub max_log_mb: u64,
 
@@ -312,8 +312,8 @@ pub struct Config {
     /// dictated text**. Off by default: with this false, your spoken words
     /// never get written to disk, even with `enable_logging` on. Only flip
     /// this on for deep debugging of a specific transcription problem, and
-    /// turn it back off afterwards -- `quickdictate.log` is not encrypted or
-    /// access-controlled beyond normal filesystem permissions.
+    /// turn it back off afterwards -- `logs\quickdictate.log` is not encrypted
+    /// or access-controlled beyond normal filesystem permissions.
     #[serde(default = "default_false")]
     pub log_transcripts: bool,
 

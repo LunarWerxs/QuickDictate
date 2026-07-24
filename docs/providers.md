@@ -205,6 +205,12 @@ preferred when available; CPU is the automatic fallback. Raw audio passes
 directly from QuickDictate's 16 kHz pipeline to the native runtime—there is no
 temporary WAV file or Python/PyTorch environment.
 
+For Cohere, long recordings are divided at the quietest available boundary
+into clips no longer than 35 seconds before native inference, then reassembled
+in order. This mirrors the model's intended long-form windowing and prevents a
+single several-minute decoder pass from falling into a repeated-phrase loop.
+Whisper keeps its native single-pass behavior.
+
 Local packs come from:
 
 - [handy-computer/transcribe.cpp](https://github.com/handy-computer/transcribe.cpp) (MIT)

@@ -94,7 +94,7 @@ Everything lives in `settings.json` (copied from `settings.example.json`). The f
 | `clipboard_restore_delay_ms` | Delay before restoring your previous clipboard contents after a clipboard-paste, in ms (default `300`) |
 | `auto_space` / `auto_newline` / `auto_punct` | Output formatting toggles (bool) |
 | `enable_sound` | Play a sound on state changes (bool) |
-| `enable_logging` | Write `quickdictate.log` next to the exe (bool) |
+| `enable_logging` | Write `logs\quickdictate.log` beside the exe (bool) |
 | `log_transcripts` | Also log your full dictated text, not just summaries (bool, default `false`; deep debugging only) |
 | `max_log_mb` | Log-file rotation cap, in MB, before `quickdictate.log` is rolled over (default `5`) |
 | `update_auto_check` | Check for a newer release at startup, at most once/day (bool, default `true`); a newer release installs silently (download, verify, swap, relaunch when idle) |
@@ -166,7 +166,7 @@ A broader, pause-gated spoken-punctuation command set (saying "period", "comma",
 
 Pick which one is live with `"mode": "toggle"` or `"mode": "hold"`, and change the keys with `"toggle_hotkey"` / `"hold_hotkey"`. While a session is running, a little status pip appears near your cursor: amber = starting, green = listening, red "!" = something went wrong.
 
-The tray menu is deliberately bare — **Settings…**, **Hide tray icon** (asks first, then tucks QuickDictate away with no icon at all; hotkeys keep working, and launching QuickDictate again brings Settings back so you can untick it), a **Recent transcriptions** submenu (click any entry to **copy it to the clipboard** — up to the last 50, newest first), and **Quit**. Everything else is inside the Settings window: the provider picker, the key manager (with a live parallel "Test all" that hits the real APIs), the text-replacement editor, a per-field hotkey recorder, all the toggles, **About** and **Save / Save & Restart** in the pinned bottom bar, and a **⋯ menu** (next to About) holding **Check for updates**, **Open log file**, and **Edit settings.json** (for the advanced fields, in Notepad).
+The tray menu is deliberately bare — **Settings…**, **Hide tray icon** (asks first, then tucks QuickDictate away with no icon at all; hotkeys keep working, and launching QuickDictate again brings Settings back so you can untick it), a **Recent transcriptions** submenu (click any entry to **copy it to the clipboard** — up to the last 50, newest first), and **Quit**. Everything else is inside the Settings window: the provider picker, the key manager (including **Bulk add** for one key per line and a live parallel "Test all" that hits the real APIs), the text-replacement editor, a per-field hotkey recorder, all the toggles, **Stats**, **About**, and **Save / Save & Restart** in the pinned bottom bar, and a **⋯ menu** (next to About) holding **Check for updates**, **Open log folder**, and **Edit settings.json** (for the advanced fields, in Notepad).
 
 One nice touch: the global hotkeys re-register themselves every minute, so dictation keeps working after sleep/resume, a session lock, or an RDP reconnect — the usual moments where global hotkeys quietly die.
 
@@ -185,7 +185,7 @@ The binary lands at `target\release\quickdictate.exe`. Put `settings.example.jso
 
 QuickDictate streams your microphone audio to the **one third-party STT provider you select** — and only that one. Your API keys and your audio never touch the QuickDictate maintainer. The only thing the app itself reports anywhere is the **optional daily update check**, which goes to LunarWerx's update endpoint; the full disclosure is in [SECURITY.md](../.github/SECURITY.md), and turning off *Check for updates daily* stops it entirely. Beyond that, nothing leaves your machine except your dictation audio (to the provider you chose) and — only if you opt in — Connections settings sync, which syncs preferences only (mode, language, hotkeys, STT provider/model, etc.) and never your API keys, audio, or transcripts. See [docs/SETTINGS_SYNC.md](SETTINGS_SYNC.md) for details, including how to turn it off. Locally, it only uses the OS clipboard and keystroke APIs to paste text into your focused window.
 
-Local logging (`enable_logging`) writes event summaries — not your recognized text — to `quickdictate.log` next to the exe. A separate `log_transcripts` setting, off by default, opts into logging the full dictated text for deep debugging; nothing written locally is ever sent anywhere.
+Local logging (`enable_logging`) writes event summaries — not your recognized text — to `logs\quickdictate.log` beside the exe. A separate `log_transcripts` setting, off by default, opts into logging the full dictated text for deep debugging; nothing written locally is ever sent anywhere. The Stats window uses a separate `quickdictate-stats.json` containing only numeric aggregates—never transcript text or API keys.
 
 More detail in [SECURITY.md](../.github/SECURITY.md).
 
