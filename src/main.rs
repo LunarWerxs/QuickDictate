@@ -448,6 +448,10 @@ fn start_queued_session_if_idle(
     *active = Some(stt::start_session(Arc::clone(app), Arc::clone(keys)));
 }
 
+fn should_open_settings_on_start(is_settings_relaunch: bool, has_usable_key: bool) -> bool {
+    is_settings_relaunch || !has_usable_key
+}
+
 fn main() -> Result<()> {
     // Single-instance guard: claims a named mutex before anything else
     // (settings.json load, logging, audio, hotkeys, tray). If another
@@ -578,13 +582,15 @@ fn main() -> Result<()> {
     // version. Must precede the UI (and hence any manual install) coming up.
     update::set_app_handle(&app);
 
-    // First-run / empty-key onboarding (§6): if no provider has a usable key,
-    // open the Settings window straight away so the user lands directly on the
-    // fix (the window shows an "add a key to get started" banner). We also log
-    // a warning line for the log file. Only fires when genuinely unconfigured,
-    // so a configured user never sees it.
-    if !keys.has_usable_key() {
+    // First-run / empty-key onboarding (§6), or a deliberate Settings "Save &
+    // Restart" hand-off: reopen Settings in the replacement process so the user
+    // returns to the window they initiated the restart from.
+    let has_usable_key = keys.has_usable_key();
+    let is_settings_relaunch = std::env::args().any(|arg| arg == "--relaunch");
+    if !has_usable_key {
         onboarding::notify_no_key();
+    }
+    if should_open_settings_on_start(is_settings_relaunch, has_usable_key) {
         settings_ui::show_settings(Arc::clone(&app));
     }
 
@@ -832,5 +838,13 @@ mod logging_tests {
             HotkeyEvent::ToggleLongPressed
         ));
         assert_eq!(pending, None);
+    }
+
+    #[test]
+    fn settings_relaunch_reopens_settings_for_configured_users() {
+        assert!(should_open_settings_on_start(true, true));
+        assert!(should_open_settings_on_start(true, false));
+        assert!(should_open_settings_on_start(false, false));
+        assert!(!should_open_settings_on_start(false, true));
     }
 }

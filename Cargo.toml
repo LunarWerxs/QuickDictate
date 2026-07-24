@@ -1,8 +1,8 @@
 [package]
 name = "quickdictate"
-version = "0.4.3"
+version = "0.5.0"
 edition = "2021"
-description = "Ultra-low-latency bring-your-own-key dictation (multi-provider STT)"
+description = "Fast Windows dictation with cloud and optional local speech recognition"
 license = "MIT"
 
 [[bin]]

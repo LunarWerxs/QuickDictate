@@ -1252,12 +1252,21 @@ impl SettingsApp {
             });
             let _ = rx.recv_timeout(std::time::Duration::from_secs(6));
         }
-        if let Ok(exe) = std::env::current_exe() {
-            // `--relaunch` marks this as a deliberate hand-off so the new process
-            // takes over the single-instance mutex instead of seeing the
-            // still-exiting old instance, bailing, and leaving zero instances
-            // running (see `single_instance_guard`).
-            let _ = std::process::Command::new(exe).arg("--relaunch").spawn();
+        let relaunch = std::env::current_exe()
+            .map_err(|e| format!("Could not locate QuickDictate: {e}"))
+            .and_then(|exe| {
+                // `--relaunch` marks this as a deliberate hand-off so the new
+                // process takes over the single-instance mutex and reopens
+                // Settings after startup (see `single_instance_guard` and
+                // `should_open_settings_on_start`).
+                std::process::Command::new(exe)
+                    .arg("--relaunch")
+                    .spawn()
+                    .map_err(|e| format!("Could not restart QuickDictate: {e}"))
+            });
+        if let Err(e) = relaunch {
+            self.status = e;
+            return;
         }
         self.app.shutdown.store(true, Ordering::Release);
     }

@@ -6,6 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-24
+
+### Added
+
+- **Fully offline transcription.** The new Local provider needs no API key and keeps microphone audio on the PC. Choose between Cohere Transcribe 03-2026 Q5_K_M (1.65 GiB, the accuracy-first default) and Whisper Large v3 Turbo Q5_K_M (591 MiB, smaller with broad language coverage).
+- **One-click local model management.** Settings can install, select, cancel an active download, or delete either model. Weights are never embedded in the executable or repository: they download on demand to Local AppData, are pinned to immutable upstream revisions, and are verified by exact size and SHA-256 before becoming usable.
+- **Purpose-built Local status feedback.** Because offline transcription runs as a final batch rather than producing live partials, the cursor pip now shows an animated spinner instead of a frozen zero-word counter.
+
+### Changed
+
+- **Local model downloads are substantially faster and safer.** QuickDictate uses up to eight parallel HTTP range workers when supported, falls back cleanly to a single stream, removes incomplete files after cancellation or interruption, and shares one small native runtime between installed models.
+- **Local startup latency is paid in the background.** The selected model loads and prewarms when Local is selected, remains resident between dictations for predictable response time, switches automatically with the model selector, and releases its RAM/VRAM when you switch to a cloud provider.
+- **Long-running memory and idle work are bounded.** Microphone queues now have fixed capacity, Google batch recognition uploads ordered 55-second blocks instead of retaining an entire long recording, logging has a bounded lossy queue and rotates during a run, clipboard/avatar/update buffers have size limits, and the cursor/tray loop polls less often while idle.
+
+### Fixed
+
+- **Cold Local results no longer appear to do nothing.** Starting another dictation while the first Vulkan inference was still initializing could supersede and discard a valid transcript. Final Local processing is now serialized, an early hotkey press queues the next dictation, and queued hold-to-talk starts are cancelled if the key is released before processing finishes.
+- **Save & Restart returns to Settings.** The replacement process now reopens the Settings window automatically, and a failed relaunch leaves the current process running with a visible error instead of silently closing QuickDictate.
+- **Audio buffers are no longer duplicated at chunk boundaries.** The microphone callback now feeds each captured buffer into each session exactly once.
+- **Non-BMP Unicode characters paste correctly.** Characters such as emoji are emitted as complete UTF-16 surrogate pairs instead of being truncated.
+- **Live settings and update paths are more robust.** Provider/key changes refresh the active key pool, failed update downloads clean up partial files, and bounded network/file handling prevents stalled external work from retaining unbounded memory.
+
 ## [0.4.3] - 2026-07-15
 
 ### Changed
