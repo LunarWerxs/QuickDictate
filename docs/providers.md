@@ -175,11 +175,10 @@ current rates and free-tier limits; both drift over time.
 - **Runtime:** pinned `transcribe.cpp` 0.1.3 CPU/Vulkan package
 
 Choose **Local (offline)** in Settings. Pick any model, click **Install**, wait
-for the verified download, then Save. You can install one model or all three:
+for the verified download, then Save. You can install either or both models:
 
 | `local_model` | Model | Download | Intended tradeoff |
 |---|---|---:|---|
-| `cohere-bf16` | Cohere Transcribe 03-2026 BF16 | 3.82 GiB | Highest numeric fidelity |
 | `cohere-q5` | Cohere Transcribe 03-2026 Q5_K_M | 1.65 GiB | Default; near-lossless accuracy/size balance |
 | `whisper-turbo-q5` | Whisper Large v3 Turbo Q5_K_M | 591 MiB | Smallest and broadest language coverage |
 

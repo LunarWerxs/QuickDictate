@@ -462,8 +462,16 @@ impl Config {
         if path.exists() {
             return match fs::read_to_string(&path) {
                 Ok(data) => match serde_json::from_str::<Config>(&data) {
-                    Ok(c) => {
+                    Ok(mut c) => {
                         diags.push(format!("INFO: Loaded settings from {}", path.display()));
+                        let configured_model = c.local_model.clone();
+                        if c.normalize_local_model() {
+                            diags.push(format!(
+                                "WARN: local model '{configured_model}' is no longer available; \
+                                 using '{}' instead",
+                                c.local_model
+                            ));
+                        }
                         (c, diags)
                     }
                     Err(e) => {
@@ -533,6 +541,17 @@ impl Config {
         fs::write(&tmp, pretty.as_bytes())?;
         fs::rename(&tmp, path)?;
         Ok(())
+    }
+
+    /// Replace a removed or otherwise unknown local-model id with the current
+    /// default. This keeps settings created by an older QuickDictate build from
+    /// leaving the Local provider in an unusable state.
+    pub(crate) fn normalize_local_model(&mut self) -> bool {
+        if crate::local_stt::model(&self.local_model).is_some() {
+            return false;
+        }
+        self.local_model = default_local_model();
+        true
     }
 
     /// Persist a freshly generated [`Config::install_id`] with the lightest
@@ -773,6 +792,17 @@ mod tests {
         assert!(c.active_keys().is_empty());
         assert_eq!(c.resolve_provider().as_deref(), Some("local"));
         assert_eq!(c.local_model, "cohere-q5");
+    }
+
+    #[test]
+    fn unavailable_local_model_falls_back_to_current_default() {
+        let mut c = Config {
+            local_model: "retired-model".into(),
+            ..Config::default()
+        };
+        assert!(c.normalize_local_model());
+        assert_eq!(c.local_model, "cohere-q5");
+        assert!(!c.normalize_local_model());
     }
 
     #[test]

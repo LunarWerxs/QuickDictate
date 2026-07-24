@@ -45,7 +45,7 @@ optional local model for fully offline transcription — <b>no QuickDictate subs
 
 | | |
 | :-- | :-- |
-| 🔑 **Cloud or fully local** | Six bring-your-own-key services plus an offline **Local** provider with three one-click model choices. |
+| 🔑 **Cloud or fully local** | Six bring-your-own-key services plus an offline **Local** provider with two one-click model choices. |
 | ⌨️ **Types into any window** | Whatever has focus — your editor, a chat box, a terminal, or a web form. |
 | ✋ **Hold or tap** | Hold a key while you talk, or tap to start and stop. Both are configurable. |
 | 💬 **Streams as you speak** | Words appear live as you talk on the streaming providers. |

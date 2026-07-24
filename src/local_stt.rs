@@ -4,7 +4,7 @@
 //! Settings can install one of the pinned model packs below into
 //! `%LOCALAPPDATA%\QuickDictate\local-stt`. Downloads use an immutable upstream
 //! revision, an exact byte count, and SHA-256; partial files never become active.
-//! All three models share one pinned transcribe.cpp CPU/Vulkan runtime.
+//! Both models share one pinned transcribe.cpp CPU/Vulkan runtime.
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
@@ -40,16 +40,7 @@ pub struct ModelSpec {
     sha256: &'static str,
 }
 
-pub const MODELS: [ModelSpec; 3] = [
-    ModelSpec {
-        id: "cohere-bf16",
-        label: "Cohere Transcribe — BF16",
-        detail: "Maximum fidelity · 14 languages · 3.82 GiB",
-        download_bytes: 4_105_263_104,
-        filename: "cohere-transcribe-03-2026-BF16.gguf",
-        url: "https://huggingface.co/handy-computer/cohere-transcribe-03-2026-gguf/resolve/dfa4adebb64f3076b7b6b90b721275cc069cb421/cohere-transcribe-03-2026-BF16.gguf",
-        sha256: "72e7625abc358da7b1a27348b18269b4a026eceb792e6ade53c6bb2280d0f3a7",
-    },
+pub const MODELS: [ModelSpec; 2] = [
     ModelSpec {
         id: "cohere-q5",
         label: "Cohere Transcribe — Q5",

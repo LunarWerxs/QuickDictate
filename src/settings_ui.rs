@@ -363,6 +363,16 @@ fn chevron_down_glyph() -> RichText {
     }
 }
 
+/// Label for deleting an installed local model. The text fallback keeps the
+/// action unambiguous if the Windows icon font is unavailable.
+fn delete_glyph() -> RichText {
+    if icons_available() {
+        RichText::new("\u{E74D}").font(icon_font(15.0)) // MDL2 "Delete"
+    } else {
+        RichText::new("Remove")
+    }
+}
+
 /// SageThumbs-flavoured egui visuals: theme surfaces, hairline borders, the
 /// brand blue for selection/links, generous rounding.
 fn apply_style(ctx: &egui::Context) {
@@ -1853,7 +1863,14 @@ impl SettingsApp {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             match &snapshot.phase {
                                 crate::local_stt::InstallPhase::Installed => {
-                                    if ui.button("Remove").clicked() {
+                                    if ui
+                                        .button(delete_glyph())
+                                        .on_hover_text(
+                                            "Delete this downloaded model from this PC. \
+                                             You can install it again later.",
+                                        )
+                                        .clicked()
+                                    {
                                         if let Err(e) = crate::local_stt::start_remove(spec.id) {
                                             self.status = e;
                                         }

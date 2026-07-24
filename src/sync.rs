@@ -148,7 +148,8 @@ pub fn apply_synced_to_config(cfg: &mut Config, remote: &Value) -> bool {
         return false;
     }
     match serde_json::from_value::<Config>(Value::Object(base)) {
-        Ok(merged) => {
+        Ok(mut merged) => {
+            merged.normalize_local_model();
             *cfg = merged;
             true
         }
@@ -962,6 +963,14 @@ mod tests {
         let mut local = Config::default();
         let snap = config_to_synced(&local);
         assert!(!apply_synced_to_config(&mut local, &snap));
+    }
+
+    #[test]
+    fn apply_replaces_an_unavailable_synced_local_model() {
+        let mut local = Config::default();
+        let remote = serde_json::json!({ "local_model": "retired-model" });
+        assert!(apply_synced_to_config(&mut local, &remote));
+        assert_eq!(local.local_model, "cohere-q5");
     }
 
     #[test]
