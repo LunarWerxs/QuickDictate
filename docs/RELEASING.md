@@ -33,3 +33,26 @@ Cargo.toml — this list exists so none of them drift (SECURITY.md sat on
   feature, which meant two different binaries shared one filename and the
   release could (and did) ship the wrong one. If you ever reintroduce a
   feature gate, this step needs a "which build?" answer again.
+
+## Known accepted advisories (don't re-flag on audit)
+
+`cargo audit` (or `cargo deny`) reports two HIGH-severity advisories against
+`quick-xml` 0.39.4: **RUSTSEC-2026-0194** and **RUSTSEC-2026-0195**. These
+are accepted risk, not an open issue:
+
+- `quick-xml` isn't a direct dependency. It's pulled in transitively through
+  `wayland-scanner`, which is only reachable from the Wayland/Linux
+  clipboard and windowing backends in the dependency tree.
+- QuickDictate is a Windows-only application (see the platform badge in
+  [README.md](../README.md)). The Wayland-only code paths that depend on
+  `wayland-scanner` are target-gated out of the build entirely, so
+  `quick-xml` 0.39.4 never compiles into `quickdictate.exe` and the
+  vulnerable code is unreachable in any shipped binary.
+- There is no local fix: the crate that pulls in `wayland-scanner` still
+  pins `quick-xml = "^0.39"` in its latest published version, so a `cargo
+  update` cannot move past the affected range. The fix has to land
+  upstream in that crate before it flows down here.
+
+If a future audit run flags these two IDs again, this is why they're not
+blocking a release: confirm the affected code is still Linux/Wayland-only
+and still unreachable from the Windows build before treating it as new.
