@@ -198,11 +198,12 @@ uses RAM/VRAM to avoid repeating model-load and Vulkan-pipeline startup on later
 dictations. It switches automatically when you select another model and unloads
 when you switch away from Local. The cursor indicator uses a spinner instead of
 a live word count because local transcription runs as one batch after release;
-another dictation waits until that batch finishes so a valid result cannot be
-superseded and discarded. Vulkan is preferred when available; CPU is the
-automatic fallback. Raw audio passes directly from QuickDictate's 16 kHz
-pipeline to the native runtime—there is no temporary WAV file or Python/PyTorch
-environment.
+a hotkey press during that final batch queues the next dictation so the valid
+pending result cannot be superseded and discarded. A queued hold-to-talk start
+is cancelled if you release the key before processing finishes. Vulkan is
+preferred when available; CPU is the automatic fallback. Raw audio passes
+directly from QuickDictate's 16 kHz pipeline to the native runtime—there is no
+temporary WAV file or Python/PyTorch environment.
 
 Local packs come from:
 

@@ -406,6 +406,48 @@ fn status_after_release(provider: &str) -> Status {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingStart {
+    Toggle,
+    Hold,
+}
+
+fn handle_processing_hotkey(pending: &mut Option<PendingStart>, event: HotkeyEvent) -> bool {
+    match event {
+        HotkeyEvent::TogglePressed => *pending = Some(PendingStart::Toggle),
+        HotkeyEvent::HoldPressed => *pending = Some(PendingStart::Hold),
+        HotkeyEvent::HoldReleased => {
+            if *pending == Some(PendingStart::Hold) {
+                *pending = None;
+            }
+        }
+        HotkeyEvent::ToggleLongPressed => {
+            *pending = None;
+            return false;
+        }
+    }
+    true
+}
+
+fn start_queued_session_if_idle(
+    app: &Arc<App>,
+    keys: &mut Arc<KeyPool>,
+    active: &mut Option<SttHandle>,
+    pending: &mut Option<PendingStart>,
+) {
+    if app.status() != Status::Idle {
+        return;
+    }
+    let Some(kind) = pending.take() else {
+        return;
+    };
+    let _ = active.take();
+    refresh_key_pool(app, keys);
+    tracing::info!("Starting queued {kind:?} session after local processing");
+    app.set_status(Status::Starting);
+    *active = Some(stt::start_session(Arc::clone(app), Arc::clone(keys)));
+}
+
 fn main() -> Result<()> {
     // Single-instance guard: claims a named mutex before anything else
     // (settings.json load, logging, audio, hotkeys, tray). If another
@@ -599,22 +641,48 @@ fn main() -> Result<()> {
     );
 
     let mut active: Option<SttHandle> = None;
+    let mut pending_start: Option<PendingStart> = None;
 
     loop {
         if app.shutdown.load(Ordering::Acquire) {
             break;
         }
+        start_queued_session_if_idle(&app, &mut keys, &mut active, &mut pending_start);
         let evt = match hotkeys.events.recv_timeout(Duration::from_millis(50)) {
             Ok(e) => e,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         };
+        // Processing may have completed while recv_timeout was blocked. Start
+        // the already-queued session before interpreting a newly arrived event,
+        // otherwise `pending_start` could survive into a later session.
+        start_queued_session_if_idle(&app, &mut keys, &mut active, &mut pending_start);
         tracing::info!("hotkey event: {evt:?} (status={:?})", app.status());
-        if app.status() == Status::Processing && !matches!(evt, HotkeyEvent::ToggleLongPressed) {
-            tracing::info!(
-                "ignoring hotkey while the local model is finishing the previous dictation"
-            );
-            continue;
+        if app.status() == Status::Processing {
+            let prior_pending = pending_start;
+            if handle_processing_hotkey(&mut pending_start, evt) {
+                match evt {
+                    HotkeyEvent::TogglePressed => {
+                        tracing::info!(
+                        "queued toggle start while the local model finishes the previous dictation"
+                    );
+                    }
+                    HotkeyEvent::HoldPressed => {
+                        tracing::info!(
+                        "queued hold start while the local model finishes the previous dictation"
+                    );
+                    }
+                    HotkeyEvent::HoldReleased => {
+                        if prior_pending == Some(PendingStart::Hold) {
+                            tracing::info!(
+                            "cancelled queued hold start because the key was released before local processing finished"
+                        );
+                        }
+                    }
+                    HotkeyEvent::ToggleLongPressed => unreachable!("not consumed above"),
+                }
+                continue;
+            }
         }
         // Main owns the visible status. Streaming sessions may keep finalizing
         // while a newer one starts. Local batch inference is deliberately
@@ -644,6 +712,7 @@ fn main() -> Result<()> {
                 }
             }
             HotkeyEvent::ToggleLongPressed => {
+                pending_start = None;
                 if let Some(h) = active.take() {
                     tracing::info!("Discarding active session for saved-transcription replay");
                     app.invalidate_current_session();
@@ -729,5 +798,39 @@ mod logging_tests {
         assert_eq!(status_after_release("local"), Status::Processing);
         assert_eq!(status_after_release("LOCAL"), Status::Processing);
         assert_eq!(status_after_release("elevenlabs"), Status::Idle);
+    }
+
+    #[test]
+    fn local_processing_queues_toggle_and_cancellable_hold_starts() {
+        let mut pending = None;
+        assert!(handle_processing_hotkey(
+            &mut pending,
+            HotkeyEvent::TogglePressed
+        ));
+        assert_eq!(pending, Some(PendingStart::Toggle));
+
+        assert!(handle_processing_hotkey(
+            &mut pending,
+            HotkeyEvent::HoldReleased
+        ));
+        assert_eq!(pending, Some(PendingStart::Toggle));
+
+        assert!(handle_processing_hotkey(
+            &mut pending,
+            HotkeyEvent::HoldPressed
+        ));
+        assert_eq!(pending, Some(PendingStart::Hold));
+        assert!(handle_processing_hotkey(
+            &mut pending,
+            HotkeyEvent::HoldReleased
+        ));
+        assert_eq!(pending, None);
+
+        pending = Some(PendingStart::Toggle);
+        assert!(!handle_processing_hotkey(
+            &mut pending,
+            HotkeyEvent::ToggleLongPressed
+        ));
+        assert_eq!(pending, None);
     }
 }
