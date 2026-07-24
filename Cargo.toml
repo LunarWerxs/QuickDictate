@@ -92,6 +92,7 @@ reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "blocking",
 ] }
+bytes = "1"
 # Optional local-STT packs are downloaded at runtime, never embedded in this
 # crate. These small helpers verify/extract the pinned native/model artifacts
 # and load the native C ABI only after a user selects Local.

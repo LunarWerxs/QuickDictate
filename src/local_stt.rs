@@ -8,10 +8,10 @@
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
-use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -28,6 +28,10 @@ const RUNTIME_SHA256: &str = "9f536cb0fb839bd305e6d92fb214fd417c7718a416a6c7646a
 const RUNTIME_BYTES: u64 = 25_957_910;
 const RUNTIME_ARCHIVE_ROOT: &str = "transcribe-native-windows-x86_64-cpu-vulkan";
 const USER_AGENT: &str = concat!("QuickDictate/", env!("CARGO_PKG_VERSION"));
+const PARALLEL_DOWNLOAD_MIN_BYTES: u64 = 32 * 1024 * 1024;
+const PARALLEL_DOWNLOAD_WORKERS: usize = 8;
+const DOWNLOAD_BUFFER_BYTES: usize = 1024 * 1024;
+const DOWNLOAD_RANGE_ATTEMPTS: usize = 3;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ModelSpec {
@@ -121,9 +125,25 @@ pub enum InstallPhase {
     DownloadingRuntime,
     InstallingRuntime,
     DownloadingModel,
+    VerifyingDownload,
+    Cancelling,
     Installed,
     Removing,
     Failed(String),
+}
+
+impl InstallPhase {
+    fn busy(&self) -> bool {
+        matches!(
+            self,
+            Self::DownloadingRuntime
+                | Self::InstallingRuntime
+                | Self::DownloadingModel
+                | Self::VerifyingDownload
+                | Self::Cancelling
+                | Self::Removing
+        )
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -135,23 +155,27 @@ pub struct InstallSnapshot {
 
 impl InstallSnapshot {
     pub fn busy(&self) -> bool {
-        matches!(
-            self.phase,
-            InstallPhase::DownloadingRuntime
-                | InstallPhase::InstallingRuntime
-                | InstallPhase::DownloadingModel
-                | InstallPhase::Removing
-        )
+        self.phase.busy()
     }
 }
 
-fn states() -> &'static Mutex<HashMap<String, InstallSnapshot>> {
-    static STATES: OnceLock<Mutex<HashMap<String, InstallSnapshot>>> = OnceLock::new();
-    STATES.get_or_init(|| Mutex::new(HashMap::new()))
+#[derive(Default)]
+struct InstallerControl {
+    states: HashMap<String, InstallSnapshot>,
+    cancels: HashMap<String, Arc<AtomicBool>>,
+}
+
+fn installer_control() -> &'static Mutex<InstallerControl> {
+    static CONTROL: OnceLock<Mutex<InstallerControl>> = OnceLock::new();
+    CONTROL.get_or_init(|| Mutex::new(InstallerControl::default()))
 }
 
 pub fn install_snapshot(id: &str) -> InstallSnapshot {
-    if let Some(state) = states().lock().ok().and_then(|s| s.get(id).cloned()) {
+    if let Some(state) = installer_control()
+        .lock()
+        .ok()
+        .and_then(|s| s.states.get(id).cloned())
+    {
         if state.busy() || matches!(state.phase, InstallPhase::Failed(_)) {
             return state;
         }
@@ -168,8 +192,20 @@ pub fn install_snapshot(id: &str) -> InstallSnapshot {
 }
 
 fn set_state(id: &str, phase: InstallPhase, downloaded: u64, total: u64) {
-    if let Ok(mut states) = states().lock() {
-        states.insert(
+    if let Ok(mut control) = installer_control().lock() {
+        let downloaded = if let Some(current) = control.states.get(id) {
+            if matches!(current.phase, InstallPhase::Cancelling) && phase.busy() {
+                return;
+            }
+            if current.phase == phase {
+                downloaded.max(current.downloaded)
+            } else {
+                downloaded
+            }
+        } else {
+            downloaded
+        };
+        control.states.insert(
             id.to_string(),
             InstallSnapshot {
                 phase,
@@ -180,18 +216,70 @@ fn set_state(id: &str, phase: InstallPhase, downloaded: u64, total: u64) {
     }
 }
 
-fn claim_operation(id: &str, phase: InstallPhase, total: u64) -> Result<(), String> {
-    let mut states = states()
+fn finish_operation(id: &str, phase: InstallPhase, downloaded: u64, total: u64) {
+    if let Ok(mut control) = installer_control().lock() {
+        control.cancels.remove(id);
+        control.states.insert(
+            id.to_string(),
+            InstallSnapshot {
+                phase,
+                downloaded,
+                total,
+            },
+        );
+    }
+}
+
+fn claim_operation(id: &str, phase: InstallPhase, total: u64) -> Result<Arc<AtomicBool>, String> {
+    let mut control = installer_control()
         .lock()
         .map_err(|_| "local model installer state is unavailable".to_string())?;
-    if states.values().any(InstallSnapshot::busy) {
+    if control.states.values().any(InstallSnapshot::busy) {
         return Err("another local model install/remove operation is already running".into());
     }
-    states.insert(
+    let cancel = Arc::new(AtomicBool::new(false));
+    control.cancels.insert(id.to_string(), Arc::clone(&cancel));
+    control.states.insert(
         id.to_string(),
         InstallSnapshot {
             phase,
             downloaded: 0,
+            total,
+        },
+    );
+    Ok(cancel)
+}
+
+pub fn cancel_install(id: &str) -> Result<(), String> {
+    let mut control = installer_control()
+        .lock()
+        .map_err(|_| "local model installer state is unavailable".to_string())?;
+    let (downloaded, total) = match control.states.get(id) {
+        Some(snapshot)
+            if matches!(
+                snapshot.phase,
+                InstallPhase::DownloadingRuntime
+                    | InstallPhase::InstallingRuntime
+                    | InstallPhase::DownloadingModel
+                    | InstallPhase::VerifyingDownload
+                    | InstallPhase::Cancelling
+            ) =>
+        {
+            (snapshot.downloaded, snapshot.total)
+        }
+        _ => return Err("that model is not currently being installed".into()),
+    };
+    let cancel = control
+        .cancels
+        .get(id)
+        .cloned()
+        .ok_or_else(|| "model installer cancellation is unavailable".to_string())?;
+    cancel.store(true, Ordering::Release);
+    control.states.insert(
+        id.to_string(),
+        InstallSnapshot {
+            phase: InstallPhase::Cancelling,
+            downloaded,
             total,
         },
     );
@@ -203,21 +291,26 @@ pub fn start_install(id: &str) -> Result<(), String> {
     if is_installed(id) {
         return Ok(());
     }
-    claim_operation(id, InstallPhase::DownloadingRuntime, spec.download_bytes)?;
+    let cancel = claim_operation(id, InstallPhase::DownloadingRuntime, spec.download_bytes)?;
     let spawn = std::thread::Builder::new()
         .name(format!("qd-model-install-{}", spec.id))
         .spawn(move || {
-            let result = install(&spec);
-            match result {
-                Ok(()) => set_state(
-                    spec.id,
-                    InstallPhase::Installed,
-                    spec.download_bytes,
-                    spec.download_bytes,
-                ),
-                Err(e) => {
-                    tracing::error!("local model '{}' install failed: {e}", spec.id);
-                    set_state(spec.id, InstallPhase::Failed(e), 0, spec.download_bytes);
+            let result = install(&spec, &cancel);
+            if cancel.load(Ordering::Acquire) {
+                tracing::info!("local model '{}' install cancelled", spec.id);
+                finish_operation(spec.id, InstallPhase::NotInstalled, 0, spec.download_bytes);
+            } else {
+                match result {
+                    Ok(()) => finish_operation(
+                        spec.id,
+                        InstallPhase::Installed,
+                        spec.download_bytes,
+                        spec.download_bytes,
+                    ),
+                    Err(e) => {
+                        tracing::error!("local model '{}' install failed: {e}", spec.id);
+                        finish_operation(spec.id, InstallPhase::Failed(e), 0, spec.download_bytes);
+                    }
                 }
             }
         });
@@ -225,7 +318,7 @@ pub fn start_install(id: &str) -> Result<(), String> {
         Ok(_) => Ok(()),
         Err(e) => {
             let message = format!("could not start model installer: {e}");
-            set_state(
+            finish_operation(
                 spec.id,
                 InstallPhase::Failed(message.clone()),
                 0,
@@ -238,7 +331,7 @@ pub fn start_install(id: &str) -> Result<(), String> {
 
 pub fn start_remove(id: &str) -> Result<(), String> {
     let spec = *model(id).ok_or_else(|| format!("unknown local model '{id}'"))?;
-    claim_operation(spec.id, InstallPhase::Removing, spec.download_bytes)?;
+    let _cancel = claim_operation(spec.id, InstallPhase::Removing, spec.download_bytes)?;
     let spawn = std::thread::Builder::new()
         .name(format!("qd-model-remove-{}", spec.id))
         .spawn(move || {
@@ -250,15 +343,19 @@ pub fn start_remove(id: &str) -> Result<(), String> {
                 Ok(())
             });
             match result {
-                Ok(()) => set_state(spec.id, InstallPhase::NotInstalled, 0, spec.download_bytes),
-                Err(e) => set_state(spec.id, InstallPhase::Failed(e), 0, spec.download_bytes),
+                Ok(()) => {
+                    finish_operation(spec.id, InstallPhase::NotInstalled, 0, spec.download_bytes)
+                }
+                Err(e) => {
+                    finish_operation(spec.id, InstallPhase::Failed(e), 0, spec.download_bytes)
+                }
             }
         });
     match spawn {
         Ok(_) => Ok(()),
         Err(e) => {
             let message = format!("could not start model removal: {e}");
-            set_state(
+            finish_operation(
                 spec.id,
                 InstallPhase::Failed(message.clone()),
                 0,
@@ -269,8 +366,9 @@ pub fn start_remove(id: &str) -> Result<(), String> {
     }
 }
 
-fn install(spec: &ModelSpec) -> Result<(), String> {
-    ensure_runtime(spec)?;
+fn install(spec: &ModelSpec, cancel: &AtomicBool) -> Result<(), String> {
+    ensure_runtime(spec, cancel)?;
+    check_cancelled(cancel)?;
     set_state(
         spec.id,
         InstallPhase::DownloadingModel,
@@ -288,13 +386,18 @@ fn install(spec: &ModelSpec) -> Result<(), String> {
         spec.sha256,
         &dest,
         spec.download_bytes,
+        cancel,
     )?;
+    if let Err(e) = check_cancelled(cancel) {
+        let _ = fs::remove_file(&dest);
+        return Err(e);
+    }
     let marker = marker_path(spec)?;
     write_atomic(&marker, expected_marker(spec).as_bytes())?;
     Ok(())
 }
 
-fn ensure_runtime(spec: &ModelSpec) -> Result<(), String> {
+fn ensure_runtime(spec: &ModelSpec, cancel: &AtomicBool) -> Result<(), String> {
     let final_dir = runtime_dir()?;
     if final_dir.join("transcribe.dll").is_file() && final_dir.join(".verified").is_file() {
         return Ok(());
@@ -313,7 +416,9 @@ fn ensure_runtime(spec: &ModelSpec) -> Result<(), String> {
         RUNTIME_SHA256,
         &archive,
         RUNTIME_BYTES,
+        cancel,
     )?;
+    check_cancelled(cancel)?;
     set_state(
         spec.id,
         InstallPhase::InstallingRuntime,
@@ -335,6 +440,7 @@ fn ensure_runtime(spec: &ModelSpec) -> Result<(), String> {
         // `unpack` routes every entry through tar's traversal-safe `unpack_in`.
         tar.unpack(&staging)
             .map_err(|e| format!("could not extract local runtime: {e}"))?;
+        check_cancelled(cancel)?;
         let extracted = staging.join(RUNTIME_ARCHIVE_ROOT);
         if !extracted.join("transcribe.dll").is_file() || !extracted.join("contract.json").is_file()
         {
@@ -350,6 +456,7 @@ fn ensure_runtime(spec: &ModelSpec) -> Result<(), String> {
         }
         fs::rename(&extracted, &final_dir)
             .map_err(|e| format!("could not activate local runtime: {e}"))?;
+        check_cancelled(cancel)?;
         Ok(())
     })();
     let _ = fs::remove_file(&archive);
@@ -357,6 +464,7 @@ fn ensure_runtime(spec: &ModelSpec) -> Result<(), String> {
     unpack_result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn download_verified(
     id: &str,
     phase: InstallPhase,
@@ -365,6 +473,7 @@ fn download_verified(
     expected_sha256: &str,
     dest: &Path,
     display_total: u64,
+    cancel: &AtomicBool,
 ) -> Result<(), String> {
     let parent = dest
         .parent()
@@ -374,55 +483,50 @@ fn download_verified(
     let part = dest.with_extension("part");
     let _ = fs::remove_file(&part);
     let result = (|| {
-        let client = reqwest::blocking::Client::builder()
-            .user_agent(USER_AGENT)
-            .connect_timeout(Duration::from_secs(20))
-            .timeout(Duration::from_secs(4 * 60 * 60))
+        check_cancelled(cancel)?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
             .build()
-            .map_err(|e| format!("could not create download client: {e}"))?;
-        let mut response = client
-            .get(url)
-            .send()
-            .map_err(|e| format!("download failed: {e}"))?;
-        if !response.status().is_success() {
-            return Err(format!("download failed: HTTP {}", response.status()));
-        }
-        if let Some(len) = response.content_length() {
-            if len != expected_bytes {
-                return Err(format!(
-                    "download size changed upstream (expected {expected_bytes}, got {len})"
-                ));
-            }
-        }
-        let mut file =
-            File::create(&part).map_err(|e| format!("could not create {}: {e}", part.display()))?;
-        let mut hasher = Sha256::new();
-        let mut buf = vec![0u8; 1024 * 1024];
-        let mut downloaded = 0u64;
-        loop {
-            let n = response
-                .read(&mut buf)
-                .map_err(|e| format!("download read failed: {e}"))?;
-            if n == 0 {
-                break;
-            }
-            downloaded = downloaded.saturating_add(n as u64);
-            if downloaded > expected_bytes {
-                return Err("download exceeded its pinned size".into());
-            }
-            hasher.update(&buf[..n]);
-            file.write_all(&buf[..n])
-                .map_err(|e| format!("download write failed: {e}"))?;
-            set_state(id, phase.clone(), downloaded, display_total);
-        }
-        file.sync_all()
-            .map_err(|e| format!("could not flush download: {e}"))?;
-        if downloaded != expected_bytes {
-            return Err(format!(
-                "download was incomplete (expected {expected_bytes} bytes, got {downloaded})"
-            ));
-        }
-        let actual = format!("{:x}", hasher.finalize());
+            .map_err(|e| format!("could not start download runtime: {e}"))?;
+        let client = download_client()?;
+        let parallel = expected_bytes >= PARALLEL_DOWNLOAD_MIN_BYTES
+            && runtime.block_on(server_supports_ranges(&client, url, expected_bytes, cancel))?;
+        let actual = if parallel {
+            tracing::info!(
+                "downloading {expected_bytes} bytes with {PARALLEL_DOWNLOAD_WORKERS} parallel ranges"
+            );
+            runtime.block_on(download_parallel(
+                &client,
+                id,
+                phase,
+                url,
+                expected_bytes,
+                &part,
+                display_total,
+                cancel,
+                PARALLEL_DOWNLOAD_WORKERS,
+            ))?;
+            set_state(
+                id,
+                InstallPhase::VerifyingDownload,
+                expected_bytes,
+                display_total,
+            );
+            hash_file(&part, cancel)?
+        } else {
+            tracing::info!("downloading {expected_bytes} bytes as one HTTP stream");
+            runtime.block_on(download_single(
+                &client,
+                id,
+                phase,
+                url,
+                expected_bytes,
+                &part,
+                display_total,
+                cancel,
+            ))?
+        };
+        check_cancelled(cancel)?;
         if actual != expected_sha256 {
             return Err("download failed SHA-256 verification".into());
         }
@@ -438,6 +542,359 @@ fn download_verified(
         let _ = fs::remove_file(&part);
     }
     result
+}
+
+fn check_cancelled(cancel: &AtomicBool) -> Result<(), String> {
+    if cancel.load(Ordering::Acquire) {
+        Err("download cancelled".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn download_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .connect_timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(4 * 60 * 60))
+        .build()
+        .map_err(|e| format!("could not create download client: {e}"))
+}
+
+async fn send_with_cancel(
+    request: reqwest::RequestBuilder,
+    cancel: &AtomicBool,
+) -> Result<reqwest::Response, String> {
+    let request = request.send();
+    tokio::pin!(request);
+    loop {
+        tokio::select! {
+            result = &mut request => {
+                return result.map_err(|e| format!("download request failed: {e}"));
+            }
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                check_cancelled(cancel)?;
+            }
+        }
+    }
+}
+
+async fn next_chunk_with_cancel(
+    response: &mut reqwest::Response,
+    cancel: &AtomicBool,
+) -> Result<Option<bytes::Bytes>, String> {
+    let chunk = response.chunk();
+    tokio::pin!(chunk);
+    loop {
+        tokio::select! {
+            result = &mut chunk => {
+                return result.map_err(|e| format!("download read failed: {e}"));
+            }
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                check_cancelled(cancel)?;
+            }
+        }
+    }
+}
+
+async fn server_supports_ranges(
+    client: &reqwest::Client,
+    url: &str,
+    expected_bytes: u64,
+    cancel: &AtomicBool,
+) -> Result<bool, String> {
+    check_cancelled(cancel)?;
+    let mut response = send_with_cancel(
+        client.get(url).header(reqwest::header::RANGE, "bytes=0-0"),
+        cancel,
+    )
+    .await
+    .map_err(|e| format!("download range probe failed: {e}"))?;
+    if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Ok(false);
+    }
+    let expected_range = format!("bytes 0-0/{expected_bytes}");
+    let actual_range = response
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok());
+    if actual_range != Some(expected_range.as_str()) || response.content_length() != Some(1) {
+        return Ok(false);
+    }
+    let chunk = next_chunk_with_cancel(&mut response, cancel)
+        .await
+        .map_err(|e| format!("download range probe failed: {e}"))?;
+    if chunk.as_deref().map(<[u8]>::len) != Some(1) {
+        return Ok(false);
+    }
+    check_cancelled(cancel)?;
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn download_single(
+    client: &reqwest::Client,
+    id: &str,
+    phase: InstallPhase,
+    url: &str,
+    expected_bytes: u64,
+    part: &Path,
+    display_total: u64,
+    cancel: &AtomicBool,
+) -> Result<String, String> {
+    let mut response = send_with_cancel(client.get(url), cancel)
+        .await
+        .map_err(|e| format!("download failed: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("download failed: HTTP {}", response.status()));
+    }
+    if let Some(len) = response.content_length() {
+        if len != expected_bytes {
+            return Err(format!(
+                "download size changed upstream (expected {expected_bytes}, got {len})"
+            ));
+        }
+    }
+    let mut file =
+        File::create(part).map_err(|e| format!("could not create {}: {e}", part.display()))?;
+    let mut hasher = Sha256::new();
+    let mut downloaded = 0u64;
+    loop {
+        check_cancelled(cancel)?;
+        let Some(chunk) = next_chunk_with_cancel(&mut response, cancel).await? else {
+            break;
+        };
+        let n = chunk.len();
+        downloaded = downloaded.saturating_add(n as u64);
+        if downloaded > expected_bytes {
+            return Err("download exceeded its pinned size".into());
+        }
+        hasher.update(&chunk);
+        file.write_all(&chunk)
+            .map_err(|e| format!("download write failed: {e}"))?;
+        set_state(id, phase.clone(), downloaded, display_total);
+    }
+    file.sync_all()
+        .map_err(|e| format!("could not flush download: {e}"))?;
+    if downloaded != expected_bytes {
+        return Err(format!(
+            "download was incomplete (expected {expected_bytes} bytes, got {downloaded})"
+        ));
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn range_segments(total: u64, workers: usize) -> Vec<(u64, u64)> {
+    if total == 0 || workers == 0 {
+        return Vec::new();
+    }
+    let workers = workers.min(usize::try_from(total).unwrap_or(usize::MAX));
+    let chunk = total.div_ceil(workers as u64);
+    (0..workers)
+        .filter_map(|index| {
+            let start = index as u64 * chunk;
+            (start < total).then(|| (start, (start + chunk).min(total) - 1))
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn download_parallel(
+    client: &reqwest::Client,
+    id: &str,
+    phase: InstallPhase,
+    url: &str,
+    expected_bytes: u64,
+    part: &Path,
+    display_total: u64,
+    cancel: &AtomicBool,
+    workers: usize,
+) -> Result<(), String> {
+    let file =
+        File::create(part).map_err(|e| format!("could not create {}: {e}", part.display()))?;
+    file.set_len(expected_bytes)
+        .map_err(|e| format!("could not size {}: {e}", part.display()))?;
+    drop(file);
+
+    let progress = AtomicU64::new(0);
+    let failed = AtomicBool::new(false);
+    let first_error = Mutex::new(None::<String>);
+    let downloads = range_segments(expected_bytes, workers)
+        .into_iter()
+        .map(|(start, end)| {
+            let client = client.clone();
+            let phase = phase.clone();
+            let progress = &progress;
+            let failed = &failed;
+            let first_error = &first_error;
+            async move {
+                let result = download_range(
+                    &client,
+                    id,
+                    phase,
+                    url,
+                    expected_bytes,
+                    start,
+                    end,
+                    part,
+                    display_total,
+                    progress,
+                    cancel,
+                    failed,
+                )
+                .await;
+                if let Err(error) = result {
+                    if failed
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        if let Ok(mut first) = first_error.lock() {
+                            *first = Some(error);
+                        }
+                    }
+                }
+            }
+        });
+    futures_util::future::join_all(downloads).await;
+    check_cancelled(cancel)?;
+    if let Some(error) = first_error.lock().ok().and_then(|mut e| e.take()) {
+        return Err(error);
+    }
+    let downloaded = progress.load(Ordering::Acquire);
+    if downloaded != expected_bytes {
+        return Err(format!(
+            "parallel download was incomplete (expected {expected_bytes} bytes, got {downloaded})"
+        ));
+    }
+    let file = OpenOptions::new()
+        .write(true)
+        .open(part)
+        .map_err(|e| format!("could not open {} for flushing: {e}", part.display()))?;
+    file.sync_all()
+        .map_err(|e| format!("could not flush download: {e}"))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn download_range(
+    client: &reqwest::Client,
+    id: &str,
+    phase: InstallPhase,
+    url: &str,
+    expected_bytes: u64,
+    start: u64,
+    end: u64,
+    part: &Path,
+    display_total: u64,
+    progress: &AtomicU64,
+    cancel: &AtomicBool,
+    failed: &AtomicBool,
+) -> Result<(), String> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(part)
+        .map_err(|e| format!("could not open {}: {e}", part.display()))?;
+    file.seek(SeekFrom::Start(start))
+        .map_err(|e| format!("could not seek {}: {e}", part.display()))?;
+    let mut next = start;
+    let mut last_error = None;
+    for attempt in 1..=DOWNLOAD_RANGE_ATTEMPTS {
+        check_cancelled(cancel)?;
+        if failed.load(Ordering::Acquire) {
+            return Err("parallel download stopped after another range failed".into());
+        }
+        let mut response = match send_with_cancel(
+            client
+                .get(url)
+                .header(reqwest::header::RANGE, format!("bytes={next}-{end}")),
+            cancel,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(e) => {
+                last_error = Some(format!("request failed: {e}"));
+                if attempt < DOWNLOAD_RANGE_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;
+                }
+                continue;
+            }
+        };
+        let remaining = end - next + 1;
+        let expected_range = format!("bytes {next}-{end}/{expected_bytes}");
+        let actual_range = response
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok());
+        if response.status() != reqwest::StatusCode::PARTIAL_CONTENT
+            || actual_range != Some(expected_range.as_str())
+            || response.content_length() != Some(remaining)
+        {
+            last_error = Some(format!(
+                "server returned unexpected metadata ({})",
+                response.status()
+            ));
+            if attempt < DOWNLOAD_RANGE_ATTEMPTS {
+                tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;
+            }
+            continue;
+        }
+
+        last_error = Some(format!("response ended before byte {end}"));
+        while next <= end {
+            check_cancelled(cancel)?;
+            if failed.load(Ordering::Acquire) {
+                return Err("parallel download stopped after another range failed".into());
+            }
+            let limit = (end - next + 1).min(DOWNLOAD_BUFFER_BYTES as u64) as usize;
+            let chunk = match next_chunk_with_cancel(&mut response, cancel).await {
+                Ok(None) => break,
+                Ok(Some(chunk)) => chunk,
+                Err(e) => {
+                    last_error = Some(format!("read failed at byte {next}: {e}"));
+                    break;
+                }
+            };
+            if chunk.len() > limit {
+                return Err(format!(
+                    "range {start}-{end} returned more data than requested"
+                ));
+            }
+            let n = chunk.len();
+            file.write_all(&chunk)
+                .map_err(|e| format!("range {start}-{end} write failed: {e}"))?;
+            next += n as u64;
+            let downloaded = progress.fetch_add(n as u64, Ordering::AcqRel) + n as u64;
+            set_state(id, phase.clone(), downloaded, display_total);
+        }
+        if next > end {
+            return Ok(());
+        }
+        if attempt < DOWNLOAD_RANGE_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;
+        }
+    }
+    Err(format!(
+        "range {start}-{end} failed after {DOWNLOAD_RANGE_ATTEMPTS} attempts: {}",
+        last_error.unwrap_or_else(|| "range did not start".into())
+    ))
+}
+
+fn hash_file(path: &Path, cancel: &AtomicBool) -> Result<String, String> {
+    let mut file =
+        File::open(path).map_err(|e| format!("could not verify {}: {e}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; DOWNLOAD_BUFFER_BYTES];
+    loop {
+        check_cancelled(cancel)?;
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| format!("could not verify {}: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -827,6 +1284,97 @@ fn path_cstring(path: &Path) -> Result<CString, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{TcpListener, TcpStream};
+    use std::thread::JoinHandle;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_path(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "quickdictate-{name}-{}-{nonce}.bin",
+            std::process::id()
+        ))
+    }
+
+    fn read_request(stream: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = stream.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            request.extend_from_slice(&buf[..n]);
+        }
+        String::from_utf8(request).unwrap()
+    }
+
+    fn requested_range(request: &str) -> Option<(usize, usize)> {
+        request.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if !name.eq_ignore_ascii_case("range") {
+                return None;
+            }
+            let (start, end) = value.trim().strip_prefix("bytes=")?.split_once('-')?;
+            Some((start.parse().ok()?, end.parse().ok()?))
+        })
+    }
+
+    fn spawn_download_server(
+        data: Arc<Vec<u8>>,
+        requests: usize,
+        ranged: bool,
+        chunk_delay: Duration,
+    ) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut handlers = Vec::new();
+            for _ in 0..requests {
+                let (mut stream, _) = listener.accept().unwrap();
+                let data = Arc::clone(&data);
+                handlers.push(std::thread::spawn(move || {
+                    let request = read_request(&mut stream);
+                    let (start, end, status) = if ranged {
+                        let (start, end) =
+                            requested_range(&request).expect("range request expected");
+                        (start, end, "206 Partial Content")
+                    } else {
+                        (0, data.len() - 1, "200 OK")
+                    };
+                    let body = &data[start..=end];
+                    let content_range = if ranged {
+                        format!("Content-Range: bytes {start}-{end}/{}\r\n", data.len())
+                    } else {
+                        String::new()
+                    };
+                    let headers = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\n{content_range}\
+                         Connection: close\r\n\r\n",
+                        body.len()
+                    );
+                    if stream.write_all(headers.as_bytes()).is_err() {
+                        return;
+                    }
+                    for chunk in body.chunks(16 * 1024) {
+                        if stream.write_all(chunk).is_err() {
+                            return;
+                        }
+                        if !chunk_delay.is_zero() {
+                            std::thread::sleep(chunk_delay);
+                        }
+                    }
+                }));
+            }
+            for handler in handlers {
+                handler.join().unwrap();
+            }
+        });
+        (format!("http://{address}/model.bin"), handle)
+    }
 
     #[test]
     fn model_manifest_is_complete_and_unique() {
@@ -851,6 +1399,88 @@ mod tests {
     }
 
     #[test]
+    fn parallel_ranges_cover_every_byte_exactly_once() {
+        let segments = range_segments(23, 4);
+        assert_eq!(segments, vec![(0, 5), (6, 11), (12, 17), (18, 22)]);
+        let covered: u64 = segments.iter().map(|(start, end)| end - start + 1).sum();
+        assert_eq!(covered, 23);
+        assert!(range_segments(0, 8).is_empty());
+        assert_eq!(range_segments(2, 8), vec![(0, 0), (1, 1)]);
+    }
+
+    #[test]
+    fn parallel_downloader_reassembles_http_ranges() {
+        let data = Arc::new(
+            (0..1_048_603usize)
+                .map(|i| ((i * 31) % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let (url, server) = spawn_download_server(Arc::clone(&data), 4, true, Duration::ZERO);
+        let path = test_path("parallel-download");
+        let cancel = AtomicBool::new(false);
+        let client = download_client().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime
+            .block_on(download_parallel(
+                &client,
+                "parallel-download-test",
+                InstallPhase::DownloadingModel,
+                &url,
+                data.len() as u64,
+                &path,
+                data.len() as u64,
+                &cancel,
+                4,
+            ))
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), *data);
+        let _ = fs::remove_file(path);
+        finish_operation(
+            "parallel-download-test",
+            InstallPhase::NotInstalled,
+            0,
+            data.len() as u64,
+        );
+    }
+
+    #[test]
+    fn cancelling_download_stops_and_removes_partial_file() {
+        let data = Arc::new(vec![0x5a; 4 * 1024 * 1024]);
+        let expected_sha256 = format!("{:x}", Sha256::digest(data.as_slice()));
+        let (url, server) =
+            spawn_download_server(Arc::clone(&data), 1, false, Duration::from_millis(2));
+        let dest = test_path("cancel-download");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let worker_dest = dest.clone();
+        let total = data.len() as u64;
+        let worker = std::thread::spawn(move || {
+            download_verified(
+                "cancel-download-test",
+                InstallPhase::DownloadingModel,
+                &url,
+                total,
+                &expected_sha256,
+                &worker_dest,
+                total,
+                &worker_cancel,
+            )
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        cancel.store(true, Ordering::Release);
+        let result = worker.join().unwrap();
+        server.join().unwrap();
+        assert!(result.unwrap_err().contains("cancelled"));
+        assert!(!dest.exists());
+        assert!(!dest.with_extension("part").exists());
+        finish_operation("cancel-download-test", InstallPhase::NotInstalled, 0, total);
+    }
+
+    #[test]
     #[ignore = "downloads a 591 MiB model and runs real native inference"]
     fn live_whisper_pack_download_load_and_transcribe() {
         let root =
@@ -861,7 +1491,7 @@ mod tests {
         let result = (|| {
             let spec = model("whisper-turbo-q5").unwrap();
             if !is_installed(spec.id) {
-                install(spec)?;
+                install(spec, &AtomicBool::new(false))?;
             }
             let mut reader = hound::WavReader::open("tests/fixtures/speech_16k.wav")
                 .map_err(|e| e.to_string())?;

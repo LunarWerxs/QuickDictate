@@ -1886,6 +1886,11 @@ impl SettingsApp {
                                 }
                                 crate::local_stt::InstallPhase::DownloadingRuntime
                                 | crate::local_stt::InstallPhase::DownloadingModel => {
+                                    if ui.button("Cancel").clicked() {
+                                        if let Err(e) = crate::local_stt::cancel_install(spec.id) {
+                                            self.status = e;
+                                        }
+                                    }
                                     let pct = snapshot
                                         .downloaded
                                         .saturating_mul(100)
@@ -1896,9 +1901,27 @@ impl SettingsApp {
                                     );
                                     ui.add(egui::Spinner::new().size(14.0));
                                 }
-                                crate::local_stt::InstallPhase::InstallingRuntime => {
+                                crate::local_stt::InstallPhase::InstallingRuntime
+                                | crate::local_stt::InstallPhase::VerifyingDownload => {
+                                    if ui.button("Cancel").clicked() {
+                                        if let Err(e) = crate::local_stt::cancel_install(spec.id) {
+                                            self.status = e;
+                                        }
+                                    }
+                                    let label = if matches!(
+                                        snapshot.phase,
+                                        crate::local_stt::InstallPhase::VerifyingDownload
+                                    ) {
+                                        "verifying\u{2026}"
+                                    } else {
+                                        "installing runtime\u{2026}"
+                                    };
+                                    ui.label(RichText::new(label).size(12.0).color(muted()));
+                                    ui.add(egui::Spinner::new().size(14.0));
+                                }
+                                crate::local_stt::InstallPhase::Cancelling => {
                                     ui.label(
-                                        RichText::new("installing runtime\u{2026}")
+                                        RichText::new("cancelling\u{2026}")
                                             .size(12.0)
                                             .color(muted()),
                                     );

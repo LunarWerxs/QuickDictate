@@ -2958,6 +2958,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "base64",
+ "bytes",
  "cpal",
  "crossbeam-channel",
  "eframe",

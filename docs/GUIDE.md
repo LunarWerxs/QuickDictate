@@ -29,6 +29,7 @@ See the [changelog](../CHANGELOG.md) for what's changed release to release.
 ## What you get
 
 - **Seven speech providers, your pick** — six cloud services plus a fully offline Local provider with two downloadable model choices. Switch whenever you want.
+- **Local downloads stay manageable** — large model downloads use bounded parallel connections when supported, can be cancelled in Settings, and clean up incomplete files automatically.
 - **Bring your own key** — your keys, your account, your usage. Add more than one key per provider and QuickDictate round-robins between them with per-key health tracking (alive / quota / dead) and cooldown backoff. Hit a dead key mid-sentence? It rotates to the next one automatically, without dropping your press.
 - **Keys are checked before you need them** — on startup the active provider's keys get probed in the background, so a dead or rate-limited key is flagged before your first dictation and a good one is already queued. Health lives in memory only — a provider having a bad five minutes never permanently brands a key as dead; every launch re-checks.
 - **Hold or toggle — your call** — hold a key while you talk, or tap once to start and once to stop. Both hotkeys are configurable.

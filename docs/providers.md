@@ -186,9 +186,11 @@ The executable contains none of these weights. Downloads go under
 `%LOCALAPPDATA%\QuickDictate\local-stt`; a shared runtime adds roughly 80 MiB
 once. Every artifact is pinned to an immutable upstream revision and verified
 by exact byte count plus SHA-256 before an atomic rename makes it usable.
-Interrupted downloads remain `.part` files and are discarded on the next
-attempt. **Remove** deletes that model's directory; the small shared runtime
-stays available for other models.
+Large downloads use up to eight HTTP range workers when the server supports
+them and safely fall back to one stream otherwise. **Cancel** stops an active
+install and immediately discards its `.part` file; files left by a forced exit
+are discarded on the next attempt. The trash button deletes that model's
+directory; the small shared runtime stays available for other models.
 
 The model remains loaded briefly between dictations for speed, switches
 automatically when you select another model, unloads when you switch away from
