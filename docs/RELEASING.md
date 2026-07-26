@@ -47,3 +47,24 @@ future advisory is genuinely unreachable and no compatible fix exists, record
 the dependency path (`cargo tree --target all -i <crate>`), affected target,
 and rationale here. Re-check that exception on every release instead of
 silently carrying it forward.
+
+## Accepted audit warnings for 0.5.1
+
+The 0.5.1 release audit reports ten advisory warnings, all in target-gated
+Linux dependencies that are absent from both Windows dependency trees:
+
+- **GTK tray backend:** RUSTSEC-2024-0370, RUSTSEC-2024-0412,
+  RUSTSEC-2024-0413, RUSTSEC-2024-0415, RUSTSEC-2024-0416,
+  RUSTSEC-2024-0418, RUSTSEC-2024-0419, RUSTSEC-2024-0420, and
+  RUSTSEC-2024-0429 enter through `tray-icon -> libappindicator/gtk -> glib`.
+- **Wayland window decorations:** RUSTSEC-2026-0192 enters through
+  `eframe/winit -> sctk-adwaita -> ab_glyph -> owned_ttf_parser ->
+  ttf-parser`.
+
+`cargo tree --target x86_64-pc-windows-gnu -i <crate>` and the equivalent
+`x86_64-pc-windows-msvc` checks print no dependency path for any warned crate.
+QuickDictate ships only a Windows executable, so none of this code is compiled
+into the released binary. Targeted `cargo update --dry-run` checks for the
+warning roots found no compatible lockfile update. These warnings do not block
+0.5.1, but their target reachability and upgrade status must be checked again
+before the next release.
