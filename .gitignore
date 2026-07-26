@@ -34,6 +34,7 @@ settings.json
 *.key
 
 # Packaged artifacts / loose binaries.
+/out/
 *.zip
 *.7z
 *.rar
