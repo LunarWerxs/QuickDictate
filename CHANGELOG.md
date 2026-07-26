@@ -4,7 +4,7 @@ All notable changes to QuickDictate will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.5.2] - 2026-07-25
+## [0.5.2] - 2026-07-26
 
 ### Changed
 
@@ -12,7 +12,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   replacing unrelated remote changes, cache validators stay tied to the active account, pending
   settings flush during shutdown, and server throttling follows its requested retry delay.
 - **The release is a normal icon-bearing Windows GUI executable.** It starts without an
-  accompanying console; the ZIP remains available as the updater-friendly transport.
+  accompanying console, and the same direct executable remains the established self-update
+  payload so existing installations keep updating without an archive migration.
 
 ### Fixed
 
