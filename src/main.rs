@@ -549,6 +549,16 @@ fn should_open_settings_on_start(is_settings_relaunch: bool, has_usable_key: boo
 }
 
 fn main() -> Result<()> {
+    // A side-effect-free canary for release CI and the self-updater. Handle it before the
+    // single-instance mutex, settings, microphone, hotkeys, tray, or logging are initialized.
+    if std::env::args()
+        .nth(1)
+        .is_some_and(|arg| arg == "--version" || arg == "version")
+    {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     // Single-instance guard: claims a named mutex before anything else
     // (settings.json load, logging, audio, hotkeys, tray). If another
     // QuickDictate is already running, this asks it to reveal Settings and
@@ -865,6 +875,7 @@ fn main() -> Result<()> {
     // runtime alive until every physical dictation has finalized and its stats
     // write is durable, then let process exit hand the mutex to the child.
     app.stats.finish_sessions_and_flush();
+    sync::flush_before_exit(&app, Duration::from_secs(6));
     audio.shutdown();
     // Give in-flight pastes a moment to finish.
     std::thread::sleep(Duration::from_millis(50));

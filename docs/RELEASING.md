@@ -27,8 +27,20 @@ Cargo.toml — this list exists so none of them drift (SECURITY.md sat on
 
 ## 4. Tag and publish
 
-- [ ] Commit, tag `vX.Y.Z`, push the tag.
-- [ ] Publish the GitHub release with the release notes (the CHANGELOG section for this version) and the `target\release\quickdictate.exe` that `check.ps1 -Full` just built. The in-app update check relays GitHub's release info, so the update prompt goes live as soon as the release is published.
+- [ ] Commit, tag `vX.Y.Z`, and push the tag.
+- [ ] The `Release` GitHub Actions workflow reruns formatting, Clippy, tests, and
+      the locked release build from that exact tag. It then verifies the public
+      executable's GUI subsystem, version metadata, embedded icon, and
+      side-effect-free `--version` canary before publishing `quickdictate.exe`,
+      `SHA256SUMS.txt`, and the matching CHANGELOG section.
+
+  The direct `quickdictate.exe` is intentionally both the human download and
+  auto-update payload. A ZIP reduces the roughly 12 MB binary to about 6 MB, but
+  that modest absolute saving is not worth adding extraction and migration
+  complexity to the running dictation app; every already-published updater also
+  expects this stable exact filename. The updater requires GitHub's asset
+  SHA-256 digest and verifies the downloaded PE, byte count, digest, and reported
+  version before swapping it into place.
 
   There is exactly **one** build now — every provider is compiled in
   unconditionally. Before `0.4.3` the Google provider sat behind a Cargo

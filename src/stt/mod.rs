@@ -304,6 +304,7 @@ pub fn start_session(app: Arc<App>, keys: Arc<KeyPool>) -> SttHandle {
             app2
                 .stats
                 .record_dictation(&usage.provider, usage.words, usage.audio_ms);
+            crate::sync::schedule_stats_push(Arc::clone(&app2));
         }
         if let Err(e) = final_res {
             if e.to_string() == EXHAUSTED_SIGNAL {

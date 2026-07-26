@@ -29,6 +29,13 @@ try {
     Step 'test'         { cargo test }
     if ($Full) {
         Step 'build --release' { cargo build --release }
+        Step 'release executable' {
+            $version = (cargo metadata --no-deps --format-version 1 |
+                ConvertFrom-Json).packages[0].version
+            pwsh -File scripts\check_release_binary.ps1 `
+                -ExePath target\release\quickdictate.exe `
+                -ExpectedVersion $version
+        }
     }
 }
 finally {

@@ -14,8 +14,9 @@
 //!     the refresh token is sealed with **DPAPI** (`CryptProtectData`, CurrentUser
 //!     scope) — machine+user bound, so copying the portable folder to another PC
 //!     simply asks the user to sign in again there.
-//!   * **Only portable preferences sync** ([`SYNCED_KEYS`]). API keys, window
-//!     geometry, `run_at_startup`, and logging flags never leave the machine.
+//!   * **Only portable preferences and numeric usage totals sync**
+//!     ([`SYNCED_KEYS`]). API keys, transcript text, window geometry,
+//!     `run_at_startup`, and logging flags never leave the machine.
 //!
 //! The access token lives only in a worker's stack for the duration of one call;
 //! it is never persisted. Only the refresh token (+ a display email/name) is
@@ -24,14 +25,18 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::Config;
+use crate::state::App;
+use crate::stats::UsageStats;
 
 // ---- Public constants ------------------------------------------------------
 
@@ -49,24 +54,33 @@ const SCOPES: &str = "openid profile email photo";
 const REDIRECT_PATH: &str = "/oauth/callback";
 const CREDS_FILE: &str = "quickdictate-connections.dat";
 const USER_AGENT: &str = concat!("QuickDictate/", env!("CARGO_PKG_VERSION"));
+const STATS_KEY: &str = "usage_stats";
 
 /// How long we wait for the user to complete sign-in in their browser.
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(180);
 const MAX_AVATAR_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_AVATAR_DIMENSION: u32 = 2048;
+const MAX_DOCUMENT_BYTES: usize = 64 * 1024;
+const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(30);
 
 /// Serializes the refresh-token-using operations (`resume_and_pull`,
 /// `push_now`, `disconnect`). Without it, a Settings-open resume racing a
 /// Save & Restart push could fire two concurrent `refresh` exchanges and
 /// interleave writes to the sealed creds file. Held only for the duration of
-/// one operation; sign-in (`connect_and_reconcile`) is signed-out-only and
-/// mutually exclusive with these by app state, so it stays lock-free.
+/// one operation. Interactive sign-in only takes the lock after the browser
+/// round-trip, before it exposes credentials or touches the store.
 static SYNC_LOCK: Mutex<()> = Mutex::new(());
+static STATS_SYNC_QUEUED: AtomicBool = AtomicBool::new(false);
+static STORE_CACHE: Mutex<Option<CachedRemoteDoc>> = Mutex::new(None);
 
 /// Acquire [`SYNC_LOCK`], recovering the guard even if a previous holder
 /// panicked (the lock guards ordering, not invariant-bearing data).
 fn sync_guard() -> std::sync::MutexGuard<'static, ()> {
     SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn store_cache() -> std::sync::MutexGuard<'static, Option<CachedRemoteDoc>> {
+    STORE_CACHE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The **allowlist** of settings.json keys that sync to the cloud. Deliberately
@@ -124,6 +138,120 @@ pub fn config_to_synced(cfg: &Config) -> Value {
         }
     }
     Value::Object(out)
+}
+
+/// The portable preferences plus mergeable, numeric-only usage statistics.
+pub fn snapshot_to_synced(cfg: &Config, stats: &UsageStats) -> Value {
+    let mut snapshot = config_to_synced(cfg);
+    if let Some(object) = snapshot.as_object_mut() {
+        object.insert(STATS_KEY.to_string(), stats.synced_value());
+    }
+    snapshot
+}
+
+pub fn synced_stats(remote: &Value) -> Option<&Value> {
+    remote.as_object()?.get(STATS_KEY)
+}
+
+fn credential_patterns() -> &'static [(Regex, &'static str)] {
+    static PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
+    PATTERNS
+        .get_or_init(|| {
+            [
+                (r"^(sk|pk|rk)_(live|test)_[A-Za-z0-9]{16,}", "a Stripe key"),
+                (r"^sk-[A-Za-z0-9_-]{20,}", "an OpenAI-style API key"),
+                (r"^(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}", "a GitHub token"),
+                (
+                    r"^github_pat_[A-Za-z0-9_]{22,}",
+                    "a GitHub fine-grained token",
+                ),
+                (r"^xox[baprs]-[A-Za-z0-9-]{10,}", "a Slack token"),
+                (r"^AKIA[0-9A-Z]{16}$", "an AWS access key id"),
+                (r"^AIza[0-9A-Za-z_-]{35}$", "a Google API key"),
+                (
+                    r"^ey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}$",
+                    "a JWT",
+                ),
+                (r"-----BEGIN [A-Z ]*PRIVATE KEY-----", "a private key"),
+            ]
+            .into_iter()
+            .map(|(pattern, label)| (Regex::new(pattern).expect("static credential regex"), label))
+            .collect()
+        })
+        .as_slice()
+}
+
+fn credential_in_value(value: &Value, depth: usize) -> Option<&'static str> {
+    match value {
+        Value::String(text) => credential_patterns()
+            .iter()
+            .find_map(|(pattern, label)| pattern.is_match(text.trim()).then_some(*label)),
+        Value::Array(values) if depth < 4 => values
+            .iter()
+            .find_map(|value| credential_in_value(value, depth + 1)),
+        Value::Object(values) if depth < 4 => values
+            .values()
+            .find_map(|value| credential_in_value(value, depth + 1)),
+        _ => None,
+    }
+}
+
+fn validate_sync_snapshot(settings: &Value) -> Result<()> {
+    if let Some(entries) = settings.as_object() {
+        for (key, value) in entries {
+            if let Some(what) = credential_in_value(value, 0) {
+                bail!(
+                    "refusing to sync \"{key}\": its value is {what}; Connections stores settings, not credentials"
+                );
+            }
+        }
+    }
+
+    let bytes = serde_json::to_vec(settings).context("serialize synced settings")?;
+    if bytes.len() > MAX_DOCUMENT_BYTES {
+        let biggest = settings
+            .as_object()
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .map(|(key, value)| {
+                        (
+                            key,
+                            serde_json::to_vec(value)
+                                .map(|bytes| bytes.len())
+                                .unwrap_or(0),
+                        )
+                    })
+                    .max_by_key(|(_, bytes)| *bytes)
+            })
+            .map(|(key, bytes)| format!("; \"{key}\" alone is {bytes} bytes"))
+            .unwrap_or_default();
+        bail!(
+            "synced settings are {} bytes, over the {MAX_DOCUMENT_BYTES}-byte limit{biggest}",
+            bytes.len()
+        );
+    }
+    Ok(())
+}
+
+/// Merge only the stats portion of `other` into `preferred`; portable settings
+/// in `preferred` keep their existing conflict policy.
+fn merge_stats(preferred: &mut Value, other: &Value) -> bool {
+    let Some(other_stats) = synced_stats(other) else {
+        return false;
+    };
+    let Some(preferred_obj) = preferred.as_object_mut() else {
+        return false;
+    };
+    let merged = match preferred_obj.get(STATS_KEY) {
+        Some(local_stats) => UsageStats::merge_synced_values(local_stats, other_stats),
+        None => other_stats.clone(),
+    };
+    if preferred_obj.get(STATS_KEY) == Some(&merged) {
+        return false;
+    }
+    preferred_obj.insert(STATS_KEY.to_string(), merged);
+    true
 }
 
 /// Overlay the allowlisted keys from a remote settings doc onto `cfg`, leaving
@@ -660,58 +788,135 @@ const WAIT_PAGE: &str =
 
 // ---- Store calls (§5a / §5f) ----------------------------------------------
 
+#[derive(Clone)]
 pub struct RemoteDoc {
     pub settings: Value,
     pub version: u64,
 }
 
+#[derive(Clone)]
+struct CachedRemoteDoc {
+    doc: RemoteDoc,
+    etag: String,
+}
+
+fn parse_etag_version(etag: &str) -> Option<u64> {
+    etag.trim()
+        .trim_start_matches("W/")
+        .trim_matches('"')
+        .parse()
+        .ok()
+}
+
+fn retry_after_seconds(body: &Value) -> Option<u64> {
+    body.get("retry_after_seconds")
+        .and_then(Value::as_u64)
+        .filter(|seconds| *seconds > 0)
+}
+
+fn rate_limit_wait(body: &Value) -> Duration {
+    Duration::from_secs(retry_after_seconds(body).unwrap_or(1)).min(MAX_RATE_LIMIT_WAIT)
+}
+
+fn clear_store_cache() {
+    *store_cache() = None;
+}
+
 /// `GET /v1/app-data/{appId}` → the user's settings doc (`version:0` if never
-/// written).
+/// written). Repeated reads are ETag-conditional; a 304 reuses the cached body.
 pub fn store_pull(access_token: &str) -> Result<RemoteDoc> {
-    let resp = client()?
-        .get(format!("{STORE_BASE}/{CLIENT_ID}"))
-        .bearer_auth(access_token)
-        .send()
-        .context("store GET")?;
-    let status = resp.status();
-    let body: Value = resp.json().context("store GET was not JSON")?;
-    if !status.is_success() {
-        bail!("could not read cloud settings (HTTP {status}): {body}");
-    }
-    Ok(RemoteDoc {
-        settings: body
-            .get("settings")
+    let cached = store_cache().clone();
+    let mut rate_limit_retried = false;
+    loop {
+        let mut request = client()?
+            .get(format!("{STORE_BASE}/{CLIENT_ID}"))
+            .bearer_auth(access_token);
+        if let Some(cached) = &cached {
+            request = request.header(reqwest::header::IF_NONE_MATCH, &cached.etag);
+        }
+        let resp = request.send().context("store GET")?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_MODIFIED {
+            return cached
+                .map(|cached| cached.doc)
+                .ok_or_else(|| anyhow!("sync server returned 304 without a cached document"));
+        }
+        let etag = resp
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let body: Value = resp.json().context("store GET was not JSON")?;
+        if status.as_u16() == 429 && !rate_limit_retried {
+            rate_limit_retried = true;
+            std::thread::sleep(rate_limit_wait(&body));
+            continue;
+        }
+        if !status.is_success() {
+            bail!("could not read cloud settings (HTTP {status}): {body}");
+        }
+        let body_version = body.get("version").and_then(Value::as_u64).unwrap_or(0);
+        let server_settings = body
+            .get("server_settings")
             .cloned()
-            .unwrap_or_else(|| Value::Object(Default::default())),
-        version: body.get("version").and_then(Value::as_u64).unwrap_or(0),
-    })
+            .unwrap_or_else(|| Value::Object(Default::default()));
+        if server_settings
+            .as_object()
+            .is_some_and(|settings| !settings.is_empty())
+        {
+            // Parsed deliberately, but not applied: QuickDictate currently has
+            // no server-authoritative plan/entitlement setting. Keeping this
+            // explicit prevents that tier being mistaken for user preferences.
+            tracing::debug!("connections: server settings received; no supported keys yet");
+        }
+        let doc = RemoteDoc {
+            settings: body
+                .get("settings")
+                .cloned()
+                .unwrap_or_else(|| Value::Object(Default::default())),
+            // The ETag is the authoritative conditional-read version. Fall
+            // back to the body for older/self-hosted implementations.
+            version: etag
+                .as_deref()
+                .and_then(parse_etag_version)
+                .unwrap_or(body_version),
+        };
+        let cache_etag = etag.unwrap_or_else(|| format!("\"{}\"", doc.version));
+        *store_cache() = Some(CachedRemoteDoc {
+            doc: doc.clone(),
+            etag: cache_etag,
+        });
+        return Ok(doc);
+    }
 }
 
 /// `POST /v1/app-data/{appId}` with the full syncable snapshot.
 ///
-/// We use **`merge:false` (full replace)** rather than a deep-merge: every push
-/// carries the *complete* allowlisted set, so a full replace correctly reflects
-/// deletions (e.g. a removed text-replacement) — a deep-merge never would.
-/// `baseVersion` gives optimistic concurrency; on `409` we treat a Save as an
-/// explicit "make my settings the truth" and re-read the version + overwrite
-/// (last-write-wins), bounded to a few tries.
+/// Uses RFC 7386 **merge mode**, so another device's keys survive concurrent
+/// writes. A stale base version retries the same patch against the server's
+/// current version, matching @cnct/connect 1.0.0. A 429 schedules one bounded
+/// retry using the server's documented `retry_after_seconds`.
 pub fn store_push(access_token: &str, settings: &Value, base_version: u64) -> Result<u64> {
+    validate_sync_snapshot(settings)?;
     let url = format!("{STORE_BASE}/{CLIENT_ID}");
     let mut base = base_version;
-    for attempt in 0u64..4 {
+    let mut conflicts = 0;
+    let mut rate_limit_retried = false;
+    loop {
         let resp = client()?
             .post(&url)
             .bearer_auth(access_token)
             .json(&serde_json::json!({
                 "settings": settings,
                 "baseVersion": base,
-                "merge": false,
+                "merge": true,
             }))
             .send()
             .context("store POST")?;
         let status = resp.status();
+        let body: Value = resp.json().unwrap_or(Value::Null);
         if status.is_success() {
-            let body: Value = resp.json().unwrap_or(Value::Null);
+            clear_store_cache();
             return Ok(body
                 .get("version")
                 .and_then(Value::as_u64)
@@ -719,33 +924,35 @@ pub fn store_push(access_token: &str, settings: &Value, base_version: u64) -> Re
         }
         match status.as_u16() {
             409 => {
-                let body: Value = resp.json().unwrap_or(Value::Null);
-                let current = body
+                conflicts += 1;
+                if conflicts >= 3 {
+                    bail!("push kept conflicting with a newer cloud copy; try again");
+                }
+                base = body
                     .get("current")
-                    .and_then(|c| c.get("version"))
-                    .and_then(Value::as_u64);
-                base = match current {
-                    Some(v) => v,
-                    None => store_pull(access_token)?.version,
-                };
-                // Jittered backoff so two devices saving at once don't ping-pong
-                // 409s back-to-back (this runs on a worker thread, so a short
-                // blocking sleep is fine).
-                let jitter = rand_bytes(2)
-                    .map(|b| u64::from(u16::from_le_bytes([b[0], b[1]])) % 250)
-                    .unwrap_or(125);
-                std::thread::sleep(Duration::from_millis((attempt + 1) * 250 + jitter));
+                    .and_then(|current| current.get("version"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or_else(|| {
+                        clear_store_cache();
+                        store_pull(access_token)
+                            .map(|latest| latest.version)
+                            .unwrap_or(base)
+                    });
                 continue;
             }
-            429 => bail!("the settings store is rate-limiting us; try again shortly"),
-            413 => bail!("settings are too large to sync (over 64 KB)"),
-            _ => {
-                let body: Value = resp.json().unwrap_or(Value::Null);
-                bail!("could not save to the cloud (HTTP {status}): {body}");
+            429 if !rate_limit_retried => {
+                rate_limit_retried = true;
+                std::thread::sleep(rate_limit_wait(&body));
+                continue;
             }
+            429 => bail!(
+                "the settings store is still rate-limiting us after waiting {} seconds",
+                retry_after_seconds(&body).unwrap_or(1)
+            ),
+            413 => bail!("settings are too large to sync (over 64 KB)"),
+            _ => bail!("could not save to the cloud (HTTP {status}): {body}"),
         }
     }
-    bail!("push kept conflicting with a newer cloud copy; try again")
 }
 
 /// `DELETE /v1/app-data/{appId}` — forget the remote doc. Idempotent.
@@ -784,6 +991,8 @@ pub struct Connected {
 /// empty, seed it with `local_snapshot`.
 pub fn connect_and_reconcile(local_snapshot: Value) -> Result<Connected> {
     let tokens = sign_in()?;
+    let _guard = sync_guard();
+    clear_store_cache();
     if tokens.refresh_token.is_empty() {
         tracing::warn!("connections: no refresh_token returned; sync won't survive restart");
     } else {
@@ -807,11 +1016,15 @@ pub fn connect_and_reconcile(local_snapshot: Value) -> Result<Connected> {
             seeded: true,
         })
     } else {
+        let mut merged = doc.settings;
+        if merge_stats(&mut merged, &local_snapshot) {
+            store_push(&tokens.access_token, &merged, doc.version)?;
+        }
         Ok(Connected {
             name: tokens.name,
             email: tokens.email,
             avatar,
-            remote: Some(doc.settings),
+            remote: Some(merged),
             seeded: false,
         })
     }
@@ -819,7 +1032,7 @@ pub fn connect_and_reconcile(local_snapshot: Value) -> Result<Connected> {
 
 /// Silent resume on Settings-window open when creds already exist: refresh →
 /// pull. Returns the remote doc to apply (if any).
-pub fn resume_and_pull() -> Result<Connected> {
+pub fn resume_and_pull(local_snapshot: Value) -> Result<Connected> {
     let _guard = sync_guard();
     let mut creds = load_creds().ok_or_else(|| anyhow!("not signed in"))?;
     let tokens = refresh(&creds.refresh_token)?;
@@ -849,23 +1062,53 @@ pub fn resume_and_pull() -> Result<Connected> {
     }
     let avatar = fetch_avatar(&creds.picture);
     let doc = store_pull(&tokens.access_token)?;
+    let mut merged = doc.settings;
+    if doc.version > 0 && merge_stats(&mut merged, &local_snapshot) {
+        store_push(&tokens.access_token, &merged, doc.version)?;
+    }
     Ok(Connected {
         name: creds.name,
         email: creds.email,
         avatar,
-        remote: (doc.version > 0).then_some(doc.settings),
+        remote: (doc.version > 0).then_some(merged),
         seeded: false,
     })
 }
 
 /// Push the current local snapshot to the cloud (used on Save). Refresh-aware.
-pub fn push_now(local_snapshot: Value) -> Result<u64> {
+pub fn push_now(mut local_snapshot: Value) -> Result<u64> {
     let _guard = sync_guard();
     let creds = load_creds().ok_or_else(|| anyhow!("not signed in"))?;
     let tokens = refresh(&creds.refresh_token)?;
     persist_rotated(&creds, &tokens);
-    let base = store_pull(&tokens.access_token)?.version;
-    store_push(&tokens.access_token, &local_snapshot, base)
+    let remote = store_pull(&tokens.access_token)?;
+    merge_stats(&mut local_snapshot, &remote.settings);
+    store_push(&tokens.access_token, &local_snapshot, remote.version)
+}
+
+/// Coalesce successful dictations into a quiet background stats push whenever
+/// the user has opted into Connections sync.
+pub fn schedule_stats_push(app: Arc<App>) {
+    if !is_signed_in() || STATS_SYNC_QUEUED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    if std::thread::Builder::new()
+        .name("qd-stats-sync".into())
+        .spawn(move || {
+            // A short debounce captures quick successive dictations in one
+            // request and keeps network work away from the transcription path.
+            std::thread::sleep(Duration::from_secs(3));
+            let config = app.config.load();
+            let snapshot = snapshot_to_synced(&config, &app.stats.snapshot());
+            if let Err(error) = push_now(snapshot) {
+                tracing::warn!("connections: background stats sync failed: {error}");
+            }
+            STATS_SYNC_QUEUED.store(false, Ordering::Release);
+        })
+        .is_err()
+    {
+        STATS_SYNC_QUEUED.store(false, Ordering::Release);
+    }
 }
 
 /// Disconnect: best-effort delete the remote doc, then always drop local creds.
@@ -877,6 +1120,36 @@ pub fn disconnect() {
         }
     }
     clear_creds();
+    clear_store_cache();
+}
+
+/// Best-effort final flush used by the process shutdown path. The worker is
+/// bounded so a dead network cannot hold Quit indefinitely.
+pub fn flush_before_exit(app: &Arc<App>, timeout: Duration) {
+    if !is_signed_in() {
+        return;
+    }
+    let config = app.config.load();
+    let snapshot = snapshot_to_synced(&config, &app.stats.snapshot());
+    let (tx, rx) = std::sync::mpsc::channel();
+    if std::thread::Builder::new()
+        .name("qd-sync-flush".into())
+        .spawn(move || {
+            let _ = tx.send(push_now(snapshot));
+        })
+        .is_err()
+    {
+        tracing::warn!("connections: could not start final sync flush");
+        return;
+    }
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(_)) => tracing::info!("connections: final sync flush completed"),
+        Ok(Err(error)) => tracing::warn!("connections: final sync flush failed: {error}"),
+        Err(_) => tracing::warn!(
+            "connections: final sync flush did not finish within {} seconds",
+            timeout.as_secs()
+        ),
+    }
 }
 
 /// Re-seal creds if a refresh rotated the refresh token.
@@ -893,6 +1166,8 @@ fn persist_rotated(old: &Creds, fresh: &Tokens) {
 #[allow(clippy::field_reassign_with_default)] // test setup reads clearer field-by-field
 mod tests {
     use super::*;
+    use crate::stats::{DeviceStats, PeriodStats, ProviderStats, UsageStats};
+    use std::collections::BTreeMap;
 
     #[test]
     fn synced_snapshot_carries_prefs_but_no_secrets_or_geometry() {
@@ -935,6 +1210,161 @@ mod tests {
                 "{forbidden} must never be in the synced snapshot"
             );
         }
+    }
+
+    #[test]
+    fn full_snapshot_includes_stats_but_not_the_local_device_marker() {
+        let mut stats = UsageStats::default();
+        stats.local_device_id = "local-only-marker".into();
+        stats.devices.insert(
+            "device-a".into(),
+            DeviceStats {
+                totals: PeriodStats {
+                    words: 42,
+                    audio_ms: 9_000,
+                    dictations: 2,
+                    ..PeriodStats::default()
+                },
+                ..DeviceStats::default()
+            },
+        );
+
+        let snapshot = snapshot_to_synced(&Config::default(), &stats);
+        assert!(snapshot.get(STATS_KEY).is_some());
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(!json.contains("local-only-marker"));
+        assert!(!json.contains("local_device_id"));
+    }
+
+    #[test]
+    fn stats_merge_unions_devices_without_changing_preferred_settings() {
+        let mut local_stats = UsageStats::default();
+        local_stats.devices.insert(
+            "local-device".into(),
+            DeviceStats {
+                totals: PeriodStats {
+                    words: 10,
+                    dictations: 1,
+                    ..PeriodStats::default()
+                },
+                ..DeviceStats::default()
+            },
+        );
+        let mut remote_stats = UsageStats::default();
+        remote_stats.devices.insert(
+            "remote-device".into(),
+            DeviceStats {
+                totals: PeriodStats {
+                    words: 20,
+                    dictations: 1,
+                    ..PeriodStats::default()
+                },
+                ..DeviceStats::default()
+            },
+        );
+        let mut preferred = serde_json::json!({
+            "language": "en-US",
+            (STATS_KEY): local_stats.synced_value(),
+        });
+        let other = serde_json::json!({
+            "language": "de-DE",
+            (STATS_KEY): remote_stats.synced_value(),
+        });
+
+        assert!(merge_stats(&mut preferred, &other));
+        assert_eq!(preferred["language"], "en-US");
+        let mut merged = UsageStats::default();
+        assert!(merged.merge_synced_value(&preferred[STATS_KEY]));
+        assert_eq!(merged.total_words, 30);
+        assert_eq!(merged.total_dictations, 2);
+    }
+
+    #[test]
+    fn compact_week_of_hourly_stats_stays_below_store_limit() {
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "local".into(),
+            ProviderStats {
+                words: 30,
+                audio_ms: 8_000,
+                dictations: 1,
+            },
+        );
+        providers.insert(
+            "openai".into(),
+            ProviderStats {
+                words: 30,
+                audio_ms: 8_000,
+                dictations: 1,
+            },
+        );
+        let bucket = PeriodStats {
+            words: 60,
+            audio_ms: 16_000,
+            dictations: 2,
+            longest_dictation_words: 30,
+            longest_dictation_audio_ms: 8_000,
+            providers,
+        };
+        let mut hours = BTreeMap::new();
+        for hour in 0..(24 * 8) {
+            hours.insert(1_800_000_000 + hour * 3_600, bucket.clone());
+        }
+        let mut stats = UsageStats::default();
+        stats.devices.insert(
+            "device-with-a-full-week".into(),
+            DeviceStats {
+                totals: bucket,
+                hours,
+                ..DeviceStats::default()
+            },
+        );
+
+        let snapshot = snapshot_to_synced(&Config::default(), &stats);
+        let bytes = serde_json::to_vec(&snapshot).unwrap();
+        assert!(
+            bytes.len() < 64 * 1_024,
+            "snapshot was {} bytes",
+            bytes.len()
+        );
+    }
+
+    #[test]
+    fn credential_values_are_refused_even_when_nested() {
+        let snapshot = serde_json::json!({
+            "text_replacements": [{
+                "from": "work token",
+                "to": "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+            }]
+        });
+        let error = validate_sync_snapshot(&snapshot).unwrap_err().to_string();
+        assert!(error.contains("GitHub token"), "{error}");
+
+        assert!(validate_sync_snapshot(&serde_json::json!({
+            "text_replacements": [{"from": "sk", "to": "ordinary text"}]
+        }))
+        .is_ok());
+    }
+
+    #[test]
+    fn oversized_snapshot_is_rejected_locally_and_names_the_largest_key() {
+        let snapshot = serde_json::json!({
+            "language": "en-US",
+            "text_replacements": "x".repeat(MAX_DOCUMENT_BYTES)
+        });
+        let error = validate_sync_snapshot(&snapshot).unwrap_err().to_string();
+        assert!(error.contains("over the 65536-byte limit"), "{error}");
+        assert!(error.contains("text_replacements"), "{error}");
+    }
+
+    #[test]
+    fn etag_and_rate_limit_contract_fields_are_parsed() {
+        assert_eq!(parse_etag_version("\"42\""), Some(42));
+        assert_eq!(parse_etag_version("W/\"7\""), Some(7));
+        assert_eq!(
+            retry_after_seconds(&serde_json::json!({"retry_after_seconds": 9})),
+            Some(9)
+        );
     }
 
     #[test]

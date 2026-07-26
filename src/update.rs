@@ -4,7 +4,7 @@
 //! JSON (reached via LunarWerx's Studio proxy — see [`RELEASES_API`]),
 //! lenient `vX.Y.Z` tag parsing with a plain tuple compare, a daily-throttled
 //! on-disk cache so we hit the network at most once per day, and a
-//! trusted GitHub URL + MZ-header + size + SHA-256 verified download. The install step differs
+//! trusted GitHub URL + MZ-header + size + SHA-256 + version-self-check verified download. The install step differs
 //! because QuickDictate is a **portable single exe** (no Inno Setup): instead
 //! of launching a `/SILENT` installer we swap the exe in place —
 //! `quickdictate.exe` → `quickdictate.exe.old`, new file in, relaunch with
@@ -291,34 +291,20 @@ fn trusted_asset_url(raw: &str) -> bool {
             .starts_with("/LunarWerxs/QuickDictate/releases/download/")
 }
 
-/// Pick the release's exe asset. Prefers a name containing "quickdictate";
-/// falls back to the first `.exe` asset. Reuses the JSON from the check that
-/// prompted this install (one ping per check, as SECURITY.md promises);
-/// fetches fresh only if no check preceded it.
-fn latest_exe_asset() -> Option<(String, Asset)> {
-    let cached = LAST_LATEST_JSON.lock().ok().and_then(|mut g| g.take());
-    let json = match cached {
-        Some(json) => json,
-        None => fetch_latest_json()?,
-    };
+/// Resolve only the stable, human-facing `quickdictate.exe` asset. Exact naming keeps the
+/// updater independent of GitHub upload order and prevents a future helper/debug executable
+/// from being mistaken for the portable application.
+fn exe_asset_from_json(json: &serde_json::Value) -> Option<(String, Asset)> {
     let tag = json
         .get("tag_name")?
         .as_str()?
         .trim_start_matches(['v', 'V'])
         .to_string();
-    let assets = json.get("assets")?.as_array()?;
-    let pick = |pred: &dyn Fn(&str) -> bool| -> Option<&serde_json::Value> {
-        assets.iter().find(|a| {
-            a.get("name")
-                .and_then(|n| n.as_str())
-                .map(|n| {
-                    let n = n.to_ascii_lowercase();
-                    n.ends_with(".exe") && pred(&n)
-                })
-                .unwrap_or(false)
-        })
-    };
-    let asset = pick(&|n| n.contains("quickdictate")).or_else(|| pick(&|_| true))?;
+    let asset = json.get("assets")?.as_array()?.iter().find(|a| {
+        a.get("name")
+            .and_then(|n| n.as_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case("quickdictate.exe"))
+    })?;
     let sha256 = asset
         .get("digest")
         .and_then(|d| d.as_str())
@@ -338,6 +324,17 @@ fn latest_exe_asset() -> Option<(String, Asset)> {
             sha256,
         },
     ))
+}
+
+/// Reuse the JSON from the check that prompted this install (one ping per check, as
+/// SECURITY.md promises); fetch fresh only if no check preceded it.
+fn latest_exe_asset() -> Option<(String, Asset)> {
+    let cached = LAST_LATEST_JSON.lock().ok().and_then(|mut g| g.take());
+    let json = match cached {
+        Some(json) => json,
+        None => fetch_latest_json()?,
+    };
+    exe_asset_from_json(&json)
 }
 
 /// SHA-256 via Windows CNG (`BCryptHash` one-shot with the SHA-256
@@ -372,6 +369,19 @@ fn verify_exe_bytes(bytes: &[u8], asset: &Asset) -> bool {
         return false;
     }
     true
+}
+
+/// Prove the downloaded PE is actually the release it claims to be before replacing the
+/// running application. `--version` exits before any settings/audio/UI side effects.
+fn verify_exe_version(path: &Path, expected: &str) -> bool {
+    std::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).trim()
+                    == expected.trim_start_matches(['v', 'V'])
+        })
 }
 
 /// Download the new exe, verify it, and swap it into place. Returns the path to
@@ -425,6 +435,10 @@ fn download_and_swap(tag: &str) -> Result<PathBuf, String> {
     if !verify_exe_bytes(&reread, &asset) {
         let _ = std::fs::remove_file(&new);
         return Err("on-disk verification failed".into());
+    }
+    if !verify_exe_version(&new, &asset_tag) {
+        let _ = std::fs::remove_file(&new);
+        return Err("downloaded executable failed its version self-check".into());
     }
 
     // The swap: a running exe can be renamed on Windows, just not deleted.
@@ -726,6 +740,33 @@ mod tests {
             sha256: "00".repeat(32),
         };
         assert!(!verify_exe_bytes(b"MZ\x90\x00", &bad_hash));
+    }
+
+    #[test]
+    fn updater_selects_only_the_exact_portable_executable() {
+        let digest = format!("sha256:{}", "ab".repeat(32));
+        let json = serde_json::json!({
+            "tag_name": "v0.5.2",
+            "assets": [
+                {
+                    "name": "quickdictate-debug.exe",
+                    "browser_download_url": "https://github.com/LunarWerxs/QuickDictate/releases/download/v0.5.2/quickdictate-debug.exe",
+                    "size": 99,
+                    "digest": digest
+                },
+                {
+                    "name": "quickdictate.exe",
+                    "browser_download_url": "https://github.com/LunarWerxs/QuickDictate/releases/download/v0.5.2/quickdictate.exe",
+                    "size": 42,
+                    "digest": format!("sha256:{}", "cd".repeat(32))
+                }
+            ]
+        });
+        let (tag, asset) = exe_asset_from_json(&json).expect("exact release executable");
+        assert_eq!(tag, "0.5.2");
+        assert_eq!(asset.size, 42);
+        assert!(asset.url.ends_with("/quickdictate.exe"));
+        assert_eq!(asset.sha256, "cd".repeat(32));
     }
 
     #[test]

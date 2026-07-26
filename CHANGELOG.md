@@ -4,7 +4,20 @@ All notable changes to QuickDictate will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.5.2] - 2026-07-25
+
+### Changed
+
+- **Connections sync is safer across devices and accounts.** Nested preferences merge without
+  replacing unrelated remote changes, cache validators stay tied to the active account, pending
+  settings flush during shutdown, and server throttling follows its requested retry delay.
+- **The release is a normal icon-bearing Windows GUI executable.** It starts without an
+  accompanying console; the ZIP remains available as the updater-friendly transport.
+
+### Fixed
+
+- Settings larger than the 64 KiB Locker limit are rejected using their actual UTF-8 byte size
+  instead of character count, so non-ASCII settings cannot slip past the client-side guard.
 
 ## [0.5.1] - 2026-07-24
 

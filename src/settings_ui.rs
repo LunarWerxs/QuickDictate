@@ -30,6 +30,7 @@ use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke};
 
 use crate::config::Config;
 use crate::state::App;
+use crate::stats::StatsRange;
 use crate::theme;
 
 /// Whether the settings window is currently *visible*.
@@ -783,6 +784,173 @@ fn stat_tile(ui: &mut egui::Ui, label: &str, value: String, detail: &str) {
         });
 }
 
+fn stats_range_selector(ui: &mut egui::Ui, selected: &mut StatsRange) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 5.0;
+        for (range, label) in [
+            (StatsRange::Last24Hours, "Last 24 hours"),
+            (StatsRange::Last7Days, "Last 7 days"),
+            (StatsRange::AllTime, "All time"),
+        ] {
+            let active = *selected == range;
+            let button =
+                egui::Button::new(RichText::new(label).font(semibold(11.5)).color(if active {
+                    Color32::WHITE
+                } else {
+                    muted()
+                }))
+                .fill(if active { accent() } else { input_bg() })
+                .stroke(Stroke::new(1.0, if active { accent() } else { border() }))
+                .corner_radius(CornerRadius::same(7));
+            if ui.add_sized([104.0, 28.0], button).clicked() {
+                *selected = range;
+            }
+        }
+    });
+}
+
+fn stats_chart(ui: &mut egui::Ui, points: &[u64], caption: &str) {
+    egui::Frame::new()
+        .fill(input_bg())
+        .stroke(Stroke::new(1.0, border()))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(11, 9))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("ACTIVITY")
+                        .font(semibold(10.5))
+                        .color(muted()),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(caption).size(10.5).color(muted()));
+                });
+            });
+            ui.add_space(4.0);
+            let chart_width = ui.available_width();
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(chart_width, 54.0), egui::Sense::hover());
+            let painter = ui.painter();
+            let max = points.iter().copied().max().unwrap_or(0);
+            let count = points.len().max(1) as f32;
+            let gap = if points.len() > 24 { 2.0 } else { 3.0 };
+            let bar_width = ((rect.width() - gap * (count - 1.0)) / count).max(1.0);
+            let baseline = rect.bottom();
+            painter.line_segment(
+                [
+                    egui::pos2(rect.left(), baseline),
+                    egui::pos2(rect.right(), baseline),
+                ],
+                Stroke::new(1.0, border()),
+            );
+            for (index, value) in points.iter().enumerate() {
+                let fraction = if max == 0 {
+                    0.0
+                } else {
+                    *value as f32 / max as f32
+                };
+                let height = if *value == 0 {
+                    2.0
+                } else {
+                    (fraction * (rect.height() - 4.0)).max(5.0)
+                };
+                let left = rect.left() + index as f32 * (bar_width + gap);
+                let bar = egui::Rect::from_min_max(
+                    egui::pos2(left, baseline - height),
+                    egui::pos2((left + bar_width).min(rect.right()), baseline),
+                );
+                painter.rect_filled(
+                    bar,
+                    CornerRadius::same(2),
+                    if *value == 0 {
+                        border().gamma_multiply(0.65)
+                    } else {
+                        accent().gamma_multiply(0.88)
+                    },
+                );
+            }
+        });
+}
+
+fn stats_provider_chart(
+    ui: &mut egui::Ui,
+    providers: &std::collections::BTreeMap<String, crate::stats::ProviderStats>,
+    total_dictations: u64,
+) {
+    let mut bars = providers
+        .iter()
+        .map(|(id, totals)| (provider_label(id).to_string(), totals.dictations))
+        .collect::<Vec<_>>();
+    bars.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    bars.truncate(6);
+    if bars.is_empty() && total_dictations > 0 {
+        bars.push(("All".into(), total_dictations));
+    }
+
+    egui::Frame::new()
+        .fill(input_bg())
+        .stroke(Stroke::new(1.0, border()))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(11, 9))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("MIX").font(semibold(10.5)).color(muted()));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new("All-time dictations by provider")
+                            .size(10.5)
+                            .color(muted()),
+                    );
+                });
+            });
+            ui.add_space(4.0);
+            let (rect, _) = ui
+                .allocate_exact_size(egui::vec2(ui.available_width(), 62.0), egui::Sense::hover());
+            let painter = ui.painter();
+            let baseline = rect.bottom() - 15.0;
+            painter.line_segment(
+                [
+                    egui::pos2(rect.left(), baseline),
+                    egui::pos2(rect.right(), baseline),
+                ],
+                Stroke::new(1.0, border()),
+            );
+            let max = bars.iter().map(|(_, value)| *value).max().unwrap_or(0);
+            let slot_width = rect.width() / bars.len().max(1) as f32;
+            let bar_width = (slot_width * 0.38).clamp(18.0, 42.0);
+            for (index, (label, value)) in bars.iter().enumerate() {
+                let center = rect.left() + slot_width * (index as f32 + 0.5);
+                let fraction = if max == 0 {
+                    0.0
+                } else {
+                    *value as f32 / max as f32
+                };
+                let height = (fraction * 38.0).max(4.0);
+                let bar = egui::Rect::from_min_max(
+                    egui::pos2(center - bar_width / 2.0, baseline - height),
+                    egui::pos2(center + bar_width / 2.0, baseline),
+                );
+                painter.rect_filled(bar, CornerRadius::same(3), accent().gamma_multiply(0.88));
+                painter.text(
+                    egui::pos2(center, bar.top() - 2.0),
+                    egui::Align2::CENTER_BOTTOM,
+                    grouped_number(*value),
+                    semibold(9.0),
+                    text(),
+                );
+                painter.text(
+                    egui::pos2(center, baseline + 3.0),
+                    egui::Align2::CENTER_TOP,
+                    label,
+                    semibold(8.5),
+                    muted(),
+                );
+            }
+        });
+}
+
 /// A section header: a small accent-blue icon glyph followed by the title.
 /// `icon` is a Segoe icon-font codepoint (see `apply_fonts`); it's skipped
 /// silently on machines where the icon font failed to load.
@@ -976,8 +1144,6 @@ enum SyncPhase {
 enum SyncEvent {
     /// Sign-in or silent resume finished.
     Connected(Result<crate::sync::Connected, String>),
-    /// A Save-triggered push finished.
-    Pushed(Result<u64, String>),
     /// Disconnect finished (remote doc deleted + local creds dropped).
     Disconnected,
 }
@@ -1014,6 +1180,8 @@ struct SettingsApp {
     status: String,
     /// Connections settings-sync control state.
     sync: SyncUi,
+    stats_range: StatsRange,
+    stats_reset_confirm: bool,
     // -- headless screenshot hook (QUICKDICTATE_UI_SHOT) --
     shot_path: Option<String>,
     frames: u32,
@@ -1058,6 +1226,8 @@ impl SettingsApp {
             testing_left: 0,
             status: String::new(),
             sync,
+            stats_range: StatsRange::AllTime,
+            stats_reset_confirm: false,
             shot_path: std::env::var("QUICKDICTATE_UI_SHOT").ok(),
             frames: 0,
             shot_requested: false,
@@ -1078,6 +1248,8 @@ impl SettingsApp {
         self.test_rx = None;
         self.testing_left = 0;
         self.status.clear();
+        self.stats_range = StatsRange::AllTime;
+        self.stats_reset_confirm = false;
 
         // Re-seed the sync control from creds on disk and re-arm the one-shot
         // silent resume-pull so a re-open also refreshes from the cloud.
@@ -1154,17 +1326,24 @@ impl SettingsApp {
                     }
                     self.sync.is_error = false;
                     if let Some(remote) = &c.remote {
-                        if crate::sync::apply_synced_to_config(&mut self.draft, remote) {
+                        let config_changed =
+                            crate::sync::apply_synced_to_config(&mut self.draft, remote);
+                        let stats_changed = crate::sync::synced_stats(remote)
+                            .is_some_and(|stats| self.app.stats.apply_synced(stats));
+                        if config_changed {
                             // Persist + hot-store so the pulled prefs take effect.
                             let path = Config::settings_path();
                             let _ = self.draft.save(&path);
                             self.app.config.store(Arc::new(self.draft.clone()));
+                        }
+                        if config_changed || stats_changed {
                             self.sync.note = "Updated from your Connections account.".into();
                         } else {
                             self.sync.note = "Synced \u{2014} already up to date.".into();
                         }
                     } else if c.seeded {
-                        self.sync.note = "Synced \u{2014} your settings are now backed up.".into();
+                        self.sync.note =
+                            "Synced \u{2014} your settings and stats are now backed up.".into();
                     } else {
                         self.sync.note = "Synced.".into();
                     }
@@ -1179,14 +1358,6 @@ impl SettingsApp {
                     };
                     self.sync.is_error = true;
                     self.sync.note = format!("Sync problem: {e}");
-                }
-                SyncEvent::Pushed(Ok(_)) => {
-                    self.sync.is_error = false;
-                    self.sync.note = "Saved and synced to your Connections account.".into();
-                }
-                SyncEvent::Pushed(Err(e)) => {
-                    self.sync.is_error = true;
-                    self.sync.note = format!("Saved locally, but cloud sync failed: {e}");
                 }
                 SyncEvent::Disconnected => {
                     self.sync.phase = SyncPhase::SignedOut;
@@ -1205,7 +1376,7 @@ impl SettingsApp {
         if self.sync.rx.is_some() {
             return;
         }
-        let snapshot = crate::sync::config_to_synced(&self.draft);
+        let snapshot = crate::sync::snapshot_to_synced(&self.draft, &self.app.stats.snapshot());
         self.sync.phase = SyncPhase::SigningIn;
         self.sync.note.clear();
         self.sync.is_error = false;
@@ -1306,16 +1477,34 @@ impl SettingsApp {
             return false;
         }
         if self.sync.phase == SyncPhase::SignedIn {
-            if self.sync.rx.is_none() {
-                let snapshot = crate::sync::config_to_synced(&self.draft);
-                self.sync.note = "Saving to your Connections account\u{2026}".into();
-                self.sync.is_error = false;
-                self.spawn_sync(ctx, move || {
-                    SyncEvent::Pushed(crate::sync::push_now(snapshot).map_err(|e| e.to_string()))
-                });
-            } else {
-                self.sync.note = "Saved locally \u{2014} cloud sync busy, it'll catch up.".into();
+            let snapshot = crate::sync::snapshot_to_synced(&self.draft, &self.app.stats.snapshot());
+            self.sync.note = "Saving to your Connections account\u{2026}".into();
+            self.sync.is_error = false;
+            let (tx, rx) = mpsc::channel();
+            let spawned = std::thread::Builder::new()
+                .name("qd-sync-save".into())
+                .spawn(move || {
+                    let _ = tx.send(crate::sync::push_now(snapshot));
+                })
+                .is_ok();
+            let result = spawned.then(|| rx.recv_timeout(std::time::Duration::from_secs(6)));
+            match result {
+                Some(Ok(Ok(_))) => {
+                    self.sync.note = "Saved and synced to your Connections account.".into();
+                }
+                Some(Ok(Err(error))) => {
+                    self.sync.is_error = true;
+                    self.sync.note = format!("Saved locally, but cloud sync failed: {error}");
+                }
+                Some(Err(_)) => {
+                    self.sync.note = "Saved locally \u{2014} cloud sync is still finishing.".into();
+                }
+                None => {
+                    self.sync.is_error = true;
+                    self.sync.note = "Saved locally, but cloud sync could not start.".into();
+                }
             }
+            ctx.request_repaint();
         }
         true
     }
@@ -1364,7 +1553,7 @@ impl SettingsApp {
         // restart never races the network. Best-effort and time-bounded — a
         // dead link won't hold the restart hostage.
         if crate::sync::is_signed_in() {
-            let snapshot = crate::sync::config_to_synced(&self.draft);
+            let snapshot = crate::sync::snapshot_to_synced(&self.draft, &self.app.stats.snapshot());
             let (tx, rx) = mpsc::channel();
             std::thread::spawn(move || {
                 let _ = tx.send(crate::sync::push_now(snapshot));
@@ -1648,8 +1837,12 @@ impl eframe::App for SettingsApp {
         if !self.sync.resume_kicked {
             self.sync.resume_kicked = true;
             if crate::sync::is_signed_in() {
-                self.spawn_sync(&ctx, || {
-                    SyncEvent::Connected(crate::sync::resume_and_pull().map_err(|e| e.to_string()))
+                let snapshot =
+                    crate::sync::snapshot_to_synced(&self.draft, &self.app.stats.snapshot());
+                self.spawn_sync(&ctx, move || {
+                    SyncEvent::Connected(
+                        crate::sync::resume_and_pull(snapshot).map_err(|e| e.to_string()),
+                    )
                 });
             }
         }
@@ -2465,7 +2658,8 @@ impl SettingsApp {
                     if accent_button(ui, "Sync settings")
                         .on_hover_text(
                             "Sign in with a free Connections account to back up your preferences \
-                             \u{2014} hotkeys, providers, text replacements (never your API keys) \
+                             and numeric stats \u{2014} hotkeys, providers, text replacements \
+                             (never API keys or transcript text) \
                              \u{2014} and sync them to every device you dictate on.",
                         )
                         .clicked()
@@ -2569,47 +2763,87 @@ impl SettingsApp {
         };
         let mut action = ModalAction::None;
         let mut test_request: Option<Vec<String>> = None;
+        let mut stats_range = self.stats_range;
+        let mut stats_reset_confirm = self.stats_reset_confirm;
+        let mut reset_stats = false;
 
         match modal {
             Modal::Stats => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_secs())
+                    .unwrap_or(0);
                 let backdrop = Self::modal_frame(ctx, "Dictation stats", 500.0, |ui| {
-                    if stats_snapshot.total_dictations == 0 {
+                    stats_range_selector(ui, &mut stats_range);
+                    let stats_view = stats_snapshot.view(stats_range, now);
+                    let range_detail = match stats_range {
+                        StatsRange::Last24Hours => "Rolling 24-hour window",
+                        StatsRange::Last7Days => "Rolling 7-day window",
+                        StatsRange::AllTime => "Since stats tracking began",
+                    };
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(range_detail).size(11.0).color(muted()));
+                    ui.add_space(8.0);
+                    if stats_range == StatsRange::AllTime {
+                        stats_provider_chart(
+                            ui,
+                            &stats_view.totals.providers,
+                            stats_view.totals.dictations,
+                        );
+                    } else {
+                        stats_chart(ui, &stats_view.chart, &stats_view.chart_caption);
+                    }
+                    ui.add_space(10.0);
+
+                    if stats_view.totals.dictations == 0 {
                         ui.vertical_centered(|ui| {
-                            ui.add_space(10.0);
+                            ui.add_space(5.0);
                             ui.label(
-                                RichText::new("Your first dictation will start the scoreboard.")
-                                    .font(semibold(14.0))
-                                    .color(text()),
+                                RichText::new(if stats_snapshot.total_dictations == 0 {
+                                    "Your first dictation will start the scoreboard."
+                                } else {
+                                    "No dictations in this range yet."
+                                })
+                                .font(semibold(14.0))
+                                .color(text()),
                             );
                             ui.label(
-                                RichText::new(
-                                    "Words and processed audio time are tracked locally.",
-                                )
+                                RichText::new(if stats_snapshot.total_dictations == 0 {
+                                    "Words and processed audio time are tracked as numeric totals."
+                                } else {
+                                    "Recent-range history fills in as you dictate with this version."
+                                })
                                 .size(12.0)
                                 .color(muted()),
                             );
-                            ui.add_space(10.0);
+                            ui.add_space(5.0);
                         });
                     } else {
                         let average_words =
-                            stats_snapshot.total_words / stats_snapshot.total_dictations.max(1);
-                        let pace = stats_snapshot
-                            .total_words
+                            stats_view.totals.words / stats_view.totals.dictations.max(1);
+                        let pace = stats_view
+                            .totals
+                            .words
                             .saturating_mul(60_000)
-                            .checked_div(stats_snapshot.total_audio_ms)
+                            .checked_div(stats_view.totals.audio_ms)
                             .unwrap_or(0);
+                        let words_detail = match stats_range {
+                            StatsRange::Last24Hours => "In the last 24 hours",
+                            StatsRange::Last7Days => "In the last 7 days",
+                            StatsRange::AllTime => "All recognized words",
+                        };
 
                         ui.columns(2, |cols| {
                             stat_tile(
                                 &mut cols[0],
                                 "WORDS TRANSCRIBED",
-                                grouped_number(stats_snapshot.total_words),
-                                "Lifetime recognized words",
+                                grouped_number(stats_view.totals.words),
+                                words_detail,
                             );
                             stat_tile(
                                 &mut cols[1],
                                 "AUDIO PROCESSED",
-                                format_audio_time(stats_snapshot.total_audio_ms),
+                                format_audio_time(stats_view.totals.audio_ms),
                                 "Trailing silence excluded",
                             );
                         });
@@ -2618,7 +2852,7 @@ impl SettingsApp {
                             stat_tile(
                                 &mut cols[0],
                                 "DICTATIONS",
-                                grouped_number(stats_snapshot.total_dictations),
+                                grouped_number(stats_view.totals.dictations),
                                 &format!("{average_words} words on average"),
                             );
                             stat_tile(
@@ -2638,21 +2872,22 @@ impl SettingsApp {
                         ui.label(
                             RichText::new(format!(
                                 "Most words: {} \u{00b7} Longest audio: {}",
-                                grouped_number(stats_snapshot.longest_dictation_words),
-                                format_audio_time(stats_snapshot.longest_dictation_audio_ms)
+                                grouped_number(stats_view.totals.longest_dictation_words),
+                                format_audio_time(stats_view.totals.longest_dictation_audio_ms)
                             ))
                             .font(semibold(14.0))
                             .color(text()),
                         );
 
-                        if !stats_snapshot.providers.is_empty() {
+                        if !stats_view.totals.providers.is_empty() {
                             ui.add_space(13.0);
                             ui.label(
                                 RichText::new("BY PROVIDER")
                                     .font(semibold(11.5))
                                     .color(muted()),
                             );
-                            let mut providers = stats_snapshot.providers.iter().collect::<Vec<_>>();
+                            let mut providers =
+                                stats_view.totals.providers.iter().collect::<Vec<_>>();
                             providers.sort_by(|left, right| {
                                 right
                                     .1
@@ -2686,10 +2921,61 @@ impl SettingsApp {
                         }
                     }
 
+                    if stats_reset_confirm {
+                        ui.add_space(12.0);
+                        egui::Frame::new()
+                            .fill(bad().gamma_multiply(0.09))
+                            .stroke(Stroke::new(1.0, bad().gamma_multiply(0.45)))
+                            .corner_radius(CornerRadius::same(8))
+                            .inner_margin(Margin::symmetric(10, 8))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(
+                                            "Reset all stats? This also resets synced devices.",
+                                        )
+                                        .size(11.5)
+                                        .color(text()),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui
+                                                .button(
+                                                    RichText::new("Reset")
+                                                        .font(semibold(11.5))
+                                                        .color(bad()),
+                                                )
+                                                .clicked()
+                                            {
+                                                reset_stats = true;
+                                                stats_reset_confirm = false;
+                                            }
+                                            if ui.button("Cancel").clicked() {
+                                                stats_reset_confirm = false;
+                                            }
+                                        },
+                                    );
+                                });
+                            });
+                    }
+
                     ui.add_space(12.0);
                     ui.separator();
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
+                        if !stats_reset_confirm
+                            && ui
+                                .button(
+                                    RichText::new("Reset stats")
+                                        .font(semibold(11.5))
+                                        .color(bad()),
+                                )
+                                .clicked()
+                        {
+                            stats_reset_confirm = true;
+                        }
                         ui.label(
                             RichText::new(
                                 "Numeric totals only \u{2014} transcript text is never stored.",
@@ -3012,6 +3298,13 @@ impl SettingsApp {
             }
         }
 
+        self.stats_range = stats_range;
+        self.stats_reset_confirm = stats_reset_confirm;
+        if reset_stats {
+            self.app.stats.reset();
+            crate::sync::schedule_stats_push(Arc::clone(&self.app));
+        }
+
         if let Some(keys) = test_request {
             self.start_key_test(ctx, keys);
         }
@@ -3045,6 +3338,7 @@ impl SettingsApp {
             },
             ModalAction::Cancel => {
                 self.modal = None;
+                self.stats_reset_confirm = false;
             }
             ModalAction::None => {}
         }

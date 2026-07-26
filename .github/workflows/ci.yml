@@ -32,6 +32,15 @@ jobs:
       - name: Build release
         run: cargo build --release
 
+      - name: Validate release executable
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 |
+            ConvertFrom-Json).packages[0].version
+          ./scripts/check_release_binary.ps1 `
+            -ExePath target/release/quickdictate.exe `
+            -ExpectedVersion $version
+
       # Unit tests only. The live provider tests are #[ignore] — they need real
       # API keys + network and are run locally, never in CI.
       - name: Test

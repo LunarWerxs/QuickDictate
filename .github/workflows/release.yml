@@ -1,0 +1,91 @@
+name: Release
+
+# QuickDictate is a genuinely portable, single Windows executable. Its ~12 MB direct `.exe`
+# is both the obvious human download and the self-updater payload. A ZIP saves about 6 MB, but
+# keeping one canonical asset avoids an archive extractor in the running dictation app and
+# preserves updates from every already-published build. GitHub supplies the mandatory SHA-256
+# digest the updater verifies.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: validate · build · smoke · publish
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Validate tag, version, and changelog
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 |
+            ConvertFrom-Json).packages[0].version
+          $tagVersion = $env:GITHUB_REF_NAME.TrimStart('v')
+          if ($version -cne $tagVersion) {
+            throw "tag $env:GITHUB_REF_NAME does not match Cargo.toml version $version"
+          }
+          $lines = @(Get-Content -LiteralPath CHANGELOG.md)
+          $start = -1
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match "^## \[$([regex]::Escape($version))\](?:\s|$)") {
+              $start = $i
+              break
+            }
+          }
+          if ($start -lt 0) { throw "CHANGELOG.md has no section for $version" }
+          $end = $lines.Count
+          for ($i = $start + 1; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^## \[') { $end = $i; break }
+          }
+          $notes = @($lines | Select-Object -Skip ($start + 1) -First ($end - $start - 1))
+          if (-not (($notes -join "`n") -match '\S')) {
+            throw "CHANGELOG.md section for $version is empty"
+          }
+          $notes | Set-Content -LiteralPath RELEASE_NOTES.md -Encoding utf8
+
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked
+      - name: Build release executable
+        run: cargo build --release --locked
+
+      - name: Validate the exact public executable
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 |
+            ConvertFrom-Json).packages[0].version
+          ./scripts/check_release_binary.ps1 `
+            -ExePath target/release/quickdictate.exe `
+            -ExpectedVersion $version
+
+      - name: Stage release assets
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path out -Force | Out-Null
+          Copy-Item -LiteralPath target/release/quickdictate.exe `
+            -Destination out/quickdictate.exe
+          $hash = (Get-FileHash -LiteralPath out/quickdictate.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  quickdictate.exe" |
+            Set-Content -LiteralPath out/SHA256SUMS.txt -Encoding ascii
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: out/*
+          body_path: RELEASE_NOTES.md
+          fail_on_unmatched_files: true

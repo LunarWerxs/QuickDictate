@@ -175,8 +175,9 @@ pub struct App {
     /// pip can show how many words have been heard so far. Reset to 0 when
     /// a new session starts.
     pub word_count: AtomicU32,
-    /// Lifetime numeric-only transcription totals persisted separately from
-    /// settings so Settings/sync writes cannot clobber live counters.
+    /// Numeric-only transcription totals persisted separately from settings so
+    /// Settings saves cannot clobber live counters. Connections sync merges a
+    /// privacy-safe copy when the user has opted in.
     pub stats: Arc<StatsStore>,
     /// Global pre-warmed audio source. Sessions subscribe to get an
     /// already-running audio feed instead of opening WASAPI per session.
