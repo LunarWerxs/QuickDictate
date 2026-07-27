@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Weekly dependency audit (see the `audit` job below). Cron is UTC.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -11,6 +15,10 @@ env:
 jobs:
   check:
     name: fmt · clippy · build · test
+    # Push/PR/manual only. The weekly `schedule` trigger exists solely to
+    # drive the `audit` job below; it must not re-run the full build+test
+    # pipeline every week for no code change.
+    if: github.event_name != 'schedule'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
@@ -45,3 +53,27 @@ jobs:
       # API keys + network and are run locally, never in CI.
       - name: Test
         run: cargo test
+
+  audit:
+    name: cargo audit (dependency vulnerabilities)
+    # Weekly + on-demand only. A push/PR does not change published advisories,
+    # so running this on every commit would just burn minutes for no signal.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # cargo-audit has no first-party GitHub Action; the community
+      # actions-rs/audit-check action is archived/unmaintained, so install
+      # the tool directly instead of depending on a dead action.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Run cargo audit
+        run: cargo audit

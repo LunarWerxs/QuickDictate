@@ -70,6 +70,12 @@ const LOGS_DIR_NAME: &str = "logs";
 const MAIN_LOG_NAME: &str = "quickdictate.log";
 const OLD_LOG_NAME: &str = "quickdictate.log.old";
 const PANIC_LOG_NAME: &str = "quickdictate-panic.log";
+/// Numbered backup generations kept alongside the active log file
+/// (`quickdictate.log.1` .. `quickdictate.log.{MAX_LOG_GENERATIONS}`), oldest
+/// last. Combined with the per-generation `max_bytes` cap this bounds total
+/// on-disk log usage to roughly `(MAX_LOG_GENERATIONS + 1) * max_bytes`, even
+/// for a session that stays open for days at a verbose log level.
+const MAX_LOG_GENERATIONS: u32 = 4;
 /// Root-level diagnostic files written by older releases are kept separate
 /// from the active files. In particular, a future size rotation must never
 /// consume the only migrated copy of an old diagnostic.
@@ -313,14 +319,13 @@ fn install_panic_hook() {
 /// The stdout layer is always attached -- it's cheap and shows up in debug
 /// builds with a console attached; under `windows_subsystem = "windows"` it
 /// silently goes nowhere.
-/// Single-file writer with one rotated generation. Unlike a startup-only
-/// check, this keeps a long-running process bounded too. It is owned by
-/// tracing-appender's one background worker, so no extra synchronization is
-/// needed here.
+/// Single-active-file writer with `MAX_LOG_GENERATIONS` numbered backups.
+/// Unlike a startup-only check, the per-write cap below keeps a long-running
+/// process bounded too. It is owned by tracing-appender's one background
+/// worker, so no extra synchronization is needed here.
 struct SizeCappedLogWriter {
     file: Option<std::fs::File>,
-    path: PathBuf,
-    old_path: PathBuf,
+    dir: PathBuf,
     max_bytes: u64,
     bytes_written: u64,
 }
@@ -331,8 +336,7 @@ impl SizeCappedLogWriter {
     }
 
     fn open_with_max_bytes(dir: &Path, max_bytes: u64) -> io::Result<Self> {
-        let path = dir.join(MAIN_LOG_NAME);
-        let old_path = dir.join(OLD_LOG_NAME);
+        let path = Self::generation_path(dir, 0);
 
         // Preserve the previous startup behavior as well as rotating during
         // this run. Rotation is diagnostic-only and best-effort: if an old log
@@ -342,16 +346,14 @@ impl SizeCappedLogWriter {
                 .map(|meta| meta.len() > max_bytes)
                 .unwrap_or(false)
         {
-            let _ = std::fs::remove_file(&old_path);
-            let _ = std::fs::rename(&path, &old_path);
+            let _ = Self::rotate_generations(dir, max_bytes);
         }
 
         let file = Self::open_file(&path)?;
         let bytes_written = file.metadata().map(|meta| meta.len()).unwrap_or(0);
         Ok(Self {
             file: Some(file),
-            path,
-            old_path,
+            dir: dir.to_path_buf(),
             max_bytes,
             bytes_written,
         })
@@ -364,25 +366,84 @@ impl SizeCappedLogWriter {
             .open(path)
     }
 
+    /// Generation `0` is the active file (`quickdictate.log`); `1..=N` are
+    /// the numbered backups (`quickdictate.log.1`, ..., oldest last).
+    fn generation_path(dir: &Path, generation: u32) -> PathBuf {
+        if generation == 0 {
+            dir.join(MAIN_LOG_NAME)
+        } else {
+            dir.join(format!("{MAIN_LOG_NAME}.{generation}"))
+        }
+    }
+
+    /// Shifts every numbered backup up by one slot (dropping whatever sat in
+    /// the oldest slot), then moves the active file into slot 1. Returns an
+    /// error only if the critical active-to-slot-1 rename fails; shifting the
+    /// older numbered backups is best-effort so a single locked generation
+    /// (antivirus, an open Explorer handle) cannot stop rotation entirely.
+    fn rotate_generations(dir: &Path, max_bytes: u64) -> io::Result<()> {
+        let oldest = Self::generation_path(dir, MAX_LOG_GENERATIONS);
+        let _ = std::fs::remove_file(&oldest);
+
+        for generation in (1..MAX_LOG_GENERATIONS).rev() {
+            let from = Self::generation_path(dir, generation);
+            let to = Self::generation_path(dir, generation + 1);
+            let _ = std::fs::rename(&from, &to);
+        }
+
+        let active = Self::generation_path(dir, 0);
+        let first_backup = Self::generation_path(dir, 1);
+        let rotation_result = match std::fs::rename(&active, &first_backup) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        };
+
+        Self::enforce_total_bytes_bound(dir, max_bytes);
+        rotation_result
+    }
+
+    /// Safety net for the case where a single write larger than `max_bytes`
+    /// lands whole in one generation: the per-write check in `write` only
+    /// rotates *before* a write that would push the active file over the
+    /// cap (see its comment), so one oversized line is never split, and can
+    /// leave that generation over `max_bytes`. This prunes the oldest
+    /// numbered backups, if needed, until total disk usage is back under
+    /// `(MAX_LOG_GENERATIONS + 1) * max_bytes`, so the bound holds even
+    /// under that edge case.
+    fn enforce_total_bytes_bound(dir: &Path, max_bytes: u64) {
+        if max_bytes == 0 {
+            return;
+        }
+        let total_budget = max_bytes.saturating_mul(u64::from(MAX_LOG_GENERATIONS) + 1);
+        for generation in (1..=MAX_LOG_GENERATIONS).rev() {
+            let total: u64 = (0..=MAX_LOG_GENERATIONS)
+                .map(|g| {
+                    std::fs::metadata(Self::generation_path(dir, g))
+                        .map(|meta| meta.len())
+                        .unwrap_or(0)
+                })
+                .sum();
+            if total <= total_budget {
+                break;
+            }
+            let _ = std::fs::remove_file(Self::generation_path(dir, generation));
+        }
+    }
+
     fn rotate(&mut self) -> io::Result<()> {
         if let Some(mut file) = self.file.take() {
             let _ = file.flush();
         }
 
-        let rotation_result = (|| -> io::Result<()> {
-            match std::fs::remove_file(&self.old_path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
-            std::fs::rename(&self.path, &self.old_path)
-        })();
+        let rotation_result = Self::rotate_generations(&self.dir, self.max_bytes);
 
         // Always try to restore a usable writer. If rotation itself failed
         // (for example an antivirus briefly locked the file), disable further
         // attempts for this run so every subsequent log line does not repeat
         // filesystem work. The next launch gets another chance.
-        let file = Self::open_file(&self.path)?;
+        let path = Self::generation_path(&self.dir, 0);
+        let file = Self::open_file(&path)?;
         self.bytes_written = file.metadata().map(|meta| meta.len()).unwrap_or(0);
         self.file = Some(file);
         if rotation_result.is_err() {
@@ -967,15 +1028,8 @@ mod logging_tests {
     }
 
     #[test]
-    fn log_writer_rotates_during_a_long_run() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "quickdictate-log-test-{}-{unique}",
-            std::process::id()
-        ));
+    fn log_writer_rotates_into_generation_one() {
+        let dir = temp_log_test_dir("rotate-basic");
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut writer = SizeCappedLogWriter::open_with_max_bytes(&dir, 10).unwrap();
@@ -985,13 +1039,154 @@ mod logging_tests {
         drop(writer);
 
         assert_eq!(
-            std::fs::read(dir.join("quickdictate.log.old")).unwrap(),
+            std::fs::read(dir.join("quickdictate.log.1")).unwrap(),
             b"12345678"
         );
         assert_eq!(
             std::fs::read(dir.join("quickdictate.log")).unwrap(),
             b"abcd"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn log_writer_creates_successive_numbered_generations() {
+        let dir = temp_log_test_dir("rotate-succession");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Each write is exactly at the cap, so every write after the first
+        // forces exactly one rotation, walking a fresh letter down through
+        // the numbered backups one slot per write.
+        let mut writer = SizeCappedLogWriter::open_with_max_bytes(&dir, 8).unwrap();
+        for chunk in [
+            b"AAAAAAAA",
+            b"BBBBBBBB",
+            b"CCCCCCCC",
+            b"DDDDDDDD",
+            b"EEEEEEEE",
+        ] {
+            writer.write_all(chunk).unwrap();
+        }
+        writer.flush().unwrap();
+        drop(writer);
+
+        assert_eq!(
+            std::fs::read(dir.join("quickdictate.log")).unwrap(),
+            b"EEEEEEEE"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("quickdictate.log.1")).unwrap(),
+            b"DDDDDDDD"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("quickdictate.log.2")).unwrap(),
+            b"CCCCCCCC"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("quickdictate.log.3")).unwrap(),
+            b"BBBBBBBB"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("quickdictate.log.4")).unwrap(),
+            b"AAAAAAAA"
+        );
+        assert!(!dir.join("quickdictate.log.5").exists());
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn log_writer_prunes_oldest_generation_once_count_exceeds_max() {
+        let dir = temp_log_test_dir("rotate-prune");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // One more write than the previous test: MAX_LOG_GENERATIONS backup
+        // slots are already full, so this rotation must drop the oldest
+        // ("AAAAAAAA") entirely rather than growing a 5th numbered file.
+        let mut writer = SizeCappedLogWriter::open_with_max_bytes(&dir, 8).unwrap();
+        for chunk in [
+            b"AAAAAAAA",
+            b"BBBBBBBB",
+            b"CCCCCCCC",
+            b"DDDDDDDD",
+            b"EEEEEEEE",
+            b"FFFFFFFF",
+        ] {
+            writer.write_all(chunk).unwrap();
+        }
+        writer.flush().unwrap();
+        drop(writer);
+
+        assert_eq!(
+            std::fs::read(dir.join("quickdictate.log")).unwrap(),
+            b"FFFFFFFF"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("quickdictate.log.1")).unwrap(),
+            b"EEEEEEEE"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("quickdictate.log.2")).unwrap(),
+            b"DDDDDDDD"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("quickdictate.log.3")).unwrap(),
+            b"CCCCCCCC"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("quickdictate.log.4")).unwrap(),
+            b"BBBBBBBB"
+        );
+        assert!(
+            !dir.join("quickdictate.log.5").exists(),
+            "must not grow a generation beyond MAX_LOG_GENERATIONS"
+        );
+
+        // Never on disk anywhere: pruned, not just unreferenced.
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let content = std::fs::read(entry.unwrap().path()).unwrap();
+            assert_ne!(content, b"AAAAAAAA");
+        }
+
+        let total: u64 = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().metadata().unwrap().len())
+            .sum();
+        assert!(total <= 8 * (MAX_LOG_GENERATIONS as u64 + 1));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rotate_generations_keeps_total_bytes_bounded_after_an_oversized_write() {
+        let dir = temp_log_test_dir("rotate-bytes-bound");
+        std::fs::create_dir_all(&dir).unwrap();
+        let max_bytes: u64 = 8;
+
+        // Simulate a single tracing event larger than the cap (the per-write
+        // check in `write` cannot split or reject one oversized buffer; see
+        // its comment), landing whole in the active file, plus a history of
+        // normal-sized backups already at the cap.
+        std::fs::write(dir.join(MAIN_LOG_NAME), vec![b'X'; 20]).unwrap();
+        std::fs::write(dir.join("quickdictate.log.1"), b"AAAAAAAA").unwrap();
+        std::fs::write(dir.join("quickdictate.log.2"), b"BBBBBBBB").unwrap();
+        std::fs::write(dir.join("quickdictate.log.3"), b"CCCCCCCC").unwrap();
+
+        SizeCappedLogWriter::rotate_generations(&dir, max_bytes).unwrap();
+
+        // The oversized generation is kept (rotation never truncates a log
+        // line), but the safety net prunes enough of the oldest survivors
+        // that the total stays within (MAX_LOG_GENERATIONS + 1) * max_bytes.
+        assert_eq!(
+            std::fs::read(dir.join("quickdictate.log.1")).unwrap().len(),
+            20
+        );
+        let total: u64 = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().metadata().unwrap().len())
+            .sum();
+        assert!(total <= max_bytes * (MAX_LOG_GENERATIONS as u64 + 1));
+
         std::fs::remove_dir_all(dir).unwrap();
     }
 
