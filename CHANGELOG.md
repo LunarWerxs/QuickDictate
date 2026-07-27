@@ -4,6 +4,20 @@ All notable changes to QuickDictate will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.3] - 2026-07-27
+
+### Fixed
+
+- **Log files can no longer grow without a real bound.** Rotation kept a single backup, so a
+  long-running session at a verbose level could sit at roughly twice the configured cap forever.
+  It now keeps four numbered generations, drops the oldest, and enforces a total on-disk budget
+  even when one oversized write lands whole.
+
+### Changed
+
+- Dependency monitoring runs on its own weekly schedule in CI, and Dependabot watches both the
+  crate graph and the workflow actions.
+
 ## [0.5.2] - 2026-07-26
 
 ### Changed
