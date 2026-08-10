@@ -47,32 +47,33 @@ straight back into `InnerSize` resizes the window by the zoom factor every frame
 (it reported ~11000 in testing). Use `ViewportInfo::inner_rect` for the real
 window size, then convert units.
 
-## 2. The window auto-fits its height to its content
+## 2. There is a nav rail, and the window does NOT auto-size itself
 
-Find the "Auto-fit the window height to its content" block in `fn ui`. Each
-frame it:
+The window is a fixed-size box: a nav rail on the left (`nav.rs`), one category
+page in the middle, and the action bar along the bottom. Only the active page
+draws; the rest are not laid out at all. `with_inner_size([760, 600])` in the
+viewport builder is the real size, not an estimate, and nothing resizes the
+window afterwards.
 
-1. reads `content_h = body.inner.content_size.y` (the scroll body's natural
-   height) and `bottom_h = bottom_bar.response.rect.height()`,
-2. computes `desired_h = bottom_h + content_h + central_panel_margins + pad`,
-3. sends `ViewportCommand::InnerSize` only when `desired_h` differs from
-   `last_fit_h` by more than 1 point. winit applies the resize a frame late, so
-   resending an unchanged value fights itself.
+**Do not reintroduce an auto-fit.** Until v0.5.5 `fn ui` measured the body every
+frame and sent `ViewportCommand::InnerSize` to match. It had two problems, and
+the second is the reason this rule exists:
 
-Why it exists: at 0.9 zoom the body needs roughly 845 egui points of height, and
-any hard-coded window height smaller than that makes the body scroll. Auto-fit
-means the window can never scroll and is never taller than its content, in every
-state (for example the "add an API key" onboarding banner, which only shows when
-no provider key is set). `content_size` is the body's natural size and does not
-depend on the window height as long as the width is fixed, so it settles in a
-frame or two instead of oscillating.
+1. Stacking every card into one column made the window about 1160 points tall,
+   taller than a lot of laptop screens.
+2. It fought the user. Dragging the window edge changes the width, which
+   rewraps the content, which changes the measured height, which sent a new
+   `InnerSize`, which the OS applied a frame later, mid-drag. Resizing snapped
+   the window open and shut. Measured A/B: asked for 900x620, the old build
+   settled at 757x1184, then 860x1184, then 812x1184. The current build returns
+   exactly what it was asked for, every time.
 
-If you add a tall widget and the window will not stop growing, you have
-introduced a vertically-expanding element whose size tracks the available
-height. Find it and give it a fixed size.
+If a page outgrows the window, let the page scroll (its `ScrollArea` already
+does) or move settings into another category. Do not grow the window to fit.
 
-`with_inner_size([...])` in the viewport builder is only the *opening* estimate;
-the auto-fit trims it to the exact content height on the first frame.
+To check a page you are editing, screenshot it directly:
+`pwsh -File scripts\ui_shot.ps1 -Tab dictation`. `-Tab` takes a prefix of the
+rail label (provider, dictation, application, history, settings).
 
 ## 3. The Save split button (`SPLIT_BTN_H`)
 

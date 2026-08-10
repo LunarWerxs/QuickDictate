@@ -32,8 +32,8 @@
 //!
 //! ## Changing the window size or the Save button?
 //! Read `docs/SETTINGS_WINDOW.md` first. This window runs at 0.9 zoom (so three
-//! coordinate systems are in play), auto-fits its height to its content, and the
-//! Save split button has a border/height gotcha. That doc captures the traps so
+//! coordinate systems are in play) and the Save split button has a
+//! border/height gotcha. That doc captures the traps so
 //! an edit does not turn into a long debugging session.
 
 use std::collections::HashSet;
@@ -54,6 +54,7 @@ mod cards;
 mod history_sync;
 mod logic;
 mod modals;
+mod nav;
 mod style;
 mod widgets;
 
@@ -502,10 +503,16 @@ pub fn show_settings(app: Arc<App>) {
         .spawn(move || {
             let options = eframe::NativeOptions {
                 viewport: egui::ViewportBuilder::default()
-                    // Opening height is a close estimate; `ui`'s auto-fit trims
-                    // it to the exact content height on the first frame.
-                    .with_inner_size([600.0, 760.0])
-                    .with_min_inner_size([520.0, 480.0])
+                    // A fixed, comfortable size. This used to open tall and then
+                    // auto-fit to the full stacked-card height every frame,
+                    // which reached roughly 1160 points (taller than plenty of
+                    // laptop screens) and, worse, fought the user: dragging the
+                    // edge changed the content's wrap height, which re-sent
+                    // InnerSize, which snapped the window back, so a resize
+                    // oscillated. One page at a time fits in this box, and
+                    // anything taller scrolls inside the pane.
+                    .with_inner_size([760.0, 600.0])
+                    .with_min_inner_size([620.0, 420.0])
                     .with_icon(Arc::new(icon_data())),
                 // The tray thread owns the "main" loop; winit on Windows is
                 // fine running this window's loop on a worker thread.
@@ -672,8 +679,9 @@ struct SettingsApp {
     /// scroll and is never taller than needed; this cache gates the resize so we
     /// only issue a viewport command when the content height actually changes
     /// (winit applies `InnerSize` a frame late, so resending every frame would
-    /// oscillate). 0.0 forces the first measured frame to apply.
-    last_fit_h: f32,
+    /// Which page the nav rail is showing. Kept across a hide/reveal so
+    /// reopening Settings lands where you left off.
+    tab: nav::Tab,
 }
 
 impl eframe::App for SettingsApp {
@@ -754,7 +762,7 @@ impl eframe::App for SettingsApp {
         let mut do_about = false;
         let mut do_save = false;
         let mut do_save_restart = false;
-        let bottom_bar = egui::Panel::bottom("qd_actions")
+        egui::Panel::bottom("qd_actions")
             .frame(egui::Frame::new().fill(bg()).inner_margin(Margin {
                 left: 16,
                 right: 16,
@@ -856,7 +864,22 @@ impl eframe::App for SettingsApp {
             });
 
         // ---- Scrollable settings body ---------------------------------------
-        let body = egui::CentralPanel::default()
+        // ---- Nav rail --------------------------------------------------------
+        // Added above the CentralPanel so it occupies the area left of the
+        // content and above the bottom bar. Not resizable: it is a fixed rail,
+        // not a splitter, and a draggable edge here would be one more thing
+        // that can fight the user's window resize.
+        egui::Panel::left("nav_rail")
+            .exact_size(nav::NAV_W)
+            .resizable(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(surface())
+                    .inner_margin(Margin::symmetric(6, 0)),
+            )
+            .show(ui, |ui| self.nav_rail(ui));
+
+        egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(bg()).inner_margin(Margin {
                 left: 16,
                 right: 16,
@@ -864,83 +887,29 @@ impl eframe::App for SettingsApp {
                 bottom: 4,
             }))
             .show(ui, |ui| {
+                // Banners sit ABOVE the pane header and outside the scroll
+                // area: "you have no API key" and "an update is waiting" are
+                // true regardless of which page you are on, so they must not
+                // be something you can navigate away from.
+                self.onboarding_banner(ui);
+                self.update_available_banner(ui);
+                self.page_header(ui);
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        // The old logo / "QuickDictate Settings" / version
-                        // header was removed — the window title bar already
-                        // names the app and the version lives in About.
-                        self.onboarding_banner(ui);
-                        self.update_available_banner(ui);
-                        self.provider_card(ui, &ctx, testing);
-                        ui.add_space(10.0);
-                        self.dictation_card(ui);
-                        ui.add_space(10.0);
-                        // Per-app profiles now live inside the Application card
-                        // (toggle + read-only list), so there's no standalone
-                        // profiles section. Check-for-updates / log / settings.json
-                        // moved to the ⋯ overflow menu in the bottom bar.
-                        self.application_card(ui);
-                        ui.add_space(10.0);
-                        self.history_card(ui);
-                        ui.add_space(10.0);
-                        self.sync_card(ui, &ctx);
+                        // Exactly one page. Per-app profiles live inside the
+                        // Application card; check-for-updates / log /
+                        // settings.json are in the ⋯ overflow menu below.
+                        match self.tab {
+                            nav::Tab::Provider => self.provider_card(ui, &ctx, testing),
+                            nav::Tab::Dictation => self.dictation_card(ui),
+                            nav::Tab::Application => self.application_card(ui),
+                            nav::Tab::History => self.history_card(ui),
+                            nav::Tab::Sync => self.sync_card(ui, &ctx),
+                        }
                         ui.add_space(12.0);
-                    })
+                    });
             });
-
-        // ---- Auto-fit the window height to its content ----------------------
-        // Size the OS window to exactly hold the bottom bar + the settings body,
-        // so it can never scroll (window height >= content) and is never taller
-        // than needed (window height == content). The scroll area's content_size
-        // is the body's *natural* height; with the width held fixed it does not
-        // depend on the window height, so this settles in one frame rather than
-        // oscillating. `last_fit_h` gates the resize because winit applies
-        // InnerSize a frame late; resending an unchanged height would fight that.
-        //
-        // Units: content_h / bottom_h / the panel rects are all egui points
-        // (i.e. scaled by the app's 0.9 zoom), and ViewportCommand::InnerSize is
-        // interpreted in those same egui points — so every value here is in one
-        // consistent unit. (Do NOT pull the width from ViewportInfo.inner_rect:
-        // that is in *native* points, and feeding it back through InnerSize —
-        // which re-applies the zoom — shrinks the window by the zoom factor on
-        // every resize.)
-        let content_h = body.inner.content_size.y;
-        let bottom_h = bottom_bar.response.rect.height();
-        // 16 + 4 = the CentralPanel's top/bottom inner_margin; + 2 absorbs
-        // sub-pixel rounding so a stray pixel never re-triggers the scrollbar.
-        let desired_h = (bottom_h + content_h + 16.0 + 4.0).ceil() + 2.0;
-        // Never request a window taller than the monitor. monitor_size is in
-        // native points, so convert it into the egui points desired_h uses
-        // before comparing; leave a margin for the taskbar/title bar (egui
-        // exposes no work area). If content genuinely can't fit, the scroll area
-        // is the fallback.
-        let native_ppp = ctx
-            .input(|i| i.viewport().native_pixels_per_point)
-            .unwrap_or(1.0);
-        let egui_ppp = ctx.pixels_per_point().max(0.1);
-        let max_h = ctx
-            .input(|i| i.viewport().monitor_size)
-            .map_or(f32::INFINITY, |m| {
-                (m.y * native_ppp / egui_ppp - 80.0).max(480.0)
-            });
-        let desired_h = desired_h.clamp(480.0, max_h);
-        if (desired_h - self.last_fit_h).abs() > 1.0 {
-            self.last_fit_h = desired_h;
-            // Reproduce the current width so we only ever drive the height (and
-            // honour a user-widened window). inner_rect is in native points but
-            // InnerSize expects egui (zoom-scaled) points, so convert by
-            // native_ppp/egui_ppp — feeding the native value in raw would resize
-            // the window by the zoom factor on every frame.
-            let width = ctx
-                .input(|i| i.viewport().inner_rect.map(|r| r.width()))
-                .unwrap_or(600.0)
-                * native_ppp
-                / egui_ppp;
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                width, desired_h,
-            )));
-        }
 
         // Act on pinned-bar clicks with a clean &mut self.
         if do_about {

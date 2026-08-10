@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **The Settings window has a nav rail instead of one long scroll.** Provider
+  and keys, Dictation, Application, History, and Settings sync are now separate
+  pages, following SageThumbs 2K's layout. The window went from roughly 1160
+  points tall to a fixed 760x600.
+
+### Fixed
+
+- **Resizing the Settings window no longer fights back.** It measured its
+  content every frame and pushed its own size to the OS; dragging an edge
+  rewrapped the content, which changed the measured height, which snapped the
+  window to a new size mid-drag, so it appeared to jump open and shut and
+  change width on its own. It now keeps whatever size you give it.
+
 ## [0.5.4] - 2026-08-09
 
 ### Added

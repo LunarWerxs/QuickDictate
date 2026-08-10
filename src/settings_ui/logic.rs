@@ -47,7 +47,7 @@ impl super::SettingsApp {
             shot_path: std::env::var("QUICKDICTATE_UI_SHOT").ok(),
             frames: 0,
             shot_requested: false,
-            last_fit_h: 0.0,
+            tab: nav::Tab::Provider,
         };
         this.resync_vocabulary_scratch();
         this
@@ -592,6 +592,18 @@ impl super::SettingsApp {
         };
         self.frames += 1;
         let mode = std::env::var("QUICKDICTATE_UI_OPEN").unwrap_or_default();
+        // Which nav page to capture. Without this every shot would show the
+        // page the rail opens on, so a change to any other page could not be
+        // verified headlessly at all.
+        if let Ok(want) = std::env::var("QUICKDICTATE_UI_TAB") {
+            if let Some(tab) = nav::TABS.iter().find(|t| {
+                t.label()
+                    .to_ascii_lowercase()
+                    .starts_with(&want.to_ascii_lowercase())
+            }) {
+                self.tab = *tab;
+            }
+        }
         // Let fonts/layout settle, optionally auto-open a modal for the shot.
         if self.frames == 5 {
             match mode.as_str() {

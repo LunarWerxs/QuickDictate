@@ -16,6 +16,9 @@ param(
     [string] $Open = '',
     # Optional --provider override for the launched exe.
     [string] $Provider = '',
+    # Which nav page to capture (prefix match on the rail label).
+    [ValidateSet('', 'provider', 'dictation', 'application', 'history', 'settings')]
+    [string] $Tab = '',
     [switch] $UseDebugBuild,
     [int]    $DevPort = 7460
 )
@@ -25,7 +28,7 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 $exe = Join-Path $projectRoot ($(if ($UseDebugBuild) { 'target\debug\quickdictate.exe' } else { 'target\release\quickdictate.exe' }))
 if (-not (Test-Path $exe)) { throw "exe not found: $exe" }
 if ([string]::IsNullOrWhiteSpace($Shot)) {
-    $Shot = Join-Path $projectRoot ("ui-shot" + $(if ($Open) { "-$Open" } else { "" }) + ".png")
+    $Shot = Join-Path $projectRoot ("ui-shot" + $(if ($Tab) { "-$Tab" } else { "" }) + $(if ($Open) { "-$Open" } else { "" }) + ".png")
 }
 Remove-Item $Shot -Force -ErrorAction SilentlyContinue
 
@@ -35,6 +38,7 @@ Start-Sleep -Milliseconds 400
 $env:QUICKDICTATE_DEV_PORT = "$DevPort"
 $env:QUICKDICTATE_UI_SHOT = $Shot
 $env:QUICKDICTATE_UI_OPEN = $Open
+$env:QUICKDICTATE_UI_TAB = $Tab
 $procArgs = @{ FilePath = $exe; PassThru = $true; WorkingDirectory = $projectRoot }
 if ($Provider) { $procArgs.ArgumentList = @('--provider', $Provider) }
 $proc = Start-Process @procArgs

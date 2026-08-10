@@ -14,7 +14,6 @@ impl super::SettingsApp {
         let mut do_copy: Option<usize> = None;
         let mut do_replay: Option<usize> = None;
         card(ui, |ui| {
-            section_title(ui, "\u{E81C}", "History");
             ui.label(
                 RichText::new(
                     "Your recent dictations for this session (not saved to disk). Copy one back \
@@ -117,7 +116,6 @@ impl super::SettingsApp {
         let mut do_sign_in = false;
         let mut do_disconnect = false;
         card(ui, |ui| {
-            section_title(ui, "\u{E895}", "Settings sync");
             let working = self.sync.rx.is_some();
             match self.sync.phase {
                 SyncPhase::SignedOut => {

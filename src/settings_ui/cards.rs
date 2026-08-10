@@ -380,8 +380,6 @@ impl super::SettingsApp {
     }
     pub(crate) fn dictation_card(&mut self, ui: &mut egui::Ui) {
         card(ui, |ui| {
-            section_title(ui, "\u{E765}", "Dictation");
-
             // ---- Top: a 2×2 block of labeled inputs / dropdowns ----------
             // Two independent columns, each a [label | control] mini-grid, so
             // the left half's widths never couple to the right half's (a single
@@ -564,8 +562,8 @@ impl super::SettingsApp {
             );
             ui.label(
                 RichText::new(
-                    "Words and phrases sent to the provider to bias recognition toward them \
-                     \u{2014} names, jargon, product names it keeps mishearing. This is \
+                    "Words and phrases sent to the provider to bias recognition toward them: \
+                     names, jargon, product names it keeps mishearing. This is \
                      different from text replacements above, which repair the text *after* \
                      recognition. One term per line.",
                 )
@@ -584,7 +582,6 @@ impl super::SettingsApp {
     }
     pub(crate) fn application_card(&mut self, ui: &mut egui::Ui) {
         card(ui, |ui| {
-            section_title(ui, "\u{E713}", "Application");
             // Eight toggles split across two columns. The wordiest options are
             // trimmed to short labels with the detail moved into their hover
             // tooltips. "Enable per-app profiles" lives here too — it used to
