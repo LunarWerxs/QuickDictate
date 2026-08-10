@@ -17,7 +17,7 @@ param(
     # Optional --provider override for the launched exe.
     [string] $Provider = '',
     # Which nav page to capture (prefix match on the rail label).
-    [ValidateSet('', 'provider', 'dictation', 'application', 'history', 'settings')]
+    [ValidateSet('', 'application', 'dictation', 'history')]
     [string] $Tab = '',
     [switch] $UseDebugBuild,
     [int]    $DevPort = 7460

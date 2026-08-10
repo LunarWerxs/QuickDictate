@@ -116,6 +116,9 @@ impl super::SettingsApp {
         let mut do_sign_in = false;
         let mut do_disconnect = false;
         card(ui, |ui| {
+            // Titled again: sync shares the Application page with two other
+            // cards now, so it needs a heading to stand apart from them.
+            section_title(ui, "\u{E895}", "Settings sync");
             let working = self.sync.rx.is_some();
             match self.sync.phase {
                 SyncPhase::SignedOut => {

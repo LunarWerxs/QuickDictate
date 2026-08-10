@@ -8,10 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
-- **The Settings window has a nav rail instead of one long scroll.** Provider
-  and keys, Dictation, Application, History, and Settings sync are now separate
-  pages, following SageThumbs 2K's layout. The window went from roughly 1160
-  points tall to a fixed 760x600.
+- **The Settings window has a nav rail instead of one long scroll.** Three
+  pages, following SageThumbs 2K's layout: **Application** (provider and keys,
+  app behavior, settings sync), **Dictation**, and **History**. The window went
+  from roughly 1160 points tall to a fixed 760x600.
+- **"Log full dictated text" is greyed out unless logging is on**, instead of
+  looking like an active privacy choice with nothing to write into.
 
 ### Fixed
 

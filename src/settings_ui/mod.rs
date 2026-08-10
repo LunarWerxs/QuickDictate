@@ -897,15 +897,23 @@ impl eframe::App for SettingsApp {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        // Exactly one page. Per-app profiles live inside the
-                        // Application card; check-for-updates / log /
-                        // settings.json are in the ⋯ overflow menu below.
+                        // Exactly one page. Application carries the app-level
+                        // toggles plus the two things that are set once and
+                        // rarely revisited (which provider/keys to use, and
+                        // whether settings sync is on), so the rail stays
+                        // short. Per-app profiles live inside the Application
+                        // card; check-for-updates / log / settings.json are in
+                        // the ⋯ overflow menu below.
                         match self.tab {
-                            nav::Tab::Provider => self.provider_card(ui, &ctx, testing),
+                            nav::Tab::Application => {
+                                self.application_card(ui);
+                                ui.add_space(10.0);
+                                self.provider_card(ui, &ctx, testing);
+                                ui.add_space(10.0);
+                                self.sync_card(ui, &ctx);
+                            }
                             nav::Tab::Dictation => self.dictation_card(ui),
-                            nav::Tab::Application => self.application_card(ui),
                             nav::Tab::History => self.history_card(ui),
-                            nav::Tab::Sync => self.sync_card(ui, &ctx),
                         }
                         ui.add_space(12.0);
                     });

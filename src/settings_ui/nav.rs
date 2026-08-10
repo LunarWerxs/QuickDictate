@@ -21,29 +21,19 @@ pub(crate) const NAV_ITEM_H: f32 = 34.0;
 /// dictation behaves, then the app-level and optional extras.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub(crate) enum Tab {
-    Provider,
-    Dictation,
     Application,
+    Dictation,
     History,
-    Sync,
 }
 
-pub(crate) const TABS: [Tab; 5] = [
-    Tab::Provider,
-    Tab::Dictation,
-    Tab::Application,
-    Tab::History,
-    Tab::Sync,
-];
+pub(crate) const TABS: [Tab; 3] = [Tab::Application, Tab::Dictation, Tab::History];
 
 impl Tab {
     pub(crate) fn label(self) -> &'static str {
         match self {
-            Tab::Provider => "Provider & keys",
-            Tab::Dictation => "Dictation",
             Tab::Application => "Application",
+            Tab::Dictation => "Dictation",
             Tab::History => "History",
-            Tab::Sync => "Settings sync",
         }
     }
 
@@ -51,11 +41,9 @@ impl Tab {
     /// category is never just a bare noun.
     pub(crate) fn blurb(self) -> &'static str {
         match self {
-            Tab::Provider => "Choose a speech service and manage your API keys.",
+            Tab::Application => "Provider and keys, app behavior, and settings sync.",
             Tab::Dictation => "Hotkeys, timing, and how recognized text is typed.",
-            Tab::Application => "Startup, sound, logging, and per-app profiles.",
             Tab::History => "Browse, copy, and re-paste recent transcriptions.",
-            Tab::Sync => "Optionally carry your preferences between machines.",
         }
     }
 
@@ -64,11 +52,9 @@ impl Tab {
     /// rail falls back to text alone.
     fn glyph(self) -> &'static str {
         match self {
-            Tab::Provider => "\u{E8D7}",    // key
-            Tab::Dictation => "\u{E720}",   // microphone
             Tab::Application => "\u{E713}", // settings gear
+            Tab::Dictation => "\u{E720}",   // microphone
             Tab::History => "\u{E81C}",     // history
-            Tab::Sync => "\u{E895}",        // sync
         }
     }
 }
@@ -176,7 +162,12 @@ mod tests {
         for tab in TABS {
             assert_eq!(TABS.iter().filter(|t| **t == tab).count(), 1);
         }
-        assert_eq!(TABS.len(), 5);
+        assert_eq!(TABS.len(), 3);
+    }
+
+    #[test]
+    fn application_is_the_landing_page() {
+        assert_eq!(TABS[0], Tab::Application);
     }
 
     #[test]

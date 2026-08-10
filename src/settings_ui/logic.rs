@@ -47,7 +47,7 @@ impl super::SettingsApp {
             shot_path: std::env::var("QUICKDICTATE_UI_SHOT").ok(),
             frames: 0,
             shot_requested: false,
-            tab: nav::Tab::Provider,
+            tab: nav::Tab::Application,
         };
         this.resync_vocabulary_scratch();
         this

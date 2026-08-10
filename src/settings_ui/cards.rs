@@ -632,15 +632,25 @@ impl super::SettingsApp {
                     "Write quickdictate.log",
                 )
                 .on_hover_text("Write troubleshooting diagnostics in the app's logs folder.");
-                blue_check(
-                    right,
-                    &mut self.draft.log_transcripts,
-                    "Log full dictated text",
-                )
-                .on_hover_text(
-                    "Deep debugging only \u{2014} records the actual text you dictate into \
-                         the log file. Leave off for privacy.",
-                );
+                // Dependent on the log file existing at all: without
+                // `enable_logging` there is nothing for this to write into, so
+                // gray it out rather than letting it read as an active privacy
+                // choice that does nothing.
+                let logging_on = self.draft.enable_logging;
+                right.add_enabled_ui(logging_on, |right| {
+                    blue_check(
+                        right,
+                        &mut self.draft.log_transcripts,
+                        "Log full dictated text",
+                    )
+                    .on_hover_text(if logging_on {
+                        "Deep debugging only: records the actual text you dictate into \
+                         the log file. Leave off for privacy."
+                    } else {
+                        "Turn on \u{201c}Write quickdictate.log\u{201d} first: there is no \
+                         log file for this to write into."
+                    });
+                });
                 blue_check(
                     right,
                     &mut self.draft.voice_commands,
