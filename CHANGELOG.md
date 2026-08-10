@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **No more red "!" after a dictation you never spoke into.** Start a
+  dictation, say nothing, stop it, and ElevenLabs closes the socket without a
+  closing handshake. That reset was being reported as a failed dictation even
+  though there was no transcript to lose, so an empty press occasionally
+  flashed the error pip for nothing. The pip is now raised only when speech
+  really was lost: the transcript already landed (no error), the provider
+  returned no words at all (an empty press, so also no error), or the socket
+  died mid-press and cut us off (still an error). Session logs now also record
+  how many chunks were above the silence floor, next to the chunk totals.
+
 ## [0.5.5] - 2026-08-09
 
 ### Changed

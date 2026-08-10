@@ -470,6 +470,12 @@ async fn ship_all(sink: &mut Box<dyn ProviderSink>, chunks: &[Vec<i16>], dead: &
 struct SentAudio {
     chunks: usize,
     samples: u64,
+    /// The send half watched the socket die (a failed `ship` or keepalive)
+    /// before it was done. Chunk counts alone cannot tell "the user said
+    /// nothing" apart from "we were cut off before they got a word in", and
+    /// only the second one is worth an error pip. See
+    /// [`transport_failure_lost_speech`].
+    socket_died: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -917,6 +923,10 @@ async fn run_session(
             let _ = sink.commit().await;
             let _ = sink.close().await;
         }
+        // Carry the socket's fate back with the byte counts: the end-of-session
+        // gate needs it to tell an empty press from one that was cut off.
+        sent.socket_died = ws_dead;
+        *sent_progress_send.lock() = sent;
         sent
     });
 
@@ -1236,9 +1246,15 @@ async fn run_session(
         }
     };
     let audio_ms = audio_duration_ms(sent.samples, fmt.sample_rate);
+    // `speech` is the end-of-session gate's evidence that the user actually
+    // said something (see `transport_failure_lost_speech`), so log it here
+    // rather than only at the gate: a press that pips reveals in one line
+    // whether the mic really heard speech or just crossed the floor on noise.
+    let speech_chunks = speech_shipped.load(Ordering::Acquire);
     tracing::info!(
-        "session[{epoch}] audio chunks sent = {} ({} samples @ {} Hz, ~{} ms of audio)",
+        "session[{epoch}] audio chunks sent = {} ({} speech-bearing, {} samples @ {} Hz, ~{} ms of audio)",
         sent.chunks,
+        speech_chunks,
         sent.samples,
         fmt.sample_rate,
         audio_ms
@@ -1353,20 +1369,28 @@ async fn run_session(
         return Err(anyhow!(EXHAUSTED_SIGNAL));
     }
     if let Some(message) = provider_failure.lock().take() {
-        // A transport that died AFTER the words already landed is a teardown,
-        // not a failure. ElevenLabs in particular often drops the TCP
-        // connection without a closing handshake once it has sent the final
-        // transcript, so `recv_event` reports "Connection reset without closing
-        // handshake" on a session that fully succeeded. Raising the error pip
-        // for that is a lie: the user watched their sentence get typed.
-        //
-        // The point of recording a mid-session transport error is the case
-        // where speech was LOST, so gate on exactly that: nothing delivered.
-        if words > 0 {
-            tracing::info!(
-                "session[{epoch}] transport dropped during teardown after delivering \
-                 {words} word(s); not surfacing an error ({message})"
-            );
+        // A transport that died without costing the user anything is a
+        // teardown, not a failure. ElevenLabs in particular often drops the TCP
+        // connection without a closing handshake, so `recv_event` reports
+        // "Connection reset without closing handshake" on sessions that lost
+        // nothing at all. Raising the error pip for those is a lie. The point
+        // of recording a mid-session transport error is the case where speech
+        // was LOST, so gate on exactly that (see
+        // `transport_failure_lost_speech`).
+        if !transport_failure_lost_speech(words, sent.socket_died) {
+            if words > 0 {
+                tracing::info!(
+                    "session[{epoch}] transport dropped during teardown after delivering \
+                     {words} word(s); not surfacing an error ({message})"
+                );
+            } else {
+                tracing::info!(
+                    "session[{epoch}] transport dropped on an empty dictation -- the provider \
+                     returned no words at all ({speech_chunks} chunk(s) were above our silence \
+                     floor), so there is no transcript to lose; not surfacing an error \
+                     ({message})"
+                );
+            }
             return Ok(());
         }
         return Err(anyhow!(message));
@@ -1394,6 +1418,35 @@ async fn run_session(
 #[inline]
 fn is_phantom_finalization(released: bool, speech_now: u64, speech_at_last_commit: u64) -> bool {
     released && speech_now == speech_at_last_commit
+}
+
+/// Did a mid-session transport failure actually cost the user any speech?
+/// Only when it did is the red "!" pip honest. Three cases:
+///
+/// * `words > 0` -- the transcript already landed and the user watched it get
+///   typed. The reset is ElevenLabs hanging up after a job well done.
+/// * `words == 0` and the send half never saw the socket die -- the press
+///   produced nothing this app judged worth typing. Either the provider never
+///   emitted a single word, or everything it emitted was discarded as a
+///   phantom finalization. Both are EMPTY presses: start a dictation, say
+///   nothing, stop. There is no transcript to lose, so the reset costs the
+///   user nothing and a red "!" is complaining about a press they already
+///   know was empty.
+/// * `words == 0` and the socket died under the send half -- we were cut off
+///   mid-press, so anything said from that moment on never even reached the
+///   provider. That is a real failure and keeps the pip.
+///
+/// Note what is deliberately NOT consulted: our own count of speech-bearing
+/// (RMS >= [`SILENCE_RMS`]) chunks. Measured over ten consecutive silent
+/// presses, three of them shipped 3-17 "speech-bearing" chunks of room noise
+/// and ElevenLabs returned not one partial for any of them -- so a bare RMS
+/// floor is a far worse judge of "did a human say something" than the
+/// provider's own verdict, and gating the pip on it just moved the false
+/// alarms around. The count is still logged next to the chunk totals, because
+/// it is exactly what you want when diagnosing a press after the fact.
+#[inline]
+fn transport_failure_lost_speech(words: u64, socket_died: bool) -> bool {
+    words == 0 && socket_died
 }
 
 fn transcripts_equivalent(left: &str, right: &str) -> bool {
@@ -1446,7 +1499,8 @@ fn rms_i16(samples: &[i16]) -> i32 {
 mod tests {
     use super::{
         audio_duration_ms, is_phantom_finalization, looks_like_short_answer,
-        transcripts_equivalent, SentAudio, SessionUsage, TailSilenceGate,
+        transcripts_equivalent, transport_failure_lost_speech, SentAudio, SessionUsage,
+        TailSilenceGate,
     };
 
     #[test]
@@ -1510,6 +1564,38 @@ mod tests {
         // manual commit flushes them post-release; new speech since the last
         // commit means this is real, not a phantom.
         assert!(!is_phantom_finalization(true, 20, 0));
+    }
+
+    #[test]
+    fn an_empty_dictation_never_raises_the_error_pip() {
+        // The reported bug: start a dictation, say nothing, stop. ElevenLabs
+        // resets the socket without a closing handshake, but the provider
+        // returned no words, so there is no transcript to lose and no "!".
+        assert!(!transport_failure_lost_speech(0, false));
+    }
+
+    #[test]
+    fn room_noise_on_an_empty_press_is_still_an_empty_press() {
+        // Same call, stated separately because it is the case that made the
+        // first fix wrong: a silent press in a room with a TV on ships plenty
+        // of chunks above SILENCE_RMS, and ElevenLabs still returns nothing.
+        // Zero words back means an empty press however loud the room was.
+        assert!(!transport_failure_lost_speech(0, false));
+    }
+
+    #[test]
+    fn a_socket_that_died_under_us_still_raises_the_pip() {
+        // Cut off mid-press: whatever was said from that point never reached
+        // the provider, so the user really did lose speech and should see it.
+        assert!(transport_failure_lost_speech(0, true));
+    }
+
+    #[test]
+    fn a_reset_after_the_words_landed_is_teardown_not_failure() {
+        // The pre-existing guard, unchanged: the user watched their sentence
+        // get typed, so how the socket closed afterwards is not their problem.
+        assert!(!transport_failure_lost_speech(27, false));
+        assert!(!transport_failure_lost_speech(27, true));
     }
 
     #[test]
