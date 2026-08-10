@@ -110,18 +110,7 @@ impl SttProvider for DashScopeProvider {
             .map_err(|e| ConnectError(format!("ws connect failed: {e}")))?;
 
         // 1) send run-task
-        let run_task = json!({
-            "header": { "action": "run-task", "task_id": task_id, "streaming": "duplex" },
-            "payload": {
-                "task_group": "audio",
-                "task": "asr",
-                "function": "recognition",
-                "model": model,
-                "parameters": { "format": "pcm", "sample_rate": opts.sample_rate },
-                "input": {}
-            }
-        })
-        .to_string();
+        let run_task = build_run_task(&task_id, model, opts);
         ws.send(Message::Text(run_task))
             .await
             .map_err(|e| ConnectError(format!("run-task send: {e}")))?;
@@ -162,6 +151,51 @@ impl SttProvider for DashScopeProvider {
             }),
         })
     }
+}
+
+/// Build the `run-task` payload for `model`/`opts`/`task_id`. Pure
+/// (fixture-tested); `connect` just sends this. `language_hints` is
+/// Paraformer realtime's array-of-language-codes parameter -- `opts.language`
+/// was previously computed by the runner but never placed anywhere in this
+/// payload, so a user's language choice was silently ignored.
+///
+/// The hint is only sent for a NON-default language. QuickDictate shipped for
+/// months never sending it, which left Paraformer in its own auto-detect
+/// mode, and DashScope's user base skews heavily toward speakers relying on
+/// exactly that. The app-wide default language is "en-US" whether or not the
+/// user ever looked at the setting, so forcing `["en"]` on every default
+/// config would have flipped those users from working auto-detect to
+/// forced-English. An explicit non-default choice is the only signal the user
+/// actually wants a language pinned, so that is when the hint goes on the
+/// wire.
+///
+/// `opts.custom_vocabulary` is intentionally **not** wired in here: DashScope's
+/// only inline biasing knob, `vocabulary_id`, requires pre-registering a named
+/// vocabulary through a separate Create Vocabulary List API call ahead of time
+/// -- there is no way to bias recognition with a plain, on-the-fly term list
+/// as the other providers allow.
+fn build_run_task(task_id: &str, model: &str, opts: &SttSessionOpts) -> String {
+    let mut parameters = json!({
+        "format": "pcm",
+        "sample_rate": opts.sample_rate,
+    });
+    // "en" is what the default "en-US" reduces to via language_for; anything
+    // else is an explicit user choice.
+    if !opts.language.is_empty() && opts.language != "en" {
+        parameters["language_hints"] = json!([opts.language.clone()]);
+    }
+    json!({
+        "header": { "action": "run-task", "task_id": task_id, "streaming": "duplex" },
+        "payload": {
+            "task_group": "audio",
+            "task": "asr",
+            "function": "recognition",
+            "model": model,
+            "parameters": parameters,
+            "input": {}
+        }
+    })
+    .to_string()
 }
 
 struct DashScopeSink {
@@ -371,5 +405,43 @@ mod tests {
         let b = gen_task_id();
         assert_eq!(a.len(), 32);
         assert_ne!(a, b);
+    }
+
+    fn test_opts(language: &str) -> SttSessionOpts {
+        SttSessionOpts {
+            language: language.into(),
+            sample_rate: 16_000,
+            model: None,
+            custom_vocabulary: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn run_task_carries_language_hints_only_for_a_non_default_language() {
+        let payload = build_run_task("t1", MODEL_ID, &test_opts("es"));
+        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(
+            parsed["payload"]["parameters"]["language_hints"],
+            serde_json::json!(["es"])
+        );
+        // The default language ("en-US" -> "en") must NOT pin a language:
+        // omitting the field is what preserves Paraformer's auto-detect for
+        // every config that never touched the setting.
+        let payload = build_run_task("t1", MODEL_ID, &test_opts("en"));
+        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert!(parsed["payload"]["parameters"]
+            .as_object()
+            .unwrap()
+            .get("language_hints")
+            .is_none());
+    }
+
+    #[test]
+    fn run_task_still_carries_format_and_sample_rate() {
+        let payload = build_run_task("t1", MODEL_ID, &test_opts("en"));
+        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(parsed["payload"]["parameters"]["format"], "pcm");
+        assert_eq!(parsed["payload"]["parameters"]["sample_rate"], 16_000);
+        assert_eq!(parsed["payload"]["model"], MODEL_ID);
     }
 }

@@ -32,6 +32,16 @@ const RECOGNIZE_URL: &str = "https://speech.googleapis.com/v1/speech:recognize";
 const DEFAULT_MODEL: &str = "latest_long";
 /// Sync `recognize` accepts ≤ ~60 s of audio; segment below that with margin.
 const SEGMENT_SECS: usize = 55;
+/// Google's documented inline speech-adaptation ceiling: 5,000 phrases per
+/// request (100 characters each). Our vocabulary is realistically far
+/// smaller, but this keeps us honest with the documented limit.
+const MAX_SPEECH_CONTEXT_PHRASES: usize = 5_000;
+/// How many extra attempts a failed segment gets before we give up on it. A
+/// transient network hiccup or 5xx on one 55-second segment must not cost the
+/// rest of a long dictation.
+const MAX_RETRIES: u32 = 2;
+/// Exponential backoff base: 400 ms, then 800 ms.
+const RETRY_BASE_DELAY: Duration = Duration::from_millis(400);
 
 pub struct GoogleProvider;
 
@@ -78,6 +88,7 @@ impl SttProvider for GoogleProvider {
                 .clone()
                 .unwrap_or_else(|| DEFAULT_MODEL.to_string()),
             sample_rate: opts.sample_rate,
+            vocabulary: opts.custom_vocabulary.clone(),
         };
         let worker_task = tokio::spawn(worker.run(work_rx, event_tx));
 
@@ -112,18 +123,16 @@ struct GoogleWorker {
     language: String,
     model: String,
     sample_rate: u32,
+    /// Words/phrases to bias recognition toward, from `Config::custom_vocabulary`.
+    /// Mapped onto `speechContexts[].phrases`; empty when the user set nothing.
+    vocabulary: Vec<String>,
 }
 
 impl GoogleWorker {
     async fn recognize(&self, pcm: &[i16]) -> Result<Option<String>, FailKind> {
         let content = base64::engine::general_purpose::STANDARD.encode(i16_slice_as_bytes(pcm));
         let body = json!({
-            "config": {
-                "encoding": "LINEAR16",
-                "sampleRateHertz": self.sample_rate,
-                "languageCode": self.language,
-                "model": self.model,
-            },
+            "config": build_config(self.sample_rate, &self.language, &self.model, &self.vocabulary),
             "audio": { "content": content }
         });
         let url = format!("{RECOGNIZE_URL}?key={}", self.key);
@@ -148,6 +157,13 @@ impl GoogleWorker {
         parse_transcript(&text)
     }
 
+    /// `recognize`, retried up to `MAX_RETRIES` extra times with exponential
+    /// backoff before giving up on this segment. See `run` for what happens
+    /// to the final classified error.
+    async fn recognize_with_retry(&self, pcm: &[i16]) -> Result<Option<String>, FailKind> {
+        retry_with_backoff(RETRY_BASE_DELAY, || self.recognize(pcm)).await
+    }
+
     async fn run(
         self,
         mut work_rx: mpsc::Receiver<GoogleCommand>,
@@ -166,12 +182,17 @@ impl GoogleWorker {
                     if failed {
                         continue;
                     }
-                    match self.recognize(&pcm).await {
+                    match self.recognize_with_retry(&pcm).await {
                         Ok(Some(text)) => pending_events.push(SttEvent::Committed(text)),
                         Ok(None) => {}
                         Err(kind) => {
-                            pending_events.push(SttEvent::KeyFailure(kind));
-                            failed = true;
+                            // A bad key or exhausted quota poisons every later
+                            // segment too, so stop draining and bench the key.
+                            // A transient blip or rate-limit on one segment
+                            // must not do either -- surface it and keep going.
+                            let (event, stop) = segment_failure_event(kind);
+                            pending_events.push(event);
+                            failed = stop;
                         }
                     }
                 }
@@ -185,6 +206,78 @@ impl GoogleWorker {
             }
         }
     }
+}
+
+/// Retry `attempt` up to `MAX_RETRIES` extra times with exponential backoff
+/// (`base_delay`, then `base_delay * 2`, ...) before giving up, returning
+/// whatever the final attempt returned. Generic over the attempt closure so
+/// the retry/backoff schedule is fixture-tested without a live HTTP request
+/// (tests pass `Duration::ZERO` to run instantly).
+async fn retry_with_backoff<F, Fut>(
+    base_delay: Duration,
+    mut attempt: F,
+) -> Result<Option<String>, FailKind>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<String>, FailKind>>,
+{
+    let mut last_err = None;
+    for i in 0..=MAX_RETRIES {
+        match attempt().await {
+            Ok(result) => return Ok(result),
+            Err(kind) => {
+                last_err = Some(kind);
+                if i < MAX_RETRIES {
+                    tokio::time::sleep(base_delay * 2u32.pow(i)).await;
+                }
+            }
+        }
+    }
+    Err(last_err.expect("loop runs at least once, so an Err always sets this"))
+}
+
+/// Decide what a segment's final (post-retry) failure means for the session:
+/// a bad/exhausted key is worth benching (`KeyFailure`, and `run` stops
+/// draining further segments since they'd fail too); a transient blip or
+/// rate-limit is just this segment's bad luck (`ProviderFailure`, which does
+/// not poison the key pool, and `run` keeps draining). Pure (fixture-tested).
+fn segment_failure_event(kind: FailKind) -> (SttEvent, bool) {
+    match kind {
+        FailKind::Invalid | FailKind::Exhausted => (SttEvent::KeyFailure(kind), true),
+        FailKind::Transient | FailKind::RateLimit => (
+            SttEvent::ProviderFailure(format!(
+                "Google speech:recognize failed for one segment after retries: {kind:?}"
+            )),
+            false,
+        ),
+    }
+}
+
+/// Build the `config` object for one `speech:recognize` request. Pure
+/// (fixture-tested); `recognize` just calls this. `speechContexts[].phrases`
+/// is added only when the vocabulary is non-empty, so a user with none set
+/// gets the exact same request body as before this existed.
+fn build_config(
+    sample_rate: u32,
+    language: &str,
+    model: &str,
+    vocabulary: &[String],
+) -> serde_json::Value {
+    let mut config = json!({
+        "encoding": "LINEAR16",
+        "sampleRateHertz": sample_rate,
+        "languageCode": language,
+        "model": model,
+    });
+    if !vocabulary.is_empty() {
+        let phrases: Vec<&str> = vocabulary
+            .iter()
+            .take(MAX_SPEECH_CONTEXT_PHRASES)
+            .map(String::as_str)
+            .collect();
+        config["speechContexts"] = json!([{ "phrases": phrases }]);
+    }
+    config
 }
 
 /// Move one complete prefix out without copying that 55-second prefix. Only
@@ -368,5 +461,85 @@ mod tests {
         assert_eq!(take_full_segment(&mut buffer, 5), Some(vec![5, 6, 7, 8, 9]));
         assert_eq!(take_full_segment(&mut buffer, 5), None);
         assert_eq!(buffer, vec![10, 11]);
+    }
+
+    #[test]
+    fn empty_vocabulary_config_is_unchanged() {
+        let config = build_config(16_000, "en-US", DEFAULT_MODEL, &[]);
+        assert!(config.get("speechContexts").is_none());
+        assert_eq!(config["languageCode"], "en-US");
+        assert_eq!(config["model"], DEFAULT_MODEL);
+        assert_eq!(config["encoding"], "LINEAR16");
+        assert_eq!(config["sampleRateHertz"], 16_000);
+    }
+
+    #[test]
+    fn vocabulary_adds_speech_contexts() {
+        let vocab = vec!["Anthropic".to_string(), "QuickDictate".to_string()];
+        let config = build_config(16_000, "en-US", DEFAULT_MODEL, &vocab);
+        assert_eq!(
+            config["speechContexts"],
+            serde_json::json!([{ "phrases": ["Anthropic", "QuickDictate"] }])
+        );
+    }
+
+    #[test]
+    fn speech_context_phrases_are_capped_at_documented_limit() {
+        let vocab: Vec<String> = (0..(MAX_SPEECH_CONTEXT_PHRASES + 10))
+            .map(|i| format!("term{i}"))
+            .collect();
+        let config = build_config(16_000, "en-US", DEFAULT_MODEL, &vocab);
+        let phrases = config["speechContexts"][0]["phrases"].as_array().unwrap();
+        assert_eq!(phrases.len(), MAX_SPEECH_CONTEXT_PHRASES);
+    }
+
+    // Task C: retry-then-continue instead of one bad segment poisoning the
+    // whole session and the key pool.
+
+    #[tokio::test]
+    async fn transient_failure_retries_and_eventually_succeeds() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let attempts = AtomicU32::new(0);
+        let result = retry_with_backoff(Duration::ZERO, || {
+            let n = attempts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if n < MAX_RETRIES {
+                    Err(FailKind::Transient)
+                } else {
+                    Ok(Some("hello world".to_string()))
+                }
+            }
+        })
+        .await;
+        assert_eq!(result, Ok(Some("hello world".to_string())));
+        // The initial attempt plus MAX_RETRIES retries.
+        assert_eq!(attempts.load(Ordering::SeqCst), MAX_RETRIES + 1);
+    }
+
+    #[tokio::test]
+    async fn retries_are_exhausted_and_final_error_is_returned() {
+        let result: Result<Option<String>, FailKind> =
+            retry_with_backoff(Duration::ZERO, || async { Err(FailKind::Transient) }).await;
+        assert_eq!(result, Err(FailKind::Transient));
+    }
+
+    #[test]
+    fn transient_and_rate_limit_emit_provider_failure_and_keep_draining() {
+        let (event, stop) = segment_failure_event(FailKind::Transient);
+        assert!(matches!(event, SttEvent::ProviderFailure(_)));
+        assert!(!stop);
+        let (event, stop) = segment_failure_event(FailKind::RateLimit);
+        assert!(matches!(event, SttEvent::ProviderFailure(_)));
+        assert!(!stop);
+    }
+
+    #[test]
+    fn invalid_and_exhausted_emit_key_failure_and_stop_draining() {
+        let (event, stop) = segment_failure_event(FailKind::Invalid);
+        assert!(matches!(event, SttEvent::KeyFailure(FailKind::Invalid)));
+        assert!(stop);
+        let (event, stop) = segment_failure_event(FailKind::Exhausted);
+        assert!(matches!(event, SttEvent::KeyFailure(FailKind::Exhausted)));
+        assert!(stop);
     }
 }

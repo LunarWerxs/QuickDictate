@@ -62,6 +62,23 @@ struct SessionEntry {
 struct SessionResampler {
     resampler: LinearResampler,
     pending: Vec<i16>,
+    /// Output rate this session was subscribed at. Fixed for the session's
+    /// lifetime; needed to recompute the resampler's step if it has to be
+    /// rebuilt for a new device rate.
+    target_rate: u32,
+    /// Device sample rate and channel count `resampler` was last built for.
+    /// Compared against the shared `device_rate`/`channels` atomics on every
+    /// callback (see `feed_sessions`) so a device reopen after an unplug, mic
+    /// swap, or sleep resume is caught in-flight and the resampler rebuilt
+    /// for the new format, instead of silently mis-pacing or mis-mixing new
+    /// PCM according to the old one.
+    built_rate: u32,
+    built_channels: usize,
+    /// Small free list of chunk buffers recovered from sends that hit a full
+    /// queue, reused for the next completed chunk instead of allocating
+    /// fresh audio storage. Empty in the common case; a fresh buffer is
+    /// allocated whenever the pool has none to give.
+    spare_chunks: Vec<Vec<i16>>,
 }
 
 impl AudioSource {
@@ -139,15 +156,29 @@ impl AudioSource {
         self: &Arc<Self>,
         target_rate: u32,
     ) -> (mpsc::Receiver<Vec<i16>>, SessionFlusher) {
-        let step = self.device_rate.load(Ordering::Acquire) as f64 / target_rate as f64;
+        let device_rate = self.device_rate.load(Ordering::Acquire);
+        let channels = self.channels.load(Ordering::Acquire);
+        let step = device_rate as f64 / target_rate as f64;
         let (tx, rx) = mpsc::channel(AUDIO_QUEUE_CAPACITY);
         let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
         let entry = SessionEntry {
             id: session_id,
             tx,
             inner: Mutex::new(SessionResampler {
-                resampler: LinearResampler::new(step, self.channels.load(Ordering::Acquire)),
+                resampler: LinearResampler::new(step, channels),
                 pending: Vec::with_capacity(CHUNK_SAMPLES * 2),
+                target_rate,
+                built_rate: device_rate,
+                built_channels: channels,
+                // Seed a couple of buffers up front so the first chunks a
+                // fresh session emits can reuse them too, not just chunks
+                // recovered later from a full queue. Built with a loop, not
+                // `vec![Vec::with_capacity(n); k]`, because cloning an empty
+                // Vec does not carry its capacity along, only the original
+                // would actually be preallocated.
+                spare_chunks: (0..SPARE_CHUNK_POOL_CAP)
+                    .map(|_| Vec::with_capacity(CHUNK_SAMPLES))
+                    .collect(),
             }),
             queue_full_reported: AtomicBool::new(false),
         };
@@ -209,7 +240,15 @@ fn run_global_capture(
     let mut device = device;
     let mut supported = supported;
     loop {
-        match stream_until_failure(&sessions, &stop, &healthy, &device, &supported) {
+        match stream_until_failure(
+            &sessions,
+            &stop,
+            &healthy,
+            &device_rate,
+            &channels,
+            &device,
+            &supported,
+        ) {
             Ok(()) => return, // clean shutdown
             Err(e) => {
                 healthy.store(false, Ordering::Release);
@@ -260,6 +299,8 @@ fn stream_until_failure(
     sessions: &Arc<parking_lot::RwLock<Vec<SessionEntry>>>,
     stop: &Arc<AtomicBool>,
     healthy: &Arc<AtomicBool>,
+    device_rate: &Arc<AtomicU32>,
+    channels: &Arc<AtomicUsize>,
     device: &cpal::Device,
     supported: &cpal::SupportedStreamConfig,
 ) -> Result<()> {
@@ -283,6 +324,8 @@ fn stream_until_failure(
     let stream: cpal::Stream = match sample_format {
         cpal::SampleFormat::F32 => {
             let sessions = Arc::clone(sessions);
+            let device_rate = Arc::clone(device_rate);
+            let channels = Arc::clone(channels);
             let mut scratch: Vec<i16> = Vec::new();
             device.build_input_stream(
                 &config,
@@ -292,7 +335,7 @@ fn stream_until_failure(
                     for s in data {
                         scratch.push(f32_to_i16(*s));
                     }
-                    feed_sessions(&sessions, &scratch);
+                    feed_sessions(&sessions, &device_rate, &channels, &scratch);
                 },
                 make_err_fn(),
                 None,
@@ -300,13 +343,15 @@ fn stream_until_failure(
         }
         cpal::SampleFormat::I16 => {
             let sessions = Arc::clone(sessions);
+            let device_rate = Arc::clone(device_rate);
+            let channels = Arc::clone(channels);
             device.build_input_stream(
                 &config,
                 move |data: &[i16], _| {
                     // WASAPI already gave us the exact representation the
                     // resamplers consume, so avoid copying every callback into
                     // an otherwise-identical scratch buffer.
-                    feed_sessions(&sessions, data);
+                    feed_sessions(&sessions, &device_rate, &channels, data);
                 },
                 make_err_fn(),
                 None,
@@ -314,6 +359,8 @@ fn stream_until_failure(
         }
         cpal::SampleFormat::U16 => {
             let sessions = Arc::clone(sessions);
+            let device_rate = Arc::clone(device_rate);
+            let channels = Arc::clone(channels);
             let mut scratch: Vec<i16> = Vec::new();
             device.build_input_stream(
                 &config,
@@ -323,7 +370,7 @@ fn stream_until_failure(
                     for s in data {
                         scratch.push((*s as i32 - 32768) as i16);
                     }
-                    feed_sessions(&sessions, &scratch);
+                    feed_sessions(&sessions, &device_rate, &channels, &scratch);
                 },
                 make_err_fn(),
                 None,
@@ -402,9 +449,23 @@ impl Drop for SessionFlusher {
 // Feed helpers
 // ---------------------------------------------------------------------------
 
+/// Cap on how many recovered chunk buffers a session's free list holds, so a
+/// long stretch of a full queue cannot grow it without bound. Also the number
+/// of buffers a session preallocates up front in `subscribe()`.
+const SPARE_CHUNK_POOL_CAP: usize = 4;
+
 /// Called from the cpal callback. Feeds every active session's resampler.
 /// Dead senders (session dropped without cleanup) are pruned lazily.
-fn feed_sessions(sessions: &parking_lot::RwLock<Vec<SessionEntry>>, data: &[i16]) {
+/// `device_rate`/`channels` are the shared atomics for the device's current
+/// format; each session's resampler is compared against them below and
+/// rebuilt in place if a device reopen (unplug, mic swap, sleep resume)
+/// changed the format out from under it.
+fn feed_sessions(
+    sessions: &parking_lot::RwLock<Vec<SessionEntry>>,
+    device_rate: &AtomicU32,
+    channels: &AtomicUsize,
+    data: &[i16],
+) {
     // Normal path takes only a shared lock. A write lock is needed solely when
     // a session disappeared without its normal flusher cleanup.
     let mut list = sessions.read();
@@ -424,6 +485,12 @@ fn feed_sessions(sessions: &parking_lot::RwLock<Vec<SessionEntry>>, data: &[i16]
         }
     }
 
+    // Two cheap atomic loads per callback, not per session and not per
+    // sample. Every session below compares its own built-for values against
+    // this single snapshot of the device's current format.
+    let current_rate = device_rate.load(Ordering::Acquire);
+    let current_channels = channels.load(Ordering::Acquire);
+
     for entry in list.iter() {
         // Feed this callback buffer exactly once, drain every complete chunk,
         // then unlock before touching the channel. Re-feeding `data` inside the
@@ -431,12 +498,54 @@ fn feed_sessions(sessions: &parking_lot::RwLock<Vec<SessionEntry>>, data: &[i16]
         // chunk boundary.
         let chunks = {
             let mut inner = entry.inner.lock();
-            let SessionResampler { resampler, pending } = &mut *inner;
+            let SessionResampler {
+                resampler,
+                pending,
+                target_rate,
+                built_rate,
+                built_channels,
+                spare_chunks,
+            } = &mut *inner;
+
+            if *built_rate != current_rate || *built_channels != current_channels {
+                tracing::warn!(
+                    "audio: device format changed ({} Hz, {} ch -> {} Hz, {} ch); \
+                     rebuilding session resampler",
+                    built_rate,
+                    built_channels,
+                    current_rate,
+                    current_channels
+                );
+                let step = current_rate as f64 / *target_rate as f64;
+                *resampler = LinearResampler::new(step, current_channels);
+                *built_rate = current_rate;
+                *built_channels = current_channels;
+                // `pending` is left alone: it holds already-resampled output
+                // waiting to be chunked, which is still correct: only the
+                // resampler's own interpolation state (fed samples, half-frame
+                // carry) was tied to the old format, and `LinearResampler::new`
+                // resets exactly that.
+            }
+
             resampler.feed_and_emit(data, pending);
-            let mut chunks = Vec::with_capacity(pending.len() / CHUNK_SAMPLES);
+
+            let mut chunks = Vec::new();
             while pending.len() >= CHUNK_SAMPLES {
-                let tail = pending.split_off(CHUNK_SAMPLES);
-                chunks.push(std::mem::replace(pending, tail));
+                // Reuse a buffer from the session's free list when one is
+                // available instead of allocating fresh audio storage on
+                // every chunk boundary; a new buffer is allocated only when
+                // the pool is empty.
+                let mut chunk = spare_chunks
+                    .pop()
+                    .unwrap_or_else(|| Vec::with_capacity(CHUNK_SAMPLES));
+                chunk.clear();
+                chunk.extend_from_slice(&pending[..CHUNK_SAMPLES]);
+                // drain() shifts the remainder down in place, reusing
+                // `pending`'s existing allocation. split_off() would allocate
+                // a brand new Vec for the tail on every chunk boundary, which
+                // is an allocation inside the real-time capture callback.
+                pending.drain(..CHUNK_SAMPLES);
+                chunks.push(chunk);
             }
             chunks
         };
@@ -447,16 +556,28 @@ fn feed_sessions(sessions: &parking_lot::RwLock<Vec<SessionEntry>>, data: &[i16]
                         tracing::info!("audio: session queue recovered");
                     }
                 }
-                Err(mpsc::error::TrySendError::Full(_)) => {
+                Err(mpsc::error::TrySendError::Full(returned)) => {
                     if !entry.queue_full_reported.swap(true, Ordering::Relaxed) {
                         tracing::warn!(
                             "audio: session queue full; dropping audio to keep latency bounded"
                         );
                     }
+                    return_spare_chunk(entry, returned);
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => break,
             }
         }
+    }
+}
+
+/// A `try_send` that hit a full queue hands the chunk buffer back instead of
+/// dropping it silently. Stash it on the session's free list so the next
+/// completed chunk can reuse its allocation.
+fn return_spare_chunk(entry: &SessionEntry, mut buf: Vec<i16>) {
+    let mut inner = entry.inner.lock();
+    if inner.spare_chunks.len() < SPARE_CHUNK_POOL_CAP {
+        buf.clear();
+        inner.spare_chunks.push(buf);
     }
 }
 
@@ -557,23 +678,98 @@ mod tests {
             inner: Mutex::new(SessionResampler {
                 resampler: LinearResampler::new(1.0, 1),
                 pending: Vec::new(),
+                target_rate: 16_000,
+                built_rate: 16_000,
+                built_channels: 1,
+                spare_chunks: Vec::new(),
             }),
             queue_full_reported: AtomicBool::new(false),
         }
+    }
+
+    /// Device-format atomics matching what `test_entry` was built for, so a
+    /// plain `feed_sessions` call in a test does not itself trigger a rebuild.
+    fn native_format() -> (AtomicU32, AtomicUsize) {
+        (AtomicU32::new(16_000), AtomicUsize::new(1))
     }
 
     #[test]
     fn feed_sessions_processes_each_input_buffer_once() {
         let (tx, mut rx) = mpsc::channel(4);
         let sessions = parking_lot::RwLock::new(vec![test_entry(1, tx)]);
+        let (device_rate, channels) = native_format();
         let input = vec![123_i16; CHUNK_SAMPLES + 1];
 
-        feed_sessions(&sessions, &input);
+        feed_sessions(&sessions, &device_rate, &channels, &input);
 
         let chunk = rx.try_recv().expect("one complete audio chunk");
         assert_eq!(chunk.len(), CHUNK_SAMPLES);
         assert!(rx.try_recv().is_err(), "input buffer was duplicated");
         assert_eq!(sessions.read()[0].inner.lock().pending.len(), 1);
+    }
+
+    #[test]
+    fn feed_sessions_rebuilds_resampler_on_device_format_change() {
+        // Session subscribed at 16 kHz target; device starts at 16 kHz mono,
+        // so step 1.0 is a passthrough. Simulate a reopen at double the rate
+        // mid-stream, as `run_global_capture` does after an unplug, mic swap,
+        // or sleep resume, and confirm the session's resampler rebuilds for
+        // the new step instead of continuing to pace input as if the device
+        // were still at the old rate.
+        let (tx, mut rx) = mpsc::channel(4);
+        let sessions = parking_lot::RwLock::new(vec![test_entry(1, tx)]);
+        let (device_rate, channels) = native_format();
+
+        let warm = vec![1_i16; CHUNK_SAMPLES];
+        feed_sessions(&sessions, &device_rate, &channels, &warm);
+        let first = rx.try_recv().expect("chunk at the original rate");
+        assert_eq!(first.len(), CHUNK_SAMPLES);
+
+        // Reopen at double the rate; channel count is unchanged.
+        device_rate.store(32_000, Ordering::Release);
+
+        // At the new 32 kHz -> 16 kHz step (2.0), the same input length now
+        // yields half as many output samples, so it alone cannot complete a
+        // chunk unless the resampler picked up the new step.
+        let after = vec![2_i16; CHUNK_SAMPLES];
+        feed_sessions(&sessions, &device_rate, &channels, &after);
+        assert!(
+            rx.try_recv().is_err(),
+            "resampler kept the stale step instead of rebuilding for the new rate"
+        );
+        assert_eq!(
+            sessions.read()[0].inner.lock().pending.len(),
+            CHUNK_SAMPLES / 2,
+            "rebuilt resampler should downsample 2:1 at the new device rate"
+        );
+    }
+
+    #[test]
+    fn feed_sessions_drain_chunking_preserves_exact_sample_order() {
+        // Regression guard for the split_off -> drain change: feed input
+        // across several callback-sized slices that do not line up with
+        // CHUNK_SAMPLES boundaries, and confirm every emitted chunk plus the
+        // final pending tail reconstructs the exact original sample
+        // sequence, with no gaps, duplicates, or off-by-one shifts from
+        // reusing pooled buffers.
+        let (tx, mut rx) = mpsc::channel(32);
+        let sessions = parking_lot::RwLock::new(vec![test_entry(1, tx)]);
+        let (device_rate, channels) = native_format();
+
+        let total = CHUNK_SAMPLES * 3 + 250;
+        let all: Vec<i16> = (0..total as i32).map(|v| v as i16).collect();
+
+        let mut received = Vec::new();
+        // Odd-sized slices so chunk boundaries land mid-callback.
+        for slice in all.chunks(777) {
+            feed_sessions(&sessions, &device_rate, &channels, slice);
+            while let Ok(chunk) = rx.try_recv() {
+                received.extend(chunk);
+            }
+        }
+        received.extend(sessions.read()[0].inner.lock().pending.clone());
+
+        assert_eq!(received, all);
     }
 
     #[test]

@@ -90,6 +90,7 @@ mod tests {
             language: "en".into(),
             sample_rate: 16_000,
             model: None,
+            custom_vocabulary: Vec::new(),
         };
         let ProviderSession {
             mut sink,

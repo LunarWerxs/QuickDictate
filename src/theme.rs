@@ -21,14 +21,22 @@ pub const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF((r as u32) | ((g as u32) << 8) | ((b as u32) << 16))
 }
 
-/// Pick the dark or light value for the current theme.
+/// Pick the dark-mode or light-mode variant of a themed value. The shared
+/// decision behind every themed getter in this module, factored out so it can
+/// be tested without going through `is_dark()`'s registry/env-var read.
 #[inline]
-fn tc(dark: COLORREF, light: COLORREF) -> COLORREF {
-    if is_dark() {
+fn pick<T>(dark_mode: bool, dark: T, light: T) -> T {
+    if dark_mode {
         dark
     } else {
         light
     }
+}
+
+/// Pick the dark or light value for the current theme.
+#[inline]
+fn tc(dark: COLORREF, light: COLORREF) -> COLORREF {
+    pick(is_dark(), dark, light)
 }
 
 // ---- Theme-aware palette (dark value, light value) — SageThumbs' values ----
@@ -206,5 +214,45 @@ pub unsafe fn dark_ctlcolor(msg: u32, wparam: WPARAM) -> Option<LRESULT> {
             Some(LRESULT(dark_bg_brush().0 as isize))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- rgb ----
+
+    #[test]
+    fn rgb_packs_channels_as_0x00bbggrr() {
+        // COLORREF stores 0x00BBGGRR — the reverse byte order of the (r,g,b)
+        // arguments.
+        assert_eq!(rgb(0x12, 0x34, 0x56).0, 0x0056_3412);
+    }
+
+    #[test]
+    fn rgb_of_black_and_white_are_the_colorref_extremes() {
+        assert_eq!(rgb(0, 0, 0).0, 0x0000_0000);
+        assert_eq!(rgb(255, 255, 255).0, 0x00FF_FFFF);
+    }
+
+    // ---- pick ----
+
+    #[test]
+    fn pick_selects_the_dark_branch_in_dark_mode() {
+        assert_eq!(pick(true, "dark", "light"), "dark");
+    }
+
+    #[test]
+    fn pick_selects_the_light_branch_in_light_mode() {
+        assert_eq!(pick(false, "dark", "light"), "light");
+    }
+
+    #[test]
+    fn pick_works_with_colorref_like_tc_uses_it() {
+        let dark = rgb(32, 32, 32);
+        let light = rgb(243, 243, 243);
+        assert_eq!(pick(true, dark, light), dark);
+        assert_eq!(pick(false, dark, light), light);
     }
 }

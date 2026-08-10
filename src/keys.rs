@@ -67,6 +67,10 @@ struct KeyEntry {
 
 struct Inner {
     provider_id: String,
+    /// The most recent failure reason seen this run, so the error pip and tray
+    /// tooltip can say "out of credit" or "rate limited" instead of collapsing
+    /// every non-all-dead failure into a bare "!".
+    last_fail: Option<FailKind>,
     keys: Vec<KeyEntry>,
     /// The key we intend to use next — either the last one that carried a real
     /// session, or the first one the prewarm probe validated. `acquire`
@@ -78,24 +82,27 @@ pub struct KeyPool {
     inner: RwLock<Inner>,
 }
 
-fn key_suffix(key: &str) -> String {
-    key.chars()
-        .rev()
-        .take(6)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect()
+/// A log-safe positional label for a key ("#2 of 3"). Never any part of the
+/// credential itself: log files get attached to bug reports.
+fn position_label(keys: &[KeyEntry], key: &str) -> String {
+    match keys.iter().position(|e| e.value == key) {
+        Some(i) => format!("#{} of {}", i + 1, keys.len()),
+        None => "#? (not in pool)".to_string(),
+    }
 }
 
 fn configured_keys(cfg: &Config) -> Vec<String> {
+    configured_keys_for(cfg, &cfg.stt_provider)
+}
+
+fn configured_keys_for(cfg: &Config, provider: &str) -> Vec<String> {
     // The local provider uses the same session runner but has no credential.
     // A private sentinel keeps the generic pool/startup readiness plumbing
     // usable without storing or exposing a fake key in settings.json.
-    if cfg.stt_provider.trim().eq_ignore_ascii_case("local") {
+    if provider.trim().eq_ignore_ascii_case("local") {
         return vec!["local".into()];
     }
-    cfg.active_keys()
+    cfg.keys_for(provider)
         .iter()
         .map(|v| v.trim())
         .filter(|v| !v.is_empty())
@@ -105,7 +112,14 @@ fn configured_keys(cfg: &Config) -> Vec<String> {
 
 impl KeyPool {
     pub fn new(cfg: &Config) -> Arc<Self> {
-        let keys = configured_keys(cfg)
+        Self::for_provider(cfg, &cfg.stt_provider)
+    }
+
+    /// A pool for an EXPLICIT provider rather than the globally configured
+    /// one. Used when a Per-App Profile overrides `stt_provider`: the session
+    /// needs that provider's keys, not the global provider's.
+    pub fn for_provider(cfg: &Config, provider: &str) -> Arc<Self> {
+        let keys = configured_keys_for(cfg, provider)
             .into_iter()
             .map(|value| KeyEntry {
                 value,
@@ -119,11 +133,25 @@ impl KeyPool {
             .collect();
         Arc::new(Self {
             inner: RwLock::new(Inner {
-                provider_id: cfg.stt_provider.trim().to_ascii_lowercase(),
+                provider_id: provider.trim().to_ascii_lowercase(),
+                last_fail: None,
                 keys,
                 last_good: None,
             }),
         })
+    }
+
+    /// The provider this pool was built for.
+    pub fn provider_id(&self) -> String {
+        self.inner.read().provider_id.clone()
+    }
+
+    /// A log-safe label for one key: its 1-based position in the configured
+    /// list, never any part of the key itself. Diagnosing "which of my three
+    /// keys failed" does not require putting a slice of the credential into a
+    /// file the user may well attach to a bug report.
+    pub fn label(&self, key: &str) -> String {
+        position_label(&self.inner.read().keys, key)
     }
 
     /// Whether this pool still represents the provider and keys in the latest
@@ -221,6 +249,7 @@ impl KeyPool {
     pub fn mark_success(&self, key: &str, audio_ms: u64) {
         let now = Instant::now();
         let mut inner = self.inner.write();
+        let label = position_label(&inner.keys, key);
         let mut totals = None;
         if let Some(e) = inner.keys.iter_mut().find(|e| e.value == key) {
             e.status = KeyHealthStatus::Alive;
@@ -232,10 +261,11 @@ impl KeyPool {
             totals = Some((e.total_audio_ms, e.successful_sessions));
         }
         inner.last_good = Some(key.to_string());
+        inner.last_fail = None;
         if let Some((total, sessions)) = totals {
             tracing::info!(
-                "key ...{} alive: +{:.1}s audio this session, {:.1} min total across {sessions} session(s) this run",
-                key_suffix(key),
+                "key {} alive: +{:.1}s audio this session, {:.1} min total across {sessions} session(s) this run",
+                label,
                 audio_ms as f64 / 1000.0,
                 total as f64 / 60_000.0,
             );
@@ -256,14 +286,23 @@ impl KeyPool {
         }
         if inner.last_good.is_none() {
             inner.last_good = Some(key.to_string());
-            tracing::info!("key ...{} queued as the ready key", key_suffix(key));
+            let label = position_label(&inner.keys, key);
+            tracing::info!("key {label} queued as the ready key");
         }
+    }
+
+    /// The most recent failure reason recorded this run, if any. Cleared by a
+    /// success so a recovered provider stops reporting a stale cause.
+    pub fn last_failure(&self) -> Option<FailKind> {
+        self.inner.read().last_fail
     }
 
     pub fn mark_failed(&self, key: &str, kind: FailKind) {
         let cd = kind.cooldown();
         let now = Instant::now();
         let mut inner = self.inner.write();
+        inner.last_fail = Some(kind);
+        let label = position_label(&inner.keys, key);
         if let Some(e) = inner.keys.iter_mut().find(|e| e.value == key) {
             e.failures = e.failures.saturating_add(1);
             e.cooldown_until = Some(now + cd);
@@ -271,8 +310,8 @@ impl KeyPool {
                 e.status = status;
             }
             tracing::warn!(
-                "key ...{} {:?}: cooling down for {:?} (status {:?}, {} failure(s) this run)",
-                key_suffix(key),
+                "key {} {:?}: cooling down for {:?} (status {:?}, {} failure(s) this run)",
+                label,
                 kind,
                 cd,
                 e.status,
@@ -290,7 +329,8 @@ impl KeyPool {
         inner
             .keys
             .iter()
-            .map(|e| format!("...{} {:?}", key_suffix(&e.value), e.status))
+            .enumerate()
+            .map(|(i, e)| format!("#{} {:?}", i + 1, e.status))
             .collect::<Vec<_>>()
             .join(", ")
     }

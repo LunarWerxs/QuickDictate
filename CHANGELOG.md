@@ -4,6 +4,116 @@ All notable changes to QuickDictate will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **Custom vocabulary.** A list of words and phrases QuickDictate sends to the provider so it
+  gets names, jargon, and product names right in the first place, instead of repairing them
+  afterwards with the text-replacement fix-list. Wired into each backend's own biasing
+  parameter; providers without one ignore it.
+- **Per-app profiles can now override language, provider, and vocabulary**, not just text
+  handling. A profile naming a provider with no configured key falls back to the global one, so
+  a typo cannot leave you unable to dictate.
+- **Transcript history browser** in Settings, with search, copy, and paste-again. Previously the
+  history was only reachable through a small tray submenu.
+- **`protect_keys_at_rest`** (off by default) encrypts the API keys in `settings.json` with
+  Windows DPAPI. Off by default because it costs portability: a sealed file will not decrypt on
+  another PC or another Windows account.
+- Per-app profiles, the profiles master switch, voice commands, and the custom vocabulary now
+  travel with Connections settings sync. A new test fails the build if a future `Config` field is
+  neither synced nor explicitly marked machine-local, which is how these four came to be missed.
+- The tray tooltip and the cursor pip now name the actual failure: out of credit, rate limited,
+  network unreachable, keys rejected, elevated window, or a hotkey another app has claimed.
+  Every adapter already computed this; it was being collapsed into a bare "!".
+
+### Fixed
+
+- **A replacement value containing `$` was silently corrupted.** Replacement text went through
+  regex capture-group expansion, so a rule producing `$50` typed nothing for the amount.
+- **Replacement rules could cascade into each other.** Rules were applied one after another over
+  the growing output in alphabetical key order, so one rule's output could trigger another. They
+  now all apply in a single pass over the original text, longest pattern first.
+- **The clipboard is no longer destroyed by a paste.** Text, files, images, HTML, RTF, and PNG
+  are snapshotted and restored, not just plain text, so copying an image, a file list, or an
+  HTML fragment and then dictating no longer loses it. (Deliberately not every format: fetching
+  the exotic ones an Excel or browser copy advertises forces the source app to render them on
+  the spot, which froze the paste.) The restore now also runs on every failure path and on a
+  panic; previously an error after the clipboard was emptied lost its contents permanently.
+- **A long dictation is no longer lost when the clipboard is busy.** If another app is holding
+  the clipboard, the paste falls back to keystrokes, and every transcript now enters the history
+  even when the paste fails, so "recent transcriptions" can always recover it.
+- **"Scratch that" no longer backspaces into the wrong window.** It refuses to fire if focus
+  moved since the paste it would undo, and it counts grapheme clusters rather than Unicode
+  scalars, so a multi-codepoint emoji no longer over-deletes.
+- **Held modifier keys no longer corrupt the paste.** A modifier-based hotkey left Ctrl or Alt
+  physically down while text was injected, turning Ctrl+V into Ctrl+Alt+V and typed characters
+  into menu accelerators.
+- **Typing into an elevated window no longer reports success.** Windows discards injected input
+  from a lower integrity level and `SendInput` still claims every event was sent. QuickDictate
+  now detects this, leaves the text on the clipboard, and says so.
+- **A dropped connection mid-dictation is no longer reported as a clean finish.** It was
+  indistinguishable from a normal end of stream: no retry, no error, and uncommitted speech
+  silently gone.
+- **The last spoken segment is no longer dropped after an earlier sentence committed.** The
+  fallback that promotes an unfinalized trailing partial was gated on a session-wide flag, so it
+  switched itself off permanently after the first successful commit.
+- **A stalled network during dictation now surfaces instead of hanging.** `send_audio` had no
+  timeout in the live phase, so a blackholed connection froze the session until the user let go.
+- **Google: one transient error no longer discards the rest of the recording** or benches a
+  healthy API key. Failed segments retry with backoff, and only genuine credential failures
+  touch the key pool.
+- **A microphone change mid-dictation no longer corrupts the audio.** Sessions in flight kept
+  resampling at the old device's rate and channel count after a reopen.
+- **DashScope now honours an explicitly selected language.** It was computed and never sent.
+  The app-wide default ("en-US") is still NOT sent, so configs that never touched the language
+  setting keep Paraformer's auto-detect instead of being pinned to English.
+- **`shutdown()` could block for up to 60 seconds** on a stale hotkey thread-id snapshot.
+- **Saving no longer freezes the Settings window** for up to six seconds on a slow network.
+- **"Default settings" now asks for confirmation** before wiping every setting, and closing
+  Settings with unsaved edits warns instead of discarding them silently.
+- **Toggle and Hold can no longer be saved to the same key**, which silently disabled one of the
+  two dictation modes.
+- A portable build no longer adopts an unrelated `settings.json` found in a parent folder, which
+  it would then overwrite on the next save.
+- The panic log honours the `enable_logging` opt-in like every other log file.
+- The daily update check now stamps its cache even when it fails, so an offline machine stops
+  making the network round-trip on every launch.
+- A final release now correctly supersedes its own release candidate; the prerelease suffix was
+  stripped before comparison, so `1.0.0` looked identical to `1.0.0-rc1`.
+- Log lines identify a failing key by its position in the list rather than by the last six
+  characters of the credential.
+- The cursor pip reacts to the hotkey instantly again while the app still idles quietly: the
+  overlay thread now wakes on status changes and window messages instead of polling, so both
+  the earlier 100 ms poll and the brief laggy 1 s version are gone.
+- A provider dropping the connection right after delivering the final transcript no longer
+  flashes the error pip; transport errors only surface when the session delivered nothing.
+- A dictation error before the first successful session names its real cause instead of
+  inheriting a stale "out of credit" from startup key probing.
+- Opening Settings on a synced machine no longer shows a false "unsaved changes" prompt after
+  the silent cloud pull, and Save can no longer revert a just-pulled vocabulary.
+- Settings sync no longer refuses to push when a synced text field happens to contain a
+  32/40-character hex string (a git commit id, an MD5 hash); only unambiguous credential
+  shapes are blocked.
+- A brief disk hiccup during a background sync-token refresh retries instead of signing the
+  account out.
+
+### Changed
+
+- **An available update is reported, not installed.** Through v0.5.3 the daily check silently
+  downloaded, verified, swapped the executable, and relaunched. The download URL and its
+  SHA-256 both come from the same release payload, so the hash proves the bytes match what was
+  uploaded, not that anyone intended to upload them. Clicking the About pill is now the consent.
+  Set `update_auto_install` to restore the old behaviour. See SECURITY.md.
+- The local model unloads after ten minutes idle instead of holding several GB of RAM and VRAM
+  for the whole uptime of the tray app.
+- The overlay no longer wakes ten times a second while idle, and no longer creates and destroys
+  a GDI font on every repaint.
+- The audio capture callback no longer allocates per chunk.
+- Release CI pins every third-party GitHub Action to a commit SHA, `cargo audit` also runs on
+  pull requests that change the lockfile, and the accepted advisory list moved from a manual
+  step in RELEASING.md into `.cargo/audit.toml`.
+
 ## [0.5.3] - 2026-07-27
 
 ### Fixed
@@ -105,7 +215,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
-- **Dictation no longer tacks on a short answer you never said.** After you stop talking, QuickDictate keeps listening briefly to catch trailing words; that trailing silence used to be sent to the provider, and some models (notably ElevenLabs Scribe) would "complete" the dead air with a hallucinated reply. It now holds silent audio back and forwards it only if you resume speaking — for any tail length.
+- **Dictation no longer tacks on a short answer you never said.** After you stop talking, QuickDictate keeps listening briefly to catch trailing words; that trailing silence used to be sent to the provider, and some models (notably ElevenLabs Scribe) would "complete" the dead air with a hallucinated reply. It now holds silent audio back and forwards it only if you resume speaking, for any tail length.
 - **Long silences no longer drop the live transcription.** Streaming providers get a lightweight keep-alive during a quiet tail, so a long "keep listening" window stays connected.
 - **The Settings window no longer scrolls or leaves dead space.** It sizes to fit its content exactly, at any zoom or window state.
 - **The Save split-button's dropdown matches the Save button.**
@@ -130,17 +240,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- **Two timing levers in Settings → Dictation.** **Hold to re-paste** sets how long you hold the toggle hotkey to replay your last dictation (was a fixed 1.5 s; applies after a restart). **Keep listening after you stop** sets how long QuickDictate keeps capturing after you stop talking before it finalizes — the "dynamic tail" silence window (was a fixed 0.8 s; applies on your next dictation). Both are sliders shown in seconds, sync with your other portable prefs, and default to the previous fixed values so behavior is unchanged until you move them.
-- **Optional "Sync settings with Connections."** A new opt-in card in Settings signs you in with a free Connections account (system-browser OAuth with PKCE — no password ever touches the app) and syncs your **portable preferences** (hotkeys, provider, text replacements, toggles) across every machine you use QuickDictate on. **Your API keys never sync** — only an allowlist of non-secret prefs travels, and the refresh token is sealed with Windows DPAPI. No new dependencies. Details: `docs/SETTINGS_SYNC.md`.
+- **Two timing levers in Settings → Dictation.** **Hold to re-paste** sets how long you hold the toggle hotkey to replay your last dictation (was a fixed 1.5 s; applies after a restart). **Keep listening after you stop** sets how long QuickDictate keeps capturing after you stop talking before it finalizes, the "dynamic tail" silence window (was a fixed 0.8 s; applies on your next dictation). Both are sliders shown in seconds, sync with your other portable prefs, and default to the previous fixed values so behavior is unchanged until you move them.
+- **Optional "Sync settings with Connections."** A new opt-in card in Settings signs you in with a free Connections account (system-browser OAuth with PKCE, no password ever touches the app) and syncs your **portable preferences** (hotkeys, provider, text replacements, toggles) across every machine you use QuickDictate on. **Your API keys never sync**, only an allowlist of non-secret prefs travels, and the refresh token is sealed with Windows DPAPI. No new dependencies. Details: `docs/SETTINGS_SYNC.md`.
 
 ### Changed
 
 - **Log file no longer grows without bound.** `quickdictate.log` is a single file appended across every launch; it now rotates aside to `quickdictate.log.old` at startup once it passes a size cap (`max_log_mb`, default **5 MB**; `0` disables). Machine-local, not synced.
 - **Settings-sync card is more compact.** The signed-in row drops the "as <account>" text and shows the sync status inline next to the green **Synced** badge instead of on a separate line below.
-- **Settings window is ~10% smaller** (a uniform zoom — it read a touch oversized).
-- **Primary actions moved to a pinned bottom bar:** **About** at the bottom-left, **Save** / **Save & Restart** at the bottom-right — which also removes the empty padding that used to sit below the buttons.
+- **Settings window is ~10% smaller** (a uniform zoom, it read a touch oversized).
+- **Primary actions moved to a pinned bottom bar:** **About** at the bottom-left, **Save** / **Save & Restart** at the bottom-right, which also removes the empty padding that used to sit below the buttons.
 - **Bottom bar tidied up.** The loose "Check for updates / Open log file / Edit settings.json" button row is now a single **⋯ overflow menu** next to About, and the two Save buttons became one **split button**: **Save** with a small **▾** that drops down **Save and restart**.
-- **Dictation timing knobs are now compact, inline controls.** "Hold to re-paste" and "Keep listening after you stop" used to be two long full-width sliders; they're now a plain seconds text box each (type the value — no click-and-drag), with a small "s" unit label, laid out label-left / control-right in two columns to match Language, Mode, and the hotkey fields above them. The divider that used to sit above them is gone, so they tuck directly under the hotkey block as one group and the card is shorter.
+- **Dictation timing knobs are now compact, inline controls.** "Hold to re-paste" and "Keep listening after you stop" used to be two long full-width sliders; they're now a plain seconds text box each (type the value, no click-and-drag), with a small "s" unit label, laid out label-left / control-right in two columns to match Language, Mode, and the hotkey fields above them. The divider that used to sit above them is gone, so they tuck directly under the hotkey block as one group and the card is shorter.
 - **Record-hotkey dot shows a pointer cursor.** Hovering the little "record" dot in a hotkey field now switches the cursor to a pointing hand, so it reads as clickable.
 - **Per-app profiles folded into the Application card.** The "Enable per-app profiles" toggle now sits with the other Application toggles instead of in its own near-empty section; the read-only profile list only appears when you've actually added `profiles` to settings.json.
 - **Roomier modals.** The Text replacements (and API keys) pop-ups got more left/right padding so their fields no longer hug the edges.
@@ -149,16 +259,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
-- **Dictation no longer pastes old/stale clipboard text.** For longer dictations (which paste via the clipboard), QuickDictate briefly put your text on the clipboard, pressed Ctrl+V, then restored your previous clipboard after only 60 ms. But the keystroke is only *queued* — a slower app (browsers, Electron apps) often read the clipboard after the restore and pasted the **old** contents instead, and that stale text got re-parked on your clipboard after every long dictation. The restore delay is now a configurable **300 ms** (`clipboard_restore_delay_ms`, `0` = don't restore), and the restore is skipped entirely if another app wrote the clipboard in the meantime, so it can never clobber a fresh copy.
-- **Hotkeys no longer die after "Save & Restart."** Global Windows hotkeys are exclusive to one process, so the relaunched app could fail to grab the hotkey while the old instance was still exiting — and the old code treated that as fatal, killing the hotkey thread until you manually restarted again. Startup registration is now non-fatal and retries for a few seconds (invisible handoff), falling back to the periodic self-heal re-arm if needed.
-- **Settings re-opens every time now (and no longer disturbs the hotkey).** Opening Settings, closing it, and opening it again used to do nothing — the window stayed shut — and could also leave the global dictation hotkey unresponsive. Root cause: the window's UI toolkit only allows one event loop per process, so tearing it down on close permanently blocked re-creating it. The window now **hides** on close and re-shows on the next open (re-seeded to a clean state), so Settings opens reliably and closing it no longer tears down anything that the hotkey path could get caught on.
-- **First run with no API keys now opens Settings for you.** Previously it only showed a pop-up telling you to go open Settings yourself and then did nothing. Now the Settings window opens automatically, with a pinned **"Add an API key to get started"** banner at the top (with a one-click **Manage keys…** button) that disappears the moment you save a key for any provider. The old separate warning pop-up is gone — the auto-opened window carries the message instead.
+- **Dictation no longer pastes old/stale clipboard text.** For longer dictations (which paste via the clipboard), QuickDictate briefly put your text on the clipboard, pressed Ctrl+V, then restored your previous clipboard after only 60 ms. But the keystroke is only *queued*, a slower app (browsers, Electron apps) often read the clipboard after the restore and pasted the **old** contents instead, and that stale text got re-parked on your clipboard after every long dictation. The restore delay is now a configurable **300 ms** (`clipboard_restore_delay_ms`, `0` = don't restore), and the restore is skipped entirely if another app wrote the clipboard in the meantime, so it can never clobber a fresh copy.
+- **Hotkeys no longer die after "Save & Restart."** Global Windows hotkeys are exclusive to one process, so the relaunched app could fail to grab the hotkey while the old instance was still exiting, and the old code treated that as fatal, killing the hotkey thread until you manually restarted again. Startup registration is now non-fatal and retries for a few seconds (invisible handoff), falling back to the periodic self-heal re-arm if needed.
+- **Settings re-opens every time now (and no longer disturbs the hotkey).** Opening Settings, closing it, and opening it again used to do nothing, the window stayed shut, and could also leave the global dictation hotkey unresponsive. Root cause: the window's UI toolkit only allows one event loop per process, so tearing it down on close permanently blocked re-creating it. The window now **hides** on close and re-shows on the next open (re-seeded to a clean state), so Settings opens reliably and closing it no longer tears down anything that the hotkey path could get caught on.
+- **First run with no API keys now opens Settings for you.** Previously it only showed a pop-up telling you to go open Settings yourself and then did nothing. Now the Settings window opens automatically, with a pinned **"Add an API key to get started"** banner at the top (with a one-click **Manage keys…** button) that disappears the moment you save a key for any provider. The old separate warning pop-up is gone, the auto-opened window carries the message instead.
 
 ## [0.1.7] - 2026-07-04
 
 ### Changed
 
-- **~21% smaller download** (13.6 MB → 10.7 MB): HTTPS now uses the OS-native TLS backend (schannel) instead of bundling a second full rustls + Mozilla-CA stack, and the release binary is fully symbol-stripped. No behavior change — the update-check and Google STT paths were re-verified over schannel.
+- **~21% smaller download** (13.6 MB → 10.7 MB): HTTPS now uses the OS-native TLS backend (schannel) instead of bundling a second full rustls + Mozilla-CA stack, and the release binary is fully symbol-stripped. No behavior change, the update-check and Google STT paths were re-verified over schannel.
 
 ### Added
 
@@ -173,15 +283,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 
 - Settings → Speech-to-text provider: **Manage keys… and Test all keys now sit on the dropdown's row** (one row shorter).
-- Settings → Dictation: the **Record buttons are gone** — each hotkey field now has a small, subtle record dot tucked into its right edge (click it, then press a key). The two input halves are laid out independently so neither can squeeze the other.
+- Settings → Dictation: the **Record buttons are gone**, each hotkey field now has a small, subtle record dot tucked into its right edge (click it, then press a key). The two input halves are laid out independently so neither can squeeze the other.
 - Settings → Application: the four toggles are now in **two columns**.
-- The **Text replacements…** button no longer stretches full-width — it sizes to its label.
+- The **Text replacements…** button no longer stretches full-width, it sizes to its label.
 
 ## [0.1.5] - 2026-07-04
 
 ### Added
 
-- **Enable text replacements** toggle in Settings — a master on/off switch for the whole replacement pass (the saved list is kept, just not applied while off).
+- **Enable text replacements** toggle in Settings, a master on/off switch for the whole replacement pass (the saved list is kept, just not applied while off).
 - The **Check for updates** flow now shows a spinning arc for at least ~2 seconds before the result lands, so the check reads as actually doing something instead of flashing past.
 
 ### Changed
@@ -194,32 +304,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- **Record hotkey**: a "Record" button next to each hotkey field in Settings — click it and press a key/combo to set the hotkey.
+- **Record hotkey**: a "Record" button next to each hotkey field in Settings, click it and press a key/combo to set the hotkey.
 - **Bulk text-replacements editor**: the Text replacements modal has a "Text editor" toggle that shows all replacements as `from => to` lines, so a big set can be pasted/copied at once.
 
 ### Changed
 
 - The tray menu is now minimal (version, Settings…, Open Executable Location, Quit). **About**, **Check for updates** (opens the About window with the live version status), **Open log file**, and **Edit settings.json** moved into the Settings window.
-- Fixed the "Save && Restart" button showing a double ampersand — now "Save & Restart".
+- Fixed the "Save && Restart" button showing a double ampersand, now "Save & Restart".
 
 ## [0.1.3] - 2026-07-04
 
 ### Added
 
 - Auto-default provider: if the configured `stt_provider` has no keys but another provider does, the app opens straight into that provider (so pasting only, say, Google keys just works). An explicit `--provider` is always respected.
-- The settings template is now **baked into the exe** (`include_str!` of settings.example.json); on first run, when no settings.json exists, it's written out from that template — no separate settings.example.json file shipped alongside.
-- `scripts/check.ps1`: local CI — runs the exact fmt/clippy/build/test gates GitHub CI runs, so you can verify a change in ~1 minute instead of waiting on GitHub.
+- The settings template is now **baked into the exe** (`include_str!` of settings.example.json); on first run, when no settings.json exists, it's written out from that template, no separate settings.example.json file shipped alongside.
+- `scripts/check.ps1`: local CI, runs the exact fmt/clippy/build/test gates GitHub CI runs, so you can verify a change in ~1 minute instead of waiting on GitHub.
 
 ### Changed
 
-- Empty-key onboarding notice is now **provider-agnostic** ("No API keys found" instead of naming ElevenLabs) — QuickDictate works with any provider.
+- Empty-key onboarding notice is now **provider-agnostic** ("No API keys found" instead of naming ElevenLabs), QuickDictate works with any provider.
 - Updated the settings window to **egui/eframe 0.35** (from 0.31); the key/text-replacement modals now use egui's native `Modal`.
 
 ## [0.1.2] - 2026-07-04
 
 ### Added
 
-- **Settings window** (tray → "Settings…"): provider dropdown, API-key manager in a modal (masked keys, add/remove, per-key status chips, "Test all" probing every key **in parallel** against the real provider API), text-replacements editor modal, hotkey fields with validation, and all the common toggles — styled to the LunarWerx look (brand-blue rounded checkboxes and buttons, carded sections, Segoe UI, dark/light theme). `settings.json` stays the source of truth; "Edit Settings (JSON)" remains in the tray for advanced fields.
+- **Settings window** (tray → "Settings…"): provider dropdown, API-key manager in a modal (masked keys, add/remove, per-key status chips, "Test all" probing every key **in parallel** against the real provider API), text-replacements editor modal, hotkey fields with validation, and all the common toggles, styled to the LunarWerx look (brand-blue rounded checkboxes and buttons, carded sections, Segoe UI, dark/light theme). `settings.json` stays the source of truth; "Edit Settings (JSON)" remains in the tray for advanced fields.
 - Headless UI screenshots for development: `QUICKDICTATE_UI_SHOT=<png>` makes the settings window capture itself via egui's viewport screenshot (`scripts/ui_shot.ps1` wraps the loop; `-Open keys-test` also runs a live parallel key test before capturing).
 
 ## [0.1.1] - 2026-07-04
@@ -232,7 +342,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
-- Key health now lives in memory only — `key-health.json` is gone. Every launch starts fresh and re-probes, so a temporarily limited key or a provider outage never permanently brands a key dead. Failed keys cool down (duration scaled to the failure kind) and become eligible again automatically.
+- Key health now lives in memory only, `key-health.json` is gone. Every launch starts fresh and re-probes, so a temporarily limited key or a provider outage never permanently brands a key dead. Failed keys cool down (duration scaled to the failure kind) and become eligible again automatically.
 - About window rebuilt as a faithful port of the LunarWerx "2026" card: owner-drawn version + update-status pills (GitHub mark, live status dot), theme-aware dark/light skin with dark titlebar, per-monitor DPI scaling, LunarWerx Studios wordmark, hand cursors over clickables.
 
 ### Fixed

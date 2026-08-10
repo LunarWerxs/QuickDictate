@@ -34,6 +34,8 @@
   "local_model": "cohere-q5",
   "dashscope_intl": false,
   "update_auto_check": true,
+  "update_auto_install": false,
+  "protect_keys_at_rest": false,
   "install_id": "",
   "run_at_startup": false,
   "hide_tray_icon": false,
@@ -44,6 +46,8 @@
     "Chat GPT": "ChatGPT",
     "Github": "GitHub"
   },
+
+  "custom_vocabulary": [],
 
   "profiles_enabled": true,
   "profiles": [],

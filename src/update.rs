@@ -12,10 +12,17 @@
 //!
 //! Trigger points:
 //!   * startup auto-check (gated by `update_auto_check` in settings, default
-//!     on; throttled to one network hit per 24 h via the cache file). When a
-//!     newer release exists it installs **silently** — download, verify, swap,
-//!     relaunch — with no prompt. The relaunch is deferred to the next restart
-//!     if a dictation is in progress, so a silent update never interrupts you.
+//!     on; throttled to one network hit per 24 h via the cache file). A newer
+//!     release is **reported, not installed**: [`pending_update`] is published
+//!     for the tray tooltip and the About pill, and clicking the pill is the
+//!     consent to install. Setting `update_auto_install` restores the old
+//!     silent behaviour (download, verify, swap, relaunch), deferring the
+//!     relaunch until you are idle so it never interrupts a dictation.
+//!     The default changed in v0.5.4 because the download URL and its SHA-256
+//!     both come from the release payload: hash pinning proves the bytes match
+//!     what was uploaded, not that the maintainer intended to upload them, so
+//!     anything able to publish a release could otherwise reach every install
+//!     unattended within a day.
 //!   * the About window (Settings → About, or its "Check for updates" item):
 //!     the status pill checks on open and on click, and when an update is
 //!     waiting, clicking the pill installs it in-app via
@@ -95,15 +102,43 @@ pub enum UpdateCheck {
     Failed,
 }
 
-/// Lenient `vX.Y.Z` / `X.Y` / `X.Y.Z-rc1` parser (copied from SageThumbs).
-fn parse_ver(s: &str) -> Option<(u32, u32, u32)> {
-    let core = s.trim().trim_start_matches(['v', 'V']);
-    let core = core.split(['-', '+']).next().unwrap_or(core);
+/// Lenient `vX.Y.Z` / `X.Y` / `X.Y.Z-rc1` parser.
+///
+/// The fourth element is a prerelease rank: `0` for a prerelease, `1` for a
+/// final release. Semver orders `1.0.0-rc1` BELOW `1.0.0`, and dropping the
+/// suffix entirely (as this did) made them compare equal, so a final release
+/// following its own release candidate reported "up to date" and was never
+/// delivered. Build metadata (`+build7`) is still ignored, which is correct:
+/// semver says it does not affect precedence.
+///
+/// Note this deliberately does NOT distinguish two DIFFERENT builds published
+/// under the same tag. Detecting that would mean trusting the release payload
+/// to say "this is newer than the identical-looking thing you have", which is
+/// exactly the input an attacker controls. Republishing therefore requires a
+/// version bump; `docs/RELEASING.md` says so.
+fn parse_ver(s: &str) -> Option<(u32, u32, u32, u8)> {
+    let trimmed = s.trim().trim_start_matches(['v', 'V']);
+    // Strip build metadata first, then split off any prerelease tag.
+    let no_build = trimmed.split('+').next().unwrap_or(trimmed);
+    let mut parts = no_build.splitn(2, '-');
+    let core = parts.next().unwrap_or(no_build);
+    let is_prerelease = parts.next().is_some_and(|p| !p.is_empty());
     let mut it = core.split('.');
     let maj = it.next()?.parse::<u32>().ok()?;
     let min = it.next().and_then(|p| p.parse().ok()).unwrap_or(0);
     let pat = it.next().and_then(|p| p.parse().ok()).unwrap_or(0);
-    Some((maj, min, pat))
+    Some((maj, min, pat, u8::from(!is_prerelease)))
+}
+
+/// A newer release the user has not installed yet, published by the auto-check
+/// when `update_auto_install` is off (the default). The About window's pill and
+/// the tray tooltip read this so "an update is waiting" is visible without the
+/// app having replaced its own binary behind the user's back.
+static PENDING_UPDATE: Mutex<Option<String>> = Mutex::new(None);
+
+/// The tag of a newer release found by the last auto-check, if any.
+pub fn pending_update() -> Option<String> {
+    PENDING_UPDATE.lock().ok().and_then(|g| g.clone())
 }
 
 fn client() -> Option<reqwest::blocking::Client> {
@@ -268,6 +303,24 @@ fn write_cache(tag: &str) {
     }
 }
 
+/// After a FAILED check, retry this much later instead of the full 24 h.
+const FAILED_RETRY_SECS: u64 = 60 * 60;
+
+/// Stamp the cache after a failed check, backdated so it reads as fresh for
+/// only [`FAILED_RETRY_SECS`]. Two constraints meet here: an offline machine
+/// must not hammer the endpoint on every launch (why the failure is cached at
+/// all), but one bad check at boot, Wi-Fi not up yet, a DNS blip, must not
+/// count as a real answer, or the machine spends a full day believing it is
+/// up to date when a release is out (updates are notify-only now, so a
+/// suppressed check IS a suppressed notice). Backdating keeps the cache file
+/// format and every reader unchanged.
+fn write_cache_failed() {
+    if let Some(p) = cache_path() {
+        let ts = now_secs().saturating_sub(CHECK_INTERVAL_SECS - FAILED_RETRY_SECS);
+        let _ = std::fs::write(p, format!("{}\n{}\n", ts, env!("CARGO_PKG_VERSION")));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Download, verify, swap, relaunch
 // ---------------------------------------------------------------------------
@@ -374,14 +427,41 @@ fn verify_exe_bytes(bytes: &[u8], asset: &Asset) -> bool {
 /// Prove the downloaded PE is actually the release it claims to be before replacing the
 /// running application. `--version` exits before any settings/audio/UI side effects.
 fn verify_exe_version(path: &Path, expected: &str) -> bool {
-    std::process::Command::new(path)
-        .arg("--version")
-        .output()
-        .is_ok_and(|output| {
-            output.status.success()
-                && String::from_utf8_lossy(&output.stdout).trim()
-                    == expected.trim_start_matches(['v', 'V'])
-        })
+    // Bounded. `Command::output()` blocks forever if the child never exits,
+    // and this child is a binary we just downloaded, so "it hangs" is squarely
+    // in scope. Run the wait on a helper thread and give up after
+    // VERSION_CHECK_TIMEOUT; a downloaded exe that will not answer --version
+    // promptly has already failed the check.
+    const VERSION_CHECK_TIMEOUT: Duration = Duration::from_secs(20);
+    let expected = expected.trim_start_matches(['v', 'V']).to_string();
+    let path = path.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawn = std::thread::Builder::new()
+        .name("qd-update-verify".into())
+        .spawn(move || {
+            let verdict = std::process::Command::new(&path)
+                .arg("--version")
+                .output()
+                .is_ok_and(|output| {
+                    output.status.success()
+                        && String::from_utf8_lossy(&output.stdout).trim() == expected
+                });
+            let _ = tx.send(verdict);
+        });
+    if spawn.is_err() {
+        tracing::warn!("update: could not spawn the version self-check");
+        return false;
+    }
+    match rx.recv_timeout(VERSION_CHECK_TIMEOUT) {
+        Ok(verdict) => verdict,
+        Err(_) => {
+            tracing::warn!(
+                "update: downloaded executable did not answer --version within \
+                 {VERSION_CHECK_TIMEOUT:?}; refusing to install it"
+            );
+            false
+        }
+    }
 }
 
 /// Download the new exe, verify it, and swap it into place. Returns the path to
@@ -497,6 +577,11 @@ pub fn download_and_install_now(tag: &str) -> Result<(), String> {
     // Manual install from the About window → reopen About after the relaunch so
     // the user lands back where they were and sees the new version.
     let result = download_and_swap(tag).and_then(|exe| relaunch(&exe, tag, true));
+    if result.is_ok() {
+        if let Ok(mut slot) = PENDING_UPDATE.lock() {
+            *slot = None;
+        }
+    }
     if result.is_err() {
         // Free the lock so a later retry can run. On success we intentionally
         // leave it set — the process is on its way out.
@@ -576,16 +661,40 @@ pub fn spawn_startup_check(app: Arc<App>) {
             match check() {
                 UpdateCheck::Available(tag) => {
                     write_cache(&tag);
-                    tracing::info!("update: v{tag} available; installing silently");
-                    relaunching = install_silently(&app, &tag);
+                    if let Ok(mut slot) = PENDING_UPDATE.lock() {
+                        *slot = Some(tag.clone());
+                    }
+                    if app.config.load().update_auto_install {
+                        tracing::info!("update: v{tag} available; installing silently (opted in)");
+                        relaunching = install_silently(&app, &tag);
+                    } else {
+                        // Default since v0.5.4. The URL and the SHA-256 both
+                        // come out of the release payload, so hash pinning
+                        // proves the bytes match what was uploaded, not that
+                        // the maintainer meant to upload them. Anything able
+                        // to publish a release would otherwise reach every
+                        // install unattended within a day. The click on the
+                        // About pill is the consent.
+                        tracing::info!(
+                            "update: v{tag} available; waiting for the user to confirm \
+                             (set update_auto_install to install silently)"
+                        );
+                    }
                 }
                 UpdateCheck::UpToDate => {
                     write_cache(env!("CARGO_PKG_VERSION"));
+                    if let Ok(mut slot) = PENDING_UPDATE.lock() {
+                        *slot = None;
+                    }
                     tracing::info!("update: up to date");
                 }
                 UpdateCheck::Failed => {
                     // Silent: no release yet / offline is not the user's problem.
-                    tracing::info!("update: auto-check failed (silent)");
+                    // Stamp the cache with the short retry window: bounded
+                    // network chatter while offline, without one boot-time
+                    // blip suppressing a real update notice for a day.
+                    write_cache_failed();
+                    tracing::info!("update: auto-check failed (silent); retrying in about an hour");
                 }
             }
         }
@@ -634,11 +743,11 @@ mod tests {
 
     #[test]
     fn parses_plain_and_prefixed_tags() {
-        assert_eq!(parse_ver("0.1.0"), Some((0, 1, 0)));
-        assert_eq!(parse_ver("v1.2.3"), Some((1, 2, 3)));
-        assert_eq!(parse_ver("V2.0"), Some((2, 0, 0)));
-        assert_eq!(parse_ver("1.2.3-rc1"), Some((1, 2, 3)));
-        assert_eq!(parse_ver("1.2.3+build7"), Some((1, 2, 3)));
+        assert_eq!(parse_ver("0.1.0"), Some((0, 1, 0, 1)));
+        assert_eq!(parse_ver("v1.2.3"), Some((1, 2, 3, 1)));
+        assert_eq!(parse_ver("V2.0"), Some((2, 0, 0, 1)));
+        assert_eq!(parse_ver("1.2.3-rc1"), Some((1, 2, 3, 0)));
+        assert_eq!(parse_ver("1.2.3+build7"), Some((1, 2, 3, 1)));
         assert_eq!(parse_ver("garbage"), None);
         assert_eq!(parse_ver(""), None);
     }
@@ -648,7 +757,18 @@ mod tests {
         assert!(parse_ver("0.2.0") > parse_ver("0.1.9"));
         assert!(parse_ver("1.0.0") > parse_ver("0.99.99"));
         assert!(parse_ver("0.1.0") == parse_ver("v0.1.0"));
-        assert!(parse_ver("0.1.1") > parse_ver(env!("CARGO_PKG_VERSION")).map(|_| (0, 1, 0)));
+        assert!(parse_ver("0.1.1") > parse_ver("0.1.0"));
+    }
+
+    #[test]
+    fn a_final_release_outranks_its_own_prerelease() {
+        // Semver: 1.0.0-rc1 < 1.0.0. Stripping the suffix made these compare
+        // equal, so the real 1.0.0 was reported as "up to date" and never
+        // delivered to anyone running the rc.
+        assert!(parse_ver("1.0.0") > parse_ver("1.0.0-rc1"));
+        assert!(parse_ver("1.0.0-rc2") > parse_ver("0.9.9"));
+        // Build metadata does not affect precedence.
+        assert_eq!(parse_ver("1.0.0+abc"), parse_ver("1.0.0"));
     }
 
     #[test]

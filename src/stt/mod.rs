@@ -75,6 +75,13 @@ const ERROR_PIP_VISIBLE: Duration = Duration::from_secs(2);
 /// mid-handshake) could hang the user's hotkey press until the OS TCP timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Hard cap on ONE `send_audio` call. Chunks are ~100 ms of audio, so a
+/// healthy socket completes this in single-digit milliseconds; anything near
+/// this bound means the transport is gone. Generous enough not to trip on a
+/// brief stall, short enough that a dead network surfaces while the user is
+/// still talking rather than after they release.
+const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Hard cap on rounds (3 keys × 2 rounds = up to 6 attempts per press).
 const MAX_RETRY_ROUNDS: u32 = 2;
 
@@ -86,7 +93,13 @@ const EXHAUSTED_SIGNAL: &str = "__quickdictate_key_exhausted__";
 /// ElevenLabs (the baseline) with a warning. Providers are cheap unit structs,
 /// rebuilt per session so a settings edit + restart cleanly switches backend.
 fn make_provider(cfg: &Config) -> Box<dyn SttProvider> {
-    match cfg.stt_provider.trim().to_ascii_lowercase().as_str() {
+    make_provider_id(&cfg.stt_provider, cfg)
+}
+
+/// Build a provider by EXPLICIT id, so a Per-App Profile can select one that
+/// differs from `cfg.stt_provider` (see `Config::provider_for_exe`).
+fn make_provider_id(id: &str, cfg: &Config) -> Box<dyn SttProvider> {
+    match id.trim().to_ascii_lowercase().as_str() {
         "elevenlabs" => Box::new(elevenlabs::ElevenLabsProvider),
         "deepgram" => Box::new(deepgram::DeepgramProvider),
         "assemblyai" => Box::new(assemblyai::AssemblyAiProvider),
@@ -124,6 +137,9 @@ pub fn spawn_prewarm(app: Arc<App>, keys: Arc<KeyPool>) {
             language: provider.language_for(&cfg.language),
             sample_rate: fmt.sample_rate,
             model: cfg.stt_model.clone(),
+            // A probe only proves the credential works; biasing terms would
+            // just make the handshake bigger for no benefit.
+            custom_vocabulary: Vec::new(),
         };
         let list = keys.all_keys();
         if list.is_empty() {
@@ -162,6 +178,7 @@ pub fn spawn_key_test(
                 language: provider.language_for(&cfg.language),
                 sample_rate: provider.required_audio_format().sample_rate,
                 model: cfg.stt_model.clone(),
+                custom_vocabulary: Vec::new(),
             };
             let ok = probe_key(provider.as_ref(), &key, &opts).await.is_ok();
             on_result(key, ok);
@@ -307,7 +324,8 @@ pub fn start_session(app: Arc<App>, keys: Arc<KeyPool>) -> SttHandle {
             crate::sync::schedule_stats_push(Arc::clone(&app2));
         }
         if let Err(e) = final_res {
-            if e.to_string() == EXHAUSTED_SIGNAL {
+            let key_shaped = e.to_string() == EXHAUSTED_SIGNAL;
+            if key_shaped {
                 tracing::error!(
                     "session[{epoch}] tried {MAX_KEY_ATTEMPTS} keys, none worked -- check provider credit / pool health"
                 );
@@ -315,12 +333,15 @@ pub fn start_session(app: Arc<App>, keys: Arc<KeyPool>) -> SttHandle {
                 tracing::error!("session error: {e:#}");
             }
             if app2.current_session_epoch() == epoch {
-                // Distinguish "all your keys are dead/unauthorized" so the pip
-                // shows a key glyph and the tray tooltip explains it, instead of
-                // a bare "!". `keys.all_dead()` is true only when every key was
-                // rejected as invalid this run (not a transient/network failure).
-                let kind = if keys.all_dead() {
-                    crate::state::ErrorKind::DeadKeys
+                // Name the actual cause, but only when the failure was
+                // actually key-shaped. The pool's `last_failure` outlives the
+                // session (prewarm marks quota-limited keys at startup), so
+                // consulting it for a NON-key failure misattributes: a mic or
+                // network error on a machine whose spare keys sat at Quota
+                // would show "out of credit" for a dictation that never
+                // touched those keys.
+                let kind = if key_shaped {
+                    error_kind_for(&keys)
                 } else {
                     crate::state::ErrorKind::Generic
                 };
@@ -344,6 +365,64 @@ pub fn start_session(app: Arc<App>, keys: Arc<KeyPool>) -> SttHandle {
     }
 }
 
+/// Trim, drop blanks, and de-duplicate the user's biasing terms before they go
+/// on the wire. Case-insensitive de-dup keeping first-seen order, so a list
+/// hand-edited in settings.json cannot send the same term three times and eat
+/// a provider's term budget.
+fn normalize_vocabulary(terms: &[String]) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut out: Vec<String> = Vec::new();
+    for term in terms {
+        let t = term.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let folded = t.to_ascii_lowercase();
+        if seen.contains(&folded) {
+            continue;
+        }
+        seen.push(folded);
+        out.push(t.to_string());
+    }
+    out
+}
+
+/// Map what the key pool observed this run onto the pip/tooltip cause.
+/// `all_dead` (every key rejected as invalid) stays the strongest signal;
+/// below that the most recent [`FailKind`] is the honest answer.
+fn error_kind_for(keys: &KeyPool) -> crate::state::ErrorKind {
+    use crate::state::ErrorKind;
+    if keys.all_dead() {
+        return ErrorKind::DeadKeys;
+    }
+    match keys.last_failure() {
+        Some(FailKind::Exhausted) => ErrorKind::Quota,
+        Some(FailKind::RateLimit) => ErrorKind::RateLimited,
+        Some(FailKind::Transient) => ErrorKind::Network,
+        Some(FailKind::Invalid) => ErrorKind::DeadKeys,
+        None => ErrorKind::Generic,
+    }
+}
+
+/// Hand a finished transcript to the output thread.
+///
+/// The channel is bounded (64) and the plain `send()` this replaces BLOCKS
+/// when it is full. run_session runs on one of only two tokio worker threads, so a
+/// stalled paste (SendInput into a hung foreground window) could wedge both
+/// workers and freeze every session and timer in the app. A bounded wait keeps
+/// the transcript in the normal case and gives up loudly rather than deadlocking.
+fn deliver_transcript(tx: &crossbeam_channel::Sender<String>, text: String) {
+    const DELIVER_TIMEOUT: Duration = Duration::from_secs(30);
+    let chars = text.chars().count();
+    if let Err(e) = tx.send_timeout(text, DELIVER_TIMEOUT) {
+        tracing::error!(
+            "output queue did not accept a {chars}-char transcript within \
+             {DELIVER_TIMEOUT:?} ({e}); the paste pipeline is stalled and this \
+             transcript is lost"
+        );
+    }
+}
+
 /// Send one PCM chunk through the provider sink. Mirrors the original `ship()`:
 /// once a send errors the socket is dead, so we log only the first failure and
 /// skip every subsequent send.
@@ -351,10 +430,21 @@ async fn ship(sink: &mut Box<dyn ProviderSink>, chunk: &[i16], dead: &mut bool) 
     if *dead {
         return false;
     }
-    match sink.send_audio(chunk).await {
-        Ok(()) => true,
-        Err(e) => {
+    // Bounded: `connect()` had CONNECT_TIMEOUT and the post-release flush had
+    // `send_deadline`, but the LIVE phase awaited send_audio with no limit at
+    // all. A blackholed network while the user is holding the hotkey would
+    // hang the whole session with no partials and no error until they let go.
+    match tokio::time::timeout(SEND_TIMEOUT, sink.send_audio(chunk)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
             tracing::debug!("provider send error (subsequent sends will be skipped): {e}");
+            *dead = true;
+            false
+        }
+        Err(_) => {
+            tracing::warn!(
+                "provider send stalled for {SEND_TIMEOUT:?}; treating the socket as dead"
+            );
             *dead = true;
             false
         }
@@ -504,7 +594,32 @@ async fn run_session(
     }
 
     let cfg = app.config.load_full();
-    let provider = make_provider(&cfg);
+    // Resolve Per-App Profile overrides ONCE, at session start. The profile
+    // that matters for provider/language is the one for the window the user
+    // was in when they pressed the hotkey; the text-processing profile is
+    // resolved separately at commit time in output.rs, because by then focus
+    // may legitimately have moved.
+    let exe_at_start = crate::focus::foreground_exe_name();
+    let effective = cfg.effective_settings(exe_at_start.as_deref());
+    let resolved_provider = cfg.provider_for_exe(exe_at_start.as_deref());
+    // A profile that names a DIFFERENT provider needs that provider's keys,
+    // so the session runs on its own pool. Everything else keeps using the
+    // shared pool the main loop maintains, byte-identically to before.
+    let keys = match resolved_provider.as_deref() {
+        Some(want) if want != keys.provider_id() => {
+            tracing::info!(
+                "session[{epoch}] profile for {:?} overrides the provider: {} -> {want}",
+                exe_at_start.as_deref().unwrap_or("<unknown>"),
+                keys.provider_id()
+            );
+            crate::keys::KeyPool::for_provider(&cfg, want)
+        }
+        _ => keys,
+    };
+    let provider = make_provider_id(
+        resolved_provider.as_deref().unwrap_or(&cfg.stt_provider),
+        &cfg,
+    );
     let provider_id = provider.id();
     let requires_api_key = provider.requires_api_key();
     let finalize_timeout = provider.finalize_timeout();
@@ -528,16 +643,11 @@ async fn run_session(
     } else {
         String::new()
     };
-    let key_suffix: String = key
-        .chars()
-        .rev()
-        .take(6)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
+    // Positional label, never a slice of the credential: log files end up
+    // attached to bug reports.
+    let key_suffix = keys.label(&key);
     if requires_api_key {
-        tracing::info!("session[{epoch}] provider={provider_id} using key ...{key_suffix}");
+        tracing::info!("session[{epoch}] provider={provider_id} using key {key_suffix}");
         *app.current_key.lock() = Some(key.clone());
     } else {
         tracing::info!("session[{epoch}] provider={provider_id} (no API key)");
@@ -546,9 +656,10 @@ async fn run_session(
 
     let fmt = provider.required_audio_format();
     let opts = SttSessionOpts {
-        language: provider.language_for(&cfg.language),
+        language: provider.language_for(&effective.language),
         sample_rate: fmt.sample_rate,
         model: cfg.stt_model.clone(),
+        custom_vocabulary: normalize_vocabulary(&effective.custom_vocabulary),
     };
 
     // Subscribe to the pre-warmed global audio pipeline BEFORE connecting so a
@@ -826,6 +937,11 @@ async fn run_session(
     let dropped_phantom_buf: Arc<parking_lot::Mutex<Option<String>>> =
         Arc::new(parking_lot::Mutex::new(None));
     let committed_flag = Arc::new(AtomicBool::new(false));
+    // Text of the most recent KEPT commit, so the end-of-session fallback can
+    // tell a genuinely-unfinalized trailing partial from a partial that
+    // merely repeats what was already committed.
+    let last_commit_text: Arc<parking_lot::Mutex<String>> =
+        Arc::new(parking_lot::Mutex::new(String::new()));
     let transcribed_words = Arc::new(AtomicU64::new(0));
     let key_fail_kind: Arc<parking_lot::Mutex<Option<FailKind>>> =
         Arc::new(parking_lot::Mutex::new(None));
@@ -835,6 +951,7 @@ async fn run_session(
     let last_partial_for_task = Arc::clone(&last_partial_buf);
     let dropped_phantom_for_task = Arc::clone(&dropped_phantom_buf);
     let committed_for_task = Arc::clone(&committed_flag);
+    let last_commit_text_for_task = Arc::clone(&last_commit_text);
     let transcribed_words_for_task = Arc::clone(&transcribed_words);
     let key_fail_for_task = Arc::clone(&key_fail_kind);
     let provider_failure_for_task = Arc::clone(&provider_failure);
@@ -855,7 +972,25 @@ async fn run_session(
                 Ok(Some(ev)) => ev,
                 Ok(None) => break,
                 Err(e) => {
+                    // A read error mid-utterance is NOT a clean end of stream.
+                    // Recording it in `provider_failure` is what makes
+                    // run_session return Err, so the retry shell can rotate or
+                    // the pip can show an error. Without this a dropped socket
+                    // was indistinguishable from the provider finishing
+                    // normally: no retry, no error, and any uncommitted speech
+                    // silently gone while the app reported success.
+                    //
+                    // Recorded unconditionally here, but only SURFACED at the
+                    // end of run_session when the session delivered no words.
+                    // ElevenLabs routinely resets the socket without a closing
+                    // handshake once it has sent the final transcript, and
+                    // erroring on that flashed the pip after a dictation the
+                    // user watched succeed.
                     tracing::warn!("session[{epoch}] recv error: {e}");
+                    let mut slot = provider_failure_for_task.lock();
+                    if slot.is_none() {
+                        *slot = Some(format!("transport failed mid-session: {e}"));
+                    }
                     break;
                 }
             };
@@ -935,6 +1070,17 @@ async fn run_session(
                     committed_for_task.store(true, Ordering::Release);
                     last_commit_speech = speech_now;
 
+                    // This commit supersedes every partial up to this point, so
+                    // clear the buffer. What lands in it AFTER this is speech
+                    // from a LATER segment, and that segment deserves the
+                    // last-partial fallback even though an earlier commit
+                    // already succeeded. The old session-wide `!got_committed`
+                    // gate disabled the fallback for the rest of the session
+                    // after the first commit, so a final segment whose
+                    // finalization timed out was discarded outright.
+                    last_partial_for_task.lock().clear();
+                    *last_commit_text_for_task.lock() = final_text.clone();
+
                     let chunk_words = final_text.split_whitespace().count() as u32;
                     committed_words = committed_words.saturating_add(chunk_words);
                     transcribed_words_for_task.fetch_add(chunk_words as u64, Ordering::AcqRel);
@@ -969,7 +1115,7 @@ async fn run_session(
                                 final_text.chars().count()
                             );
                         }
-                        let _ = recv_app.transcript_tx.send(final_text);
+                        deliver_transcript(&recv_app.transcript_tx, final_text);
                     }
                 }
                 SttEvent::KeyFailure(kind) => {
@@ -1058,7 +1204,7 @@ async fn run_session(
                 release_flush.len(),
                 joined.chars().count()
             );
-            let _ = app.transcript_tx.send(joined);
+            deliver_transcript(&app.transcript_tx, joined);
         } else {
             tracing::info!(
                 "session[{epoch}] skipping release flush because a newer action superseded it"
@@ -1129,7 +1275,7 @@ async fn run_session(
                 held_chunks.len(),
                 joined.chars().count()
             );
-            let _ = app.transcript_tx.send(joined);
+            deliver_transcript(&app.transcript_tx, joined);
         } else {
             tracing::info!(
                 "session[{epoch}] skipping held commit flush because a newer action superseded it"
@@ -1137,15 +1283,32 @@ async fn run_session(
         }
     }
 
+    // The last-partial fallback is now per SEGMENT, not per session: a kept
+    // commit clears the partial buffer, so anything left here is speech that
+    // arrived after the last commit and never got finalized (the provider hit
+    // `final_transcript_timeout`). Gating it on `!got_committed` used to throw
+    // that trailing segment away for the rest of the session as soon as one
+    // earlier sentence committed. `got_committed` still guards the
+    // "no transcript at all" diagnostic below, which is genuinely per session.
     let had_partial = !last_partial.is_empty();
     let partial_was_dropped_phantom = dropped_phantom
         .as_deref()
         .is_some_and(|phantom| transcripts_equivalent(phantom, &last_partial));
-    if !got_committed && had_partial && partial_was_dropped_phantom {
+    // Belt and braces: if a provider re-emits the committed text as a trailing
+    // partial, promoting it would paste the same words twice.
+    let partial_repeats_last_commit = {
+        let last = last_commit_text.lock();
+        !last.is_empty() && transcripts_equivalent(&last, &last_partial)
+    };
+    if had_partial && partial_was_dropped_phantom {
         tracing::info!(
             "session[{epoch}] suppressing last partial because it matches a dropped phantom finalization"
         );
-    } else if !got_committed && had_partial && app.current_session_epoch() == epoch {
+    } else if had_partial && partial_repeats_last_commit {
+        tracing::info!(
+            "session[{epoch}] suppressing last partial because it repeats the last commit"
+        );
+    } else if had_partial && app.current_session_epoch() == epoch {
         transcribed_words.fetch_add(
             last_partial.split_whitespace().count() as u64,
             Ordering::AcqRel,
@@ -1158,8 +1321,8 @@ async fn run_session(
                 last_partial.chars().count()
             );
         }
-        let _ = app.transcript_tx.send(last_partial);
-    } else if !got_committed && had_partial {
+        deliver_transcript(&app.transcript_tx, last_partial);
+    } else if had_partial {
         tracing::info!(
             "session[{epoch}] skipping last partial because a newer action superseded it"
         );
@@ -1190,6 +1353,22 @@ async fn run_session(
         return Err(anyhow!(EXHAUSTED_SIGNAL));
     }
     if let Some(message) = provider_failure.lock().take() {
+        // A transport that died AFTER the words already landed is a teardown,
+        // not a failure. ElevenLabs in particular often drops the TCP
+        // connection without a closing handshake once it has sent the final
+        // transcript, so `recv_event` reports "Connection reset without closing
+        // handshake" on a session that fully succeeded. Raising the error pip
+        // for that is a lie: the user watched their sentence get typed.
+        //
+        // The point of recording a mid-session transport error is the case
+        // where speech was LOST, so gate on exactly that: nothing delivered.
+        if words > 0 {
+            tracing::info!(
+                "session[{epoch}] transport dropped during teardown after delivering \
+                 {words} word(s); not surfacing an error ({message})"
+            );
+            return Ok(());
+        }
         return Err(anyhow!(message));
     }
     Ok(())

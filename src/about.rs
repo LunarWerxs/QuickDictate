@@ -429,10 +429,9 @@ unsafe fn rgba_to_hbitmap(w: u32, h: u32, rgba: &[u8]) -> Option<HBITMAP> {
             rgba[i * 4 + 2],
             rgba[i * 4 + 3],
         );
-        let m = |c: u8| (((c as u16) * (a as u16) + 127) / 255) as u8;
-        dst[i * 4] = m(b);
-        dst[i * 4 + 1] = m(g);
-        dst[i * 4 + 2] = m(r);
+        dst[i * 4] = premultiply(b, a);
+        dst[i * 4 + 1] = premultiply(g, a);
+        dst[i * 4 + 2] = premultiply(r, a);
         dst[i * 4 + 3] = a;
     }
     Some(hbmp)
@@ -462,6 +461,41 @@ fn color_g(c: COLORREF) -> u8 {
 }
 fn color_b(c: COLORREF) -> u8 {
     ((c.0 >> 16) & 0xFF) as u8
+}
+
+/// Premultiply a straight-alpha channel value against coverage `a`:
+/// `(c * a + 127) / 255`, rounded to the nearest whole channel value.
+fn premultiply(c: u8, a: u8) -> u8 {
+    (((c as u16) * (a as u16) + 127) / 255) as u8
+}
+
+/// Linear-interpolate `on` over `dst` by coverage `a` (0 = all `dst`, 255 =
+/// all `on`) — used to tint the GitHub mark onto the pill face with no real
+/// alpha channel in the destination bitmap.
+fn blend(dst: u8, on: u8, a: u8) -> u8 {
+    let a = a as u32;
+    ((on as u32 * a + dst as u32 * (255 - a)) / 255) as u8
+}
+
+// ---- Pure layout helpers (extracted from build_about / draw_*_pill) -----
+
+/// The version-pill label, e.g. "v1.2.3" (from the crate's own Cargo.toml).
+fn version_label() -> String {
+    format!("v{}", env!("CARGO_PKG_VERSION"))
+}
+
+/// Centered top-left offset for placing `content` inside a `container` span
+/// that starts at 0 (add the span's own origin to get the final coordinate).
+/// Integer division truncates toward zero, same as the inline arithmetic this
+/// replaces.
+fn center_offset(container: i32, content: i32) -> i32 {
+    (container - content) / 2
+}
+
+/// Width that keeps `aspect` (width / height) when scaled to `height`,
+/// rounded to the nearest pixel.
+fn aspect_width(height: i32, aspect: f32) -> i32 {
+    (height as f32 * aspect).round() as i32
 }
 
 unsafe fn about_state(hwnd: HWND) -> *mut About {
@@ -528,9 +562,8 @@ unsafe fn github_icon_hbitmap(px: u32, fill: COLORREF, fg: COLORREF) -> Option<H
     let (gr, gg, gb) = (color_r(fg), color_g(fg), color_b(fg));
     let mut out = image::RgbaImage::new(src.width(), src.height());
     for (o, p) in out.pixels_mut().zip(src.pixels()) {
-        let a = p[3] as u32; // octocat coverage
-        let mix = |dst: u8, on: u8| ((on as u32 * a + dst as u32 * (255 - a)) / 255) as u8;
-        *o = image::Rgba([mix(fr, gr), mix(fgc, gg), mix(fb, gb), 255]);
+        let a = p[3]; // octocat coverage
+        *o = image::Rgba([blend(fr, gr, a), blend(fgc, gg, a), blend(fb, gb, a), 255]);
     }
     rgba_to_hbitmap(out.width(), out.height(), out.as_raw())
 }
@@ -576,7 +609,7 @@ unsafe fn build_about(hwnd: HWND) {
     // The two status pills, centered as a group. Each pill's width is fixed
     // (the version is constant; the status pill is sized to its widest
     // possible text), so the owner-draw just centers content inside.
-    let ver = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let ver = version_label();
     let ver_w = 14 + ICON + 7 + text_width(&ver) + 14;
     let cand = [
         "Checking\u{2026}".to_string(),
@@ -588,7 +621,7 @@ unsafe fn build_about(hwnd: HWND) {
     let max_tw = cand.iter().map(|c| text_width(c)).max().unwrap_or(80);
     let status_w = 14 + 10 + 8 + max_tw + 14;
     let gap = 12;
-    let gx = (CW - (ver_w + gap + status_w)) / 2;
+    let gx = center_offset(CW, ver_w + gap + status_w);
     let pill = SS_OWNERDRAW | SS_NOTIFY;
     let ver_pill = ctl(hwnd, "", pill, gx, 174, ver_w, 30, ID_VER_PILL);
     let status_pill = ctl(
@@ -620,7 +653,7 @@ unsafe fn build_about(hwnd: HWND) {
     // one (fixed height, width from the aspect) and right-anchor it.
     let (_, lw_aspect) = lw_logo();
     let lw_h = 26;
-    let lw_w = (lw_h as f32 * lw_aspect).round() as i32;
+    let lw_w = aspect_width(lw_h, lw_aspect);
     let lw = ctl(
         hwnd,
         "",
@@ -841,12 +874,12 @@ unsafe fn draw_ver_pill(hwnd: HWND, d: &DRAWITEMSTRUCT) {
 
     let icon_px = s(hwnd, ICON);
     let gap = s(hwnd, 7);
-    let ver = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let ver = version_label();
     SelectObject(hdc, gui_font_for(hwnd));
     let tw = measure(hdc, &ver);
     let group = icon_px + gap + tw;
-    let gx = rc.left + ((rc.right - rc.left) - group) / 2;
-    let iy = rc.top + ((rc.bottom - rc.top) - icon_px) / 2;
+    let gx = rc.left + center_offset(rc.right - rc.left, group);
+    let iy = rc.top + center_offset(rc.bottom - rc.top, icon_px);
     let st = about_state(hwnd);
     if !st.is_null() {
         if let Some(icon) = (*st).gh_icon {
@@ -856,12 +889,10 @@ unsafe fn draw_ver_pill(hwnd: HWND, d: &DRAWITEMSTRUCT) {
     draw_pill_text(hdc, &ver, gx + icon_px + gap, &rc, DARK_TEXT());
 }
 
-/// Map the current status to (dot colour, label).
-unsafe fn status_display(st: *mut About) -> (COLORREF, String) {
-    if st.is_null() {
-        return (rgb(150, 150, 150), "Checking\u{2026}".to_string());
-    }
-    match &(*st).status {
+/// Map a status to (dot colour, label). Pure — no pointer, no FFI — so the
+/// wndproc-facing wrapper below can stay a thin null check over this.
+fn status_label(status: &Status) -> (COLORREF, String) {
+    match status {
         Status::Checking => (rgb(150, 150, 150), "Checking\u{2026}".to_string()),
         Status::UpToDate => (rgb(63, 185, 80), "Up to date".to_string()),
         Status::Available(tag) => (rgb(210, 153, 34), format!("Update to {tag}")),
@@ -869,6 +900,14 @@ unsafe fn status_display(st: *mut About) -> (COLORREF, String) {
         Status::Updating => (rgb(74, 144, 245), "Updating\u{2026}".to_string()),
         Status::Failed => (rgb(190, 110, 110), "Check failed".to_string()),
     }
+}
+
+/// Map the current status to (dot colour, label).
+unsafe fn status_display(st: *mut About) -> (COLORREF, String) {
+    if st.is_null() {
+        return (rgb(150, 150, 150), "Checking\u{2026}".to_string());
+    }
+    status_label(&(*st).status)
 }
 
 /// Draw a rotating open arc (~270°) in the `dotd`×`dotd` box at `(x,y)`, using
@@ -909,8 +948,8 @@ unsafe fn draw_status_pill(hwnd: HWND, d: &DRAWITEMSTRUCT) {
     SelectObject(hdc, gui_font_for(hwnd));
     let tw = measure(hdc, &text);
     let group = dotd + gap + tw;
-    let gx = rc.left + ((rc.right - rc.left) - group) / 2;
-    let dy = rc.top + ((rc.bottom - rc.top) - dotd) / 2;
+    let gx = rc.left + center_offset(rc.right - rc.left, group);
+    let dy = rc.top + center_offset(rc.bottom - rc.top, dotd);
     if checking {
         // Animated spinner arc in place of the static dot.
         let angle = if st.is_null() { 0 } else { (*st).spinner_angle };
@@ -1100,5 +1139,170 @@ extern "system" fn about_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- scale_dpi ----
+
+    #[test]
+    fn scale_dpi_at_96_is_a_no_op() {
+        assert_eq!(scale_dpi(96, 96), 96);
+        assert_eq!(scale_dpi(440, 96), 440);
+    }
+
+    #[test]
+    fn scale_dpi_scales_up_at_common_dpi_steps() {
+        // 120/144/192 dpi are the standard 125%/150%/200% Windows scale steps.
+        assert_eq!(scale_dpi(10, 120), 13);
+        assert_eq!(scale_dpi(10, 144), 15);
+        assert_eq!(scale_dpi(10, 192), 20);
+    }
+
+    #[test]
+    fn scale_dpi_treats_zero_dpi_as_96() {
+        assert_eq!(scale_dpi(200, 0), scale_dpi(200, 96));
+    }
+
+    // ---- wide ----
+
+    #[test]
+    fn wide_null_terminates_the_utf16_buffer() {
+        assert_eq!(wide("ab"), vec!['a' as u16, 'b' as u16, 0]);
+    }
+
+    #[test]
+    fn wide_of_empty_string_is_only_the_terminator() {
+        assert_eq!(wide(""), vec![0]);
+    }
+
+    // ---- colour channel extraction ----
+
+    #[test]
+    fn color_channels_round_trip_through_rgb() {
+        let c = rgb(0x12, 0x34, 0x56);
+        assert_eq!(color_r(c), 0x12);
+        assert_eq!(color_g(c), 0x34);
+        assert_eq!(color_b(c), 0x56);
+    }
+
+    #[test]
+    fn color_channels_mask_out_unrelated_high_bits() {
+        // COLORREF only defines the low 24 bits; a stray high bit must not
+        // leak into any channel.
+        let c = COLORREF(0xFF12_3456);
+        assert_eq!(color_r(c), 0x56);
+        assert_eq!(color_g(c), 0x34);
+        assert_eq!(color_b(c), 0x12);
+    }
+
+    // ---- premultiply ----
+
+    #[test]
+    fn premultiply_at_full_coverage_keeps_the_channel() {
+        assert_eq!(premultiply(255, 255), 255);
+    }
+
+    #[test]
+    fn premultiply_at_zero_coverage_zeroes_the_channel() {
+        assert_eq!(premultiply(255, 0), 0);
+    }
+
+    #[test]
+    fn premultiply_scales_by_the_coverage_fraction() {
+        // (200 * 128 + 127) / 255 == 100 (integer division).
+        assert_eq!(premultiply(200, 128), 100);
+    }
+
+    // ---- blend ----
+
+    #[test]
+    fn blend_at_zero_alpha_is_pure_background() {
+        assert_eq!(blend(10, 200, 0), 10);
+    }
+
+    #[test]
+    fn blend_at_full_alpha_is_pure_foreground() {
+        assert_eq!(blend(10, 200, 255), 200);
+    }
+
+    #[test]
+    fn blend_at_half_alpha_is_a_weighted_average() {
+        // (200 * 128 + 10 * 127) / 255 == 105 (integer division).
+        assert_eq!(blend(10, 200, 128), 105);
+    }
+
+    // ---- version_label ----
+
+    #[test]
+    fn version_label_prefixes_the_crate_version_with_v() {
+        let label = version_label();
+        assert!(label.starts_with('v'));
+        assert_eq!(&label[1..], env!("CARGO_PKG_VERSION"));
+    }
+
+    // ---- center_offset ----
+
+    #[test]
+    fn center_offset_splits_the_remaining_space_evenly() {
+        assert_eq!(center_offset(440, 200), 120);
+        assert_eq!(center_offset(100, 100), 0);
+    }
+
+    #[test]
+    fn center_offset_truncates_an_odd_remainder_toward_zero() {
+        // (11 - 4) / 2 == 3, not 4 — integer division, matching the inline
+        // arithmetic this replaced.
+        assert_eq!(center_offset(11, 4), 3);
+    }
+
+    // ---- aspect_width ----
+
+    #[test]
+    fn aspect_width_scales_by_the_ratio() {
+        assert_eq!(aspect_width(10, 2.0), 20);
+    }
+
+    #[test]
+    fn aspect_width_rounds_to_the_nearest_pixel() {
+        // 3 * 2.5 == 7.5, rounds away from zero to 8.
+        assert_eq!(aspect_width(3, 2.5), 8);
+    }
+
+    // ---- status_label ----
+
+    #[test]
+    fn status_label_checking_shows_ellipsis() {
+        let (_, text) = status_label(&Status::Checking);
+        assert_eq!(text, "Checking\u{2026}");
+    }
+
+    #[test]
+    fn status_label_up_to_date_is_green() {
+        let (color, text) = status_label(&Status::UpToDate);
+        assert_eq!(text, "Up to date");
+        assert_eq!(color, rgb(63, 185, 80));
+    }
+
+    #[test]
+    fn status_label_available_names_the_tag() {
+        let (_, text) = status_label(&Status::Available("1.2.3".to_string()));
+        assert_eq!(text, "Update to 1.2.3");
+    }
+
+    #[test]
+    fn status_label_updating_shows_ellipsis() {
+        let (_, text) = status_label(&Status::Updating);
+        assert_eq!(text, "Updating\u{2026}");
+    }
+
+    #[test]
+    fn status_label_failed_is_red() {
+        let (color, text) = status_label(&Status::Failed);
+        assert_eq!(text, "Check failed");
+        assert_eq!(color, rgb(190, 110, 110));
     }
 }

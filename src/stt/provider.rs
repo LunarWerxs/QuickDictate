@@ -58,6 +58,22 @@ pub struct SttSessionOpts {
     pub sample_rate: u32,
     /// Optional per-provider model override (else the provider's default).
     pub model: Option<String>,
+    /// Words and phrases to bias recognition toward, from
+    /// `Config::custom_vocabulary` (or a matched profile's override). Each
+    /// adapter maps this onto its own biasing parameter and providers with no
+    /// such knob ignore it, so this is always advisory. Already trimmed and
+    /// de-duplicated by the runner; may be empty.
+    pub custom_vocabulary: Vec<String>,
+}
+
+impl SttSessionOpts {
+    /// The vocabulary as one space-joined prompt, for the providers whose
+    /// biasing knob is a free-text prompt rather than a term list (OpenAI
+    /// Whisper's `prompt`, the local runtime's `initial_prompt`). Empty string
+    /// when there is no vocabulary, so callers can skip the field entirely.
+    pub fn vocabulary_prompt(&self) -> String {
+        self.custom_vocabulary.join(", ")
+    }
 }
 
 /// Failure connecting / upgrading the transport. Carries the raw message so
@@ -229,5 +245,98 @@ pub(crate) fn classify_by_substring(msg: &str) -> FailKind {
         FailKind::RateLimit
     } else {
         FailKind::Transient
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Every substring the Exhausted branch checks, each embedded in a
+    // realistic-ish sentence so this also proves substring (not exact) match.
+    #[test]
+    fn exhausted_substrings_map_to_exhausted() {
+        for msg in [
+            "Error: insufficient permissions to complete this call",
+            "You have exceeded your quota",
+            "billing details are out of date",
+            "no credit remaining on this account",
+            "arrearage: account out of balance", // DashScope
+            "account is not in good standing",   // DashScope
+            "current balance is zero",
+            "payment required to continue",
+        ] {
+            assert_eq!(classify_by_substring(msg), FailKind::Exhausted, "{msg}");
+        }
+    }
+
+    // Every substring the Invalid branch checks.
+    #[test]
+    fn invalid_substrings_map_to_invalid() {
+        for msg in [
+            "HTTP 401 returned by server",
+            "HTTP 403 returned by server",
+            "invalid API key",
+            "request was unauthorized",
+        ] {
+            assert_eq!(classify_by_substring(msg), FailKind::Invalid, "{msg}");
+        }
+    }
+
+    // Every substring the RateLimit branch checks.
+    #[test]
+    fn rate_limit_substrings_map_to_rate_limit() {
+        for msg in [
+            "HTTP 429 returned by server",
+            "rate limit exceeded",
+            "too many requests, slow down",
+        ] {
+            assert_eq!(classify_by_substring(msg), FailKind::RateLimit, "{msg}");
+        }
+    }
+
+    // Nothing recognizable falls through to Transient, not to some default
+    // "worst case" bucket -- an unmatched error must not bench or rotate a key.
+    #[test]
+    fn unmatched_string_falls_through_to_transient() {
+        assert_eq!(
+            classify_by_substring("connection reset by peer"),
+            FailKind::Transient
+        );
+    }
+
+    // The function lowercases before matching, so shouting or capitalized
+    // wire text must classify the same as the lowercase form.
+    #[test]
+    fn classification_is_case_insensitive() {
+        assert_eq!(classify_by_substring("QUOTA EXCEEDED"), FailKind::Exhausted);
+        assert_eq!(classify_by_substring("Invalid API Key"), FailKind::Invalid);
+        assert_eq!(classify_by_substring("Rate Limited"), FailKind::RateLimit);
+    }
+
+    // Precedence: Exhausted is checked before Invalid/RateLimit, so a message
+    // that happens to match both wins as Exhausted. This is the current,
+    // intentional order (billing problems should not be masked by a
+    // coincidental "401"/"429" also present in the same message).
+    #[test]
+    fn exhausted_branch_takes_precedence_over_later_branches() {
+        assert_eq!(
+            classify_by_substring("401 unauthorized: insufficient credit"),
+            FailKind::Exhausted
+        );
+        assert_eq!(
+            classify_by_substring("429 too many requests: quota exceeded"),
+            FailKind::Exhausted
+        );
+    }
+
+    // Precedence: Invalid is checked before RateLimit, so a message matching
+    // both (e.g. a 401 that also happens to mention "rate") resolves Invalid.
+    #[test]
+    fn invalid_branch_takes_precedence_over_rate_limit() {
+        assert_eq!(
+            classify_by_substring("401 unauthorized, rate this call as denied"),
+            FailKind::Invalid
+        );
     }
 }

@@ -18,10 +18,16 @@ pub const PNG: &[u8] = include_bytes!("../assets/icon-256.png");
 /// looking like a solid blue box. Source: `QuickDictate Notification.svg`.
 pub const NOTIFICATION_PNG: &[u8] = include_bytes!("../assets/notification-256.png");
 
+/// Clamp a requested icon size to at least 1px — a 0x0 bitmap is invalid, and
+/// callers may pass a size derived from a shrunk-to-nothing window/DPI calc.
+fn clamp_size(size: u32) -> u32 {
+    size.max(1)
+}
+
 /// Decode `png` to raw RGBA8 at `size`² (Lanczos-resampled). Native transparency
 /// is preserved. Returns `(rgba, size, size)`.
 fn decode(png: &[u8], size: u32) -> (Vec<u8>, u32, u32) {
-    let s = size.max(1);
+    let s = clamp_size(size);
     let img = image::load_from_memory(png)
         .expect("decode embedded app icon")
         .resize_exact(s, s, FilterType::Lanczos3)
@@ -37,4 +43,20 @@ pub fn rgba(size: u32) -> (Vec<u8>, u32, u32) {
 /// The system-tray / notification-area variant at `size`².
 pub fn notification_rgba(size: u32) -> (Vec<u8>, u32, u32) {
     decode(NOTIFICATION_PNG, size)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamp_size_raises_zero_to_one() {
+        assert_eq!(clamp_size(0), 1);
+    }
+
+    #[test]
+    fn clamp_size_leaves_a_positive_size_unchanged() {
+        assert_eq!(clamp_size(256), 256);
+        assert_eq!(clamp_size(1), 1);
+    }
 }

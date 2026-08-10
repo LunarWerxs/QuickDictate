@@ -69,6 +69,7 @@ async fn probe(provider: &dyn SttProvider, key: &str, samples: Vec<i16>) -> anyh
         language: provider.language_for("en-US"),
         sample_rate: fmt.sample_rate,
         model: None,
+        custom_vocabulary: Vec::new(),
     };
     let ProviderSession { sink, mut stream } = provider
         .connect(key, &opts)

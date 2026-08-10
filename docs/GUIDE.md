@@ -1,4 +1,4 @@
-# QuickDictate — Complete Guide
+# QuickDictate, Complete Guide
 
 The full documentation for QuickDictate. For the short version, see the [README](../README.md). The website lives at <https://quickdictate.github.io/>.
 
@@ -6,12 +6,12 @@ The full documentation for QuickDictate. For the short version, see the [README]
 
 **Press a key, talk, and your words land wherever your cursor already is.**
 
-That's the whole idea. QuickDictate is a small Windows app that sits in your tray, listens while you hold (or tap) a global hotkey, and types the transcript straight into whatever window has focus — your editor, a chat box, an email, a terminal, a text field on some website. It uses *your own* speech-to-text API key or an optional local model, so there's no subscription to us and no QuickDictate account to create.
+That's the whole idea. QuickDictate is a small Windows app that sits in your tray, listens while you hold (or tap) a global hotkey, and types the transcript straight into whatever window has focus, your editor, a chat box, an email, a terminal, a text field on some website. It uses *your own* speech-to-text API key or an optional local model, so there's no subscription to us and no QuickDictate account to create.
 
 <p align="center">
   <img src="images/settings.png" alt="The QuickDictate settings window" width="470">
   <br>
-  <em>The entire app is one Settings window — no dashboard, no login, no cloud account.</em>
+  <em>The entire app is one Settings window, no dashboard, no login, no cloud account.</em>
 </p>
 
 <p align="center">
@@ -22,21 +22,21 @@ That's the whole idea. QuickDictate is a small Windows app that sits in your tra
 
 ## Why it exists
 
-Most dictation tools do one of three annoying things: lock you into a monthly subscription, route your microphone through *their* servers, or bury the settings you actually want three menus deep. QuickDictate does the opposite. Bring a key from a speech provider you already trust, drop it in, and go. Your audio goes to that provider and nowhere else — we (the folks at [LunarWerx Studios](https://lunarwerx.com)) never see your voice or your keys. It's a **beta**, it's **MIT-licensed**, and it runs on **Windows 10/11 x64**.
+Most dictation tools do one of three annoying things: lock you into a monthly subscription, route your microphone through *their* servers, or bury the settings you actually want three menus deep. QuickDictate does the opposite. Bring a key from a speech provider you already trust, drop it in, and go. Your audio goes to that provider and nowhere else, we (the folks at [LunarWerx Studios](https://lunarwerx.com)) never see your voice or your keys. It's a **beta**, it's **MIT-licensed**, and it runs on **Windows 10/11 x64**.
 
 See the [changelog](../CHANGELOG.md) for what's changed release to release.
 
 ## What you get
 
-- **Seven speech providers, your pick** — six cloud services plus a fully offline Local provider with two downloadable model choices. Switch whenever you want.
-- **Local models stay manageable** — large downloads use bounded parallel connections when supported, can be cancelled in Settings, and clean up incomplete files automatically. The selected model prewarms in the background and stays resident while Local is active for predictable response time; switch providers to release its RAM/VRAM.
-- **Bring your own key** — your keys, your account, your usage. Add more than one key per provider and QuickDictate round-robins between them with per-key health tracking (alive / quota / dead) and cooldown backoff. Hit a dead key mid-sentence? It rotates to the next one automatically, without dropping your press.
-- **Keys are checked before you need them** — on startup the active provider's keys get probed in the background, so a dead or rate-limited key is flagged before your first dictation and a good one is already queued. Health lives in memory only — a provider having a bad five minutes never permanently brands a key as dead; every launch re-checks.
-- **Hold or toggle — your call** — hold a key while you talk, or tap once to start and once to stop. Both hotkeys are configurable.
-- **Text streams in as you speak** — for the streaming providers, words paste back live instead of waiting for you to finish.
-- **Fix the words it always mishears** — a small replacement table turns "Chat GPT" into "ChatGPT", "Github" into "GitHub", and whatever else your accent and your provider disagree on.
-- **Updates itself, only if you let it** — an optional once-a-day check for a newer release (plus a button in Settings). Downloads are verified by size **and** SHA-256, and nothing installs until you say yes.
-- **Nothing else leaves your machine** — turn off *Check for updates daily* and even that check stops. Beyond it, nothing leaves your machine except your dictation audio (to the provider you chose) and — only if you opt in — Connections settings sync (preferences only, never keys/audio).
+- **Seven speech providers, your pick**, six cloud services plus a fully offline Local provider with two downloadable model choices. Switch whenever you want.
+- **Local models stay manageable**, large downloads use bounded parallel connections when supported, can be cancelled in Settings, and clean up incomplete files automatically. The selected model prewarms in the background and stays resident while Local is active for predictable response time; switch providers to release its RAM/VRAM.
+- **Bring your own key**, your keys, your account, your usage. Add more than one key per provider and QuickDictate round-robins between them with per-key health tracking (alive / quota / dead) and cooldown backoff. Hit a dead key mid-sentence? It rotates to the next one automatically, without dropping your press.
+- **Keys are checked before you need them**, on startup the active provider's keys get probed in the background, so a dead or rate-limited key is flagged before your first dictation and a good one is already queued. Health lives in memory only, a provider having a bad five minutes never permanently brands a key as dead; every launch re-checks.
+- **Hold or toggle, your call**, hold a key while you talk, or tap once to start and once to stop. Both hotkeys are configurable.
+- **Text streams in as you speak**, for the streaming providers, words paste back live instead of waiting for you to finish.
+- **Fix the words it always mishears**, a small replacement table turns "Chat GPT" into "ChatGPT", "Github" into "GitHub", and whatever else your accent and your provider disagree on.
+- **Updates itself, only if you let it**, an optional once-a-day check for a newer release (plus a button in Settings). Downloads are verified by size **and** SHA-256, and nothing installs until you say yes.
+- **Nothing else leaves your machine**, turn off *Check for updates daily* and even that check stops. Beyond it, nothing leaves your machine except your dictation audio (to the provider you chose) and, only if you opt in, Connections settings sync (preferences only, never keys/audio).
 
 That replacement table, since it's the fiddly-but-lovely part:
 
@@ -50,8 +50,8 @@ That replacement table, since it's the fiddly-but-lovely part:
 
 1. Grab the [latest release](https://github.com/LunarWerxs/QuickDictate/releases/latest) (or [build from source](#build-from-source)).
 2. Copy `settings.example.json` to `settings.json`, right next to `quickdictate.exe`.
-3. Set `"stt_provider"` to the provider you want — say `"deepgram"`.
-4. Paste your API key into that provider's array — e.g. `"deepgram_keys": ["YOUR_KEY"]`.
+3. Set `"stt_provider"` to the provider you want, say `"deepgram"`.
+4. Paste your API key into that provider's array, e.g. `"deepgram_keys": ["YOUR_KEY"]`.
 5. Run `quickdictate.exe`.
 6. Press the hotkey (**F13** to hold, **F14** to toggle by default) and start talking.
 
@@ -97,11 +97,14 @@ Everything lives in `settings.json` (copied from `settings.example.json`). The f
 | `enable_logging` | Write `logs\quickdictate.log` beside the exe (bool) |
 | `log_transcripts` | Also log your full dictated text, not just summaries (bool, default `false`; deep debugging only) |
 | `max_log_mb` | Log-file rotation cap, in MB, before `quickdictate.log` is rolled over (default `5`) |
-| `update_auto_check` | Check for a newer release at startup, at most once/day (bool, default `true`); a newer release installs silently (download, verify, swap, relaunch when idle) |
-| `install_id` | Random id sent with update checks (string, generated on first launch; never derived from your machine or identity — clear it for a fresh one) |
+| `update_auto_check` | Check for a newer release at startup, at most once/day (bool, default `true`). Finding one **reports** it on the tray tooltip and the About pill; clicking the pill installs it |
+| `update_auto_install` | Install a newer release with no prompt (bool, default `false`). Off by default because the download URL and its SHA-256 both come from the same release payload, so a click is the only thing standing between a compromised publish and every install; see SECURITY.md |
+| `protect_keys_at_rest` | Encrypt the API keys in `settings.json` with Windows DPAPI (bool, default `false`). **Costs portability:** a sealed file only decrypts for this Windows account on this machine, so copying the folder elsewhere means pasting the keys in again |
+| `custom_vocabulary` | Array of words/phrases sent to the provider to bias recognition (names, jargon, product names). Different from `text_replacements`, which repairs text *after* recognition; this tries to get it right the first time. Providers without a biasing parameter ignore it |
+| `install_id` | Random id sent with update checks (string, generated on first launch; never derived from your machine or identity, clear it for a fresh one) |
 | `run_at_startup` | Start QuickDictate at Windows login via the per-user Run key (bool, default `false`) |
 | `prewarm_keys` | Probe the active provider's keys at startup and queue a validated one (bool, default `true`) |
-| `text_replacements` | JSON object mapping misheard phrases to corrections |
+| `text_replacements` | JSON object mapping misheard phrases to corrections. All rules apply in one pass over the original text (longest match wins); one rule's output is never re-processed by another, so write each rule as a direct source-to-final mapping rather than a chain |
 | `profiles_enabled` | Master on/off switch for per-app profiles (bool, default `true`), see [Per-App Profiles](#per-app-profiles) below |
 | `profiles` | Per-application overrides, see [Per-App Profiles](#per-app-profiles) below |
 | `voice_commands` | Enables the "scratch that" voice command (bool, default `false`), see [Voice Commands](#voice-commands) below |
@@ -118,11 +121,11 @@ A minimal Deepgram config:
 }
 ```
 
-Switching providers later is just: change `stt_provider`, make sure that provider's key array is filled in, and restart. For a quick A/B test you don't even have to edit the file — `quickdictate.exe --provider <id>` overrides `stt_provider` for a single run (e.g. `quickdictate.exe --provider elevenlabs`).
+Switching providers later is just: change `stt_provider`, make sure that provider's key array is filled in, and restart. For a quick A/B test you don't even have to edit the file, `quickdictate.exe --provider <id>` overrides `stt_provider` for a single run (e.g. `quickdictate.exe --provider elevenlabs`).
 
 ## Per-App Profiles
 
-Override punctuation/spacing/replacement behavior per foreground application, resolved from `settings.json`'s `profiles` array — no UI editor for the entries themselves (Settings shows a **read-only** "Active profiles" list; you add/edit/remove profiles directly in `settings.json`, same as text replacements' bulk editor is really just a friendlier view onto the same file).
+Override punctuation/spacing/replacement behavior per foreground application, resolved from `settings.json`'s `profiles` array, no UI editor for the entries themselves (Settings shows a **read-only** "Active profiles" list; you add/edit/remove profiles directly in `settings.json`, same as text replacements' bulk editor is really just a friendlier view onto the same file).
 
 ```json
 "profiles": [
@@ -132,16 +135,21 @@ Override punctuation/spacing/replacement behavior per foreground application, re
     "auto_newline": true,
     "auto_space": false,
     "replacements_mode": "extend",
-    "text_replacements": { "dot py": ".py", "underscore": "_" }
+    "text_replacements": { "dot py": ".py", "underscore": "_" },
+    "language": "en-US",
+    "stt_provider": "local",
+    "custom_vocabulary": ["Supabase", "Cloudflare", "kubectl"]
   }
 ]
 ```
 
-- **`match`** is a list of exe basenames (case-insensitive, e.g. `"code.exe"`) checked against the foreground window at the moment a transcript is about to be pasted — not when you pressed the hotkey. If you dictate, then alt-tab elsewhere, then release, the profile for wherever focus landed is the one that applies.
+- **`match`** is a list of exe basenames (case-insensitive, e.g. `"code.exe"`) checked against the foreground window at the moment a transcript is about to be pasted, not when you pressed the hotkey. If you dictate, then alt-tab elsewhere, then release, the profile for wherever focus landed is the one that applies.
 - **First matching profile in the array wins.** No match → global settings apply, unchanged.
-- Every override field is optional: `auto_punct`, `auto_space`, `auto_newline`, `text_replacements`. Anything you omit falls back to the corresponding top-level setting.
+- Every override field is optional: `auto_punct`, `auto_space`, `auto_newline`, `text_replacements`, `language`, `stt_provider`, `custom_vocabulary`. Anything you omit falls back to the corresponding top-level setting.
 - **`replacements_mode`**: `"extend"` (default) layers the profile's `text_replacements` on top of the global map (profile wins on a key collision); `"replace"` uses only the profile's map.
-- Switching the STT provider/keys per-app is **not** supported yet — every profile dictates through whatever `stt_provider` is globally active. May come in a future version.
+- **`language`** and **`custom_vocabulary`** apply to the recognition itself. `custom_vocabulary` *replaces* the global list rather than extending it, so an empty array means "no biasing in this app", which is deliberate.
+- **`stt_provider`** is resolved when you press the hotkey, using the window focused at that moment, so switching windows switches backend on the next dictation. A profile naming a provider that has no configured key (or an id that does not exist) logs a warning and falls back to the global provider, so a typo here can never leave you unable to dictate. Handy for dictating into a password manager or a private document through the offline `"local"` provider while everything else stays on a cloud one.
+- Note the asymmetry, and it is on purpose: **provider and language** come from the window focused when you *press* the hotkey, because that is when the connection is opened. **Text handling** (punctuation, spacing, replacements) comes from the window focused when the transcript is *pasted*, because that is where the text lands.
 - No `profiles` array (or an empty one) is byte-identical to today's behavior.
 - **`profiles_enabled`** (bool, default `true`) is the master on/off switch, with a matching "Enable per-app profiles" checkbox on the Active profiles card in Settings -- flip it off to disable profile matching entirely (falling back to global settings) without deleting your `profiles` array.
 
@@ -166,9 +174,9 @@ A broader, pause-gated spoken-punctuation command set (saying "period", "comma",
 
 Pick which one is live with `"mode": "toggle"` or `"mode": "hold"`, and change the keys with `"toggle_hotkey"` / `"hold_hotkey"`. While a session is running, a little status pip appears near your cursor: amber = starting, green = listening, red "!" = something went wrong.
 
-The tray menu is deliberately bare — **Settings…**, **Hide tray icon** (asks first, then tucks QuickDictate away with no icon at all; hotkeys keep working, and launching QuickDictate again brings Settings back so you can untick it), a **Recent transcriptions** submenu (click any entry to **copy it to the clipboard** — up to the last 50, newest first), and **Quit**. Everything else is inside the Settings window: the provider picker, the key manager (including **Bulk add** for one key per line and a live parallel "Test all" that hits the real APIs), the text-replacement editor, a per-field hotkey recorder, all the toggles, **Stats**, **About**, and **Save / Save & Restart** in the pinned bottom bar, and a **⋯ menu** (next to About) holding **Check for updates**, **Open log folder**, and **Edit settings.json** (for the advanced fields, in Notepad).
+The tray menu is deliberately bare, **Settings…**, **Hide tray icon** (asks first, then tucks QuickDictate away with no icon at all; hotkeys keep working, and launching QuickDictate again brings Settings back so you can untick it), a **Recent transcriptions** submenu (click any entry to **copy it to the clipboard**, up to the last 50, newest first), and **Quit**. Everything else is inside the Settings window: the provider picker, the key manager (including **Bulk add** for one key per line and a live parallel "Test all" that hits the real APIs), the text-replacement editor, a per-field hotkey recorder, all the toggles, **Stats**, **About**, and **Save / Save & Restart** in the pinned bottom bar, and a **⋯ menu** (next to About) holding **Check for updates**, **Open log folder**, and **Edit settings.json** (for the advanced fields, in Notepad).
 
-One nice touch: the global hotkeys re-register themselves every minute, so dictation keeps working after sleep/resume, a session lock, or an RDP reconnect — the usual moments where global hotkeys quietly die.
+One nice touch: the global hotkeys re-register themselves every minute, so dictation keeps working after sleep/resume, a session lock, or an RDP reconnect, the usual moments where global hotkeys quietly die.
 
 ## Build from source
 
@@ -183,20 +191,20 @@ The binary lands at `target\release\quickdictate.exe`. Put `settings.example.jso
 
 ## Privacy
 
-QuickDictate streams your microphone audio to the **one third-party STT provider you select** — and only that one. Your API keys and your audio never touch the QuickDictate maintainer. The only thing the app itself reports anywhere is the **optional daily update check**, which goes to LunarWerx's update endpoint; the full disclosure is in [SECURITY.md](../.github/SECURITY.md), and turning off *Check for updates daily* stops it entirely. Beyond that, nothing leaves your machine except your dictation audio (to the provider you chose) and — only if you opt in — Connections settings sync, which syncs preferences only (mode, language, hotkeys, STT provider/model, etc.) and never your API keys, audio, or transcripts. See [docs/SETTINGS_SYNC.md](SETTINGS_SYNC.md) for details, including how to turn it off. Locally, it only uses the OS clipboard and keystroke APIs to paste text into your focused window.
+QuickDictate streams your microphone audio to the **one third-party STT provider you select**, and only that one. Your API keys and your audio never touch the QuickDictate maintainer. The only thing the app itself reports anywhere is the **optional daily update check**, which goes to LunarWerx's update endpoint; the full disclosure is in [SECURITY.md](../.github/SECURITY.md), and turning off *Check for updates daily* stops it entirely. Beyond that, nothing leaves your machine except your dictation audio (to the provider you chose) and, only if you opt in, Connections settings sync, which syncs preferences only (mode, language, hotkeys, STT provider/model, etc.) and never your API keys, audio, or transcripts. See [docs/SETTINGS_SYNC.md](SETTINGS_SYNC.md) for details, including how to turn it off. Locally, it only uses the OS clipboard and keystroke APIs to paste text into your focused window.
 
-Local logging (`enable_logging`) writes event summaries — not your recognized text — to `logs\quickdictate.log` beside the exe. A separate `log_transcripts` setting, off by default, opts into logging the full dictated text for deep debugging; nothing written locally is ever sent anywhere. The Stats window uses a separate `quickdictate-stats.json` containing only numeric aggregates—never transcript text or API keys.
+Local logging (`enable_logging`) writes event summaries, not your recognized text, to `logs\quickdictate.log` beside the exe. A separate `log_transcripts` setting, off by default, opts into logging the full dictated text for deep debugging; nothing written locally is ever sent anywhere. The Stats window uses a separate `quickdictate-stats.json` containing only numeric aggregates-never transcript text or API keys.
 
 More detail in [SECURITY.md](../.github/SECURITY.md).
 
 ## Antivirus / SmartScreen
 
-The released `.exe` is currently **unsigned**, and QuickDictate installs a global hotkey and synthesizes keystrokes to paste text — which, to Windows Defender and SmartScreen, looks a lot like a keylogger. So you may get a "Windows protected your PC" prompt: click **More info** → **Run anyway**. Some antivirus tools may flag the binary too; it's a known false positive tied to the keystroke-injection technique, not anything malicious. Code signing is on the roadmap.
+The released `.exe` is currently **unsigned**, and QuickDictate installs a global hotkey and synthesizes keystrokes to paste text, which, to Windows Defender and SmartScreen, looks a lot like a keylogger. So you may get a "Windows protected your PC" prompt: click **More info** → **Run anyway**. Some antivirus tools may flag the binary too; it's a known false positive tied to the keystroke-injection technique, not anything malicious. Code signing is on the roadmap.
 
 ## Contributing
 
-Bug reports and pull requests are welcome — there are issue templates under [.github/ISSUE_TEMPLATE](../.github/ISSUE_TEMPLATE), and the [CI checks](../.github/workflows/ci.yml) run against every PR. Releases are cut following the checklist in [RELEASING.md](RELEASING.md).
+Bug reports and pull requests are welcome, there are issue templates under [.github/ISSUE_TEMPLATE](../.github/ISSUE_TEMPLATE), and the [CI checks](../.github/workflows/ci.yml) run against every PR. Releases are cut following the checklist in [RELEASING.md](RELEASING.md).
 
 ## License
 
-MIT — see [LICENSE](../LICENSE). Made by [LunarWerx Studios](https://lunarwerx.com).
+MIT, see [LICENSE](../LICENSE). Made by [LunarWerx Studios](https://lunarwerx.com).

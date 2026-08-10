@@ -20,6 +20,8 @@ use super::provider::{
 };
 
 const WS_URL: &str = "wss://streaming.assemblyai.com/v3/ws";
+/// v3 streaming hard-errors above 100 keyterms per session.
+const MAX_KEYTERMS: usize = 100;
 
 type WsSink = futures_util::stream::SplitSink<
     WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
@@ -48,10 +50,7 @@ impl SttProvider for AssemblyAiProvider {
         opts: &SttSessionOpts,
     ) -> Result<ProviderSession, ConnectError> {
         // v3 streaming is English-only and takes no language param.
-        let url = format!(
-            "{WS_URL}?sample_rate={rate}&encoding=pcm_s16le",
-            rate = opts.sample_rate,
-        );
+        let url = build_url(opts);
         let mut request = url
             .as_str()
             .into_client_request()
@@ -72,6 +71,30 @@ impl SttProvider for AssemblyAiProvider {
             }),
         })
     }
+}
+
+/// Build the v3 streaming WebSocket URL. Pure (fixture-tested); `connect`
+/// just calls this. `keyterms_prompt` is a JSON-encoded array of strings per
+/// the v3 streaming API; the server hard-errors above 100 terms and silently
+/// ignores any single term over 50 characters, so only the count is capped
+/// here.
+fn build_url(opts: &SttSessionOpts) -> String {
+    let mut url = format!(
+        "{WS_URL}?sample_rate={rate}&encoding=pcm_s16le",
+        rate = opts.sample_rate,
+    );
+    if !opts.custom_vocabulary.is_empty() {
+        let terms: Vec<&str> = opts
+            .custom_vocabulary
+            .iter()
+            .take(MAX_KEYTERMS)
+            .map(String::as_str)
+            .collect();
+        let json = serde_json::to_string(&terms).unwrap_or_default();
+        url.push_str("&keyterms_prompt=");
+        url.push_str(&url::form_urlencoded::byte_serialize(json.as_bytes()).collect::<String>());
+    }
+    url
 }
 
 struct AssemblyAiSink {
@@ -213,5 +236,46 @@ mod tests {
         assert!(map_frame(r#"{"type":"Turn","transcript":"","end_of_turn":true}"#).is_none());
         assert!(map_frame(r#"{"type":"Termination","audio_duration_seconds":6}"#).is_none());
         assert!(map_frame("not json").is_none());
+    }
+
+    fn test_opts(vocab: Vec<&str>) -> SttSessionOpts {
+        SttSessionOpts {
+            language: "en".into(),
+            sample_rate: 16_000,
+            model: None,
+            custom_vocabulary: vocab.into_iter().map(String::from).collect(),
+        }
+    }
+
+    #[test]
+    fn empty_vocabulary_url_is_unchanged() {
+        let url = build_url(&test_opts(vec![]));
+        assert_eq!(
+            url,
+            format!("{WS_URL}?sample_rate=16000&encoding=pcm_s16le")
+        );
+    }
+
+    #[test]
+    fn vocabulary_adds_keyterms_prompt_as_json_array() {
+        let url = build_url(&test_opts(vec!["Anthropic", "QuickDictate"]));
+        let expected_json = serde_json::to_string(&["Anthropic", "QuickDictate"]).unwrap();
+        let expected_encoded: String =
+            url::form_urlencoded::byte_serialize(expected_json.as_bytes()).collect();
+        assert!(url.ends_with(&format!("&keyterms_prompt={expected_encoded}")));
+    }
+
+    #[test]
+    fn keyterms_prompt_is_capped_at_100_terms() {
+        let many: Vec<String> = (0..150).map(|i| format!("term{i}")).collect();
+        let opts = SttSessionOpts {
+            language: "en".into(),
+            sample_rate: 16_000,
+            model: None,
+            custom_vocabulary: many,
+        };
+        let url = build_url(&opts);
+        assert!(url.contains("term99"));
+        assert!(!url.contains("term100"));
     }
 }

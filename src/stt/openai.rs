@@ -76,20 +76,7 @@ impl SttProvider for OpenAiProvider {
 
         // Configure the transcription session (GA Realtime shape). Manual commit
         // (turn_detection = null) so we control end-of-utterance.
-        let update = json!({
-            "type": "session.update",
-            "session": {
-                "type": "transcription",
-                "audio": {
-                    "input": {
-                        "format": { "type": "audio/pcm", "rate": opts.sample_rate },
-                        "transcription": { "model": model, "language": opts.language },
-                        "turn_detection": null
-                    }
-                }
-            }
-        })
-        .to_string();
+        let update = build_session_update(model, opts).to_string();
         ws.send(Message::Text(update))
             .await
             .map_err(|e| ConnectError(format!("session.update send: {e}")))?;
@@ -104,6 +91,33 @@ impl SttProvider for OpenAiProvider {
             }),
         })
     }
+}
+
+/// Build the `session.update` payload for `model`/`opts`. Pure
+/// (fixture-tested); `connect` just serializes and sends this. Unlike the
+/// term-list biasing knobs the other providers use, `gpt-4o-transcribe`
+/// takes a free-text `prompt` -- `vocabulary_prompt()` joins the vocabulary
+/// into one. The field is added only when the vocabulary is non-empty, so a
+/// user with none set gets the exact same request as before this existed.
+fn build_session_update(model: &str, opts: &SttSessionOpts) -> serde_json::Value {
+    let mut transcription = json!({ "model": model, "language": opts.language });
+    let prompt = opts.vocabulary_prompt();
+    if !prompt.is_empty() {
+        transcription["prompt"] = json!(prompt);
+    }
+    json!({
+        "type": "session.update",
+        "session": {
+            "type": "transcription",
+            "audio": {
+                "input": {
+                    "format": { "type": "audio/pcm", "rate": opts.sample_rate },
+                    "transcription": transcription,
+                    "turn_detection": null
+                }
+            }
+        }
+    })
 }
 
 struct OpenAiSink {
@@ -303,5 +317,30 @@ mod tests {
     fn error_maps_to_failure() {
         let e = r#"{"type":"error","error":{"type":"invalid_request_error","code":"invalid_api_key","message":"Incorrect API key"}}"#;
         assert_eq!(classify_event(e), OaEvent::Failure(FailKind::Invalid));
+    }
+
+    fn test_opts(vocab: Vec<&str>) -> SttSessionOpts {
+        SttSessionOpts {
+            language: "en".into(),
+            sample_rate: 24_000,
+            model: None,
+            custom_vocabulary: vocab.into_iter().map(String::from).collect(),
+        }
+    }
+
+    #[test]
+    fn empty_vocabulary_omits_prompt_field() {
+        let update = build_session_update(DEFAULT_MODEL, &test_opts(vec![]));
+        let transcription = &update["session"]["audio"]["input"]["transcription"];
+        assert!(transcription.get("prompt").is_none());
+        assert_eq!(transcription["model"], DEFAULT_MODEL);
+        assert_eq!(transcription["language"], "en");
+    }
+
+    #[test]
+    fn vocabulary_sets_prompt_field() {
+        let update = build_session_update(DEFAULT_MODEL, &test_opts(vec!["Anthropic", "Claude"]));
+        let transcription = &update["session"]["audio"]["input"]["transcription"];
+        assert_eq!(transcription["prompt"], "Anthropic, Claude");
     }
 }

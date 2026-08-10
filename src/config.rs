@@ -84,9 +84,12 @@ fn default_replacements() -> BTreeMap<String, String> {
 /// corresponding global `Config` setting. First matching profile in the list
 /// wins.
 ///
-/// Provider override (choosing a different STT provider/keys per-app) is
-/// explicitly **out of scope for v1** -- only text-processing behavior is
-/// overridden. A future version may add it.
+/// Since v0.5.4 a profile may also override the recognition **language**, the
+/// **provider**, and the **custom vocabulary**, not just text processing. The
+/// provider override is resolved at hotkey-press time (see
+/// `Config::provider_for_exe`), so switching windows switches backend on the
+/// next dictation; a provider with no configured key is ignored and the global
+/// provider is used instead.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Profile {
     /// Human-readable label shown in the read-only "Active profiles" list in
@@ -115,6 +118,23 @@ pub struct Profile {
 
     #[serde(default)]
     pub text_replacements: BTreeMap<String, String>,
+
+    /// Recognition language for this app (same form as the global `language`,
+    /// e.g. "de-DE"). `None` falls back to the global setting.
+    #[serde(default)]
+    pub language: Option<String>,
+
+    /// STT backend for this app (same ids as the global `stt_provider`).
+    /// `None`, an unknown id, or a provider with no configured key all fall
+    /// back to the global provider, so a typo here can never break dictation.
+    #[serde(default)]
+    pub stt_provider: Option<String>,
+
+    /// Words/phrases to bias recognition toward while this app is focused.
+    /// `None` uses the global list; `Some(list)` replaces it (an empty list
+    /// therefore means "no biasing in this app", which is deliberate).
+    #[serde(default)]
+    pub custom_vocabulary: Option<Vec<String>>,
 }
 
 fn default_replacements_mode() -> String {
@@ -140,6 +160,10 @@ pub struct EffectiveSettings {
     pub auto_space: bool,
     pub auto_newline: bool,
     pub text_replacements: BTreeMap<String, String>,
+    /// Recognition language after folding in a matched profile.
+    pub language: String,
+    /// Recognition bias list after folding in a matched profile.
+    pub custom_vocabulary: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -245,10 +269,11 @@ pub struct Config {
     /// per day). The check goes to LunarWerx's update endpoint (see
     /// `update::RELEASES_API`), which relays GitHub's release info and also
     /// counts the hit as one anonymous install ping — details in SECURITY.md.
-    /// When a newer release exists it installs silently (download, verify, swap,
-    /// relaunch), deferring the relaunch until you're idle so it never interrupts
-    /// a dictation. Settings → About "Check for updates" works regardless of this
-    /// flag, and there the update installs as soon as you click the pill.
+    /// Finding a newer release only *reports* it (tray tooltip + the About
+    /// pill); installing it is a click, unless you opt into
+    /// `update_auto_install`. Settings → About "Check for updates" works
+    /// regardless of this flag, and there the update installs as soon as you
+    /// click the pill.
     #[serde(default = "default_true")]
     pub update_auto_check: bool,
 
@@ -357,6 +382,41 @@ pub struct Config {
     /// **out of scope / deferred**, not built here.
     #[serde(default = "default_false")]
     pub voice_commands: bool,
+
+    /// Words and phrases to bias recognition toward: names, jargon, product
+    /// names, anything the provider keeps mishearing. Unlike
+    /// `text_replacements` (which repairs the text *after* recognition), this
+    /// is sent to the provider so it can get the word right in the first
+    /// place. Forwarded as each backend's own biasing parameter (Deepgram
+    /// `keyterm`, AssemblyAI `keyterms_prompt`, OpenAI/Whisper `prompt`,
+    /// ElevenLabs biasing, local `initial_prompt`); providers without a
+    /// biasing knob simply ignore it. Empty by default.
+    #[serde(default)]
+    pub custom_vocabulary: Vec<String>,
+
+    /// Install a newer release automatically, with no prompt, when the daily
+    /// check finds one. **Off by default since v0.5.4**: the trust chain for an
+    /// update is the release itself (URL + SHA-256 both come from the release
+    /// payload), so anything able to publish a release could otherwise reach
+    /// every install unattended within 24 h. With this off, `update_auto_check`
+    /// still runs and QuickDictate surfaces "update available" on the tray icon
+    /// and the About pill; clicking the pill is the consent and installs it.
+    /// Turn this on if you would rather have it applied silently.
+    #[serde(default = "default_false")]
+    pub update_auto_install: bool,
+
+    /// Encrypt the API keys in settings.json at rest with Windows DPAPI
+    /// (CurrentUser scope), the same primitive that seals the settings-sync
+    /// refresh token. Off by default **because it costs portability**: a sealed
+    /// settings.json only decrypts for this Windows user on this machine, so
+    /// copying the folder to another PC or another account loses the keys and
+    /// you have to paste them again. Turn it on if the folder is somewhere
+    /// other local accounts or backup/sync tooling can read it. Toggling it
+    /// re-writes settings.json in the new form immediately; turning it back off
+    /// restores plaintext, so you can always get your keys back on the machine
+    /// that sealed them.
+    #[serde(default = "default_false")]
+    pub protect_keys_at_rest: bool,
 }
 
 impl Default for Config {
@@ -406,11 +466,32 @@ impl Default for Config {
             profiles: Vec::new(),
             profiles_enabled: true,
             voice_commands: false,
+            custom_vocabulary: Vec::new(),
+            update_auto_install: false,
+            protect_keys_at_rest: false,
         }
     }
 }
 
 impl Config {
+    /// Whether a `settings.json` found in an ANCESTOR of the exe directory may
+    /// be adopted. Debug builds: always (that is the dev-run convenience).
+    /// Release builds: only when the directory is unmistakably a QuickDictate
+    /// working tree, i.e. it holds a `Cargo.toml` whose package name is ours,
+    /// or an explicit `.quickdictate-root` marker file. Everything else is
+    /// somebody else's folder and must be left alone.
+    fn ancestor_settings_allowed(dir: &Path) -> bool {
+        if cfg!(debug_assertions) {
+            return true;
+        }
+        if dir.join(".quickdictate-root").exists() {
+            return true;
+        }
+        fs::read_to_string(dir.join("Cargo.toml"))
+            .map(|t| t.contains("name = \"quickdictate\""))
+            .unwrap_or(false)
+    }
+
     pub fn settings_path() -> PathBuf {
         // Search order:
         //   1. settings.json next to the .exe (packaged install)
@@ -426,13 +507,19 @@ impl Config {
             if direct.exists() {
                 return direct;
             }
-            // Walk up to 5 levels looking for a settings.json (handles dev runs
-            // from target/{profile}/ and target/{profile}/deps/ alike).
+            // Walk up looking for a settings.json. This exists purely so a dev
+            // run from target/{profile}/ (or .../deps/) picks up the project
+            // root's settings.json. It must NOT happen in a shipped build: a
+            // portable exe dropped in, say, Downloads\QuickDictate\ would
+            // otherwise adopt an unrelated settings.json sitting in the user's
+            // profile folder and then overwrite it wholesale on the next Save.
+            // Debug builds walk freely; release builds only accept an ancestor
+            // that is explicitly marked as a QuickDictate working tree.
             let mut cur = dir.clone();
             for _ in 0..5 {
                 if let Some(parent) = cur.parent() {
                     let candidate = parent.join("settings.json");
-                    if candidate.exists() {
+                    if candidate.exists() && Self::ancestor_settings_allowed(parent) {
                         return candidate;
                     }
                     cur = parent.to_path_buf();
@@ -464,6 +551,7 @@ impl Config {
                 Ok(data) => match serde_json::from_str::<Config>(&data) {
                     Ok(mut c) => {
                         diags.push(format!("INFO: Loaded settings from {}", path.display()));
+                        diags.extend(c.unseal_keys());
                         let configured_model = c.local_model.clone();
                         if c.normalize_local_model() {
                             diags.push(format!(
@@ -530,8 +618,89 @@ impl Config {
         (cfg, diags)
     }
 
+    /// Every per-provider key array, mutably, in canonical order. One place to
+    /// add a provider so the seal/unseal passes can never miss one.
+    fn key_arrays_mut(&mut self) -> Vec<&mut Vec<String>> {
+        vec![
+            &mut self.elevenlabs_keys,
+            &mut self.deepgram_keys,
+            &mut self.openai_keys,
+            &mut self.assemblyai_keys,
+            &mut self.dashscope_keys,
+            &mut self.google_keys,
+            &mut self.local_keys,
+        ]
+    }
+
+    /// Turn any sealed key back into plaintext for in-memory use. A value that
+    /// will not decrypt (settings.json copied from another Windows account or
+    /// machine) is dropped rather than passed to a provider as garbage, and
+    /// reported so the user is told to paste the key again here.
+    fn unseal_keys(&mut self) -> Vec<String> {
+        let mut diags = Vec::new();
+        let mut unreadable = 0usize;
+        for array in self.key_arrays_mut() {
+            array.retain_mut(|value| {
+                if !crate::secretstore::is_sealed(value) {
+                    return true;
+                }
+                match crate::secretstore::unseal_secret(value) {
+                    Some(plain) => {
+                        *value = plain;
+                        true
+                    }
+                    None => {
+                        unreadable += 1;
+                        false
+                    }
+                }
+            });
+        }
+        if unreadable > 0 {
+            diags.push(format!(
+                "ALERT: {unreadable} protected API key(s) in settings.json could not be decrypted \
+                 on this Windows account. Protected keys are bound to the user and machine that \
+                 saved them, so a copied folder needs the keys pasted in again."
+            ));
+        }
+        diags
+    }
+
+    /// Inverse of [`Config::unseal_keys`], applied to the copy about to be
+    /// written. A key that fails to seal is left as plaintext rather than
+    /// written back as an unusable value.
+    fn seal_keys(&mut self) {
+        let mut failures = 0usize;
+        for array in self.key_arrays_mut() {
+            for value in array.iter_mut() {
+                if value.trim().is_empty() || crate::secretstore::is_sealed(value) {
+                    continue;
+                }
+                match crate::secretstore::seal_secret(value) {
+                    Some(sealed) => *value = sealed,
+                    None => failures += 1,
+                }
+            }
+        }
+        if failures > 0 {
+            tracing::error!(
+                "protect_keys_at_rest is on but DPAPI refused to seal {failures} key(s); \
+                 those keys stay in plaintext in settings.json"
+            );
+        }
+    }
+
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
-        let pretty = serde_json::to_string_pretty(self)?;
+        // `protect_keys_at_rest` seals the key arrays on the way to disk only.
+        // The live Config keeps plaintext so KeyPool and the Settings window
+        // are unaffected by the toggle.
+        let pretty = if self.protect_keys_at_rest {
+            let mut sealed = self.clone();
+            sealed.seal_keys();
+            serde_json::to_string_pretty(&sealed)?
+        } else {
+            serde_json::to_string_pretty(self)?
+        };
         // Write-then-rename so a crash, power loss, or AV lock mid-write can
         // never leave a truncated settings.json (which would silently wipe the
         // user's API keys and preferences on the next load). Same atomic idiom
@@ -676,6 +845,8 @@ impl Config {
                 auto_space: self.auto_space,
                 auto_newline: self.auto_newline,
                 text_replacements: global_replacements.clone(),
+                language: self.language.clone(),
+                custom_vocabulary: self.custom_vocabulary.clone(),
             };
         };
 
@@ -699,7 +870,54 @@ impl Config {
             auto_space: profile.auto_space.unwrap_or(self.auto_space),
             auto_newline: profile.auto_newline.unwrap_or(self.auto_newline),
             text_replacements,
+            language: profile
+                .language
+                .clone()
+                .filter(|l| !l.trim().is_empty())
+                .unwrap_or_else(|| self.language.clone()),
+            custom_vocabulary: profile
+                .custom_vocabulary
+                .clone()
+                .unwrap_or_else(|| self.custom_vocabulary.clone()),
         }
+    }
+
+    /// The STT provider to use for a dictation started while `exe_name` is in
+    /// the foreground. A profile may override the global provider, but only to
+    /// one that actually has a key (or to the keyless local provider) -- an
+    /// unknown id or a keyless cloud provider silently falls back to the global
+    /// choice, so a bad profile can never leave the user unable to dictate.
+    pub fn provider_for_exe(&self, exe_name: Option<&str>) -> Option<String> {
+        let global = self.resolve_provider();
+        let Some(profile) = self.active_profile(exe_name) else {
+            return global;
+        };
+        let Some(want) = profile.stt_provider.as_deref().map(str::trim) else {
+            return global;
+        };
+        let want = want.to_ascii_lowercase();
+        if want.is_empty() {
+            return global;
+        }
+        if want == "local" {
+            return Some(want);
+        }
+        let known = [
+            "elevenlabs",
+            "deepgram",
+            "openai",
+            "assemblyai",
+            "dashscope",
+            "google",
+        ];
+        if known.contains(&want.as_str()) && !self.keys_for(&want).is_empty() {
+            return Some(want);
+        }
+        tracing::warn!(
+            "profile '{}' asks for provider '{want}', which is unknown or has no key; using the global provider",
+            profile.name
+        );
+        global
     }
 }
 
@@ -931,7 +1149,199 @@ mod tests {
             auto_newline: None,
             replacements_mode: default_replacements_mode(),
             text_replacements: BTreeMap::new(),
+            language: None,
+            stt_provider: None,
+            custom_vocabulary: None,
         }
+    }
+
+    #[test]
+    fn profile_language_overrides_the_global_language() {
+        let mut cfg = Config::default();
+        let mut p = profile("German app", &["de.exe"]);
+        p.language = Some("de-DE".into());
+        cfg.profiles = vec![p];
+        assert_eq!(cfg.effective_settings(Some("de.exe")).language, "de-DE");
+        assert_eq!(
+            cfg.effective_settings(Some("other.exe")).language,
+            cfg.language
+        );
+    }
+
+    #[test]
+    fn blank_profile_language_falls_back_to_global() {
+        let mut cfg = Config::default();
+        let mut p = profile("Blank", &["x.exe"]);
+        p.language = Some("   ".into());
+        cfg.profiles = vec![p];
+        assert_eq!(cfg.effective_settings(Some("x.exe")).language, cfg.language);
+    }
+
+    #[test]
+    fn profile_vocabulary_replaces_the_global_list_including_when_empty() {
+        let mut cfg = Config {
+            custom_vocabulary: vec!["Supabase".into()],
+            ..Config::default()
+        };
+        let mut p = profile("Quiet", &["q.exe"]);
+        p.custom_vocabulary = Some(Vec::new());
+        cfg.profiles = vec![p];
+        assert!(cfg
+            .effective_settings(Some("q.exe"))
+            .custom_vocabulary
+            .is_empty());
+        assert_eq!(
+            cfg.effective_settings(Some("z.exe")).custom_vocabulary,
+            vec!["Supabase".to_string()]
+        );
+    }
+
+    #[test]
+    fn profile_provider_override_needs_a_configured_key() {
+        let mut cfg = Config {
+            elevenlabs_keys: vec!["k1".into()],
+            ..Config::default()
+        };
+        let mut p = profile("Wants deepgram", &["a.exe"]);
+        p.stt_provider = Some("deepgram".into());
+        cfg.profiles = vec![p];
+        // Deepgram has no key: fall back to the global provider.
+        assert_eq!(
+            cfg.provider_for_exe(Some("a.exe")).as_deref(),
+            Some("elevenlabs")
+        );
+        cfg.deepgram_keys = vec!["k2".into()];
+        assert_eq!(
+            cfg.provider_for_exe(Some("a.exe")).as_deref(),
+            Some("deepgram")
+        );
+    }
+
+    #[test]
+    fn profile_provider_override_accepts_keyless_local_and_rejects_junk() {
+        let mut cfg = Config {
+            elevenlabs_keys: vec!["k1".into()],
+            ..Config::default()
+        };
+        let mut local = profile("Offline", &["secret.exe"]);
+        local.stt_provider = Some("LOCAL".into());
+        let mut junk = profile("Typo", &["typo.exe"]);
+        junk.stt_provider = Some("deepgrma".into());
+        cfg.profiles = vec![local, junk];
+        assert_eq!(
+            cfg.provider_for_exe(Some("secret.exe")).as_deref(),
+            Some("local")
+        );
+        assert_eq!(
+            cfg.provider_for_exe(Some("typo.exe")).as_deref(),
+            Some("elevenlabs")
+        );
+    }
+
+    #[test]
+    fn sealed_keys_round_trip_through_a_saved_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "qd-seal-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        let cfg = Config {
+            protect_keys_at_rest: true,
+            elevenlabs_keys: vec!["el-secret-1".into(), "el-secret-2".into()],
+            deepgram_keys: vec!["dg-secret".into()],
+            ..Config::default()
+        };
+        cfg.save(&path).unwrap();
+
+        // On disk the keys must not be readable.
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert!(
+            !on_disk.contains("el-secret-1") && !on_disk.contains("dg-secret"),
+            "sealed save still wrote a plaintext key"
+        );
+        assert!(on_disk.contains(crate::secretstore::SEALED_PREFIX));
+
+        // Loading brings them back in the clear for KeyPool.
+        let mut loaded: Config = serde_json::from_str(&on_disk).unwrap();
+        let diags = loaded.unseal_keys();
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        assert_eq!(loaded.elevenlabs_keys, cfg.elevenlabs_keys);
+        assert_eq!(loaded.deepgram_keys, cfg.deepgram_keys);
+
+        // Turning the setting back off restores a plaintext file, so nobody is
+        // locked out of their own keys on the machine that sealed them.
+        loaded.protect_keys_at_rest = false;
+        loaded.save(&path).unwrap();
+        assert!(fs::read_to_string(&path).unwrap().contains("el-secret-1"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_undecryptable_key_is_dropped_and_reported_not_used_as_garbage() {
+        let mut cfg = Config {
+            elevenlabs_keys: vec!["plain-key".into(), "dpapi:bm90LXJlYWw=".into()],
+            ..Config::default()
+        };
+        let diags = cfg.unseal_keys();
+        assert_eq!(cfg.elevenlabs_keys, vec!["plain-key".to_string()]);
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].starts_with("ALERT:"));
+    }
+
+    #[test]
+    fn a_release_build_ignores_a_settings_json_in_an_unrelated_ancestor() {
+        let dir = std::env::temp_dir().join(format!(
+            "qd-ancestor-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        // A bare directory is somebody else's folder: never adopt its config
+        // in a shipped build. Debug builds keep the dev-run convenience.
+        assert_eq!(
+            Config::ancestor_settings_allowed(&dir),
+            cfg!(debug_assertions)
+        );
+
+        // An explicit marker opts in, in every build.
+        fs::write(dir.join(".quickdictate-root"), b"").unwrap();
+        assert!(Config::ancestor_settings_allowed(&dir));
+        fs::remove_file(dir.join(".quickdictate-root")).unwrap();
+
+        // So does our own Cargo.toml, which is what a dev run walks up to.
+        fs::write(
+            dir.join("Cargo.toml"),
+            b"[package]\nname = \"quickdictate\"\n",
+        )
+        .unwrap();
+        assert!(Config::ancestor_settings_allowed(&dir));
+
+        // Someone else's Cargo.toml does not.
+        fs::write(dir.join("Cargo.toml"), b"[package]\nname = \"other-app\"\n").unwrap();
+        assert_eq!(
+            Config::ancestor_settings_allowed(&dir),
+            cfg!(debug_assertions)
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_settings_round_trip_and_default_off() {
+        let c = Config::default();
+        assert!(!c.update_auto_install, "silent install must be opt-in");
+        assert!(!c.protect_keys_at_rest, "key sealing must be opt-in");
+        assert!(c.custom_vocabulary.is_empty());
+        let json = serde_json::to_string(&c).unwrap();
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.update_auto_install, c.update_auto_install);
+        assert_eq!(back.protect_keys_at_rest, c.protect_keys_at_rest);
+        assert_eq!(back.custom_vocabulary, c.custom_vocabulary);
     }
 
     #[test]

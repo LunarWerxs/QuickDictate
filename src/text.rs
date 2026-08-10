@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use once_cell::sync::Lazy;
-use regex::Regex;
+use regex::{Regex, Replacer};
 
 static SPACE_BEFORE_PUNCT: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+([,.;:?!])").unwrap());
 // Match a punctuation char followed by a letter; we'll splice a space between
@@ -49,7 +49,13 @@ static DEV_TERMS_MIXED: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
 
 /// Smart punctuation, capitalization, replacement, etc.
 pub struct TextProcessor {
-    replacements: Vec<(Regex, String)>,
+    /// A single alternation regex over every rule's pattern (longest
+    /// pattern first) paired with each pattern's literal replacement
+    /// value, indexed by capture group. `None` when the map is empty, so
+    /// the common "no rules configured" case skips regex work entirely.
+    /// See [`Self::build_replacements`] for why this is one combined
+    /// regex instead of one regex per rule.
+    replacements: Option<(Regex, Vec<String>)>,
     auto_punct: bool,
     auto_space: bool,
     auto_newline: bool,
@@ -62,20 +68,60 @@ impl TextProcessor {
         auto_space: bool,
         auto_newline: bool,
     ) -> Self {
-        let mut replacements = Vec::with_capacity(map.len());
-        for (k, v) in map {
-            let escaped = regex::escape(k);
-            // Word-boundary, case-insensitive.
-            if let Ok(re) = Regex::new(&format!(r"(?i)\b{}\b", escaped)) {
-                replacements.push((re, v.clone()));
-            }
-        }
         Self {
-            replacements,
+            replacements: Self::build_replacements(map),
             auto_punct,
             auto_space,
             auto_newline,
         }
+    }
+
+    /// Builds one alternation regex over every rule's pattern instead of a
+    /// regex per rule. The previous approach ran each rule as its own
+    /// sequential `replace_all` pass over the progressively-rewritten
+    /// output, in `BTreeMap` (alphabetical) key order. That let an
+    /// EARLIER rule's replacement text be matched and rewritten again by
+    /// a LATER rule, so two independent user rules could silently chain
+    /// (e.g. "cat" -> "dog" then "dog" -> "cat" flips "cat" right back).
+    /// Matching everything in one simultaneous pass over the ORIGINAL
+    /// text can't do that: every match position is decided once, against
+    /// text no earlier rule has touched.
+    ///
+    /// Patterns are sorted longest-first (by character count, ties broken
+    /// by the map's existing alphabetical order for determinism) before
+    /// being joined with `|`. The `regex` crate's alternation is
+    /// leftmost-first: when two patterns could both match starting at the
+    /// same position, whichever alternative is listed first wins.
+    /// Longest-first makes that deterministic and matches the intuitive
+    /// rule that a more specific (longer) phrase should win over a
+    /// shorter one it happens to contain.
+    fn build_replacements(map: &BTreeMap<String, String>) -> Option<(Regex, Vec<String>)> {
+        if map.is_empty() {
+            return None;
+        }
+        let mut rules: Vec<(&String, &String)> = map.iter().collect();
+        rules.sort_by_key(|(k, _)| std::cmp::Reverse(k.chars().count()));
+
+        let mut alt = String::new();
+        let mut values = Vec::with_capacity(rules.len());
+        for (k, v) in rules {
+            if !alt.is_empty() {
+                alt.push('|');
+            }
+            // Each pattern gets its own capture group so the replacement
+            // closure in `apply_replacements` can tell which rule fired.
+            alt.push('(');
+            alt.push_str(&regex::escape(k));
+            alt.push(')');
+            values.push(v.clone());
+        }
+        // Word-boundary, case-insensitive -- same semantics each per-rule
+        // regex used to have on its own; wrapping the whole alternation in
+        // one shared `\b...\b` is equivalent because a `\b` assertion only
+        // depends on the characters at that position, not on which
+        // alternative matched there.
+        let pattern = format!(r"(?i)\b(?:{alt})\b");
+        Regex::new(&pattern).ok().map(|re| (re, values))
     }
 
     pub fn process(&self, raw: &str) -> String {
@@ -100,11 +146,33 @@ impl TextProcessor {
     }
 
     fn apply_replacements(&self, t: &str) -> String {
-        let mut out = t.to_string();
-        for (re, repl) in &self.replacements {
-            out = re.replace_all(&out, repl.as_str()).into_owned();
-        }
-        out
+        let Some((re, values)) = &self.replacements else {
+            return t.to_string();
+        };
+        re.replace_all(t, |caps: &regex::Captures| -> String {
+            // Group 0 is the whole match; groups 1..=values.len() line up
+            // 1:1 with `values` in the same order `build_replacements`
+            // built them, and exactly one of those groups is `Some` per
+            // match. Find which rule's pattern fired and use its value.
+            for (i, value) in values.iter().enumerate() {
+                if caps.get(i + 1).is_some() {
+                    // `regex::NoExpand` inserts `value` byte-for-byte
+                    // instead of treating it as a capture-group template.
+                    // Without this, a bare `&str` Replacer interprets a
+                    // `$` in the replacement text as `$1`/`$name` capture
+                    // syntax, so a rule whose value contains a literal
+                    // `$` (e.g. "$50") silently ate the `$` and whatever
+                    // looked like a group reference after it.
+                    let mut buf = String::new();
+                    regex::NoExpand(value.as_str()).replace_append(caps, &mut buf);
+                    return buf;
+                }
+            }
+            // Unreachable: the outer regex only matches when some inner
+            // group matched too.
+            String::new()
+        })
+        .into_owned()
     }
 
     fn remove_fillers(&self, t: &str) -> String {
@@ -264,6 +332,73 @@ mod tests {
         // auto_newline wins over auto_space and appends a newline.
         let newline = TextProcessor::new(&BTreeMap::new(), false, false, true);
         assert_eq!(newline.process("hello"), "hello\n");
+    }
+
+    #[test]
+    fn dollar_sign_replacement_values_survive_verbatim() {
+        // FIX 1: a bare `&str` Replacer treats `$` in the replacement text
+        // as capture-group syntax, so a rule's value containing a literal
+        // `$` used to vanish along with whatever followed it.
+        let p = TextProcessor::new(
+            &map(&[("price tag", "$50"), ("first item", "$1 special")]),
+            false,
+            false,
+            false,
+        );
+        assert_eq!(p.process("the price tag is set"), "the $50 is set");
+        assert_eq!(
+            p.process("this is the first item"),
+            "this is the $1 special"
+        );
+    }
+
+    #[test]
+    fn independent_rules_do_not_cascade() {
+        // FIX 2: the old code applied rules sequentially over the growing
+        // output in BTreeMap (alphabetical) key order, so "cat" -> "dog"
+        // ran first and then "dog" -> "cat" ran second and found the
+        // "dog" the FIRST rule had just produced, flipping it straight
+        // back to "cat". A single simultaneous pass over the original
+        // text must leave both rules independent.
+        let p = TextProcessor::new(&map(&[("cat", "dog"), ("dog", "cat")]), false, false, false);
+        assert_eq!(p.process("cat and dog"), "dog and cat");
+    }
+
+    #[test]
+    fn longest_pattern_wins_on_overlap() {
+        // "new york" and "new york city" both start matching at the same
+        // position in "new york city". Longest-pattern-first ordering
+        // means the longer, more specific rule wins instead of the
+        // shorter one consuming its prefix first.
+        let p = TextProcessor::new(
+            &map(&[("new york", "NYC"), ("new york city", "The Big Apple")]),
+            false,
+            false,
+            false,
+        );
+        assert_eq!(p.process("i love new york city"), "I love The Big Apple");
+    }
+
+    #[test]
+    fn default_replacement_map_entries_still_work() {
+        // Mirrors two entries from config::default_replacements (chat gpt
+        // and github) to spot-check that the FIX 2 rewrite didn't change
+        // behavior for the shipped default replacement map.
+        let defaults = map(&[("chat gpt", "ChatGPT"), ("github", "GitHub")]);
+        let p = TextProcessor::new(&defaults, false, false, false);
+        assert_eq!(
+            p.process("ask chat gpt about github"),
+            "ask ChatGPT about GitHub"
+        );
+    }
+
+    #[test]
+    fn empty_replacement_map_is_a_no_op() {
+        let p = TextProcessor::new(&BTreeMap::new(), false, false, false);
+        assert_eq!(
+            p.process("nothing to replace here"),
+            "nothing to replace here"
+        );
     }
 
     #[test]

@@ -12,6 +12,7 @@ mod keys;
 mod local_stt;
 mod onboarding;
 mod output;
+mod secretstore;
 mod settings_ui;
 mod sound;
 mod state;
@@ -264,7 +265,7 @@ fn prepare_logs_dir() -> Vec<String> {
 /// Install a panic hook that writes panic info to a dedicated unbuffered
 /// file (and via tracing, if it still works). Without this, panics in any
 /// background thread silently disappear under `windows_subsystem = "windows"`.
-fn install_panic_hook() {
+fn install_panic_hook(write_panic_file: bool) {
     let panic_path = logs_dir().join(PANIC_LOG_NAME);
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -289,18 +290,21 @@ fn install_panic_hook() {
             .unwrap_or(0);
 
         // 1) Synchronous append to a dedicated panic file. This survives even
-        //    if the tracing pipeline is mid-shutdown.
+        //    if the tracing pipeline is mid-shutdown. Gated on the same
+        //    opt-in as every other on-disk log (see the call site).
         use std::io::Write as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&panic_path)
-        {
-            let _ = writeln!(
-                f,
-                "[{now}] PANIC thread='{thread}' at {location}: {payload}\n{backtrace:?}"
-            );
-            let _ = f.flush();
+        if write_panic_file {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&panic_path)
+            {
+                let _ = writeln!(
+                    f,
+                    "[{now}] PANIC thread='{thread}' at {location}: {payload}\n{backtrace:?}"
+                );
+                let _ = f.flush();
+            }
         }
 
         // 2) Also fire through tracing so it lands in the main log if possible.
@@ -702,7 +706,14 @@ fn main() -> Result<()> {
         }
     }
 
-    install_panic_hook();
+    // The panic FILE honours the same opt-in as every other log. SECURITY.md
+    // promises local logging is opt-in, and a panic hook that always writes to
+    // disk quietly breaks that promise: the payload of a future panic near
+    // key-handling code would land in a file next to settings.json regardless.
+    // The tracing path inside the hook is always installed and stays silent
+    // unless logging is on, so crashes are still diagnosable the moment the
+    // user turns logging on and reproduces.
+    install_panic_hook(cfg.enable_logging || std::env::var_os("QUICKDICTATE_LOG").is_some());
     if std::env::var_os("RUST_BACKTRACE").is_none() {
         std::env::set_var("RUST_BACKTRACE", "1");
     }
@@ -898,10 +909,13 @@ fn main() -> Result<()> {
                 }
                 app.word_count.store(0, Ordering::Release);
                 app.set_status(Status::Idle);
-                if app.replay_tx.send(None).is_err() {
-                    tracing::warn!(
-                        "saved-transcription replay requested, but output worker is unavailable"
-                    );
+                // try_send, never send: this runs on the win32 message-pump
+                // thread. A blocking send on a full queue would freeze the
+                // tray, the hotkeys, and every window this process owns until
+                // the paste worker drained. Dropping one replay request is a
+                // far better outcome than a frozen app.
+                if let Err(e) = app.replay_tx.try_send(None) {
+                    tracing::warn!("saved-transcription replay request dropped: {e}");
                 }
             }
             HotkeyEvent::HoldPressed => {

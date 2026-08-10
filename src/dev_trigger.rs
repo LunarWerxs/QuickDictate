@@ -22,7 +22,7 @@
 //! so a test harness can discover it without hard-coding.
 
 use std::net::{SocketAddr, UdpSocket};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -32,6 +32,55 @@ use crate::hotkeys::HotkeyEvent;
 use crate::state::App;
 
 const ENV_PORT: &str = "QUICKDICTATE_DEV_PORT";
+
+/// A parsed control-channel command, decoupled from dispatch (which needs the
+/// app handles / channels this module is wired to).
+#[derive(Debug, PartialEq)]
+enum Command {
+    Toggle,
+    ToggleLong,
+    HoldPress,
+    HoldRelease,
+    PasteLast,
+    /// `paste_history:<n>` with a valid index.
+    PasteHistory(usize),
+    About,
+    Settings,
+    /// `fake:<text>` with the text after the prefix.
+    Fake(String),
+    Quit,
+    /// `paste_history:<n>` where `<n>` didn't parse as a `usize`.
+    BadPasteHistory,
+    Unknown,
+}
+
+/// Parse a raw command line (already trimmed) into a [`Command`]. Pure — no
+/// I/O, no channel sends — so the dispatch loop can stay a thin match over it.
+fn parse_command(cmd: &str) -> Command {
+    match cmd {
+        "toggle" => Command::Toggle,
+        "toggle_long" => Command::ToggleLong,
+        "hold_press" => Command::HoldPress,
+        "hold_release" => Command::HoldRelease,
+        "paste_last" => Command::PasteLast,
+        "about" => Command::About,
+        "settings" => Command::Settings,
+        "quit" => Command::Quit,
+        c if c.starts_with("paste_history:") => {
+            match c.trim_start_matches("paste_history:").parse::<usize>() {
+                Ok(i) => Command::PasteHistory(i),
+                Err(_) => Command::BadPasteHistory,
+            }
+        }
+        c if c.starts_with("fake:") => Command::Fake(c.trim_start_matches("fake:").to_string()),
+        _ => Command::Unknown,
+    }
+}
+
+/// The dev-trigger port file's path given the exe's own directory.
+fn port_file_path_in(dir: &Path) -> PathBuf {
+    dir.join("quickdictate-dev-port.txt")
+}
 
 pub fn maybe_spawn(app: Arc<App>, tx: Sender<HotkeyEvent>) -> Option<std::thread::JoinHandle<()>> {
     let port_str = std::env::var(ENV_PORT).ok()?;
@@ -63,8 +112,7 @@ pub fn maybe_spawn(app: Arc<App>, tx: Sender<HotkeyEvent>) -> Option<std::thread
 fn port_file_path() -> Option<PathBuf> {
     std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .map(|d| d.join("quickdictate-dev-port.txt"))
+        .and_then(|p| p.parent().map(port_file_path_in))
 }
 
 fn run(app: Arc<App>, tx: Sender<HotkeyEvent>, socket: UdpSocket) {
@@ -98,56 +146,111 @@ fn run(app: Arc<App>, tx: Sender<HotkeyEvent>, socket: UdpSocket) {
         } else {
             tracing::info!("dev_trigger: received '{cmd}'");
         }
-        match cmd {
-            "toggle" => {
+        match parse_command(cmd) {
+            Command::Toggle => {
                 let _ = tx.send(HotkeyEvent::TogglePressed);
             }
-            "toggle_long" => {
+            Command::ToggleLong => {
                 let _ = tx.send(HotkeyEvent::ToggleLongPressed);
             }
-            "hold_press" => {
+            Command::HoldPress => {
                 let _ = tx.send(HotkeyEvent::HoldPressed);
             }
-            "hold_release" => {
+            Command::HoldRelease => {
                 let _ = tx.send(HotkeyEvent::HoldReleased);
             }
-            "paste_last" => {
+            Command::PasteLast => {
                 let _ = app.replay_tx.send(None);
             }
-            c if c.starts_with("paste_history:") => {
+            Command::PasteHistory(i) => {
                 // Test hook for the "Recent transcriptions" tray submenu:
                 // replay history entry N (0 = most recent) without clicking.
-                match c.trim_start_matches("paste_history:").parse::<usize>() {
-                    Ok(i) => {
-                        let _ = app.replay_tx.send(Some(i));
-                    }
-                    Err(_) => tracing::warn!("dev_trigger: bad paste_history index in '{c}'"),
-                }
+                let _ = app.replay_tx.send(Some(i));
             }
-            "about" => {
+            Command::BadPasteHistory => {
+                tracing::warn!("dev_trigger: bad paste_history index in '{cmd}'");
+            }
+            Command::About => {
                 // Test hook: open the About window without clicking the tray.
                 crate::about::show_about();
             }
-            "settings" => {
+            Command::Settings => {
                 // Test hook: open the Settings window without clicking the tray.
                 crate::settings_ui::show_settings(Arc::clone(&app));
             }
-            c if c.starts_with("fake:") => {
-                let text = c.trim_start_matches("fake:").to_string();
+            Command::Fake(text) => {
                 tracing::info!(
                     "dev_trigger: injecting fake transcript ({} chars)",
                     text.chars().count()
                 );
                 let _ = app.transcript_tx.send(text);
             }
-            "quit" => {
+            Command::Quit => {
                 app.shutdown.store(true, Ordering::Release);
                 break;
             }
-            other => tracing::warn!("dev_trigger: unknown command '{other}'"),
+            Command::Unknown => tracing::warn!("dev_trigger: unknown command '{cmd}'"),
         }
     }
     if let Some(path) = port_file_path() {
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_command_recognizes_the_fixed_commands() {
+        assert_eq!(parse_command("toggle"), Command::Toggle);
+        assert_eq!(parse_command("toggle_long"), Command::ToggleLong);
+        assert_eq!(parse_command("hold_press"), Command::HoldPress);
+        assert_eq!(parse_command("hold_release"), Command::HoldRelease);
+        assert_eq!(parse_command("paste_last"), Command::PasteLast);
+        assert_eq!(parse_command("about"), Command::About);
+        assert_eq!(parse_command("settings"), Command::Settings);
+        assert_eq!(parse_command("quit"), Command::Quit);
+    }
+
+    #[test]
+    fn parse_command_parses_a_valid_paste_history_index() {
+        assert_eq!(parse_command("paste_history:3"), Command::PasteHistory(3));
+        assert_eq!(parse_command("paste_history:0"), Command::PasteHistory(0));
+    }
+
+    #[test]
+    fn parse_command_rejects_a_malformed_paste_history_index() {
+        assert_eq!(parse_command("paste_history:abc"), Command::BadPasteHistory);
+        assert_eq!(parse_command("paste_history:"), Command::BadPasteHistory);
+        assert_eq!(parse_command("paste_history:-1"), Command::BadPasteHistory);
+    }
+
+    #[test]
+    fn parse_command_extracts_the_fake_transcript_text() {
+        assert_eq!(
+            parse_command("fake:hello world"),
+            Command::Fake("hello world".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_command_of_bare_fake_prefix_is_empty_text() {
+        assert_eq!(parse_command("fake:"), Command::Fake(String::new()));
+    }
+
+    #[test]
+    fn parse_command_of_unrecognized_text_is_unknown() {
+        assert_eq!(parse_command("banana"), Command::Unknown);
+        assert_eq!(parse_command(""), Command::Unknown);
+    }
+
+    #[test]
+    fn port_file_path_in_joins_the_dev_port_filename() {
+        let dir = Path::new("C:\\some\\dir");
+        assert_eq!(
+            port_file_path_in(dir),
+            PathBuf::from("C:\\some\\dir\\quickdictate-dev-port.txt")
+        );
     }
 }

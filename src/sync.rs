@@ -35,6 +35,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::Config;
+use crate::secretstore::dpapi;
 use crate::state::App;
 use crate::stats::UsageStats;
 
@@ -92,10 +93,23 @@ fn store_cache() -> std::sync::MutexGuard<'static, Option<CachedRemoteDoc>> {
 ///   * `hide_tray_icon` — per-machine, like `run_at_startup`: whether the
 ///     notification-area icon is shown is a property of this install, not a
 ///     portable preference, so it never travels with the synced settings;
-///   * `enable_logging` — a local diagnostics toggle.
+///   * `enable_logging` / `log_transcripts` — local diagnostics toggles;
+///   * `max_log_mb` — a per-install log-size cap, machine-local like
+///     `enable_logging`, not a portable preference;
+///   * `install_id` — this install's anonymous update-check id; syncing it
+///     would merge two machines' identities into one;
+///   * `update_auto_install` — a machine-local policy choice (whether *this*
+///     machine applies updates unattended); syncing it would silently opt a
+///     second machine into unattended installs;
+///   * `protect_keys_at_rest` — whether *this* machine's settings.json seals
+///     its keys with DPAPI bound to this Windows account; meaningless (and
+///     misleading) if carried to another account or machine.
 ///
 /// Only portable preferences travel. Names match `Config`'s serde field names
-/// exactly, so the transforms below stay in lock-step with the struct.
+/// exactly, so the transforms below stay in lock-step with the struct. See
+/// [`NEVER_SYNCED`] and the `every_config_field_is_synced_or_never_synced`
+/// test below: together the two lists must partition every `Config` field, so
+/// a newly added field can never silently fall through uncategorized again.
 pub const SYNCED_KEYS: &[&str] = &[
     "mode",
     "language",
@@ -121,6 +135,46 @@ pub const SYNCED_KEYS: &[&str] = &[
     "prewarm_keys",
     "text_replacements",
     "enable_text_replacements",
+    // Portable, secret-free preferences added to `Config` after this list was
+    // first written. Per-app profiles in particular are exactly what a user
+    // syncing two machines expects to travel.
+    "profiles",
+    "profiles_enabled",
+    "voice_commands",
+    "custom_vocabulary",
+];
+
+/// Every `Config` field that is deliberately **never** synced: secrets and
+/// machine-local settings that must stay off the wire. This exists so the
+/// drift [`SYNCED_KEYS`] once suffered (portable fields silently never added)
+/// can't happen again: the `every_config_field_is_synced_or_never_synced`
+/// test below asserts these two lists together cover every key `Config`
+/// serializes to JSON, with no name in both, so a new `Config` field fails
+/// the build until someone files it into one list or the other on purpose.
+/// Only the guard test reads this at runtime; its real job is to be the
+/// written-down decision, and to break the build when a new field has no
+/// decision yet.
+#[cfg_attr(not(test), allow(dead_code))]
+const NEVER_SYNCED: &[&str] = &[
+    "elevenlabs_keys",      // secret API key array
+    "deepgram_keys",        // secret API key array
+    "openai_keys",          // secret API key array
+    "assemblyai_keys",      // secret API key array
+    "dashscope_keys",       // secret API key array
+    "google_keys",          // secret API key array
+    "local_keys",           // legacy secret API key array, folds into elevenlabs_keys
+    "window_width",         // machine-local window geometry
+    "window_height",        // machine-local window geometry
+    "window_x",             // machine-local window geometry
+    "window_y",             // machine-local window geometry
+    "run_at_startup",       // per-machine registry (Run key) behavior
+    "hide_tray_icon",       // a property of this install, not a portable preference
+    "enable_logging",       // local diagnostics toggle
+    "max_log_mb",           // per-install log-size cap, machine-local like enable_logging
+    "log_transcripts",      // local diagnostics toggle; must never leave the machine
+    "install_id", // anonymous per-install id; syncing would merge two machines' identities
+    "update_auto_install", // machine-local unattended-update policy choice
+    "protect_keys_at_rest", // controls DPAPI sealing bound to this Windows account; meaningless elsewhere
 ];
 
 // ---- Allowlist transforms (Config <-> synced JSON) -------------------------
@@ -159,6 +213,14 @@ fn credential_patterns() -> &'static [(Regex, &'static str)] {
         .get_or_init(|| {
             [
                 (r"^(sk|pk|rk)_(live|test)_[A-Za-z0-9]{16,}", "a Stripe key"),
+                // ElevenLabs keys begin `sk_` (underscore) followed by a long
+                // hex string — distinct from OpenAI's `sk-` (hyphen) below.
+                (r"^sk_[A-Za-z0-9]{32,}$", "an ElevenLabs API key"),
+                // DashScope (Alibaba Cloud / Qwen) keys are `sk-` followed by
+                // a 32+ character lowercase-hex id. Checked before the
+                // generic OpenAI-style pattern below (which would otherwise
+                // also match) so a DashScope key is labeled correctly.
+                (r"^sk-[0-9a-f]{32,}$", "a DashScope API key"),
                 (r"^sk-[A-Za-z0-9_-]{20,}", "an OpenAI-style API key"),
                 (r"^(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}", "a GitHub token"),
                 (
@@ -168,6 +230,16 @@ fn credential_patterns() -> &'static [(Regex, &'static str)] {
                 (r"^xox[baprs]-[A-Za-z0-9-]{10,}", "a Slack token"),
                 (r"^AKIA[0-9A-Z]{16}$", "an AWS access key id"),
                 (r"^AIza[0-9A-Za-z_-]{35}$", "a Google API key"),
+                // Deepgram and AssemblyAI keys have NO distinguishing prefix:
+                // they are undifferentiated lowercase-hex blobs (40 and 32
+                // chars). Deliberately NOT matched here. A bare-hex pattern
+                // also matches every git SHA-1, MD5 hash, and dashless GUID,
+                // and one such string in a synced text field (a replacement
+                // value, a vocabulary term) would block EVERY future settings
+                // push for that user, silently, until they found and removed
+                // it. This scanner is defense-in-depth behind the SYNCED_KEYS
+                // allowlist, which already keeps all key arrays off the wire;
+                // it must never cost a legitimate sync.
                 (
                     r"^ey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}$",
                     "a JWT",
@@ -383,50 +455,6 @@ fn sha256(bytes: &[u8]) -> Result<[u8; 32]> {
         Ok(out)
     } else {
         bail!("SHA-256 (BCryptHash) failed: {status:?}")
-    }
-}
-
-/// DPAPI seal (`op=true`) / unseal (`op=false`), CurrentUser scope, no prompt.
-#[cfg(windows)]
-fn dpapi(encrypt: bool, data: &[u8]) -> Option<Vec<u8>> {
-    use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{LocalFree, HLOCAL};
-    use windows::Win32::Security::Cryptography::{
-        CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
-    };
-    unsafe {
-        let inb = CRYPT_INTEGER_BLOB {
-            cbData: data.len() as u32,
-            pbData: data.as_ptr() as *mut u8,
-        };
-        let mut out = CRYPT_INTEGER_BLOB::default();
-        let res = if encrypt {
-            CryptProtectData(
-                &inb,
-                PCWSTR::null(),
-                None,
-                None,
-                None,
-                CRYPTPROTECT_UI_FORBIDDEN,
-                &mut out,
-            )
-        } else {
-            CryptUnprotectData(
-                &inb,
-                None,
-                None,
-                None,
-                None,
-                CRYPTPROTECT_UI_FORBIDDEN,
-                &mut out,
-            )
-        };
-        if res.is_err() || out.pbData.is_null() {
-            return None;
-        }
-        let bytes = std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec();
-        let _ = LocalFree(HLOCAL(out.pbData as *mut core::ffi::c_void));
-        Some(bytes)
     }
 }
 
@@ -1152,13 +1180,44 @@ pub fn flush_before_exit(app: &Arc<App>, timeout: Duration) {
     }
 }
 
-/// Re-seal creds if a refresh rotated the refresh token.
+/// Re-seal creds if a refresh rotated the refresh token. OAuth servers
+/// commonly invalidate the OLD refresh token the instant a rotated one is
+/// issued, so a failed write here is not a safe no-op: the in-memory session
+/// keeps working for the rest of this run, but the NEXT launch would load the
+/// now-dead old token off disk and get an opaque "token refresh failed" with
+/// no clue why. Rather than leave that trap, a save failure on a genuine
+/// rotation logs the real cause and clears the local creds, so the next
+/// launch presents a clean signed-out state the user can act on (sign in
+/// again) instead of a confusing refresh error. This is distinct from the
+/// benign identity-backfill re-seal in `resume_and_pull` (same `save_creds`,
+/// but backfilling a display name/email, not persisting a rotated token) —
+/// that path is left as best-effort, unchanged.
 fn persist_rotated(old: &Creds, fresh: &Tokens) {
-    if !fresh.refresh_token.is_empty() && fresh.refresh_token != old.refresh_token {
-        let _ = save_creds(&Creds {
-            refresh_token: fresh.refresh_token.clone(),
-            ..old.clone()
-        });
+    if fresh.refresh_token.is_empty() || fresh.refresh_token == old.refresh_token {
+        return;
+    }
+    let rotated = Creds {
+        refresh_token: fresh.refresh_token.clone(),
+        ..old.clone()
+    };
+    // One retry after a beat: the classic failure here is an AV scanner or
+    // backup tool briefly holding the file, which clears in milliseconds.
+    // Rotation happens on ROUTINE background refreshes, so treating one
+    // transient write failure as a sign-out forced a full browser re-login
+    // for a disk hiccup the user never saw. Only after both attempts fail do
+    // we keep the old file and say so loudly; the next launch then shows a
+    // refresh error rather than a silent sign-out, which at least names the
+    // moment things went wrong.
+    if let Err(first) = save_creds(&rotated) {
+        std::thread::sleep(Duration::from_millis(250));
+        if let Err(second) = save_creds(&rotated) {
+            tracing::error!(
+                "connections: failed twice to persist a rotated refresh token \
+                 (first: {first}; retry: {second}); the old token may already be \
+                 invalidated server-side, so the next launch's sync resume may \
+                 fail and ask you to sign in again"
+            );
+        }
     }
 }
 
@@ -1347,6 +1406,42 @@ mod tests {
     }
 
     #[test]
+    fn credential_patterns_catch_prefixed_stt_keys_but_not_bare_hex() {
+        // Prefixed key shapes are unambiguous and must be caught.
+        for (value, provider) in [
+            ("sk_0123456789abcdef0123456789abcdef01234567", "ElevenLabs"),
+            ("sk-0123456789abcdef0123456789abcdef", "DashScope"),
+        ] {
+            let snapshot = serde_json::json!({
+                "text_replacements": [{"from": "x", "to": value}]
+            });
+            let error = validate_sync_snapshot(&snapshot).unwrap_err().to_string();
+            assert!(
+                error.contains(provider),
+                "expected the {provider} key pattern to catch {value:?}, got: {error}"
+            );
+        }
+        // Bare 32/40-char hex is NOT flagged: it is indistinguishable from a
+        // git SHA, an MD5 hash, or a dashless GUID, and flagging it would
+        // permanently block sync for a user with one such string in a synced
+        // text field. The SYNCED_KEYS allowlist is the real guard for the
+        // prefixless Deepgram/AssemblyAI shapes.
+        for value in [
+            "2f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a", // git-SHA shaped
+            "9e11c31e751b4a12a3f9f4c3b2b1a123",         // MD5/GUID shaped
+        ] {
+            let snapshot = serde_json::json!({
+                "text_replacements": [{"from": "commit", "to": value}],
+                "custom_vocabulary": [value]
+            });
+            assert!(
+                validate_sync_snapshot(&snapshot).is_ok(),
+                "bare hex {value:?} must not block a legitimate sync push"
+            );
+        }
+    }
+
+    #[test]
     fn oversized_snapshot_is_rejected_locally_and_names_the_largest_key() {
         let snapshot = serde_json::json!({
             "language": "en-US",
@@ -1425,5 +1520,40 @@ mod tests {
             Some("the")
         );
         assert_eq!(b.openai_keys, vec!["sk_b".to_string()]); // untouched
+    }
+
+    /// Guard against the exact drift that motivated [`NEVER_SYNCED`]: a
+    /// portable `Config` field gets added but nobody remembers to add it to
+    /// [`SYNCED_KEYS`], so it silently never syncs. Serializes a real
+    /// `Config::default()` and checks every JSON key is filed into exactly
+    /// one of the two lists, so a new field breaks this test (naming itself)
+    /// until someone decides where it belongs.
+    #[test]
+    fn every_config_field_is_synced_or_never_synced() {
+        let value = serde_json::to_value(Config::default()).expect("Config serializes");
+        let obj = value.as_object().expect("Config serializes to an object");
+
+        for key in obj.keys() {
+            let synced = SYNCED_KEYS.contains(&key.as_str());
+            let never = NEVER_SYNCED.contains(&key.as_str());
+            assert!(
+                synced || never,
+                "Config field \"{key}\" is in neither SYNCED_KEYS nor NEVER_SYNCED — \
+                 decide whether it should sync and add it to one of them"
+            );
+            assert!(
+                !(synced && never),
+                "Config field \"{key}\" is listed in BOTH SYNCED_KEYS and NEVER_SYNCED"
+            );
+        }
+
+        // Catch the reverse mistake too: a stale or misspelled name sitting in
+        // one of the lists that no longer (or never did) match a real field.
+        for key in SYNCED_KEYS.iter().chain(NEVER_SYNCED.iter()) {
+            assert!(
+                obj.contains_key(*key),
+                "\"{key}\" is listed in SYNCED_KEYS/NEVER_SYNCED but is not a Config field"
+            );
+        }
     }
 }

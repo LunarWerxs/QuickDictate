@@ -21,6 +21,10 @@ use super::provider::{
 
 const WS_URL: &str = "wss://api.deepgram.com/v1/listen";
 const MODEL_ID: &str = "nova-3";
+/// Deepgram caps keyterm prompting at 500 tokens combined across all terms,
+/// not a term count; we don't tokenize client-side, so this bounds the term
+/// *count* as a conservative stand-in for that limit.
+const MAX_KEYTERMS: usize = 100;
 
 type WsSink = futures_util::stream::SplitSink<
     WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
@@ -49,11 +53,7 @@ impl SttProvider for DeepgramProvider {
         opts: &SttSessionOpts,
     ) -> Result<ProviderSession, ConnectError> {
         let model = opts.model.as_deref().unwrap_or(MODEL_ID);
-        let url = format!(
-            "{WS_URL}?model={model}&encoding=linear16&sample_rate={rate}&interim_results=true&language={lang}",
-            rate = opts.sample_rate,
-            lang = opts.language,
-        );
+        let url = build_url(model, opts);
         let mut request = url
             .as_str()
             .into_client_request()
@@ -75,6 +75,27 @@ impl SttProvider for DeepgramProvider {
             }),
         })
     }
+}
+
+/// Build the `listen` WebSocket URL for `model`/`opts`. Pure (fixture-tested);
+/// `connect` just calls this. Nova-3 (and Flux) keyterm prompting is added
+/// only when the vocabulary is non-empty and the model is one of those two --
+/// Deepgram returns a Bad Request for `keyterm` on other models.
+fn build_url(model: &str, opts: &SttSessionOpts) -> String {
+    let mut url = format!(
+        "{WS_URL}?model={model}&encoding=linear16&sample_rate={rate}&interim_results=true&language={lang}",
+        rate = opts.sample_rate,
+        lang = opts.language,
+    );
+    if !opts.custom_vocabulary.is_empty() && (model.contains("nova-3") || model.contains("flux")) {
+        for term in opts.custom_vocabulary.iter().take(MAX_KEYTERMS) {
+            url.push_str("&keyterm=");
+            url.push_str(
+                &url::form_urlencoded::byte_serialize(term.as_bytes()).collect::<String>(),
+            );
+        }
+    }
+    url
 }
 
 struct DeepgramSink {
@@ -254,5 +275,52 @@ mod tests {
             map_frame(r#"{"type":"Error","description":"401 Unauthorized"}"#),
             Some(SttEvent::KeyFailure(FailKind::Invalid))
         ));
+    }
+
+    fn test_opts(vocab: Vec<&str>) -> SttSessionOpts {
+        SttSessionOpts {
+            language: "en".into(),
+            sample_rate: 16_000,
+            model: None,
+            custom_vocabulary: vocab.into_iter().map(String::from).collect(),
+        }
+    }
+
+    #[test]
+    fn empty_vocabulary_url_is_unchanged() {
+        let url = build_url(MODEL_ID, &test_opts(vec![]));
+        assert_eq!(
+            url,
+            format!(
+                "{WS_URL}?model={MODEL_ID}&encoding=linear16&sample_rate=16000&interim_results=true&language=en"
+            )
+        );
+    }
+
+    #[test]
+    fn vocabulary_adds_keyterm_params_for_nova3() {
+        let url = build_url(MODEL_ID, &test_opts(vec!["Anthropic", "QuickDictate"]));
+        assert!(url.contains("&keyterm=Anthropic"));
+        assert!(url.contains("&keyterm=QuickDictate"));
+    }
+
+    #[test]
+    fn vocabulary_is_skipped_for_non_nova3_model() {
+        let url = build_url("nova-2", &test_opts(vec!["Anthropic"]));
+        assert!(!url.contains("keyterm"));
+    }
+
+    #[test]
+    fn keyterms_are_capped_at_max() {
+        let many: Vec<String> = (0..150).map(|i| format!("term{i}")).collect();
+        let opts = SttSessionOpts {
+            language: "en".into(),
+            sample_rate: 16_000,
+            model: None,
+            custom_vocabulary: many,
+        };
+        let url = build_url(MODEL_ID, &opts);
+        assert!(url.contains("keyterm=term99"));
+        assert!(!url.contains("keyterm=term100"));
     }
 }

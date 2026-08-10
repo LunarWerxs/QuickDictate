@@ -1,7 +1,7 @@
 # Settings sync (Connections)
 
-QuickDictate can optionally back up and sync your **portable preferences** —
-things like mode, language, hotkeys, and STT provider/model — across the
+QuickDictate can optionally back up and sync your **portable preferences** -
+things like mode, language, hotkeys, and STT provider/model, across the
 machines you use, via a LunarWerx Connections account.
 
 **This feature is opt-in and off by default.** If you never click "Sync
@@ -13,7 +13,7 @@ happens.
 
 A **"Settings sync"** card lives in the Settings window. Click *Sync settings
 with Connections* and your system browser opens a normal sign-in page
-(OAuth Authorization Code + PKCE) — your password never touches the app
+(OAuth Authorization Code + PKCE), your password never touches the app
 itself. Once signed in:
 
 - Your portable preferences are pulled down on Settings-window open (so any
@@ -21,22 +21,29 @@ itself. Once signed in:
 - Your preferences are pushed up whenever you hit **Save** (or **Save &
   Restart**).
 - Clicking **Stop syncing** disconnects the account, deletes the synced copy
-  from the server, and drops the local sign-in — everything reverts to
+  from the server, and drops the local sign-in, everything reverts to
   local-only.
 
 ## What syncs and what never does
 
-- **Syncs:** portable preferences only — mode, language, toggle/hold hotkeys,
+- **Syncs:** portable preferences only, mode, language, toggle/hold hotkeys,
   timing tweaks, output formatting toggles, sound/close-behavior settings,
-  STT provider and model choice, text replacements, and similar app-behavior
+  STT provider and model choice, text replacements, per-app profiles, the
+  custom vocabulary, the voice-commands toggle, and similar app-behavior
   settings.
 - **Never syncs:** your **API keys**, microphone **audio**, or **transcripts**.
   Also excluded: window position/size and other per-machine or local-only
-  settings (e.g. `run_at_startup`, logging toggles), since those don't make
-  sense to carry between machines.
+  settings (e.g. `run_at_startup`, logging toggles, `update_auto_install`,
+  `protect_keys_at_rest`), since those don't make sense to carry between
+  machines.
+
+The two lists are enforced in code: every settings field must be declared
+either synced or machine-local (`SYNCED_KEYS` / `NEVER_SYNCED` in
+`src/sync.rs`), and a test fails the build if a new field is in neither, so
+nothing can silently start or stop syncing again.
 
 Your API keys, dictation audio, and recognized text never leave your machine
-because of this feature — it only ever reads and writes the small set of
+because of this feature, it only ever reads and writes the small set of
 preference fields listed above.
 
 ## How to turn it on
@@ -52,7 +59,7 @@ preference fields listed above.
 
 Open **Settings**, find the **Settings sync** card, and click **Stop
 syncing**. This removes your synced preferences from the server and signs
-the app out locally — QuickDictate goes back to fully local-only operation.
+the app out locally, QuickDictate goes back to fully local-only operation.
 
 See [.github/SECURITY.md](../.github/SECURITY.md) for the full data-handling
 policy.

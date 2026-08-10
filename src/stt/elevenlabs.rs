@@ -25,6 +25,8 @@ use crate::keys::FailKind;
 
 const WS_URL: &str = "wss://api.elevenlabs.io/v1/speech-to-text/realtime";
 const MODEL_ID: &str = "scribe_v2_realtime";
+/// Scribe v2 Realtime caps keyterm biasing at 50 terms (20 characters each).
+const MAX_KEYTERMS: usize = 50;
 
 /// How long the send task waits after the manual commit before sending the
 /// WebSocket Close. Some servers race Close against in-flight commit
@@ -67,21 +69,63 @@ impl SttProvider for ElevenLabsProvider {
         opts: &SttSessionOpts,
     ) -> Result<ProviderSession, ConnectError> {
         let model = opts.model.as_deref().unwrap_or(MODEL_ID);
-        let url = format!(
-            "{WS_URL}?language_code={lang}&model_id={model}&audio_format=pcm_16000&commit_strategy=vad",
-            lang = opts.language,
-        );
-        let mut request = url
-            .as_str()
-            .into_client_request()
-            .map_err(|e| ConnectError(format!("ws request: {e}")))?;
-        request.headers_mut().insert(
-            "xi-api-key",
-            HeaderValue::from_str(key).map_err(|e| ConnectError(format!("bad key header: {e}")))?,
-        );
-        let (ws, _resp) = tokio_tungstenite::connect_async(request)
-            .await
-            .map_err(|e| ConnectError(format!("ws connect failed: {e}")))?;
+
+        // Two-shot connect, and only when a custom vocabulary is actually set.
+        // The `keyterms` parameter's name and limits come from ElevenLabs' own
+        // AsyncAPI spec, but their docs show no literal wire example, so the
+        // encoding here is inferred from the identical shape AssemblyAI uses.
+        // ElevenLabs is also the DEFAULT provider. If that guess is wrong the
+        // server rejects the upgrade, and a user who typed a few words into
+        // the vocabulary box would find dictation simply broken. So: if the
+        // handshake fails with a vocabulary attached, drop it and try once
+        // more. Losing the biasing is a small regression; losing dictation is
+        // not. Remove this fallback once a live run confirms the encoding.
+        let attempts: &[bool] = if opts.custom_vocabulary.is_empty() {
+            &[false]
+        } else {
+            &[true, false]
+        };
+        let mut last_err: Option<ConnectError> = None;
+        let mut connected = None;
+        for (i, &with_vocabulary) in attempts.iter().enumerate() {
+            let url = if with_vocabulary {
+                build_url(model, opts)
+            } else {
+                build_url(
+                    model,
+                    &SttSessionOpts {
+                        custom_vocabulary: Vec::new(),
+                        ..opts.clone()
+                    },
+                )
+            };
+            let mut request = url
+                .as_str()
+                .into_client_request()
+                .map_err(|e| ConnectError(format!("ws request: {e}")))?;
+            request.headers_mut().insert(
+                "xi-api-key",
+                HeaderValue::from_str(key)
+                    .map_err(|e| ConnectError(format!("bad key header: {e}")))?,
+            );
+            match tokio_tungstenite::connect_async(request).await {
+                Ok((ws, _resp)) => {
+                    if i > 0 {
+                        tracing::warn!(
+                            "elevenlabs: the server rejected the connection with keyterms \
+                             attached; reconnected without recognition biasing"
+                        );
+                    }
+                    connected = Some(ws);
+                    break;
+                }
+                Err(e) => last_err = Some(ConnectError(format!("ws connect failed: {e}"))),
+            }
+        }
+        let ws = match connected {
+            Some(ws) => ws,
+            None => return Err(last_err.unwrap_or(ConnectError("ws connect failed".into()))),
+        };
         let (sink, stream) = ws.split();
         Ok(ProviderSession {
             sink: Box::new(ElevenLabsSink {
@@ -96,6 +140,32 @@ impl SttProvider for ElevenLabsProvider {
             }),
         })
     }
+}
+
+/// Build the realtime WebSocket URL for `model`/`opts`. Pure
+/// (fixture-tested); `connect` just calls this. `keyterms` biases the model
+/// toward specific terms; realtime caps it at 50 terms of up to 20
+/// characters each. ElevenLabs' own docs don't show a literal wire example
+/// for this query param, so this follows the same JSON-array-in-one-param
+/// encoding the sibling `keyterms_prompt`/AssemblyAI knob uses for the
+/// identical "array of terms in a WS query string" shape.
+fn build_url(model: &str, opts: &SttSessionOpts) -> String {
+    let mut url = format!(
+        "{WS_URL}?language_code={lang}&model_id={model}&audio_format=pcm_16000&commit_strategy=vad",
+        lang = opts.language,
+    );
+    if !opts.custom_vocabulary.is_empty() {
+        let terms: Vec<&str> = opts
+            .custom_vocabulary
+            .iter()
+            .take(MAX_KEYTERMS)
+            .map(String::as_str)
+            .collect();
+        let json = serde_json::to_string(&terms).unwrap_or_default();
+        url.push_str("&keyterms=");
+        url.push_str(&url::form_urlencoded::byte_serialize(json.as_bytes()).collect::<String>());
+    }
+    url
 }
 
 struct ElevenLabsSink {
@@ -342,5 +412,46 @@ mod tests {
     fn non_json_and_unknown_are_ignored() {
         assert!(map_frame("not json at all").is_none());
         assert!(map_frame(r#"{"message_type":"heartbeat"}"#).is_none());
+    }
+
+    fn test_opts(vocab: Vec<&str>) -> SttSessionOpts {
+        SttSessionOpts {
+            language: "en".into(),
+            sample_rate: 16_000,
+            model: None,
+            custom_vocabulary: vocab.into_iter().map(String::from).collect(),
+        }
+    }
+
+    #[test]
+    fn empty_vocabulary_url_is_unchanged() {
+        let url = build_url(MODEL_ID, &test_opts(vec![]));
+        assert_eq!(
+            url,
+            format!("{WS_URL}?language_code=en&model_id={MODEL_ID}&audio_format=pcm_16000&commit_strategy=vad")
+        );
+    }
+
+    #[test]
+    fn vocabulary_adds_keyterms_as_json_array() {
+        let url = build_url(MODEL_ID, &test_opts(vec!["Anthropic", "Scribe"]));
+        let expected_json = serde_json::to_string(&["Anthropic", "Scribe"]).unwrap();
+        let expected_encoded: String =
+            url::form_urlencoded::byte_serialize(expected_json.as_bytes()).collect();
+        assert!(url.ends_with(&format!("&keyterms={expected_encoded}")));
+    }
+
+    #[test]
+    fn keyterms_are_capped_at_50_terms() {
+        let many: Vec<String> = (0..80).map(|i| format!("term{i}")).collect();
+        let opts = SttSessionOpts {
+            language: "en".into(),
+            sample_rate: 16_000,
+            model: None,
+            custom_vocabulary: many,
+        };
+        let url = build_url(MODEL_ID, &opts);
+        assert!(url.contains("term49"));
+        assert!(!url.contains("term50"));
     }
 }

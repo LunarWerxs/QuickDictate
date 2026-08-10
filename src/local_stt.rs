@@ -102,6 +102,20 @@ fn expected_marker(spec: &ModelSpec) -> String {
     format!("sha256={}\nbytes={}\n", spec.sha256, spec.download_bytes)
 }
 
+fn expected_runtime_marker() -> String {
+    format!("version={RUNTIME_VERSION}\nsha256={RUNTIME_SHA256}\n")
+}
+
+/// A runtime directory only counts as trusted when its `.verified` marker
+/// content matches the pinned version and hash; merely having a file named
+/// transcribe.dll (and an empty or stale marker) proves nothing about what
+/// is actually inside it, so this is checked instead of a bare `is_file()`.
+fn runtime_verified(dir: &Path) -> bool {
+    dir.join("transcribe.dll").is_file()
+        && fs::read_to_string(dir.join(".verified")).ok().as_deref()
+            == Some(expected_runtime_marker().as_str())
+}
+
 pub fn is_installed(id: &str) -> bool {
     let Some(spec) = model(id) else {
         return false;
@@ -116,7 +130,7 @@ pub fn is_installed(id: &str) -> bool {
         && fs::read_to_string(marker).ok().as_deref() == Some(expected_marker(spec).as_str())
         && runtime_dir()
             .ok()
-            .map(|p| p.join("transcribe.dll").is_file() && p.join(".verified").is_file())
+            .map(|p| runtime_verified(&p))
             .unwrap_or(false)
 }
 
@@ -400,7 +414,7 @@ fn install(spec: &ModelSpec, cancel: &AtomicBool) -> Result<(), String> {
 
 fn ensure_runtime(spec: &ModelSpec, cancel: &AtomicBool) -> Result<(), String> {
     let final_dir = runtime_dir()?;
-    if final_dir.join("transcribe.dll").is_file() && final_dir.join(".verified").is_file() {
+    if runtime_verified(&final_dir) {
         return Ok(());
     }
     let root = root_dir()?;
@@ -449,7 +463,7 @@ fn ensure_runtime(spec: &ModelSpec, cancel: &AtomicBool) -> Result<(), String> {
         }
         write_atomic(
             &extracted.join(".verified"),
-            format!("version={RUNTIME_VERSION}\nsha256={RUNTIME_SHA256}\n").as_bytes(),
+            expected_runtime_marker().as_bytes(),
         )?;
         if final_dir.exists() {
             fs::remove_dir_all(&final_dir)
@@ -898,6 +912,41 @@ fn hash_file(path: &Path, cancel: &AtomicBool) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// `is_installed` trusts a matching length plus a marker derived only from
+/// public compile-time constants, because it is polled from the UI and must
+/// stay cheap; that means a same-length swap performed after install would
+/// otherwise be trusted forever. This re-hashes the installed model file
+/// against its pinned SHA-256 the first time a process actually loads it,
+/// caching the outcome so a second dictation in the same run does not
+/// re-hash multiple gigabytes. A failed check is deliberately not cached, so
+/// a reinstall in the same process is re-verified rather than staying stuck.
+fn verify_model_hash_once(spec: &ModelSpec, path: &Path) -> Result<(), String> {
+    static VERIFIED: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    let cache = VERIFIED.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let verified = cache
+            .lock()
+            .map_err(|_| "local model verification state is unavailable".to_string())?;
+        if verified.get(spec.id) == Some(&true) {
+            return Ok(());
+        }
+    }
+    let actual = hash_file(path, &AtomicBool::new(false))?;
+    let ok = actual == spec.sha256;
+    let mut verified = cache
+        .lock()
+        .map_err(|_| "local model verification state is unavailable".to_string())?;
+    verified.insert(spec.id.to_string(), ok);
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "local model '{}' failed integrity verification; its file no longer matches the installed checksum. Reinstall it in Settings",
+            spec.id
+        ))
+    }
+}
+
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, bytes).map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
@@ -1192,6 +1241,21 @@ enum WorkerCommand {
 static WORKER: OnceLock<Result<mpsc::SyncSender<WorkerCommand>, String>> = OnceLock::new();
 static UNLOAD_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// How long the worker keeps an idle model resident before releasing it.
+/// `request_unload` already handles the explicit case (Settings switches
+/// away from Local); this covers a user who leaves Local selected and simply
+/// stops dictating, which would otherwise pin multi-gigabyte weights in
+/// memory for the rest of the tray app's uptime.
+const IDLE_UNLOAD_AFTER: Duration = Duration::from_secs(10 * 60);
+
+/// Pure decision behind the idle unload: has the worker gone at least
+/// `IDLE_UNLOAD_AFTER` without a Transcribe or Prewarm command reaching it.
+/// Split out from `worker_loop` so the threshold has a fast unit test
+/// instead of needing a live worker thread and a real ten-minute wait.
+fn idle_unload_due(idle_for: Duration) -> bool {
+    idle_for >= IDLE_UNLOAD_AFTER
+}
+
 fn worker() -> Result<&'static mpsc::SyncSender<WorkerCommand>, String> {
     WORKER
         .get_or_init(|| {
@@ -1271,7 +1335,32 @@ pub fn request_unload() {
 
 fn worker_loop(rx: mpsc::Receiver<WorkerCommand>) {
     let mut engine: Option<NativeEngine> = None;
-    while let Ok(command) = rx.recv() {
+    let mut idle_since = Instant::now();
+    loop {
+        // The wait only ever runs between commands (Transcribe and Prewarm
+        // are handled synchronously below before the loop comes back here),
+        // so a timeout can never race an in-flight transcription or prewarm.
+        // Waiting for only the remaining budget, rather than the full
+        // constant, means a burst of quick commands does not each restart a
+        // fresh ten-minute window.
+        let command = match rx.recv_timeout(IDLE_UNLOAD_AFTER.saturating_sub(idle_since.elapsed()))
+        {
+            Ok(command) => command,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if idle_unload_due(idle_since.elapsed()) {
+                    if engine.take().is_some() {
+                        tracing::info!(
+                            "local STT model unloaded after {} minutes idle",
+                            IDLE_UNLOAD_AFTER.as_secs() / 60
+                        );
+                    }
+                    idle_since = Instant::now();
+                }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        idle_since = Instant::now();
         match command {
             WorkerCommand::Unload => {
                 UNLOAD_REQUESTED.store(false, Ordering::Release);
@@ -1487,6 +1576,11 @@ impl NativeEngine {
             unsafe { (self.api.free)(old.session) };
         }
         let path = model_path(model_id)?;
+        // Re-hash before handing the file to the native runtime: length and
+        // marker alone (see `is_installed`) do not prove the bytes were not
+        // swapped after install.
+        let spec = model(model_id).ok_or_else(|| format!("unknown local model '{model_id}'"))?;
+        verify_model_hash_once(spec, &path)?;
         let path_c = path_cstring(&path)?;
         let mut load = std::mem::zeroed::<ModelLoadParams>();
         unsafe { (self.api.load_params_init)(&mut load) };
@@ -1794,6 +1888,103 @@ mod tests {
             assert!(!spec.url.contains("/resolve/main/"));
             assert!(spec.download_bytes > 500_000_000);
         }
+    }
+
+    #[test]
+    fn runtime_marker_requires_exact_version_and_hash() {
+        let dir = test_path("runtime-marker");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("transcribe.dll"), b"stub").unwrap();
+
+        // No marker at all.
+        assert!(!runtime_verified(&dir));
+
+        // Empty marker: exactly the exploit this guards against, a
+        // `.verified` file with no content sitting next to any file named
+        // transcribe.dll.
+        fs::write(dir.join(".verified"), b"").unwrap();
+        assert!(!runtime_verified(&dir));
+
+        // Wrong version, wrong hash.
+        fs::write(dir.join(".verified"), b"version=0.0.0\nsha256=deadbeef\n").unwrap();
+        assert!(!runtime_verified(&dir));
+
+        // Right version, wrong hash.
+        fs::write(
+            dir.join(".verified"),
+            format!("version={RUNTIME_VERSION}\nsha256=deadbeef\n"),
+        )
+        .unwrap();
+        assert!(!runtime_verified(&dir));
+
+        // Exactly the expected marker.
+        fs::write(dir.join(".verified"), expected_runtime_marker()).unwrap();
+        assert!(runtime_verified(&dir));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn model_hash_is_verified_once_then_cached_per_process() {
+        let path = test_path("model-hash-cache");
+        fs::write(&path, b"hello world").unwrap();
+        let good_hash: &'static str =
+            Box::leak(format!("{:x}", Sha256::digest(b"hello world")).into_boxed_str());
+        let spec = ModelSpec {
+            id: "test-model-hash-cache",
+            label: "test",
+            detail: "test",
+            download_bytes: 11,
+            filename: "unused.gguf",
+            url: "https://example.invalid/unused",
+            sha256: good_hash,
+        };
+        assert!(verify_model_hash_once(&spec, &path).is_ok());
+
+        // A cached pass is per-process, not re-checked against the file on
+        // disk; tampering after the first (and only) hash must not surface
+        // here, which is exactly what makes caching safe to do only once.
+        fs::write(&path, b"tampered").unwrap();
+        assert!(verify_model_hash_once(&spec, &path).is_ok());
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn model_hash_mismatch_is_reported_and_not_cached_as_passing() {
+        let path = test_path("model-hash-mismatch");
+        fs::write(&path, b"actual content").unwrap();
+        let spec = ModelSpec {
+            id: "test-model-hash-mismatch",
+            label: "test",
+            detail: "test",
+            download_bytes: 14,
+            filename: "unused.gguf",
+            url: "https://example.invalid/unused",
+            sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+        };
+        assert!(verify_model_hash_once(&spec, &path)
+            .unwrap_err()
+            .contains("integrity verification"));
+
+        // Not cached as a pass: fixing the file and re-checking succeeds.
+        let good_hash: &'static str =
+            Box::leak(format!("{:x}", Sha256::digest(b"actual content")).into_boxed_str());
+        let fixed = ModelSpec {
+            sha256: good_hash,
+            ..spec
+        };
+        assert!(verify_model_hash_once(&fixed, &path).is_ok());
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn idle_unload_only_fires_once_the_full_window_elapses() {
+        assert!(!idle_unload_due(Duration::from_secs(0)));
+        assert!(!idle_unload_due(IDLE_UNLOAD_AFTER - Duration::from_secs(1)));
+        assert!(idle_unload_due(IDLE_UNLOAD_AFTER));
+        assert!(idle_unload_due(IDLE_UNLOAD_AFTER + Duration::from_secs(1)));
     }
 
     #[test]

@@ -5,18 +5,18 @@ optional local model that keeps audio offline. This guide covers all seven
 providers.
 
 > **As of 2026-07.** Provider endpoints, consoles, model names, and pricing
-> pages can and do change after this was written — if a link or field name
+> pages can and do change after this was written, if a link or field name
 > below doesn't match what you see, check the provider's current
 > documentation.
 
 ## Before you start
 
 1. Copy `settings.example.json` to `settings.json` if you haven't already.
-   `settings.json` is gitignored — your keys never get committed.
+   `settings.json` is gitignored, your keys never get committed.
 2. Pick a provider and set `"stt_provider"` to its exact value (listed in each
    section below).
 3. Add one or more keys to that provider's key array (also a JSON array of
-   strings — you can list multiple keys and QuickDictate will round-robin
+   strings, you can list multiple keys and QuickDictate will round-robin
    across them with per-key health tracking and cooldown backoff, handy for
    e.g. a personal key plus a work key).
 4. Save and restart QuickDictate for the change to take effect.
@@ -38,7 +38,7 @@ the others can stay empty. The Local provider needs no key.
 3. Create an API key on that page and copy it.
 4. Paste it into `elevenlabs_keys` in `settings.json`, e.g. `["your-key-here"]`.
 
-**Notes:** Streaming provider — you'll see words appear live as you speak.
+**Notes:** Streaming provider, you'll see words appear live as you speak.
 
 **Pricing:** Check ElevenLabs' official pricing page for current rates; prices
 and included quotas drift over time, so don't rely on cached numbers.
@@ -53,12 +53,12 @@ and included quotas drift over time, so don't rely on cached numbers.
 
 **Getting a key:**
 1. Go to <https://console.deepgram.com/signup>.
-2. Create an account (Deepgram typically offers free credit on signup — check
+2. Create an account (Deepgram typically offers free credit on signup, check
    the console for current terms).
 3. In the Deepgram console, create an API key.
 4. Paste it into `deepgram_keys` in `settings.json`.
 
-**Notes:** Streaming provider — live word count as you speak.
+**Notes:** Streaming provider, live word count as you speak.
 
 **Pricing:** Check Deepgram's official pricing page for current rates; figures
 change over time.
@@ -79,7 +79,7 @@ change over time.
 4. Paste it into `openai_keys` in `settings.json`.
 
 **Notes:** Uses the general-availability Realtime API (not a beta/preview
-endpoint), streaming audio at 24 kHz. Streaming provider — live word count.
+endpoint), streaming audio at 24 kHz. Streaming provider, live word count.
 
 **Pricing:** Check OpenAI's official pricing page for current Realtime API
 rates; pricing drifts and varies by model.
@@ -118,15 +118,15 @@ figures drift.
 3. Create an API key and copy it.
 4. Paste it into `dashscope_keys` in `settings.json`.
 
-**Notes — region matters:** DashScope keys are region-locked.
+**Notes, region matters:** DashScope keys are region-locked.
 - By default QuickDictate connects to the **mainland-China** host
   (`"dashscope_intl": false`).
 - If your key was issued for the **International** region, set
   `"dashscope_intl": true` in `settings.json`.
-- A key from the wrong region will simply fail to connect — if DashScope
+- A key from the wrong region will simply fail to connect, if DashScope
   doesn't work, this mismatch is the first thing to check.
 
-Streaming provider — live word count.
+Streaming provider, live word count.
 
 **Pricing:** Check Alibaba Cloud DashScope's official pricing page for current
 rates; figures drift and can differ between the mainland and international
@@ -153,13 +153,13 @@ arrive together, in order.
 3. Enable the **"Cloud Speech-to-Text API"** for that project.
 4. Attach a billing account to the project. Google's free tier for this API is
    typically around 60 minutes/month, but confirm current limits in the
-   console — this is exactly the kind of figure that drifts.
+   console, this is exactly the kind of figure that drifts.
 5. Create an API key under **Credentials** and copy it.
 6. Paste it into `google_keys` in `settings.json`.
 
 **Model note:** QuickDictate talks to the v1 endpoint and only supports v1
 models (`latest_long` / `default`). Newer v2/Chirp models reject plain API-key
-auth, so they are out of scope here — don't set `stt_model` to a v2/Chirp
+auth, so they are out of scope here, don't set `stt_model` to a v2/Chirp
 model name for this provider.
 
 **Pricing:** Check Google Cloud's official Speech-to-Text pricing page for
@@ -202,7 +202,7 @@ a hotkey press during that final batch queues the next dictation so the valid
 pending result cannot be superseded and discarded. A queued hold-to-talk start
 is cancelled if you release the key before processing finishes. Vulkan is
 preferred when available; CPU is the automatic fallback. Raw audio passes
-directly from QuickDictate's 16 kHz pipeline to the native runtime—there is no
+directly from QuickDictate's 16 kHz pipeline to the native runtime-there is no
 temporary WAV file or Python/PyTorch environment.
 
 For Cohere, long recordings are divided at the quietest available boundary
@@ -236,3 +236,25 @@ Whichever you choose, remember: your audio and API keys go only to the
 provider you select, never to the QuickDictate maintainer. (The only thing the
 app ever reports is the anonymous daily update-check ping described in
 [SECURITY.md](../.github/SECURITY.md).)
+
+## Custom vocabulary support
+
+`custom_vocabulary` (see the [guide](GUIDE.md#settings-reference)) is a list of
+words and phrases sent to the provider so it recognises them correctly the first
+time, rather than repairing them afterwards with `text_replacements`. Every
+provider maps it onto its own parameter, and the limits are theirs, not ours.
+A provider with no biasing knob ignores the list entirely; nothing breaks and
+nothing else changes.
+
+| Provider | Parameter | Limit QuickDictate applies |
+| --- | --- | --- |
+| ElevenLabs | `keyterms` | 50 terms, 20 characters each |
+| Deepgram | `keyterm` | 100 terms, and only on `nova-3`/`flux` models (older models reject the parameter) |
+| AssemblyAI | `keyterms_prompt` | 100 terms (their documented hard limit) |
+| OpenAI | transcription `prompt` | Terms are joined into one prompt string |
+| Google | `speechContexts[].phrases` | 5000 phrases |
+| DashScope | not supported | Paraformer needs a vocabulary registered up front through a separate API, so there is no inline term list to send |
+| Local (offline) | not supported yet | The bundled runtime entry point takes no prompt parameter |
+
+If a term never sticks no matter what, fall back to `text_replacements`: that
+runs locally on the recognised text and always wins.

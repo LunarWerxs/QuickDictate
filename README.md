@@ -1,7 +1,7 @@
 <div align="center">
 
 <a href="https://quickdictate.github.io/">
-  <img src="assets/og-image.png" alt="QuickDictate — talk instead of type, in any app" width="820">
+  <img src="assets/og-image.png" alt="QuickDictate, talk instead of type, in any app" width="820">
 </a>
 
 <h1>QuickDictate</h1>
@@ -10,9 +10,9 @@
 
 <p>
 A tiny Windows tray app for voice dictation. Hold or tap a global hotkey, speak, and the
-transcript types straight into whatever window has focus — your editor, a chat box, an email,
+transcript types straight into whatever window has focus, your editor, a chat box, an email,
 a terminal, any web text field. Use <i>your own</i> speech-to-text API key, or install an
-optional local model for fully offline transcription — <b>no QuickDictate subscription or account</b>.
+optional local model for fully offline transcription, <b>no QuickDictate subscription or account</b>.
 </p>
 
 <p>
@@ -38,7 +38,7 @@ optional local model for fully offline transcription — <b>no QuickDictate subs
 <div align="center">
   <img src="docs/images/settings.png" alt="The QuickDictate settings window" width="480">
   <br>
-  <sub><i>Everything lives in one small settings window — providers, keys, hotkeys, and toggles.</i></sub>
+  <sub><i>Everything lives in one small settings window, providers, keys, hotkeys, and toggles.</i></sub>
 </div>
 
 ## 🆕 New in v0.5.0: fully offline dictation
@@ -71,11 +71,11 @@ key or an internet connection. Microphone audio stays on your PC.
 | | |
 | :-- | :-- |
 | 🔑 **Cloud or fully local** | Six bring-your-own-key services plus two optional offline models. Switch whenever you like. |
-| ⌨️ **Types into any window** | Whatever has focus — your editor, a chat box, a terminal, or a web form. |
+| ⌨️ **Types into any window** | Whatever has focus, your editor, a chat box, a terminal, or a web form. |
 | ✋ **Hold or tap** | Hold a key while you talk, or tap to start and stop. Both are configurable. |
 | 💬 **Clear live feedback** | Five cloud providers stream words as you talk; batch and Local modes show when the final result is processing. |
-| 🪄 **Little touches that add up** | A fix-list for words it mishears, per-app profiles, and a *"scratch that"* voice command. |
-| 🔒 **Your data stays yours** | Cloud audio goes only to the provider you pick; Local audio never leaves the PC. Optional settings sync is opt-in. |
+| 🪄 **Little touches that add up** | A custom vocabulary so your jargon is heard right the first time, a fix-list for words it mishears, per-app profiles, a searchable dictation history, and a *"scratch that"* voice command. |
+| 🔒 **Your data stays yours** | Cloud audio goes only to the provider you pick; Local audio never leaves the PC. Optional settings sync is opt-in, and updates ask before installing. |
 
 ## 🚀 Quick start
 
@@ -93,9 +93,9 @@ key or an internet connection. Microphone audio stays on your PC.
 ## 📚 Learn more
 
 Every setting, per-provider setup, and the privacy details live in the
-**[complete guide](docs/GUIDE.md)** — with provider-specific notes in
+**[complete guide](docs/GUIDE.md)**, with provider-specific notes in
 **[docs/providers.md](docs/providers.md)**, including local model and storage details.
 
 ## 📄 License
 
-MIT — see [LICENSE](LICENSE). Made with care by **[LunarWerx Studios](https://lunarwerx.com)**.
+MIT, see [LICENSE](LICENSE). Made with care by **[LunarWerx Studios](https://lunarwerx.com)**.

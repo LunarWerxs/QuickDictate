@@ -1,18 +1,18 @@
 # Releasing QuickDictate
 
 Maintainer checklist for cutting a release. Versions live in more places than
-Cargo.toml — this list exists so none of them drift (SECURITY.md sat on
+Cargo.toml: this list exists so none of them drift (SECURITY.md sat on
 `0.1.x` until `0.3.0` shipped).
 
 ## 1. Bump the version
 
-- [ ] `Cargo.toml` — set `version = "X.Y.Z"` (Cargo.lock refreshes on the next build).
+- [ ] `Cargo.toml`: set `version = "X.Y.Z"` (Cargo.lock refreshes on the next build).
 
 ## 2. Update the docs that name a version
 
-- [ ] `CHANGELOG.md` — move the `[Unreleased]` items into a new `## [X.Y.Z] - YYYY-MM-DD` section, leaving `[Unreleased]` empty at the top.
-- [ ] `.github/SECURITY.md` — "Supported Versions": update the "(currently the `X.Y.x` line)" note and the `X.Y.x (latest release)` table row.
-- [ ] `.github/ISSUE_TEMPLATE/bug_report.md` — refresh the example version in the "QuickDictate version" comment.
+- [ ] `CHANGELOG.md`: move the `[Unreleased]` items into a new `## [X.Y.Z] - YYYY-MM-DD` section, leaving `[Unreleased]` empty at the top.
+- [ ] `.github/SECURITY.md`: "Supported Versions": update the "(currently the `X.Y.x` line)" note and the `X.Y.x (latest release)` table row.
+- [ ] `.github/ISSUE_TEMPLATE/bug_report.md`: refresh the example version in the "QuickDictate version" comment.
 - [ ] Sweep for stragglers referencing the *previous* version (ignore CHANGELOG history and test fixtures in `src/update.rs`):
 
   ```powershell
@@ -21,8 +21,16 @@ Cargo.toml — this list exists so none of them drift (SECURITY.md sat on
 
 ## 3. Verify
 
-- [ ] `pwsh -File scripts\check.ps1 -Full` — the exact gates CI runs, including release builds.
-- [ ] `cargo audit` — refresh the advisory database and resolve every compatible
+- [ ] `pwsh -File scripts\check.ps1 -Full`: the exact gates CI runs, including release builds.
+- [ ] `pwsh -File scripts\smoke_test.ps1`: the only check that exercises the real
+      pipeline end to end (hotkey capture, audio routing, provider connect, paste).
+      CI cannot run it: it needs a microphone, a focused window, and a live API key.
+      Everything the release workflow verifies is static (PE metadata, fmt, Clippy,
+      unit tests), so a regression in dictation itself ships undetected without this.
+- [ ] Dictate once by hand into a normal editor and once into a long-text target
+      (>80 characters, which takes the clipboard path), then confirm the clipboard
+      still holds whatever you had copied beforehand.
+- [ ] `cargo audit`: refresh the advisory database and resolve every compatible
       patched version into `Cargo.lock`.
 
 ## 4. Tag and publish
@@ -42,7 +50,7 @@ Cargo.toml — this list exists so none of them drift (SECURITY.md sat on
   SHA-256 digest and verifies the downloaded PE, byte count, digest, and reported
   version before swapping it into place.
 
-  There is exactly **one** build now — every provider is compiled in
+  There is exactly **one** build now: every provider is compiled in
   unconditionally. Before `0.4.3` the Google provider sat behind a Cargo
   feature, which meant two different binaries shared one filename and the
   release could (and did) ship the wrong one. If you ever reintroduce a
@@ -51,32 +59,26 @@ Cargo.toml — this list exists so none of them drift (SECURITY.md sat on
 ## Dependency security
 
 Run `cargo audit` before every release and resolve any compatible patched
-version into `Cargo.lock`. There is no standing advisory ignore list.
+version into `Cargo.lock`.
 
-`cargo audit` examines every package in the lockfile, including dependencies
-for target-gated platforms that are not compiled into the Windows binary. If a
-future advisory is genuinely unreachable and no compatible fix exists, record
-the dependency path (`cargo tree --target all -i <crate>`), affected target,
-and rationale here. Re-check that exception on every release instead of
-silently carrying it forward.
+The accepted advisory ignore list now lives in `.cargo/audit.toml`
+(`[advisories] ignore = [...]`), each entry commented with the dependency
+path and affected target that make it unreachable on Windows. `cargo audit`
+reads that file automatically, so a clean run means every advisory is either
+fixed or already accounted for there.
 
-## Accepted audit warnings for 0.5.1
+You only need to touch this section of the checklist when `cargo audit`
+reports something **not** already in `.cargo/audit.toml`:
 
-The 0.5.1 release audit reports ten advisory warnings, all in target-gated
-Linux dependencies that are absent from both Windows dependency trees:
+- If it's a genuinely new, reachable advisory: resolve a compatible patched
+  version into `Cargo.lock`.
+- If it's genuinely unreachable (a target-gated platform not compiled into
+  the Windows binary) and no compatible fix exists: verify with
+  `cargo tree --target <triple> -i <crate>` for both
+  `x86_64-pc-windows-gnu` and `x86_64-pc-windows-msvc`, then add it to
+  `.cargo/audit.toml` with a comment recording the dependency path,
+  affected target, and rationale.
 
-- **GTK tray backend:** RUSTSEC-2024-0370, RUSTSEC-2024-0412,
-  RUSTSEC-2024-0413, RUSTSEC-2024-0415, RUSTSEC-2024-0416,
-  RUSTSEC-2024-0418, RUSTSEC-2024-0419, RUSTSEC-2024-0420, and
-  RUSTSEC-2024-0429 enter through `tray-icon -> libappindicator/gtk -> glib`.
-- **Wayland window decorations:** RUSTSEC-2026-0192 enters through
-  `eframe/winit -> sctk-adwaita -> ab_glyph -> owned_ttf_parser ->
-  ttf-parser`.
-
-`cargo tree --target x86_64-pc-windows-gnu -i <crate>` and the equivalent
-`x86_64-pc-windows-msvc` checks print no dependency path for any warned crate.
-QuickDictate ships only a Windows executable, so none of this code is compiled
-into the released binary. Targeted `cargo update --dry-run` checks for the
-warning roots found no compatible lockfile update. These warnings do not block
-0.5.1, but their target reachability and upgrade status must be checked again
-before the next release.
+Re-verify every existing entry in `.cargo/audit.toml` on each release instead
+of assuming it still holds: a dependency bump could make a previously
+target-gated crate reachable again.

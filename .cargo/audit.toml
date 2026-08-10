@@ -1,0 +1,35 @@
+# Accepted `cargo audit` advisories.
+#
+# QuickDictate ships only a Windows executable. `cargo audit` still examines
+# every package in Cargo.lock, including dependencies for target-gated
+# platforms that are never compiled into the Windows binary. The advisories
+# below were verified unreachable on x86_64-pc-windows-* (see
+# docs/RELEASING.md's "Dependency security" section for the full
+# verification method: `cargo tree --target <triple> -i <crate>` prints no
+# dependency path for any of these crates on either Windows target).
+#
+# Re-check this list on every release: a future dependency bump could make a
+# previously target-gated crate reachable again.
+
+[advisories]
+ignore = [
+    # GTK tray backend: enters through
+    # `tray-icon -> libappindicator/gtk -> glib`, which is only pulled in on
+    # Linux. Not reachable from either x86_64-pc-windows-gnu or
+    # x86_64-pc-windows-msvc.
+    "RUSTSEC-2024-0370",
+    "RUSTSEC-2024-0412",
+    "RUSTSEC-2024-0413",
+    "RUSTSEC-2024-0415",
+    "RUSTSEC-2024-0416",
+    "RUSTSEC-2024-0418",
+    "RUSTSEC-2024-0419",
+    "RUSTSEC-2024-0420",
+    "RUSTSEC-2024-0429",
+
+    # Wayland window decorations: enters through
+    # `eframe/winit -> sctk-adwaita -> ab_glyph -> owned_ttf_parser ->
+    # ttf-parser`, which is only pulled in on Linux/Wayland. Not reachable
+    # from either Windows target.
+    "RUSTSEC-2026-0192",
+]

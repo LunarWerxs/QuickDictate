@@ -28,6 +28,79 @@ const STARTUP_REGISTER_BUDGET: Duration = Duration::from_secs(6);
 /// Gap between initial-registration retries within that budget.
 const STARTUP_REGISTER_RETRY_MS: u64 = 150;
 
+/// Consecutive periodic re-arm attempts (see `REARM_INTERVAL_MS`) that must
+/// all fail to register before we call the hotkeys "blocked" rather than
+/// mid-transient (e.g. a sleep/resume or RDP reconnect the very next re-arm
+/// clears on its own). At the default 60s interval, 2 consecutive failures
+/// means the failure has already persisted for roughly a minute.
+const BLOCKED_STREAK_THRESHOLD: u32 = 2;
+
+/// Floor between "hotkeys still not registered" warnings out of the periodic
+/// re-arm, so a permanently-claimed hotkey nudges the log every few minutes
+/// instead of either going silent forever or spamming once a minute forever.
+const REARM_WARN_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// How many consecutive re-arm attempts have failed to register *something*.
+/// Reset to 0 the moment a re-arm attempt registers everything configured.
+static REARM_FAIL_STREAK: AtomicU32 = AtomicU32::new(0);
+
+/// Set once `REARM_FAIL_STREAK` reaches `BLOCKED_STREAK_THRESHOLD`; cleared
+/// as soon as a re-arm attempt succeeds again. Backs `hotkeys_blocked()`.
+static HOTKEYS_BLOCKED: AtomicBool = AtomicBool::new(false);
+
+/// Last time the periodic re-arm logged a "still blocked" warning, for the
+/// `REARM_WARN_INTERVAL` rate limit.
+static LAST_BLOCKED_WARN: parking_lot::Mutex<Option<Instant>> = parking_lot::Mutex::new(None);
+
+/// True once a configured hotkey has failed to (re)register for
+/// `BLOCKED_STREAK_THRESHOLD` consecutive re-arm attempts -- i.e. it looks
+/// permanently claimed by another process rather than a one-off blip. Cheap
+/// to poll (a single atomic load) so other modules (tray icon, settings
+/// window) can surface a "hotkey didn't register" indicator without wiring
+/// up their own tracing subscriber. No UI lives here; this just exposes the
+/// state.
+pub fn hotkeys_blocked() -> bool {
+    HOTKEYS_BLOCKED.load(Ordering::Acquire)
+}
+
+/// Pure step function for the blocked-state streak, kept separate from the
+/// static atomics above so it is unit-testable without any win32 calls.
+/// Given the previous consecutive-failure count and whether the latest
+/// re-arm attempt registered everything configured, returns the new count
+/// and whether the blocked threshold has now been reached.
+fn step_blocked_streak(streak: u32, all_registered: bool) -> (u32, bool) {
+    let streak = if all_registered {
+        0
+    } else {
+        streak.saturating_add(1)
+    };
+    (streak, streak >= BLOCKED_STREAK_THRESHOLD)
+}
+
+/// Record the outcome of one periodic re-arm attempt, updating the flag
+/// `hotkeys_blocked()` reports and (rate-limited) logging a warning so a
+/// permanently-claimed hotkey isn't silent forever even with no console
+/// attached (`windows_subsystem = "windows"`).
+fn note_rearm_result(all_registered: bool) {
+    let prev = REARM_FAIL_STREAK.load(Ordering::Acquire);
+    let (streak, blocked) = step_blocked_streak(prev, all_registered);
+    REARM_FAIL_STREAK.store(streak, Ordering::Release);
+    HOTKEYS_BLOCKED.store(blocked, Ordering::Release);
+    if !blocked {
+        return;
+    }
+    let mut last_warn = LAST_BLOCKED_WARN.lock();
+    let should_warn = last_warn.is_none_or(|t| t.elapsed() >= REARM_WARN_INTERVAL);
+    if should_warn {
+        *last_warn = Some(Instant::now());
+        tracing::warn!(
+            "hotkey(s) still not registered after repeated re-arm attempts \
+             (another process holding them?); dictation will not respond to \
+             the configured key(s) until this clears"
+        );
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 pub enum HotkeyEvent {
     TogglePressed,
@@ -39,7 +112,11 @@ pub enum HotkeyEvent {
 pub struct HotkeyManager {
     pub events: Receiver<HotkeyEvent>,
     pub external_tx: Sender<HotkeyEvent>,
-    thread_id: AtomicU32,
+    // Shared with the spawned thread's closure (not a one-time snapshot of
+    // it) so a late-published id -- one that lands after the startup wait
+    // below gives up -- is still visible to `shutdown()` instead of a stale
+    // zero that would make it skip PostThreadMessageW forever.
+    thread_id: Arc<AtomicU32>,
     join: parking_lot::Mutex<Option<thread::JoinHandle<()>>>,
     stop_flag: Arc<AtomicBool>,
 }
@@ -75,7 +152,11 @@ impl HotkeyManager {
                 }
             })?;
 
-        // Wait briefly for the thread to publish its id.
+        // Wait briefly so the id is usually already published by the time
+        // `start()` returns. No longer load-bearing for correctness -- the
+        // `thread_id` stored below is the same Arc the spawned thread writes
+        // into, so even a publish that lands after this wait gives up is
+        // still visible the next time anything reads it (see `shutdown()`).
         let deadline = std::time::Instant::now() + Duration::from_millis(500);
         while thread_id.load(Ordering::Acquire) == 0 && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(2));
@@ -84,7 +165,7 @@ impl HotkeyManager {
         Ok(Self {
             events: rx,
             external_tx,
-            thread_id: AtomicU32::new(thread_id.load(Ordering::Acquire)),
+            thread_id,
             join: parking_lot::Mutex::new(Some(join)),
             stop_flag,
         })
@@ -239,14 +320,16 @@ fn run_hotkey_loop(
         } // 0 = WM_QUIT, -1 = error
 
         if msg.message == WM_TIMER {
+            let mut all_registered = true;
             unsafe {
                 if let Some((combo, mods, vk)) = toggle.as_ref() {
-                    register_one(toggle_id, combo, *mods, *vk, true);
+                    all_registered &= register_one(toggle_id, combo, *mods, *vk, true);
                 }
                 if let Some((combo, mods, vk)) = hold.as_ref() {
-                    register_one(hold_id, combo, *mods, *vk, true);
+                    all_registered &= register_one(hold_id, combo, *mods, *vk, true);
                 }
             }
+            note_rearm_result(all_registered);
             tracing::debug!("hotkeys re-armed");
             continue;
         }
@@ -475,6 +558,40 @@ mod tests {
         assert!(parse_combo("a+b").is_err()); // two non-modifier keys
         assert!(parse_combo("ctrl+notakey").is_err()); // unknown key name
         assert!(parse_combo("f25").is_err()); // outside the F-key table
+    }
+
+    #[test]
+    fn blocked_streak_needs_threshold_consecutive_failures() {
+        let (streak, blocked) = step_blocked_streak(0, false);
+        assert_eq!(streak, 1);
+        assert!(
+            !blocked,
+            "a single failure should not trip the blocked flag"
+        );
+
+        let (streak, blocked) = step_blocked_streak(streak, false);
+        assert_eq!(streak, BLOCKED_STREAK_THRESHOLD);
+        assert!(blocked, "threshold consecutive failures should trip it");
+    }
+
+    #[test]
+    fn blocked_streak_resets_on_any_success() {
+        let (streak, blocked) = step_blocked_streak(BLOCKED_STREAK_THRESHOLD, true);
+        assert_eq!(streak, 0, "a successful re-arm must clear the streak");
+        assert!(!blocked);
+
+        // A success right after the very first failure also resets cleanly.
+        let (streak, _) = step_blocked_streak(1, true);
+        assert_eq!(streak, 0);
+    }
+
+    #[test]
+    fn blocked_streak_stays_blocked_past_threshold() {
+        // Once blocked, continued failures keep it blocked (no wraparound)
+        // until a success clears it.
+        let (streak, blocked) = step_blocked_streak(BLOCKED_STREAK_THRESHOLD + 5, false);
+        assert!(streak > BLOCKED_STREAK_THRESHOLD);
+        assert!(blocked);
     }
 
     #[test]

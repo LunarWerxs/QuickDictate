@@ -5,6 +5,8 @@
 /.saydeploy/
 /.vscode/
 /.idea/
+# Generated symbol digest (rebuilt in under a second, never reviewed).
+/.claude/codemap/
 
 # Per-run files written next to the exe.
 quickdictate.log

@@ -29,7 +29,7 @@ use eframe::egui::containers::menu;
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke};
 
 use crate::config::Config;
-use crate::state::App;
+use crate::state::{App, HistoryEntry};
 use crate::stats::StatsRange;
 use crate::theme;
 
@@ -285,6 +285,85 @@ fn text_to_replacements(text: &str) -> Vec<(String, String)> {
             (!f.is_empty()).then(|| (f, t.trim().to_string()))
         })
         .collect()
+}
+
+/// Whether two hotkey combo strings parse to the identical (modifiers, vk)
+/// pair — the condition `SettingsApp::validate` rejects, since Windows can
+/// only register one of two identical `RegisterHotKey` calls and the loser
+/// just silently never fires. An unparsable combo is "not a conflict" here —
+/// `validate` already surfaces that parse error on its own before this ever
+/// runs. Comparing the *parsed* form (not the raw strings) is what makes this
+/// case-insensitive and order-independent, matching `parse_combo`'s own
+/// normalisation (e.g. "Ctrl+Shift+D" and "shift+ctrl+d" both parse to the
+/// same pair).
+fn hotkeys_conflict(a: &str, b: &str) -> bool {
+    matches!(
+        (crate::hotkeys::parse_combo(a), crate::hotkeys::parse_combo(b)),
+        (Ok(x), Ok(y)) if x == y
+    )
+}
+
+/// Structural equality for two [`Config`]s via their JSON shape. `Config`
+/// doesn't derive `PartialEq` (its key lists and nested `Profile`s make a
+/// hand-written impl a maintenance trap that silently goes stale as fields
+/// are added), so this compares serialized form instead — correct by
+/// construction, at the cost of a serialize round-trip. Backs the "unsaved
+/// changes" close-confirm (see `SettingsApp::draft_is_dirty`).
+fn configs_differ(a: &Config, b: &Config) -> bool {
+    match (serde_json::to_value(a), serde_json::to_value(b)) {
+        (Ok(a), Ok(b)) => a != b,
+        // Serialization failing is not expected; fail toward "differs" so an
+        // unsaved edit is never silently discarded on the strength of a
+        // could-not-compare.
+        _ => true,
+    }
+}
+
+/// Parse the multi-line custom-vocabulary editor into the list of terms sent
+/// to the provider: one non-blank line per term, trimmed. Only run at save
+/// time (see `SettingsApp::fold_vocabulary_into_draft`) — the raw text stays
+/// untouched while you're still typing, so a blank line mid-edit is never
+/// silently swallowed out from under you.
+fn parse_vocabulary(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Case-insensitive substring match for the History section's filter box. An
+/// empty (or whitespace-only) filter matches everything.
+fn history_matches(filter: &str, text: &str) -> bool {
+    let filter = filter.trim();
+    filter.is_empty() || text.to_lowercase().contains(&filter.to_lowercase())
+}
+
+/// Whether `history_card`'s cached, pre-filtered rows (see [`HistoryCache`])
+/// need to be rebuilt: true when the underlying history changed
+/// (`TranscriptHistory::version()` bumps on every push/pop) or the filter
+/// text itself changed since the cache was last built. Pulled out as a pure
+/// function so the invalidation rule is testable without a live history.
+fn history_cache_stale(
+    cached_version: u64,
+    current_version: u64,
+    cached_filter: &str,
+    current_filter: &str,
+) -> bool {
+    cached_version != current_version || cached_filter != current_filter
+}
+
+/// Shorten a history entry for its one-line list row; the full text stays
+/// reachable via the row's hover tooltip. Truncates on a `char` boundary
+/// (never splits a multi-byte character) and appends an ellipsis when cut.
+fn truncate_preview(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let head: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{head}\u{2026}")
+    } else {
+        head
+    }
 }
 
 /// The QuickDictate logo as a window icon (same art as the tray/exe icon).
@@ -1059,6 +1138,20 @@ enum Modal {
         bulk_text: String,
     },
     Stats,
+    /// Confirm-before-destroy for the overflow menu's "Default settings"
+    /// (see `SettingsApp::reset_to_defaults`). A plain menu item can't host a
+    /// two-step confirm in place — clicking anything in an egui menu closes
+    /// it — so the confirm lives here instead, styled like the Stats modal's
+    /// own "Reset stats" confirmation.
+    DefaultReset,
+    /// Shown when the window is asked to close (X / Alt-F4) while `draft`
+    /// has edits that were never saved (see `SettingsApp::draft_is_dirty`).
+    UnsavedChanges,
+    /// Shown before a Save (or Save & Restart) would overwrite settings.json
+    /// with a hand-edit still sitting on disk (see
+    /// `SettingsApp::external_change_pending`). `SettingsApp::pending_save_kind`
+    /// remembers what to actually do once the user picks Overwrite.
+    ExternalChange,
 }
 
 /// Reveal the dedicated diagnostics directory in Explorer.
@@ -1146,6 +1239,11 @@ enum SyncEvent {
     Connected(Result<crate::sync::Connected, String>),
     /// Disconnect finished (remote doc deleted + local creds dropped).
     Disconnected,
+    /// A plain background push (Save, or the best-effort push before Save &
+    /// Restart) finished. Unlike `Connected`, this never touches
+    /// `sync.phase`/`email`/`avatar` — it's just "did the write land" —
+    /// so `drain_sync` reports it through `self.status` instead.
+    Pushed(Result<(), String>),
 }
 
 /// UI-side sync state (the mechanics live in `crate::sync`).
@@ -1167,6 +1265,45 @@ struct SyncUi {
     resume_kicked: bool,
 }
 
+/// Cached, pre-filtered snapshot backing `history_card`, so a frame that
+/// changes neither the history nor the filter text doesn't re-lock
+/// `app.history` and re-run `history_matches` over every entry from scratch.
+/// Rebuilt exactly when [`history_cache_stale`] says `version` or `filter`
+/// moved since the last build.
+#[derive(Default)]
+struct HistoryCache {
+    /// `TranscriptHistory::version()` as of the last rebuild.
+    version: u64,
+    /// `history_filter` as of the last rebuild.
+    filter: String,
+    /// Whether the *unfiltered* history was empty as of the last rebuild —
+    /// cached separately from `rows` so the "no dictations yet" vs. "no
+    /// matches" messages in `history_card` stay distinguishable even though
+    /// only the filtered rows are kept around.
+    history_empty: bool,
+    /// `(original index into the live history, cloned entry)` for every entry
+    /// matching `filter`, newest first — the original index is what "Copy" /
+    /// "Paste again" need to look the entry back up in `app.history`.
+    rows: Vec<(usize, HistoryEntry)>,
+}
+
+/// A "Save and restart" that saved locally and kicked off a best-effort sync
+/// push, waiting for that push to land (or time out) before actually
+/// relaunching. See `SettingsApp::save_and_restart` / `poll_pending_restart`.
+struct PendingRestart {
+    /// Give the push at most this long — a dead network must never hold the
+    /// restart hostage indefinitely.
+    deadline: std::time::Instant,
+}
+
+/// Which action a pre-save "settings.json changed on disk" prompt
+/// (`Modal::ExternalChange`) should resume once the user picks Overwrite.
+#[derive(Clone, Copy)]
+enum PendingSaveKind {
+    Plain,
+    Restart,
+}
+
 struct SettingsApp {
     app: Arc<App>,
     draft: Config,
@@ -1182,6 +1319,29 @@ struct SettingsApp {
     sync: SyncUi,
     stats_range: StatsRange,
     stats_reset_confirm: bool,
+    /// Scratch buffer for the global custom-vocabulary multiline editor —
+    /// mirrors `draft.custom_vocabulary` as raw text (one term per line) so
+    /// blank lines can exist mid-edit without being swallowed; only parsed
+    /// back into `draft` on Save (see `parse_vocabulary`, `save`).
+    vocabulary_text: String,
+    /// Same idea as `vocabulary_text`, one scratch buffer per entry of
+    /// `draft.profiles` (same order). Kept in lockstep with `draft.profiles`
+    /// by `resync_vocabulary_scratch`.
+    profile_vocab_text: Vec<String>,
+    /// Case-insensitive substring filter for the History section.
+    history_filter: String,
+    /// Cached, pre-filtered rows for `history_card`; see [`HistoryCache`].
+    history_cache: HistoryCache,
+    /// settings.json's mtime when "Edit settings.json…" was last opened, so a
+    /// later Save can tell a hand-edit landed on disk in the meantime. `None`
+    /// when no editor session is being tracked (the common case).
+    editor_opened_at: Option<std::time::SystemTime>,
+    /// Set when `Modal::ExternalChange` is showing, so its Overwrite button
+    /// knows whether to resume a plain Save or a Save & Restart.
+    pending_save_kind: Option<PendingSaveKind>,
+    /// Set by `save_and_restart` while its background sync push is in
+    /// flight; polled by `poll_pending_restart`.
+    pending_restart: Option<PendingRestart>,
     // -- headless screenshot hook (QUICKDICTATE_UI_SHOT) --
     shot_path: Option<String>,
     frames: u32,
@@ -1216,7 +1376,7 @@ impl SettingsApp {
             rx: None,
             resume_kicked: false,
         };
-        Self {
+        let mut this = Self {
             app,
             draft,
             modal: None,
@@ -1228,11 +1388,20 @@ impl SettingsApp {
             sync,
             stats_range: StatsRange::AllTime,
             stats_reset_confirm: false,
+            vocabulary_text: String::new(),
+            profile_vocab_text: Vec::new(),
+            history_filter: String::new(),
+            history_cache: HistoryCache::default(),
+            editor_opened_at: None,
+            pending_save_kind: None,
+            pending_restart: None,
             shot_path: std::env::var("QUICKDICTATE_UI_SHOT").ok(),
             frames: 0,
             shot_requested: false,
             last_fit_h: 0.0,
-        }
+        };
+        this.resync_vocabulary_scratch();
+        this
     }
 
     /// Reset the editable draft and transient UI state so a re-opened (was
@@ -1250,6 +1419,12 @@ impl SettingsApp {
         self.status.clear();
         self.stats_range = StatsRange::AllTime;
         self.stats_reset_confirm = false;
+        self.resync_vocabulary_scratch();
+        self.history_filter.clear();
+        self.history_cache = HistoryCache::default();
+        self.editor_opened_at = None;
+        self.pending_save_kind = None;
+        self.pending_restart = None;
 
         // Re-seed the sync control from creds on disk and re-arm the one-shot
         // silent resume-pull so a re-open also refreshes from the cloud.
@@ -1267,6 +1442,83 @@ impl SettingsApp {
         self.sync.is_error = false;
         self.sync.rx = None;
         self.sync.resume_kicked = false;
+    }
+
+    /// Rebuild the vocabulary text-editor scratch buffers (global + one per
+    /// profile) from `self.draft`. Called whenever `draft` is replaced
+    /// wholesale — window open/reopen, a defaults reset, or a reload-from-disk
+    /// — so the multiline editors show what's actually in the draft instead
+    /// of stale text left over from before.
+    fn resync_vocabulary_scratch(&mut self) {
+        self.vocabulary_text = self.draft.custom_vocabulary.join("\n");
+        self.profile_vocab_text = self
+            .draft
+            .profiles
+            .iter()
+            .map(|p| p.custom_vocabulary.clone().unwrap_or_default().join("\n"))
+            .collect();
+    }
+
+    /// Materialize the vocabulary scratch buffers into `self.draft`, trimming
+    /// blank lines (see `parse_vocabulary`). Called right before every save —
+    /// and by `draft_is_dirty`, which needs to know what a save would
+    /// actually write — so the multiline editors don't need to stay in sync
+    /// with `draft` on every keystroke.
+    fn fold_vocabulary_into_draft(&mut self) {
+        self.draft.custom_vocabulary = parse_vocabulary(&self.vocabulary_text);
+        for (p, buf) in self
+            .draft
+            .profiles
+            .iter_mut()
+            .zip(self.profile_vocab_text.iter())
+        {
+            if p.custom_vocabulary.is_some() {
+                p.custom_vocabulary = Some(parse_vocabulary(buf));
+            }
+        }
+    }
+
+    /// Whether `self.draft` (plus whatever the vocabulary editors currently
+    /// hold) differs from what's actually saved on disk right now. Backs the
+    /// "unsaved changes" close-confirm (`Modal::UnsavedChanges`) so an X-click
+    /// after real edits asks first, but a no-op open-then-close (or a window
+    /// left open with nothing touched) closes exactly like before, silently.
+    fn draft_is_dirty(&self) -> bool {
+        let saved = self.app.config.load_full();
+        let mut snapshot = self.draft.clone();
+        snapshot.custom_vocabulary = parse_vocabulary(&self.vocabulary_text);
+        for (p, buf) in snapshot
+            .profiles
+            .iter_mut()
+            .zip(self.profile_vocab_text.iter())
+        {
+            if p.custom_vocabulary.is_some() {
+                p.custom_vocabulary = Some(parse_vocabulary(buf));
+            }
+        }
+        configs_differ(&snapshot, &saved)
+    }
+
+    /// Snapshot settings.json's mtime when "Edit settings.json…" is opened, so
+    /// a later Save can tell a hand-edit landed on disk in the meantime (see
+    /// `external_change_pending`) instead of silently clobbering it with
+    /// whatever's in the draft.
+    fn note_editor_opened(&mut self) {
+        let path = Config::settings_path();
+        self.editor_opened_at = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+    }
+
+    /// Whether settings.json has changed on disk since `note_editor_opened`
+    /// last ran. `false` when no editor session is being tracked (the common
+    /// case) or if the file's mtime can't be read.
+    fn external_change_pending(&self) -> bool {
+        let Some(opened_at) = self.editor_opened_at else {
+            return false;
+        };
+        let path = Config::settings_path();
+        std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .is_ok_and(|mtime| mtime > opened_at)
     }
 
     // ---- Connections settings-sync ---------------------------------------
@@ -1331,6 +1583,16 @@ impl SettingsApp {
                         let stats_changed = crate::sync::synced_stats(remote)
                             .is_some_and(|stats| self.app.stats.apply_synced(stats));
                         if config_changed {
+                            // The pull mutated `draft.custom_vocabulary` /
+                            // `draft.profiles[..].custom_vocabulary` directly, bypassing the
+                            // scratch buffers the vocabulary editors actually render (see
+                            // `resync_vocabulary_scratch`'s doc comment). Without this, the
+                            // buffers still hold the pre-pull text: closing untouched shows a
+                            // false "unsaved changes" prompt (`draft_is_dirty` folds the stale
+                            // buffer back over `draft` to compare), and clicking Save would
+                            // fold that stale text back over the just-pulled vocabulary,
+                            // reverting the cloud value right back.
+                            self.resync_vocabulary_scratch();
                             // Persist + hot-store so the pulled prefs take effect.
                             let path = Config::settings_path();
                             let _ = self.draft.save(&path);
@@ -1366,6 +1628,12 @@ impl SettingsApp {
                     self.sync.avatar = None;
                     self.sync.is_error = false;
                     self.sync.note = "Disconnected. Settings stay on this device.".into();
+                }
+                SyncEvent::Pushed(Ok(())) => {
+                    self.status = "Saved and synced to your Connections account.".into();
+                }
+                SyncEvent::Pushed(Err(error)) => {
+                    self.status = format!("Saved locally, but cloud sync failed: {error}");
                 }
             }
         }
@@ -1437,10 +1705,19 @@ impl SettingsApp {
             .map_err(|e| format!("Toggle hotkey: {e}"))?;
         crate::hotkeys::parse_combo(&self.draft.hold_hotkey)
             .map_err(|e| format!("Hold hotkey: {e}"))?;
+        if hotkeys_conflict(&self.draft.toggle_hotkey, &self.draft.hold_hotkey) {
+            return Err(format!(
+                "Toggle hotkey and Hold hotkey are both set to \"{}\" \u{2014} Windows can only \
+                 register one of them, so the other would silently never fire. Pick two \
+                 different combinations.",
+                self.draft.hold_hotkey.trim()
+            ));
+        }
         Ok(())
     }
 
     fn save(&mut self) -> bool {
+        self.fold_vocabulary_into_draft();
         if let Err(e) = self.validate() {
             self.status = format!("Not saved — {e}");
             return false;
@@ -1472,39 +1749,35 @@ impl SettingsApp {
         }
     }
 
+    /// Plain "Save" (bottom bar / dialogs): save locally — fast, so this stays
+    /// synchronous and callers can rely on the file being written when it
+    /// returns — then, if signed in, push to Connections on a *background*
+    /// thread so a slow or dead network never freezes the window (the old
+    /// version blocked the egui event-loop thread on `recv_timeout`, which
+    /// froze the whole Settings window for up to 6 seconds). The push result
+    /// lands later via `SyncEvent::Pushed`, drained by `drain_sync` into
+    /// `self.status`. Returns whether the *local* save succeeded.
     fn save_and_sync(&mut self, ctx: &egui::Context) -> bool {
         if !self.save() {
             return false;
         }
         if self.sync.phase == SyncPhase::SignedIn {
             let snapshot = crate::sync::snapshot_to_synced(&self.draft, &self.app.stats.snapshot());
-            self.sync.note = "Saving to your Connections account\u{2026}".into();
-            self.sync.is_error = false;
-            let (tx, rx) = mpsc::channel();
-            let spawned = std::thread::Builder::new()
-                .name("qd-sync-save".into())
-                .spawn(move || {
-                    let _ = tx.send(crate::sync::push_now(snapshot));
-                })
-                .is_ok();
-            let result = spawned.then(|| rx.recv_timeout(std::time::Duration::from_secs(6)));
-            match result {
-                Some(Ok(Ok(_))) => {
-                    self.sync.note = "Saved and synced to your Connections account.".into();
-                }
-                Some(Ok(Err(error))) => {
-                    self.sync.is_error = true;
-                    self.sync.note = format!("Saved locally, but cloud sync failed: {error}");
-                }
-                Some(Err(_)) => {
-                    self.sync.note = "Saved locally \u{2014} cloud sync is still finishing.".into();
-                }
-                None => {
-                    self.sync.is_error = true;
-                    self.sync.note = "Saved locally, but cloud sync could not start.".into();
-                }
-            }
-            ctx.request_repaint();
+            let spawned = self.spawn_sync(ctx, move || {
+                SyncEvent::Pushed(
+                    crate::sync::push_now(snapshot)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string()),
+                )
+            });
+            self.status = if spawned {
+                "Saved. Syncing to your Connections account\u{2026}".into()
+            } else {
+                // Another sync operation (sign-in/resume/disconnect) is
+                // already running; the local save already landed, so say so
+                // rather than silently dropping this push.
+                "Saved locally \u{2014} a sync operation is already in progress.".into()
+            };
         }
         true
     }
@@ -1540,26 +1813,81 @@ impl SettingsApp {
             ..Config::default()
         };
         self.recording = None;
+        self.resync_vocabulary_scratch();
         if self.save() {
             self.status = "Settings reset to defaults.".into();
         }
     }
 
-    fn save_and_restart(&mut self) {
+    /// "Save and restart" (bottom bar): save locally, then — if signed in —
+    /// best-effort push to Connections on a background thread exactly like
+    /// `save_and_sync` (see `SyncEvent::Pushed`), so the window never blocks
+    /// the frame. The actual relaunch is deferred to `poll_pending_restart`,
+    /// which fires once that push lands (or a short deadline passes) — a dead
+    /// network delays the restart by at most a few seconds instead of hanging
+    /// the window (the old version blocked here with `recv_timeout`).
+    fn save_and_restart(&mut self, ctx: &egui::Context) {
+        if self.pending_restart.is_some() {
+            return; // already mid-restart; ignore a repeat click
+        }
         if !self.save() {
             return;
         }
-        // If syncing, push the latest to the cloud *before* relaunching so the
-        // restart never races the network. Best-effort and time-bounded — a
-        // dead link won't hold the restart hostage.
         if crate::sync::is_signed_in() {
             let snapshot = crate::sync::snapshot_to_synced(&self.draft, &self.app.stats.snapshot());
-            let (tx, rx) = mpsc::channel();
-            std::thread::spawn(move || {
-                let _ = tx.send(crate::sync::push_now(snapshot));
+            let spawned = self.spawn_sync(ctx, move || {
+                SyncEvent::Pushed(
+                    crate::sync::push_now(snapshot)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string()),
+                )
             });
-            let _ = rx.recv_timeout(std::time::Duration::from_secs(6));
+            if spawned {
+                self.status = "Syncing before restart\u{2026}".into();
+                let timeout = std::time::Duration::from_secs(6);
+                self.pending_restart = Some(PendingRestart {
+                    deadline: std::time::Instant::now() + timeout,
+                });
+                // egui frames are event-driven: with no mouse/keyboard input, nothing
+                // would otherwise re-render `ui()` and `poll_pending_restart` would
+                // never get to notice the deadline passed. Force a frame right at the
+                // deadline so the restart still fires even if the user walks away.
+                ctx.request_repaint_after(timeout);
+                return; // do_relaunch runs from poll_pending_restart once it lands
+            }
+            // Another sync operation was already in flight; don't hold the
+            // restart hostage waiting for it (best-effort, same as before).
         }
+        self.do_relaunch();
+    }
+
+    /// Poll a pending "Save and restart" once per frame (see
+    /// `save_and_restart`): once the background push has been drained by
+    /// `drain_sync` (`sync.rx` back to `None`, whether it succeeded or
+    /// failed) or the deadline passes, actually relaunch. Called from `ui`
+    /// right after `drain_sync` so it sees a push that just landed this frame.
+    fn poll_pending_restart(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.pending_restart.as_ref() else {
+            return;
+        };
+        let deadline = pending.deadline; // copy out; releases the borrow before the mutation below
+        let now = std::time::Instant::now();
+        if self.sync.rx.is_none() || now >= deadline {
+            self.pending_restart = None;
+            self.do_relaunch();
+        } else {
+            // Still waiting on the push with no guarantee another input event
+            // triggers a frame before the deadline; keep re-arming a repaint for
+            // the remaining time so the deadline itself is what wakes us up.
+            ctx.request_repaint_after(deadline - now);
+        }
+    }
+
+    /// Flush stats, spawn a fresh `--relaunch` process, and hand shutdown off
+    /// to it. Split out of `save_and_restart` so its immediate path (not
+    /// signed in, or no sync op could be started) and its deferred path
+    /// (`poll_pending_restart`) share the same relaunch logic.
+    fn do_relaunch(&mut self) {
         self.app.stats.flush();
         let relaunch = std::env::current_exe()
             .map_err(|e| format!("Could not locate QuickDictate: {e}"))
@@ -1813,13 +2141,19 @@ impl eframe::App for SettingsApp {
             ctx.request_repaint();
         }
 
-        // Intercept the window close (X button / Alt-F4): cancel the actual
-        // close and just hide instead, keeping the event loop alive so Settings
-        // can be opened again.
+        // Intercept the window close (X button / Alt-F4): cancel the actual OS
+        // close (we manage "closing" ourselves as hide-and-reveal-later; see
+        // OPEN's doc comment) and either hide right away, or — if the draft
+        // has edits that were never saved — ask first instead of silently
+        // throwing them away (see `Modal::UnsavedChanges`).
         if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            OPEN.store(false, Ordering::Release);
+            if self.draft_is_dirty() {
+                self.modal = Some(Modal::UnsavedChanges);
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                OPEN.store(false, Ordering::Release);
+            }
         }
     }
 
@@ -1829,6 +2163,7 @@ impl eframe::App for SettingsApp {
         let ctx = ui.ctx().clone();
         self.drain_verdicts();
         self.drain_sync(&ctx);
+        self.poll_pending_restart(&ctx);
         self.capture_hotkey(&ctx);
         self.screenshot_hook(&ctx);
 
@@ -1856,7 +2191,6 @@ impl eframe::App for SettingsApp {
         let mut do_about = false;
         let mut do_save = false;
         let mut do_save_restart = false;
-        let mut do_default_settings = false;
         let bottom_bar = egui::Panel::bottom("qd_actions")
             .frame(egui::Frame::new().fill(bg()).inner_margin(Margin {
                 left: 16,
@@ -1889,6 +2223,7 @@ impl eframe::App for SettingsApp {
                         }
                         if ui.button("Edit settings.json").clicked() {
                             let path = Config::settings_path();
+                            self.note_editor_opened();
                             let _ = std::process::Command::new("notepad.exe").arg(&path).spawn();
                         }
                         ui.separator();
@@ -1899,7 +2234,12 @@ impl eframe::App for SettingsApp {
                             )
                             .clicked()
                         {
-                            do_default_settings = true;
+                            // A menu closes on any click (egui's default
+                            // `PopupCloseBehavior::CloseOnClick`), so there's
+                            // no room for a two-step confirm in place here —
+                            // open a small confirmation modal instead, styled
+                            // like the Stats modal's own "Reset stats" confirm.
+                            self.modal = Some(Modal::DefaultReset);
                         }
                     })
                     .response
@@ -1968,6 +2308,7 @@ impl eframe::App for SettingsApp {
                         // header was removed — the window title bar already
                         // names the app and the version lives in About.
                         self.onboarding_banner(ui);
+                        self.update_available_banner(ui);
                         self.provider_card(ui, &ctx, testing);
                         ui.add_space(10.0);
                         self.dictation_card(ui);
@@ -1977,6 +2318,8 @@ impl eframe::App for SettingsApp {
                         // profiles section. Check-for-updates / log / settings.json
                         // moved to the ⋯ overflow menu in the bottom bar.
                         self.application_card(ui);
+                        ui.add_space(10.0);
+                        self.history_card(ui);
                         ui.add_space(10.0);
                         self.sync_card(ui, &ctx);
                         ui.add_space(12.0);
@@ -2040,14 +2383,24 @@ impl eframe::App for SettingsApp {
         if do_about {
             crate::about::show_about();
         }
-        if do_default_settings {
-            self.reset_to_defaults();
-        }
+        // A hand-edit via "Edit settings.json…" may have landed on disk since
+        // it was opened; ask Reload/Overwrite first rather than silently
+        // clobbering it (see `external_change_pending`, `Modal::ExternalChange`).
         if do_save_restart {
-            self.save_and_restart();
+            if self.external_change_pending() {
+                self.pending_save_kind = Some(PendingSaveKind::Restart);
+                self.modal = Some(Modal::ExternalChange);
+            } else {
+                self.save_and_restart(&ctx);
+            }
         }
         if do_save {
-            self.save_and_sync(&ctx);
+            if self.external_change_pending() {
+                self.pending_save_kind = Some(PendingSaveKind::Plain);
+                self.modal = Some(Modal::ExternalChange);
+            } else {
+                self.save_and_sync(&ctx);
+            }
         }
 
         self.render_modal(&ctx);
@@ -2099,6 +2452,38 @@ impl SettingsApp {
         ui.add_space(10.0);
     }
 
+    /// A newer release the daily auto-check found but hasn't installed (see
+    /// `update::pending_update`) — surfaced here too, not just the tray
+    /// tooltip, since Settings is where most people go looking. Installing
+    /// itself still only happens from the About window's pill, matching the
+    /// click-to-consent model everywhere else in the app.
+    fn update_available_banner(&mut self, ui: &mut egui::Ui) {
+        let Some(tag) = crate::update::pending_update() else {
+            return;
+        };
+        egui::Frame::new()
+            .fill(good().gamma_multiply(0.14))
+            .stroke(Stroke::new(1.0, good().gamma_multiply(0.5)))
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(Margin::same(12))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("Update available: v{tag}"))
+                            .font(semibold(14.0))
+                            .color(text()),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if accent_button(ui, "Review\u{2026}").clicked() {
+                            crate::about::show_about();
+                        }
+                    });
+                });
+            });
+        ui.add_space(10.0);
+    }
+
     fn provider_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, testing: bool) {
         card(ui, |ui| {
             section_title(ui, "\u{E720}", "Speech-to-text provider");
@@ -2145,6 +2530,19 @@ impl SettingsApp {
                     }
                 }
             });
+
+            ui.add_space(6.0);
+            blue_check(
+                ui,
+                &mut self.draft.protect_keys_at_rest,
+                "Encrypt API keys in settings.json (this PC and Windows account only)",
+            )
+            .on_hover_text(
+                "Seals your API keys with Windows DPAPI so settings.json only decrypts on this \
+                 exact Windows account and machine. If you copy this portable folder to another \
+                 PC or another Windows user, the sealed keys will NOT work there \u{2014} you'll \
+                 need to paste them in again.",
+            );
 
             if self.draft.stt_provider == "local" {
                 ui.add_space(8.0);
@@ -2435,6 +2833,22 @@ impl SettingsApp {
                     });
             });
 
+            // Windows only grants a hotkey to the first process that asks for
+            // it; if another app got there first, `RegisterHotKey` fails and
+            // that failure otherwise only reaches a log file. Surface it here
+            // so a combo Windows won't grant is never silently invisible.
+            if crate::hotkeys::hotkeys_blocked() {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "Another app is holding one of these hotkeys \u{2014} try a different \
+                         combination.",
+                    )
+                    .size(11.5)
+                    .color(bad()),
+                );
+            }
+
             // No separator here: the timing row sits snug under the 2×2 block
             // above so it reads as one group and the card stays short.
             ui.add_space(4.0);
@@ -2547,6 +2961,33 @@ impl SettingsApp {
                     self.open_replacements_modal();
                 }
             });
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new("Custom vocabulary")
+                    .font(semibold(13.0))
+                    .color(text()),
+            );
+            ui.label(
+                RichText::new(
+                    "Words and phrases sent to the provider to bias recognition toward them \
+                     \u{2014} names, jargon, product names it keeps mishearing. This is \
+                     different from text replacements above, which repair the text *after* \
+                     recognition. One term per line.",
+                )
+                .size(11.5)
+                .color(muted()),
+            );
+            ui.add_space(6.0);
+            ui.add(
+                egui::TextEdit::multiline(&mut self.vocabulary_text)
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(4)
+                    .margin(Margin::symmetric(6, CTRL_PAD))
+                    .hint_text("Supabase\nCloudflare\nQuickDictate"),
+            );
         });
     }
 
@@ -2581,6 +3022,20 @@ impl SettingsApp {
                     "Check for updates daily",
                 )
                 .on_hover_text("Automatically check for a newer QuickDictate release once a day.");
+                // Only meaningful once auto-check is on; hidden otherwise
+                // rather than shown-but-inert.
+                if self.draft.update_auto_check {
+                    blue_check(
+                        left,
+                        &mut self.draft.update_auto_install,
+                        "Install updates automatically without asking",
+                    )
+                    .on_hover_text(
+                        "By default a newer release only shows as \u{201c}available\u{201d} \u{2014} \
+                         you click to install it (About window). Turn this on to install \
+                         automatically as soon as the daily check finds one, with no confirmation.",
+                    );
+                }
 
                 let right = &mut cols[1];
                 blue_check(
@@ -2617,30 +3072,239 @@ impl SettingsApp {
                 );
             });
 
-            // Read-only "Active profiles" list — shown only when a power user has
-            // actually added `profiles` to settings.json. With none configured,
-            // the toggle above is the whole story and we don't waste a row on a
-            // "None configured" line.
+            // "Active profiles" editor — shown only when a power user has
+            // actually added `profiles` to settings.json. With none
+            // configured, the toggle above is the whole story and we don't
+            // waste a row on a "None configured" line. Only Language,
+            // Provider, and vocabulary are editable here; the name, match
+            // list, and text replacements still require settings.json (a
+            // full add/remove/reorder editor is out of scope for this pass).
             if !self.draft.profiles.is_empty() {
                 ui.add_space(8.0);
                 ui.separator();
                 ui.add_space(6.0);
                 ui.label(RichText::new("Active profiles").size(12.0).color(muted()));
-                ui.add_space(2.0);
-                for p in &self.draft.profiles {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(&p.name).color(text()));
-                        ui.label(RichText::new(p.match_.join(", ")).size(12.0).color(muted()));
-                    });
-                }
-                ui.add_space(4.0);
                 ui.label(
-                    RichText::new("Edit settings.json to add, remove, or reorder profiles.")
+                    RichText::new(
+                        "Language, provider, and vocabulary can be tuned here. Edit \
+                         settings.json to add, remove, rename, or reorder profiles, or to \
+                         change their match list or text replacements.",
+                    )
+                    .size(11.0)
+                    .color(muted()),
+                );
+                ui.add_space(4.0);
+
+                // `draft.profiles` and `profile_vocab_text` are disjoint
+                // fields, so both can be borrowed mutably at once; keep them
+                // in lockstep defensively in case a hand-edit (via the
+                // settings.json-changed prompt's Reload) changed the profile
+                // count out from under the scratch buffers.
+                if self.profile_vocab_text.len() != self.draft.profiles.len() {
+                    self.profile_vocab_text
+                        .resize(self.draft.profiles.len(), String::new());
+                }
+                let profiles = &mut self.draft.profiles;
+                let vocab_bufs = &mut self.profile_vocab_text;
+                for (idx, (p, vocab_buf)) in
+                    profiles.iter_mut().zip(vocab_bufs.iter_mut()).enumerate()
+                {
+                    egui::Frame::new()
+                        .fill(input_bg())
+                        .stroke(Stroke::new(1.0, border()))
+                        .corner_radius(CornerRadius::same(8))
+                        .inner_margin(Margin::same(8))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(&p.name).font(semibold(13.0)).color(text()));
+                                ui.label(
+                                    RichText::new(p.match_.join(", ")).size(11.5).color(muted()),
+                                );
+                            });
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.label("Language").on_hover_text(
+                                    "Recognition language for this app. Leave blank to use the \
+                                     global language.",
+                                );
+                                let mut lang_buf = p.language.clone().unwrap_or_default();
+                                if ui
+                                    .add(
+                                        styled_input(&mut lang_buf)
+                                            .hint_text("Use global")
+                                            .desired_width(90.0),
+                                    )
+                                    .changed()
+                                {
+                                    p.language = (!lang_buf.trim().is_empty()).then_some(lang_buf);
+                                }
+                                ui.add_space(8.0);
+                                ui.label("Provider");
+                                egui::ComboBox::from_id_salt(("profile_provider", idx))
+                                    .width(150.0)
+                                    .selected_text(
+                                        p.stt_provider
+                                            .as_deref()
+                                            .map(provider_label)
+                                            .unwrap_or("Use global"),
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        if ui
+                                            .selectable_label(
+                                                p.stt_provider.is_none(),
+                                                "Use global",
+                                            )
+                                            .clicked()
+                                        {
+                                            p.stt_provider = None;
+                                        }
+                                        for (id, label) in providers() {
+                                            let selected = p.stt_provider.as_deref() == Some(id);
+                                            if ui.selectable_label(selected, label).clicked() {
+                                                p.stt_provider = Some(id.to_string());
+                                            }
+                                        }
+                                    });
+                            });
+                            ui.add_space(4.0);
+                            let mut override_vocab = p.custom_vocabulary.is_some();
+                            if blue_check(
+                                ui,
+                                &mut override_vocab,
+                                "Override vocabulary for this app",
+                            )
+                            .on_hover_text(
+                                "Unchecked: use the global custom vocabulary. Checked with \
+                                     an empty list: no vocabulary biasing at all in this app.",
+                            )
+                            .changed()
+                            {
+                                p.custom_vocabulary = if override_vocab {
+                                    Some(parse_vocabulary(vocab_buf))
+                                } else {
+                                    None
+                                };
+                            }
+                            if p.custom_vocabulary.is_some() {
+                                ui.add(
+                                    egui::TextEdit::multiline(vocab_buf)
+                                        .desired_width(f32::INFINITY)
+                                        .desired_rows(2)
+                                        .margin(Margin::symmetric(6, CTRL_PAD))
+                                        .hint_text("One term per line"),
+                                );
+                            }
+                        });
+                    ui.add_space(4.0);
+                }
+            }
+        });
+    }
+
+    /// Recent-transcriptions browser: search/filter, per-entry Copy and Paste
+    /// again. `app.history` is in-memory only for this session (see
+    /// `TranscriptHistory`) -- this is a bigger window onto the same list the
+    /// tray's "Recent transcriptions" submenu already shows. Button clicks are
+    /// captured into locals and acted on after the card closure, matching the
+    /// rest of this file's pattern for keeping `&mut self` calls unnested.
+    fn history_card(&mut self, ui: &mut egui::Ui) {
+        let mut do_copy: Option<usize> = None;
+        let mut do_replay: Option<usize> = None;
+        card(ui, |ui| {
+            section_title(ui, "\u{E81C}", "History");
+            ui.label(
+                RichText::new(
+                    "Your recent dictations for this session (not saved to disk). Copy one back \
+                     to the clipboard, or paste it again into whatever's currently focused.",
+                )
+                .size(11.5)
+                .color(muted()),
+            );
+            ui.add_space(6.0);
+            ui.add(
+                styled_input(&mut self.history_filter)
+                    .hint_text("Filter\u{2026}")
+                    .desired_width(220.0),
+            );
+            ui.add_space(6.0);
+
+            // Re-lock and re-filter only when the history or the filter text
+            // actually moved since the last frame (see `HistoryCache`) —
+            // `history_card` renders every frame, and cloning up to
+            // `HISTORY_CAP` full transcript strings on every one of them for
+            // an unchanging list is pure waste.
+            let current_version = self.app.history.lock().version();
+            if history_cache_stale(
+                self.history_cache.version,
+                current_version,
+                &self.history_cache.filter,
+                &self.history_filter,
+            ) {
+                let entries = self.app.history.lock().snapshot();
+                self.history_cache.history_empty = entries.is_empty();
+                let filter = self.history_filter.clone();
+                self.history_cache.rows = entries
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(_, e)| history_matches(&filter, &e.text))
+                    .collect();
+                self.history_cache.version = current_version;
+                self.history_cache.filter = filter;
+            }
+
+            if self.history_cache.history_empty {
+                ui.label(
+                    RichText::new("No dictations yet this session.")
                         .size(12.0)
                         .color(muted()),
                 );
+                return;
             }
+            if self.history_cache.rows.is_empty() {
+                ui.label(RichText::new("No matches.").size(12.0).color(muted()));
+                return;
+            }
+            egui::ScrollArea::vertical()
+                .id_salt("history_rows")
+                .max_height(220.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for (idx, entry) in &self.history_cache.rows {
+                        ui.horizontal(|ui| {
+                            let preview = truncate_preview(&entry.text.replace('\n', " "), 70);
+                            ui.label(RichText::new(preview).color(text()))
+                                .on_hover_text(entry.text.clone());
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("Paste again").clicked() {
+                                        do_replay = Some(*idx);
+                                    }
+                                    if ui.small_button("Copy").clicked() {
+                                        do_copy = Some(*idx);
+                                    }
+                                },
+                            );
+                        });
+                        ui.add_space(2.0);
+                    }
+                });
         });
+        if let Some(idx) = do_copy {
+            if let Some(entry) = self.app.history.lock().get(idx) {
+                match crate::output::copy_to_clipboard(&entry.text) {
+                    Ok(()) => self.status = "Copied to clipboard.".into(),
+                    Err(e) => self.status = format!("Copy failed: {e}"),
+                }
+            }
+        }
+        if let Some(idx) = do_replay {
+            // Same mechanism as the tray's "Recent transcriptions" submenu
+            // and the `paste_history:N` dev-trigger hook: hand the index to
+            // the replay channel and let the output loop (see `output.rs`)
+            // do the actual paste.
+            let _ = self.app.replay_tx.try_send(Some(idx));
+        }
     }
 
     /// Opt-in "Sync settings with Connections" control (spec §6.8): four states
@@ -2766,6 +3430,11 @@ impl SettingsApp {
         let mut stats_range = self.stats_range;
         let mut stats_reset_confirm = self.stats_reset_confirm;
         let mut reset_stats = false;
+        let mut do_default_reset = false;
+        let mut do_close_discard = false;
+        let mut do_close_save = false;
+        let mut do_reload_from_disk = false;
+        let mut do_overwrite = false;
 
         match modal {
             Modal::Stats => {
@@ -2990,6 +3659,110 @@ impl SettingsApp {
                         });
                     });
                 });
+                if backdrop || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    action = ModalAction::Cancel;
+                }
+            }
+            Modal::DefaultReset => {
+                let backdrop = Self::modal_frame(ctx, "Reset all settings?", 380.0, |ui| {
+                    egui::Frame::new()
+                        .fill(bad().gamma_multiply(0.09))
+                        .stroke(Stroke::new(1.0, bad().gamma_multiply(0.45)))
+                        .corner_radius(CornerRadius::same(8))
+                        .inner_margin(Margin::symmetric(10, 8))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(
+                                RichText::new(
+                                    "This resets every setting back to its default \u{2014} \
+                                     provider, hotkeys, replacements, and profiles. Your API \
+                                     keys are kept. This cannot be undone.",
+                                )
+                                .size(11.5)
+                                .color(text()),
+                            );
+                        });
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(RichText::new("Reset").font(semibold(11.5)).color(bad()))
+                            .clicked()
+                        {
+                            do_default_reset = true;
+                            action = ModalAction::Cancel;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            action = ModalAction::Cancel;
+                        }
+                    });
+                });
+                if backdrop || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    action = ModalAction::Cancel;
+                }
+            }
+            Modal::UnsavedChanges => {
+                let backdrop = Self::modal_frame(ctx, "Unsaved changes", 380.0, |ui| {
+                    ui.label(
+                        RichText::new(
+                            "You have unsaved changes. Save them before closing, or discard \
+                             them?",
+                        )
+                        .size(12.5)
+                        .color(text()),
+                    );
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if accent_button(ui, "Save").clicked() {
+                            do_close_save = true;
+                        }
+                        if ui.button(RichText::new("Discard").color(bad())).clicked() {
+                            do_close_discard = true;
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Cancel").clicked() {
+                                action = ModalAction::Cancel;
+                            }
+                        });
+                    });
+                });
+                // Escape/backdrop = Cancel (keep editing), never Discard — an
+                // accidental dismiss must never be the thing that throws away
+                // edits.
+                if backdrop || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    action = ModalAction::Cancel;
+                }
+            }
+            Modal::ExternalChange => {
+                let backdrop =
+                    Self::modal_frame(ctx, "settings.json changed on disk", 420.0, |ui| {
+                        ui.label(
+                            RichText::new(
+                                "settings.json changed on disk since you opened \u{201c}Edit \
+                             settings.json\u{2026}\u{201d} \u{2014} probably your own hand-edit. \
+                             Reload it here (discarding the edits you've made in this window), \
+                             or overwrite it with what's in this window?",
+                            )
+                            .size(12.5)
+                            .color(text()),
+                        );
+                        ui.add_space(12.0);
+                        ui.horizontal(|ui| {
+                            if accent_button(ui, "Reload").clicked() {
+                                do_reload_from_disk = true;
+                            }
+                            if ui.button(RichText::new("Overwrite").color(bad())).clicked() {
+                                do_overwrite = true;
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("Cancel").clicked() {
+                                        action = ModalAction::Cancel;
+                                    }
+                                },
+                            );
+                        });
+                    });
                 if backdrop || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                     action = ModalAction::Cancel;
                 }
@@ -3333,12 +4106,18 @@ impl SettingsApp {
                         .filter(|(f, _)| !f.trim().is_empty())
                         .collect();
                 }
-                Some(Modal::Stats) => {}
+                Some(Modal::Stats)
+                | Some(Modal::DefaultReset)
+                | Some(Modal::UnsavedChanges)
+                | Some(Modal::ExternalChange) => {}
                 None => {}
             },
             ModalAction::Cancel => {
                 self.modal = None;
                 self.stats_reset_confirm = false;
+                // Backing out of the settings.json-changed prompt should not
+                // leave a stale "resume this save" note behind.
+                self.pending_save_kind = None;
             }
             ModalAction::None => {}
         }
@@ -3346,6 +4125,75 @@ impl SettingsApp {
             // Keep the imported keys editable if validation or disk I/O made
             // the requested save fail. The draft already contains them.
             self.open_keys_modal();
+        }
+
+        // ---- Confirmations that were armed above, applied now that the
+        // `self.modal` borrow from the `match modal { .. }` above has ended.
+        if do_default_reset {
+            self.reset_to_defaults();
+        }
+        if do_close_discard {
+            self.modal = None;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            OPEN.store(false, Ordering::Release);
+        }
+        if do_close_save {
+            if self.external_change_pending() {
+                // A hand-edit landed on disk while this dialog was open too;
+                // surface that prompt instead of clobbering it. The window
+                // stays open — the user can retry Save (or the X) once it's
+                // resolved.
+                self.pending_save_kind = Some(PendingSaveKind::Plain);
+                self.modal = Some(Modal::ExternalChange);
+            } else {
+                self.modal = None;
+                if self.save_and_sync(ctx) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                    OPEN.store(false, Ordering::Release);
+                }
+                // On failure (e.g. a hotkey conflict) `self.status` already
+                // carries the reason — matches the ordinary Save button.
+            }
+        }
+        if do_reload_from_disk {
+            self.modal = None;
+            self.editor_opened_at = None;
+            self.pending_save_kind = None;
+            let path = Config::settings_path();
+            if path.exists() {
+                let (cfg, diags) = Config::load_or_create();
+                // Same severity-prefix convention `main.rs` replays
+                // `startup_diags` with (see there) — kept lightweight here
+                // since the Reload outcome is already visible in
+                // `self.status` right below.
+                for d in &diags {
+                    if let Some(rest) = d.strip_prefix("WARN: ") {
+                        tracing::warn!("{rest}");
+                    } else if let Some(rest) = d
+                        .strip_prefix("ERROR: ")
+                        .or_else(|| d.strip_prefix("ALERT: "))
+                    {
+                        tracing::error!("{rest}");
+                    } else {
+                        tracing::info!("{d}");
+                    }
+                }
+                self.draft = cfg;
+                self.resync_vocabulary_scratch();
+                self.status = "Reloaded settings.json from disk.".into();
+            } else {
+                self.status = "settings.json is missing \u{2014} keeping your edits here.".into();
+            }
+        }
+        if do_overwrite {
+            self.modal = None;
+            self.editor_opened_at = None;
+            match self.pending_save_kind.take() {
+                Some(PendingSaveKind::Restart) => self.save_and_restart(ctx),
+                _ => {
+                    self.save_and_sync(ctx);
+                }
+            }
         }
     }
 }
@@ -3453,5 +4301,94 @@ mod tests {
         assert_eq!(format_audio_time(42_900), "42s");
         assert_eq!(format_audio_time(125_000), "2m 5s");
         assert_eq!(format_audio_time(7_500_000), "2h 5m");
+    }
+
+    // ---- Hotkey-conflict validation (change 4) -----------------------------
+
+    #[test]
+    fn hotkeys_conflict_flags_identical_combos_case_insensitively() {
+        assert!(hotkeys_conflict("ctrl+shift+d", "Ctrl+Shift+D"));
+        // Order of modifiers shouldn't matter either -- both normalize to the
+        // same (modifiers, vk) pair.
+        assert!(hotkeys_conflict("ctrl+shift+d", "shift+ctrl+d"));
+        assert!(!hotkeys_conflict("f13", "f14"));
+    }
+
+    #[test]
+    fn hotkeys_conflict_ignores_unparsable_combos() {
+        // `validate` already surfaces the parse error for these on its own;
+        // this helper only ever runs once both sides are known-good.
+        assert!(!hotkeys_conflict("not a key", "f13"));
+        assert!(!hotkeys_conflict("f13", "also not a key"));
+    }
+
+    // ---- Unsaved-changes dirty check (change 3) ----------------------------
+
+    #[test]
+    fn configs_differ_detects_a_changed_field_and_is_false_for_equal_configs() {
+        let a = Config::default();
+        let b = Config::default();
+        assert!(!configs_differ(&a, &b));
+
+        let mut c = Config::default();
+        c.auto_punct = !c.auto_punct;
+        assert!(configs_differ(&a, &c));
+    }
+
+    // ---- Custom vocabulary editor parsing (change 6) -----------------------
+
+    #[test]
+    fn parse_vocabulary_trims_and_drops_blank_lines() {
+        let parsed = parse_vocabulary("  Supabase  \n\n\tCloudflare\n   \nGitHub\n");
+        assert_eq!(
+            parsed,
+            vec![
+                "Supabase".to_string(),
+                "Cloudflare".to_string(),
+                "GitHub".to_string(),
+            ]
+        );
+        assert!(parse_vocabulary("\n   \n\t\n").is_empty());
+    }
+
+    // ---- History search filter (change 7) ----------------------------------
+
+    #[test]
+    fn history_matches_is_case_insensitive_and_empty_filter_matches_everything() {
+        assert!(history_matches("", "anything at all"));
+        assert!(history_matches("   ", "anything at all"));
+        assert!(history_matches("hello", "Well, HELLO there"));
+        assert!(history_matches("  Hello  ", "hello world")); // filter itself is trimmed
+        assert!(!history_matches("zzz", "Well, HELLO there"));
+    }
+
+    #[test]
+    fn truncate_preview_keeps_short_text_and_ellipsizes_long_text() {
+        assert_eq!(truncate_preview("short", 10), "short");
+        assert_eq!(truncate_preview("exactly ten", 11), "exactly ten");
+        assert_eq!(truncate_preview("this is too long", 7), "this is\u{2026}");
+    }
+
+    // ---- History card cache invalidation (adversarial-review fix 3) -------
+
+    #[test]
+    fn history_cache_stale_is_false_when_neither_version_nor_filter_moved() {
+        assert!(!history_cache_stale(3, 3, "hello", "hello"));
+        assert!(!history_cache_stale(0, 0, "", ""));
+    }
+
+    #[test]
+    fn history_cache_stale_detects_a_version_bump_with_the_filter_unchanged() {
+        assert!(history_cache_stale(3, 4, "hello", "hello"));
+    }
+
+    #[test]
+    fn history_cache_stale_detects_a_filter_edit_with_the_version_unchanged() {
+        assert!(history_cache_stale(3, 3, "hello", "hell"));
+    }
+
+    #[test]
+    fn history_cache_stale_detects_both_moving_at_once() {
+        assert!(history_cache_stale(3, 5, "hello", "world"));
     }
 }

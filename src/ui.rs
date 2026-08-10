@@ -21,7 +21,7 @@ use windows::Win32::Graphics::Gdi::{
     ReleaseDC, SelectObject, SetBkMode, SetTextColor, AC_SRC_ALPHA, AC_SRC_OVER,
     ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, CLIP_DEFAULT_PRECIS,
     DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, FW_BOLD,
-    HBITMAP, HDC, OUT_DEFAULT_PRECIS, TRANSPARENT, VARIABLE_PITCH,
+    HBITMAP, HDC, HFONT, OUT_DEFAULT_PRECIS, TRANSPARENT, VARIABLE_PITCH,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::HMENU;
@@ -39,7 +39,36 @@ const PIP_SIZE: i32 = 48;
 const PIP_OFFSET_X: i32 = 18;
 const PIP_OFFSET_Y: i32 = 18;
 const ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(16);
-const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Idle-loop wait. The loop does not merely sleep this long: it blocks in
+/// `MsgWaitForMultipleObjectsEx` with this as a TIMEOUT, waking instantly for
+/// any win32 message (tray click, menu command, the second-launch activate
+/// request) AND for the wake event that every status transition signals (see
+/// `App::wake_ui`). So the pip lights the moment the hotkey is pressed and the
+/// tray menu opens the moment it is clicked, while a genuinely quiet app parks
+/// for a second at a time.
+///
+/// The distinction was learned the hard way, twice in one evening: widening a
+/// plain sleep from 100ms to 1s cut idle wakeups roughly 10x (about 86k/day
+/// instead of 864k/day) but lagged the cursor pip behind the hotkey, and
+/// fixing THAT with only a wake channel still lagged tray clicks, because the
+/// win32 message pump lives in this same loop. The timeout is a backstop for
+/// unsignalled changes (a config flag, history growth), not the mechanism for
+/// responsiveness.
+const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(1000);
+
+/// How long the main loop waits before its next pass: the fast active
+/// interval while the pip needs to track the cursor smoothly for a real
+/// dictation, the slow idle interval otherwise. When idle this is a TIMEOUT on
+/// the wake channel rather than a sleep, so a status change still lands
+/// immediately. Pure so it's unit-testable without standing up a window or an
+/// `App`.
+fn poll_interval(active_visible: bool) -> Duration {
+    if active_visible {
+        ACTIVE_POLL_INTERVAL
+    } else {
+        IDLE_POLL_INTERVAL
+    }
+}
 
 /// Class name of the hidden overlay window -- also the target `main.rs`'s
 /// single-instance guard looks up via `FindWindowW` to reach a running
@@ -97,6 +126,17 @@ fn run(app: Arc<App>) -> Result<()> {
     let tray_state = build_tray()?;
     let menu_rx = MenuEvent::receiver();
 
+    // The auto-reset event this thread idles on. `App::wake_ui` signals it on
+    // every status change; `MsgWaitForMultipleObjectsEx` below also wakes on
+    // any win32 message, so tray clicks and menu commands are handled the
+    // instant they arrive rather than at the next idle tick. Never closed:
+    // it lives exactly as long as the process.
+    let wake_event = unsafe {
+        windows::Win32::System::Threading::CreateEventW(None, false, false, None)
+            .map_err(|e| anyhow::anyhow!("CreateEventW for the UI wake event: {e}"))?
+    };
+    app.register_ui_wake_event(wake_event.0 as isize);
+
     // Register the cross-instance "show Settings" message before the overlay
     // window (whose wnd_proc handles it) is created, so there's no window
     // that could receive WM_CREATE etc. before the id is known. Idempotent.
@@ -124,13 +164,22 @@ fn run(app: Arc<App>) -> Result<()> {
     let mut spinner_angle = 0.0_f32;
     let mut msg = MSG::default();
 
-    // Tray-tooltip explanation for a dead-keys failure. The 2s error pip clears
-    // fast, so this persists the "why" on the tray icon's hover text until a
-    // dictation actually connects again (or the app restarts).
-    const DEAD_KEYS_TOOLTIP: &str =
-        "QuickDictate: your API keys were rejected. Open Settings to update them.";
+    // Tray-tooltip explanation for the last dictation error. The 2s error pip
+    // clears fast, so this persists the "why" (one line per cause, from
+    // `ErrorKind::tooltip()`) on the tray icon's hover text until a dictation
+    // actually connects again (or the app restarts).
     let default_tooltip = format!("QuickDictate v{}", env!("CARGO_PKG_VERSION"));
-    let mut dead_keys_tooltip_active = false;
+    let mut error_tooltip_kind: Option<ErrorKind> = None;
+    // Tray-tooltip explanation for a hotkey another process has claimed.
+    // Tracked separately from `error_tooltip_kind` above because it isn't
+    // gated on `Status::Error` at all -- the hotkey re-arm loop in
+    // `hotkeys.rs` polls independently of the dictation session state
+    // machine -- so it clears the instant `hotkeys_blocked()` goes false
+    // instead of waiting for a Listening status.
+    let mut hotkey_tooltip_active = false;
+    // Tag of the update currently advertised on the tooltip, so the text is
+    // only rewritten when it actually changes.
+    let mut update_tooltip_tag: Option<String> = None;
     // Rebuild the "Recent transcriptions" submenu only when the history has
     // actually changed since we last drew it (cheap version counter, see
     // `TranscriptHistory::version`), not on every poll tick.
@@ -267,7 +316,30 @@ fn run(app: Arc<App>) -> Result<()> {
         let error_kind = app.error_kind();
         let cfg = app.config.load();
         let target_count = app.word_count.load(Ordering::Acquire) as f32;
-        let want_visible = cfg.mouse_follower_enabled && status != Status::Idle;
+
+        // A hotkey another process has claimed is surfaced the same way a
+        // dictation error is (tray tooltip text, a pip glyph) even though the
+        // app itself is genuinely Idle -- the re-arm loop in `hotkeys.rs`
+        // polls independently of this session state machine, so it's
+        // synthesized here rather than being a real `Status`/`ErrorKind` pair
+        // out of `App`. Only surfaced while Idle: an active dictation always
+        // wins.
+        let hotkey_blocked = status == Status::Idle && crate::hotkeys::hotkeys_blocked();
+        let (render_status, render_kind) = if hotkey_blocked {
+            (Status::Error, ErrorKind::HotkeyBlocked)
+        } else {
+            (status, error_kind)
+        };
+
+        // `active_visible` (a real dictation in progress) drives the fast
+        // active-poll cadence at the bottom of the loop; `hotkey_pip_visible`
+        // rides whatever cadence the loop is already ticking at instead of
+        // forcing the fast one, since a stuck hotkey has no animation to keep
+        // smooth and could otherwise pin the loop at 16ms indefinitely.
+        let active_visible = cfg.mouse_follower_enabled && status != Status::Idle;
+        let hotkey_pip_visible = cfg.mouse_follower_enabled && hotkey_blocked;
+        let want_visible = active_visible || hotkey_pip_visible;
+
         let show_spinner = cfg.stt_provider.eq_ignore_ascii_case("local")
             && matches!(
                 status,
@@ -279,17 +351,54 @@ fn run(app: Arc<App>) -> Result<()> {
             spinner_angle = 0.0;
         }
 
-        // Surface a dead-keys failure on the tray tooltip, and keep it there
+        // Persist an explanation of the last dictation error on the tray
+        // tooltip, using `ErrorKind::tooltip()` so every named cause gets
+        // real text instead of collapsing to a bare "!" -- keep it there
         // until a session actually connects (Listening) so the explanation
-        // outlives the brief error pip.
-        if status == Status::Error && error_kind == ErrorKind::DeadKeys {
-            if !dead_keys_tooltip_active {
-                let _ = tray_state.tray.set_tooltip(Some(DEAD_KEYS_TOOLTIP));
-                dead_keys_tooltip_active = true;
+        // outlives the brief error pip. See `error_glyph` below for the
+        // pip's side of the same fix.
+        if !hotkey_blocked {
+            if status == Status::Error {
+                if error_tooltip_kind != Some(error_kind) {
+                    let text = format!("QuickDictate: {}", error_kind.tooltip());
+                    let _ = tray_state.tray.set_tooltip(Some(&text));
+                    error_tooltip_kind = Some(error_kind);
+                }
+            } else if error_tooltip_kind.is_some() && status == Status::Listening {
+                let _ = tray_state.tray.set_tooltip(Some(&default_tooltip));
+                error_tooltip_kind = None;
             }
-        } else if dead_keys_tooltip_active && status == Status::Listening {
+        }
+
+        // A blocked hotkey isn't a dictation error, so it doesn't share the
+        // persist-until-Listening lifetime above -- it clears the moment
+        // `hotkeys_blocked()` does.
+        if hotkey_blocked {
+            if !hotkey_tooltip_active {
+                let text = format!("QuickDictate: {}", ErrorKind::HotkeyBlocked.tooltip());
+                let _ = tray_state.tray.set_tooltip(Some(&text));
+                hotkey_tooltip_active = true;
+            }
+        } else if hotkey_tooltip_active {
             let _ = tray_state.tray.set_tooltip(Some(&default_tooltip));
-            dead_keys_tooltip_active = false;
+            hotkey_tooltip_active = false;
+        }
+
+        // A waiting update. Since v0.5.4 the daily check reports rather than
+        // installs (see update.rs), so this tooltip is how a user learns an
+        // update exists without opening About. Lowest priority of the three:
+        // an error or a blocked hotkey is more urgent and has already claimed
+        // the tooltip above.
+        if error_tooltip_kind.is_none() && !hotkey_tooltip_active {
+            let waiting = crate::update::pending_update();
+            if waiting != update_tooltip_tag {
+                let text = match waiting.as_deref() {
+                    Some(tag) => format!("QuickDictate: update available (v{tag})"),
+                    None => default_tooltip.clone(),
+                };
+                let _ = tray_state.tray.set_tooltip(Some(&text));
+                update_tooltip_tag = waiting;
+            }
         }
 
         // Live-apply the hide-tray-icon setting whenever it changes -- no
@@ -333,13 +442,13 @@ fn run(app: Arc<App>) -> Result<()> {
                 if GetCursorPos(&mut p).is_ok() {
                     let pos_changed =
                         !matches!(last_pos, Some(prev) if prev.x == p.x && prev.y == p.y);
-                    let status_changed = status != last_status;
+                    let status_changed = render_status != last_status;
                     let count_changed = smooth_count != last_word_count;
                     let spinner_changed = show_spinner != last_spinner;
                     // The error glyph depends on the kind, so a kind flip while
                     // the status stays Error must still repaint (two back-to-back
                     // errors of different kinds within the 2s pip window).
-                    let kind_changed = error_kind != last_error_kind;
+                    let kind_changed = render_kind != last_error_kind;
                     // Render whenever anything changes — the smoothed counter
                     // changes most frames during active dictation, giving a
                     // fluid animation.
@@ -351,8 +460,8 @@ fn run(app: Arc<App>) -> Result<()> {
                         || show_spinner
                     {
                         overlay.render(
-                            status,
-                            error_kind,
+                            render_status,
+                            render_kind,
                             smooth_count,
                             show_spinner.then_some(spinner_angle),
                             p.x + PIP_OFFSET_X,
@@ -360,7 +469,7 @@ fn run(app: Arc<App>) -> Result<()> {
                         );
                         last_pos = Some(p);
                         last_word_count = smooth_count;
-                        last_error_kind = error_kind;
+                        last_error_kind = render_kind;
                     }
                 }
             } else if last_status != Status::Idle || last_pos.is_some() {
@@ -369,13 +478,39 @@ fn run(app: Arc<App>) -> Result<()> {
                 last_word_count = u32::MAX;
             }
         }
-        last_status = status;
+        last_status = render_status;
         last_spinner = show_spinner;
-        std::thread::sleep(if want_visible {
-            ACTIVE_POLL_INTERVAL
+        // Fast cadence only while a real dictation needs the pip to track the
+        // cursor smoothly (a plain sleep, deliberately NOT message-woken:
+        // WM_MOUSEMOVE floods the queue while the follower pip is under the
+        // cursor, and waking per mouse message would spin the loop far faster
+        // than the 16 ms render cadence). Idle waits on
+        // MsgWaitForMultipleObjectsEx instead of sleeping, so it wakes
+        // immediately for EITHER a win32 message (tray click, menu command,
+        // the second-launch activate request, paint) or the wake event that
+        // `App::wake_ui` signals on every status change, with the long
+        // timeout purely as a backstop for unsignalled changes (a config
+        // flag flipped by Settings, history growth).
+        let wait = poll_interval(active_visible);
+        if active_visible {
+            std::thread::sleep(wait);
         } else {
-            IDLE_POLL_INTERVAL
-        });
+            use windows::Win32::UI::WindowsAndMessaging::{
+                MsgWaitForMultipleObjectsEx, MWMO_INPUTAVAILABLE, QS_ALLINPUT,
+            };
+            // MWMO_INPUTAVAILABLE: return immediately if input is ALREADY in
+            // the queue, not only for input arriving after the call -- without
+            // it a message posted between our PeekMessage drain and this wait
+            // would sit unprocessed for the whole timeout.
+            let _ = unsafe {
+                MsgWaitForMultipleObjectsEx(
+                    Some(&[wake_event]),
+                    wait.as_millis() as u32,
+                    QS_ALLINPUT,
+                    MWMO_INPUTAVAILABLE,
+                )
+            };
+        }
     }
     Ok(())
 }
@@ -554,6 +689,15 @@ struct Overlay {
     pixels: *mut u32,
     size: i32,
     visible: std::cell::Cell<bool>,
+    /// Cached label fonts, created once in `create` and sized off `size`.
+    /// `render` used to `CreateFontW`/`DeleteObject` a fresh font on every
+    /// repaint -- up to every `ACTIVE_POLL_INTERVAL` (16ms) while the pip is
+    /// visible -- which is pure per-frame churn for something that never
+    /// changes. `size` is fixed for the overlay's whole lifetime (nothing in
+    /// this file resizes it), so there's no cache-invalidation path here; a
+    /// future resize feature would need to rebuild these alongside it.
+    font_ui: HFONT,
+    font_icon: HFONT,
 }
 
 impl Overlay {
@@ -630,6 +774,14 @@ impl Overlay {
         }
         SelectObject(mem_dc, bitmap);
 
+        // Built once here rather than per-repaint -- see the `font_ui`/
+        // `font_icon` doc comment on the struct. Two distinct fonts: the
+        // MDL2 icon font for the (single) icon glyph, and a plain bold UI
+        // font for everything else (word counts and the short error labels
+        // from `error_glyph`).
+        let font_ui = create_label_font(size, 0.45, "Segoe UI\0");
+        let font_icon = create_label_font(size, 0.52, "Segoe MDL2 Assets\0");
+
         Ok(Self {
             hwnd,
             mem_dc,
@@ -637,6 +789,8 @@ impl Overlay {
             pixels: pixels_ptr as *mut u32,
             size,
             visible: std::cell::Cell::new(false),
+            font_ui,
+            font_icon,
         })
     }
 
@@ -740,32 +894,19 @@ impl Overlay {
         } else {
             // Draw the label on top. GDI doesn't touch the alpha channel, but
             // the disc interior already has alpha=255, so text stays opaque.
-            let (label, face_name, height_factor) = match status {
-                Status::Error if error_kind == ErrorKind::DeadKeys => {
-                    ("\u{E8D7}".to_string(), "Segoe MDL2 Assets\0", 0.52)
+            let (label, use_icon_font): (String, bool) = match status {
+                Status::Error => {
+                    let (glyph, icon) = error_glyph(error_kind);
+                    (glyph.to_string(), icon)
                 }
-                Status::Error => ("!".to_string(), "Segoe UI\0", 0.45),
-                _ => (format!("{word_count}"), "Segoe UI\0", 0.45),
+                _ => (format!("{word_count}"), false),
             };
             let mut label_utf16: Vec<u16> = label.encode_utf16().collect();
-            let font_height = (self.size as f32 * height_factor) as i32;
-            let face: Vec<u16> = face_name.encode_utf16().collect();
-            let font = CreateFontW(
-                -font_height,
-                0,
-                0,
-                0,
-                FW_BOLD.0 as i32,
-                0u32,
-                0u32,
-                0u32,
-                DEFAULT_CHARSET.0 as u32,
-                OUT_DEFAULT_PRECIS.0 as u32,
-                CLIP_DEFAULT_PRECIS.0 as u32,
-                ANTIALIASED_QUALITY.0 as u32,
-                (VARIABLE_PITCH.0 as u32) | (FF_DONTCARE.0 as u32),
-                PCWSTR(face.as_ptr()),
-            );
+            let font = if use_icon_font {
+                self.font_icon
+            } else {
+                self.font_ui
+            };
             let old_font = SelectObject(self.mem_dc, font);
             let _ = SetBkMode(self.mem_dc, TRANSPARENT);
 
@@ -797,8 +938,10 @@ impl Overlay {
                 &mut text_rect,
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE,
             );
+            // No DeleteObject here: `font` is one of the cached
+            // `font_ui`/`font_icon` handles, freed once in `Drop` rather than
+            // every repaint.
             SelectObject(self.mem_dc, old_font);
-            let _ = DeleteObject(font);
         }
 
         // Ship the bitmap to the screen, also moving the window.
@@ -840,9 +983,56 @@ impl Overlay {
     }
 }
 
+/// Pip glyph for a given error cause: the label text and whether it needs
+/// `Overlay::font_icon` (the Segoe MDL2 Assets icon font) instead of the
+/// plain `font_ui`. Pure and separate from the GDI calls in `Overlay::render`
+/// so the mapping itself is unit-testable. Every named `ErrorKind` variant is
+/// handled explicitly -- collapsing them behind a wildcard is exactly how
+/// this went stale before (everything but `DeadKeys` used to render as a
+/// bare "!").
+fn error_glyph(kind: ErrorKind) -> (&'static str, bool) {
+    match kind {
+        ErrorKind::Generic => ("!", false),
+        ErrorKind::DeadKeys => ("\u{E8D7}", true), // key glyph, MDL2 icon font
+        ErrorKind::Quota => ("$", false),
+        ErrorKind::RateLimited => ("429", false),
+        ErrorKind::Network => ("net", false),
+        ErrorKind::Elevated => ("UAC", false),
+        ErrorKind::HotkeyBlocked => ("hk", false),
+    }
+}
+
+/// Creates a bold, antialiased GDI font sized as `height_factor` of `size`
+/// (the pip's diameter). `face_name` must be nul-terminated (GDI wants a wide
+/// C string). Called twice total, once per cached font, in `Overlay::create`
+/// -- this used to run on every repaint (see the `font_ui`/`font_icon` doc
+/// comment on `Overlay`).
+unsafe fn create_label_font(size: i32, height_factor: f32, face_name: &str) -> HFONT {
+    let font_height = (size as f32 * height_factor) as i32;
+    let face: Vec<u16> = face_name.encode_utf16().collect();
+    CreateFontW(
+        -font_height,
+        0,
+        0,
+        0,
+        FW_BOLD.0 as i32,
+        0u32,
+        0u32,
+        0u32,
+        DEFAULT_CHARSET.0 as u32,
+        OUT_DEFAULT_PRECIS.0 as u32,
+        CLIP_DEFAULT_PRECIS.0 as u32,
+        ANTIALIASED_QUALITY.0 as u32,
+        (VARIABLE_PITCH.0 as u32) | (FF_DONTCARE.0 as u32),
+        PCWSTR(face.as_ptr()),
+    )
+}
+
 impl Drop for Overlay {
     fn drop(&mut self) {
         unsafe {
+            let _ = DeleteObject(self.font_ui);
+            let _ = DeleteObject(self.font_icon);
             let _ = DeleteObject(self.bitmap);
             let _ = DeleteDC(self.mem_dc);
         }
@@ -871,5 +1061,74 @@ unsafe extern "system" fn overlay_wnd_proc(
         }
         // No WM_PAINT handler: UpdateLayeredWindow drives all visuals.
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_glyph_covers_every_named_variant() {
+        // One deliberate call per variant rather than a loop over `0..=6` --
+        // this is the exhaustive `match` in `error_glyph` doing the real
+        // work; the point of the test is to lock each cause to its glyph, not
+        // to re-derive the mapping.
+        assert_eq!(error_glyph(ErrorKind::Generic), ("!", false));
+        assert_eq!(error_glyph(ErrorKind::DeadKeys), ("\u{E8D7}", true));
+        assert_eq!(error_glyph(ErrorKind::Quota), ("$", false));
+        assert_eq!(error_glyph(ErrorKind::RateLimited), ("429", false));
+        assert_eq!(error_glyph(ErrorKind::Network), ("net", false));
+        assert_eq!(error_glyph(ErrorKind::Elevated), ("UAC", false));
+        assert_eq!(error_glyph(ErrorKind::HotkeyBlocked), ("hk", false));
+    }
+
+    #[test]
+    fn error_glyph_labels_are_all_distinguishable() {
+        // The bug this replaces: every kind but DeadKeys collapsed to the
+        // same bare "!". Guard against a future edit reintroducing a
+        // duplicate by asserting every label is unique.
+        let kinds = [
+            ErrorKind::Generic,
+            ErrorKind::DeadKeys,
+            ErrorKind::Quota,
+            ErrorKind::RateLimited,
+            ErrorKind::Network,
+            ErrorKind::Elevated,
+            ErrorKind::HotkeyBlocked,
+        ];
+        let mut labels: Vec<&str> = kinds.iter().map(|k| error_glyph(*k).0).collect();
+        let before = labels.len();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), before, "two ErrorKind variants share a glyph");
+    }
+
+    #[test]
+    fn only_dead_keys_uses_the_icon_font() {
+        assert!(error_glyph(ErrorKind::DeadKeys).1);
+        for kind in [
+            ErrorKind::Generic,
+            ErrorKind::Quota,
+            ErrorKind::RateLimited,
+            ErrorKind::Network,
+            ErrorKind::Elevated,
+            ErrorKind::HotkeyBlocked,
+        ] {
+            assert!(
+                !error_glyph(kind).1,
+                "{kind:?} should use the plain UI font"
+            );
+        }
+    }
+
+    #[test]
+    fn poll_interval_is_fast_only_while_active() {
+        assert_eq!(poll_interval(true), ACTIVE_POLL_INTERVAL);
+        assert_eq!(poll_interval(false), IDLE_POLL_INTERVAL);
+        assert!(
+            IDLE_POLL_INTERVAL > ACTIVE_POLL_INTERVAL,
+            "idle sleep must actually be the long one"
+        );
     }
 }

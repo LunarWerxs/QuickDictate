@@ -6,7 +6,7 @@
 //! Settings saves from clobbering live totals. When Connections sync is enabled,
 //! a mergeable, numeric-only copy of the stats is included in the synced payload.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -23,6 +23,14 @@ use crate::config::Config;
 const STATS_FILE: &str = "quickdictate-stats.json";
 const HOUR_SECS: u64 = 60 * 60;
 const RECENT_HISTORY_HOURS: u64 = 24 * 8;
+/// A device with no activity for this long is folded into the archived
+/// bucket by `SyncedUsageStats::prune`, so a multi-year, multi-machine
+/// account does not accumulate one permanent entry per install id.
+const STALE_DEVICE_SECS: u64 = 60 * 60 * 24 * 180;
+/// Reserved device id that absorbs lifetime totals folded from evicted
+/// devices. Never evicted itself, and distinct from any real install id
+/// (those come from `new_local_device_id`, which is 32 hex chars).
+const ARCHIVED_DEVICE_ID: &str = "archived";
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
@@ -179,6 +187,13 @@ pub struct UsageStats {
     pub reset_id: String,
     /// Per-install monotonic counters make cloud merges idempotent.
     pub devices: BTreeMap<String, DeviceStats>,
+    /// Device ids already folded into the `ARCHIVED_DEVICE_ID` bucket by a
+    /// previous `SyncedUsageStats::prune`. Carried on `UsageStats` (not just
+    /// the synced wire format) so the ledger survives across separate
+    /// `merge_synced_value` calls: without it, a stale device's raw row
+    /// reappearing in a later sync would look "new" again and get folded a
+    /// second time.
+    pub archived_device_ids: BTreeSet<String>,
 }
 
 impl Default for UsageStats {
@@ -197,6 +212,7 @@ impl Default for UsageStats {
             reset_unix_secs: 0,
             reset_id: String::new(),
             devices: BTreeMap::new(),
+            archived_device_ids: BTreeSet::new(),
         }
     }
 }
@@ -336,37 +352,49 @@ impl UsageStats {
         serde_json::to_value(SyncedUsageStats::from(self)).unwrap_or(Value::Null)
     }
 
+    /// Merge a remote synced snapshot into this store. Devices from both
+    /// sides are unioned monotonically first, and only the combined result
+    /// is pruned (see `SyncedUsageStats::prune`) — never either side in
+    /// isolation — so stale-device eviction always sees the full picture.
+    /// Returns whether anything actually changed.
     pub fn merge_synced_value(&mut self, remote: &Value) -> bool {
-        let Ok(mut remote) = serde_json::from_value::<SyncedUsageStats>(remote.clone()) else {
+        let Ok(remote) = serde_json::from_value::<SyncedUsageStats>(remote.clone()) else {
             return false;
         };
         let now = unix_now();
         self.normalize(now);
-        remote.prune(now);
         let before = SyncedUsageStats::from(&*self);
         let mut merged = before.clone();
         merged.merge(&remote);
+        merged.prune(now);
         if merged == before {
             return false;
         }
         self.reset_unix_secs = merged.reset_unix_secs;
         self.reset_id = merged.reset_id;
         self.devices = merged.devices;
+        self.archived_device_ids = merged.archived_device_ids;
         self.normalize(now);
         true
     }
 
+    /// Merge two synced snapshots directly (used to reconcile two pushes
+    /// racing against the same cloud document). Devices are unioned first
+    /// and the combined result is pruned once, for the same reason
+    /// `merge_synced_value` prunes after merging rather than before:
+    /// pruning either side in isolation could fold a different subset of
+    /// stale devices on each side, and a later monotonic (max) merge of two
+    /// independently-folded archive totals would understate the true sum.
     pub fn merge_synced_values(local: &Value, remote: &Value) -> Value {
         let Ok(mut local) = serde_json::from_value::<SyncedUsageStats>(local.clone()) else {
             return remote.clone();
         };
-        let Ok(mut remote) = serde_json::from_value::<SyncedUsageStats>(remote.clone()) else {
+        let Ok(remote) = serde_json::from_value::<SyncedUsageStats>(remote.clone()) else {
             return serde_json::to_value(local).unwrap_or(Value::Null);
         };
         let now = unix_now();
-        local.prune(now);
-        remote.prune(now);
         local.merge(&remote);
+        local.prune(now);
         serde_json::to_value(local).unwrap_or(Value::Null)
     }
 }
@@ -397,6 +425,15 @@ struct SyncedUsageStats {
     reset_id: String,
     #[serde(rename = "d", alias = "devices")]
     devices: BTreeMap<String, DeviceStats>,
+    /// Device ids already folded into the archived bucket by a previous
+    /// `prune`, so a stale device that reappears in a later sync (the same
+    /// remote value merged again, or a peer that never itself pruned it
+    /// resending its raw row) is dropped instead of being summed into the
+    /// archive a second time. `#[serde(default)]` (via the container
+    /// attribute above) means an older peer that has never seen this field
+    /// just reads an empty set and keeps working.
+    #[serde(rename = "af", alias = "archived_device_ids")]
+    archived_device_ids: BTreeSet<String>,
 }
 
 impl From<&UsageStats> for SyncedUsageStats {
@@ -406,15 +443,72 @@ impl From<&UsageStats> for SyncedUsageStats {
             reset_unix_secs: stats.reset_unix_secs,
             reset_id: stats.reset_id.clone(),
             devices: stats.devices.clone(),
+            archived_device_ids: stats.archived_device_ids.clone(),
         }
     }
 }
 
 impl SyncedUsageStats {
+    /// Trim stale hourly history and fold devices that have gone quiet for
+    /// `STALE_DEVICE_SECS` into the reserved `ARCHIVED_DEVICE_ID` bucket, so
+    /// a multi-year, multi-machine account does not accumulate one
+    /// permanent row per install id.
+    ///
+    /// Callers always run this *after* unioning devices from both sides of
+    /// a merge, never before: this must be a pure function of `self` and
+    /// `now`, where pruning an already-pruned document, or pruning the same
+    /// document twice, is a no-op. That rules out an unconditional
+    /// accumulator (folding into the archive on every call), because the
+    /// exact same stale device can arrive again on the next sync — its raw
+    /// row simply gets re-merged in from whichever side never itself pruned
+    /// it. `archived_device_ids` is the guard: once a device id has been
+    /// folded in, it is never folded again, so a resurrected raw row is
+    /// dropped in place instead of being summed a second time.
+    ///
+    /// Folding uses `add_assign` (summed) rather than `merge_monotonic`
+    /// (maxed), because unlike two reports of the *same* device, two
+    /// different retired devices contributed independently and their counts
+    /// should add up. `hours` is intentionally not carried into the
+    /// archive: it is already capped to `RECENT_HISTORY_HOURS`, and a device
+    /// stale enough to evict has no hour buckets left inside that window
+    /// anyway. The archived bucket itself is exempt from eviction so it
+    /// cannot fold into itself.
     fn prune(&mut self, now: u64) {
         let oldest = now.saturating_sub(RECENT_HISTORY_HOURS * HOUR_SECS);
         for device in self.devices.values_mut() {
             device.hours.retain(|hour, _| *hour >= oldest);
+        }
+
+        let cutoff = now.saturating_sub(STALE_DEVICE_SECS);
+        let stale_ids: Vec<String> = self
+            .devices
+            .iter()
+            .filter(|(id, device)| {
+                id.as_str() != ARCHIVED_DEVICE_ID && device.last_dictation_unix_secs < cutoff
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in stale_ids {
+            let Some(stale) = self.devices.remove(&id) else {
+                continue;
+            };
+            if !self.archived_device_ids.insert(id) {
+                // Already folded on a previous prune; the raw row simply
+                // reappeared, so drop it without summing it in again.
+                continue;
+            }
+            let archived = self
+                .devices
+                .entry(ARCHIVED_DEVICE_ID.to_string())
+                .or_default();
+            archived.tracking_started_unix_secs = earliest_nonzero(
+                archived.tracking_started_unix_secs,
+                stale.tracking_started_unix_secs,
+            );
+            archived.last_dictation_unix_secs = archived
+                .last_dictation_unix_secs
+                .max(stale.last_dictation_unix_secs);
+            archived.totals.add_assign(&stale.totals);
         }
     }
 
@@ -435,6 +529,8 @@ impl SyncedUsageStats {
                 .or_default()
                 .merge_monotonic(remote);
         }
+        self.archived_device_ids
+            .extend(other.archived_device_ids.iter().cloned());
     }
 }
 
@@ -1004,5 +1100,184 @@ mod tests {
         join.join().unwrap();
 
         let _ = fs::remove_file(path);
+    }
+
+    // The eviction logic used to live in `UsageStats::normalize` and these
+    // tests drove it through `.normalize()`. It now lives in
+    // `SyncedUsageStats::prune` (called after devices from both sides of a
+    // merge are unioned, never on a lone local snapshot), so the tests
+    // below exercise `prune` directly.
+
+    #[test]
+    fn stale_device_is_evicted_after_the_cutoff() {
+        let now = 2_000_000_000u64;
+        let mut synced = SyncedUsageStats::default();
+        synced.devices.insert(
+            "current".into(),
+            DeviceStats {
+                last_dictation_unix_secs: now,
+                ..Default::default()
+            },
+        );
+        synced.devices.insert(
+            "retired-laptop".into(),
+            DeviceStats {
+                tracking_started_unix_secs: now - STALE_DEVICE_SECS - HOUR_SECS,
+                last_dictation_unix_secs: now - STALE_DEVICE_SECS - HOUR_SECS,
+                totals: PeriodStats {
+                    words: 30,
+                    audio_ms: 9_000,
+                    dictations: 3,
+                    ..Default::default()
+                },
+                hours: BTreeMap::new(),
+            },
+        );
+
+        synced.prune(now);
+
+        assert!(!synced.devices.contains_key("retired-laptop"));
+        assert!(synced.devices.contains_key("current"));
+    }
+
+    #[test]
+    fn evicted_device_totals_are_folded_into_the_archived_bucket() {
+        let now = 2_000_000_000u64;
+        let mut synced = SyncedUsageStats::default();
+        synced.devices.insert(
+            "current".into(),
+            DeviceStats {
+                last_dictation_unix_secs: now,
+                ..Default::default()
+            },
+        );
+        synced.devices.insert(
+            "retired-laptop".into(),
+            DeviceStats {
+                tracking_started_unix_secs: now - STALE_DEVICE_SECS - HOUR_SECS,
+                last_dictation_unix_secs: now - STALE_DEVICE_SECS - HOUR_SECS,
+                totals: PeriodStats {
+                    words: 30,
+                    audio_ms: 9_000,
+                    dictations: 3,
+                    ..Default::default()
+                },
+                hours: BTreeMap::new(),
+            },
+        );
+
+        synced.prune(now);
+
+        let archived = synced
+            .devices
+            .get(ARCHIVED_DEVICE_ID)
+            .expect("evicted totals should be folded into the archived bucket");
+        assert_eq!(archived.totals.words, 30);
+        assert_eq!(archived.totals.audio_ms, 9_000);
+        assert_eq!(archived.totals.dictations, 3);
+        assert!(synced.archived_device_ids.contains("retired-laptop"));
+    }
+
+    #[test]
+    fn a_device_with_a_recent_dictation_is_never_evicted_even_if_every_other_device_is_stale() {
+        // There is no longer a "current device" exemption inside `prune` —
+        // it has no notion of which device is local (that concept only
+        // exists on `UsageStats`, and both sides of a merge must prune
+        // identically). A device survives purely because its own timestamp
+        // is recent, which is what actually protects the device performing
+        // a sync in practice: recording a dictation refreshes its
+        // `last_dictation_unix_secs` to "now" before any merge runs.
+        let now = 2_000_000_000u64;
+        let mut synced = SyncedUsageStats::default();
+        synced.devices.insert(
+            "active".into(),
+            DeviceStats {
+                tracking_started_unix_secs: now - STALE_DEVICE_SECS - HOUR_SECS,
+                last_dictation_unix_secs: now,
+                totals: PeriodStats {
+                    words: 4,
+                    audio_ms: 500,
+                    dictations: 1,
+                    ..Default::default()
+                },
+                hours: BTreeMap::new(),
+            },
+        );
+
+        synced.prune(now);
+
+        assert!(synced.devices.contains_key("active"));
+        assert_eq!(synced.devices["active"].totals.words, 4);
+    }
+
+    #[test]
+    fn pruning_a_synced_document_twice_is_a_no_op() {
+        let now = 2_000_000_000u64;
+        let mut synced = SyncedUsageStats::default();
+        synced.devices.insert(
+            "current".into(),
+            DeviceStats {
+                last_dictation_unix_secs: now,
+                ..Default::default()
+            },
+        );
+        synced.devices.insert(
+            "retired-laptop".into(),
+            DeviceStats {
+                tracking_started_unix_secs: now - STALE_DEVICE_SECS - HOUR_SECS,
+                last_dictation_unix_secs: now - STALE_DEVICE_SECS - HOUR_SECS,
+                totals: PeriodStats {
+                    words: 30,
+                    audio_ms: 9_000,
+                    dictations: 3,
+                    ..Default::default()
+                },
+                hours: BTreeMap::new(),
+            },
+        );
+
+        synced.prune(now);
+        let once = synced.clone();
+        synced.prune(now);
+
+        assert_eq!(
+            synced, once,
+            "pruning an already-pruned document must be a no-op"
+        );
+    }
+
+    #[test]
+    fn a_reappearing_raw_row_for_an_already_archived_device_is_not_folded_again() {
+        // Simulates the actual bug: a stale device's raw row keeps arriving
+        // from a peer that never itself pruned it, on every sync. The first
+        // prune folds it in; a later prune that sees the same raw row again
+        // must drop it without summing it into the archive a second time.
+        let now = 2_000_000_000u64;
+        let stale_device = DeviceStats {
+            tracking_started_unix_secs: now - STALE_DEVICE_SECS - HOUR_SECS,
+            last_dictation_unix_secs: now - STALE_DEVICE_SECS - HOUR_SECS,
+            totals: PeriodStats {
+                words: 30,
+                audio_ms: 9_000,
+                dictations: 3,
+                ..Default::default()
+            },
+            hours: BTreeMap::new(),
+        };
+        let mut synced = SyncedUsageStats::default();
+        synced
+            .devices
+            .insert("retired-laptop".into(), stale_device.clone());
+        synced.prune(now);
+        assert_eq!(synced.devices[ARCHIVED_DEVICE_ID].totals.words, 30);
+
+        // The same raw row reappears, as it would after unioning in a fresh
+        // remote payload that carried it unpruned.
+        synced.devices.insert("retired-laptop".into(), stale_device);
+        synced.prune(now);
+
+        assert!(!synced.devices.contains_key("retired-laptop"));
+        assert_eq!(synced.devices[ARCHIVED_DEVICE_ID].totals.words, 30);
+        assert_eq!(synced.devices[ARCHIVED_DEVICE_ID].totals.dictations, 3);
     }
 }

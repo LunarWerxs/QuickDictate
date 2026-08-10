@@ -137,13 +137,45 @@ pub enum ErrorKind {
     /// Every configured API key for the active provider was rejected as
     /// invalid/unauthorized this run (see `keys::KeyPool::all_dead`).
     DeadKeys = 1,
+    /// The provider says the account is out of credit / over its plan quota.
+    /// Distinct from `DeadKeys`: the credential is fine, the balance is not.
+    Quota = 2,
+    /// The provider rate-limited us (HTTP 429 or equivalent). Transient.
+    RateLimited = 3,
+    /// The transport failed: no route, DNS, TLS, or a dropped socket.
+    Network = 4,
+    /// The focused window runs at a higher integrity level, so Windows' UIPI
+    /// discards our injected keystrokes. The text is left on the clipboard.
+    Elevated = 5,
+    /// A global hotkey is registered by another process and QuickDictate has
+    /// been unable to claim it (see `hotkeys::hotkeys_blocked`).
+    HotkeyBlocked = 6,
 }
 
 impl ErrorKind {
     pub fn from_u8(v: u8) -> Self {
         match v {
             1 => ErrorKind::DeadKeys,
+            2 => ErrorKind::Quota,
+            3 => ErrorKind::RateLimited,
+            4 => ErrorKind::Network,
+            5 => ErrorKind::Elevated,
+            6 => ErrorKind::HotkeyBlocked,
             _ => ErrorKind::Generic,
+        }
+    }
+
+    /// One short line for the tray tooltip and the pip's hover text. Kept here
+    /// rather than in `ui.rs` so every surface phrases a cause identically.
+    pub fn tooltip(self) -> &'static str {
+        match self {
+            ErrorKind::Generic => "Last dictation failed",
+            ErrorKind::DeadKeys => "API keys were rejected",
+            ErrorKind::Quota => "Provider account is out of credit",
+            ErrorKind::RateLimited => "Provider is rate limiting, try again shortly",
+            ErrorKind::Network => "Could not reach the provider",
+            ErrorKind::Elevated => "Cannot type into an elevated window; text is on the clipboard",
+            ErrorKind::HotkeyBlocked => "A hotkey is claimed by another app",
         }
     }
 }
@@ -166,6 +198,20 @@ pub struct App {
     /// older entry.
     pub replay_tx: crossbeam_channel::Sender<Option<usize>>,
     pub replay_rx: crossbeam_channel::Receiver<Option<usize>>,
+    /// Wakes the overlay/tray thread the moment anything it renders changes.
+    ///
+    /// That thread idles on `MsgWaitForMultipleObjectsEx` (so any win32
+    /// message, a tray click, a menu command, a second launch's activate
+    /// request, wakes it instantly), and this is the non-message half: a
+    /// win32 auto-reset event, signalled by every status transition, so the
+    /// cursor pip lights the moment the hotkey thread flips the status
+    /// instead of at the next idle tick up to a second later.
+    ///
+    /// Stored as the raw handle value; `0` until the UI thread creates the
+    /// event and registers it via [`App::register_ui_wake_event`], during
+    /// which window `wake_ui` is a harmless no-op (nothing exists to render
+    /// yet). Never closed: it lives exactly as long as the process.
+    ui_wake_event: std::sync::atomic::AtomicIsize,
     pub current_key: Mutex<Option<String>>,
     /// Rolling log of recent transcriptions (newest first), the generalized
     /// replacement for the old single "last transcription" slot.
@@ -198,6 +244,7 @@ impl App {
             transcript_tx,
             transcript_rx,
             replay_tx,
+            ui_wake_event: std::sync::atomic::AtomicIsize::new(0),
             replay_rx,
             current_key: Mutex::new(None),
             history: Mutex::new(TranscriptHistory::new()),
@@ -213,6 +260,32 @@ impl App {
 
     pub fn set_status(&self, s: Status) {
         self.status.store(s as u8, Ordering::Release);
+        self.wake_ui();
+    }
+
+    /// Publish the UI thread's wake event so [`App::wake_ui`] has something to
+    /// signal. Called once, from the overlay thread, right after it creates
+    /// the auto-reset event it idles on.
+    pub fn register_ui_wake_event(&self, raw_handle: isize) {
+        self.ui_wake_event
+            .store(raw_handle, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Nudge the overlay/tray thread so it renders this change now instead of
+    /// at its next idle tick. Never blocks (SetEvent on an auto-reset event),
+    /// and callers include the audio and session hot paths. A no-op before the
+    /// UI thread has registered its event.
+    pub fn wake_ui(&self) {
+        let raw = self
+            .ui_wake_event
+            .load(std::sync::atomic::Ordering::Acquire);
+        if raw != 0 {
+            unsafe {
+                let _ = windows::Win32::System::Threading::SetEvent(
+                    windows::Win32::Foundation::HANDLE(raw as *mut core::ffi::c_void),
+                );
+            }
+        }
     }
 
     /// The cause of the current [`Status::Error`]. Only meaningful while the
@@ -230,14 +303,19 @@ impl App {
     }
 
     pub fn clear_status_if(&self, current: Status, next: Status) -> bool {
-        self.status
+        let changed = self
+            .status
             .compare_exchange(
                 current as u8,
                 next as u8,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .is_ok()
+            .is_ok();
+        if changed {
+            self.wake_ui();
+        }
+        changed
     }
 
     /// Atomically transition Starting -> Listening. No-op if main has already
@@ -245,14 +323,19 @@ impl App {
     /// session became fully ready). Prevents a stale background session from
     /// re-lighting the pip after the user expects it gone.
     pub fn promote_starting_to_listening(&self) -> bool {
-        self.status
+        let promoted = self
+            .status
             .compare_exchange(
                 Status::Starting as u8,
                 Status::Listening as u8,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .is_ok()
+            .is_ok();
+        if promoted {
+            self.wake_ui();
+        }
+        promoted
     }
 
     pub fn next_session_epoch(&self) -> u64 {
