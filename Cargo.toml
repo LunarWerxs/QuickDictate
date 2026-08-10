@@ -1,6 +1,6 @@
 [package]
 name = "quickdictate"
-version = "0.5.5"
+version = "0.5.6"
 edition = "2021"
 description = "Fast Windows dictation with cloud and optional local speech recognition"
 license = "MIT"
