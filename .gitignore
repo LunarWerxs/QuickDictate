@@ -49,7 +49,9 @@ settings.json
 # provider tests are #[ignore] + need real keys, so these aren't needed in CI.
 tests/fixtures/*.wav
 
-# Headless UI screenshots (scripts/ui_shot.ps1) — dev-only artifacts.
+# Headless UI screenshots (scripts/ui_shot.ps1), dev-only artifacts. The
+# capture writes `.tmp` first and renames, so a killed run can leave it behind.
+.tmp
 ui-shot*.png
 ui-*.png
 
