@@ -1,0 +1,794 @@
+//! The main Settings cards: onboarding, provider and keys, dictation,
+//! and application behavior.
+
+use super::*;
+
+impl super::SettingsApp {
+    /// First-run onboarding banner, pinned above the provider card while *no*
+    /// provider has any key. QuickDictate is unusable until a key is added, so
+    /// when we auto-open Settings at launch (see `main`) this makes the very
+    /// first action obvious instead of leaving the user to guess. It reads the
+    /// live draft, so it vanishes the instant a key is saved into any provider.
+    pub(crate) fn onboarding_banner(&mut self, ui: &mut egui::Ui) {
+        if self.draft.stt_provider.eq_ignore_ascii_case("local")
+            || !self.draft.providers_with_keys().is_empty()
+        {
+            return;
+        }
+        let acc = accent();
+        egui::Frame::new()
+            .fill(acc.gamma_multiply(0.16))
+            .stroke(Stroke::new(1.0, acc.gamma_multiply(0.55)))
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(Margin::same(14))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    RichText::new("Add an API key to get started")
+                        .font(semibold(15.0))
+                        .color(text()),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "QuickDictate is bring-your-own-key. Pick a provider below, then \
+                         \"Manage keys\u{2026}\" to paste a key from any one of them \
+                         (ElevenLabs, Deepgram, OpenAI, AssemblyAI, DashScope, or Google). \
+                         Hit Save & Restart when you're done. Free tiers/trials exist for \
+                         several providers — signup links are in the README.",
+                    )
+                    .size(12.5)
+                    .color(muted()),
+                );
+                ui.add_space(8.0);
+                if accent_button(ui, "Manage keys\u{2026}").clicked() {
+                    self.open_keys_modal();
+                }
+            });
+        ui.add_space(10.0);
+    }
+    /// A newer release the daily auto-check found but hasn't installed (see
+    /// `update::pending_update`) — surfaced here too, not just the tray
+    /// tooltip, since Settings is where most people go looking. Installing
+    /// itself still only happens from the About window's pill, matching the
+    /// click-to-consent model everywhere else in the app.
+    pub(crate) fn update_available_banner(&mut self, ui: &mut egui::Ui) {
+        let Some(tag) = crate::update::pending_update() else {
+            return;
+        };
+        egui::Frame::new()
+            .fill(good().gamma_multiply(0.14))
+            .stroke(Stroke::new(1.0, good().gamma_multiply(0.5)))
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(Margin::same(12))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("Update available: v{tag}"))
+                            .font(semibold(14.0))
+                            .color(text()),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if accent_button(ui, "Review\u{2026}").clicked() {
+                            crate::about::show_about();
+                        }
+                    });
+                });
+            });
+        ui.add_space(10.0);
+    }
+    pub(crate) fn provider_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, testing: bool) {
+        card(ui, |ui| {
+            section_title(ui, "\u{E720}", "Speech-to-text provider");
+            // Dropdown + key actions all on one row (saves a whole row).
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt("provider")
+                    .width(200.0)
+                    .selected_text(provider_label(&self.draft.stt_provider))
+                    .show_ui(ui, |ui| {
+                        for (id, label) in providers() {
+                            if ui
+                                .selectable_value(
+                                    &mut self.draft.stt_provider,
+                                    id.to_string(),
+                                    label,
+                                )
+                                .changed()
+                            {
+                                self.verdicts.clear();
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Which speech-to-text service transcribes your dictation. Add its \
+                         API keys with Manage keys.",
+                    );
+                if self.draft.stt_provider != "local" {
+                    if accent_button(ui, "Manage keys\u{2026}")
+                        .on_hover_text("Add, remove, or paste API keys for the selected provider.")
+                        .clicked()
+                    {
+                        self.open_keys_modal();
+                    }
+                    if ui
+                        .add_enabled(!testing, egui::Button::new("Test all keys"))
+                        .on_hover_text(
+                            "Check every saved key for this provider against its live API.",
+                        )
+                        .clicked()
+                    {
+                        let keys = self.active_keys();
+                        self.start_key_test(ctx, keys);
+                    }
+                }
+            });
+
+            ui.add_space(6.0);
+            blue_check(
+                ui,
+                &mut self.draft.protect_keys_at_rest,
+                "Encrypt API keys in settings.json (this PC and Windows account only)",
+            )
+            .on_hover_text(
+                "Seals your API keys with Windows DPAPI so settings.json only decrypts on this \
+                 exact Windows account and machine. If you copy this portable folder to another \
+                 PC or another Windows user, the sealed keys will NOT work there \u{2014} you'll \
+                 need to paste them in again.",
+            );
+
+            if self.draft.stt_provider == "local" {
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(
+                        "Runs fully offline after installation. Models are stored in Local AppData, \
+                         not in QuickDictate or this repository. The selected model stays warmed in \
+                         memory while Local is active; switching providers releases it.",
+                    )
+                    .size(12.0)
+                    .color(muted()),
+                );
+                ui.add_space(7.0);
+                ui.horizontal(|ui| {
+                    ui.label("Active model");
+                    egui::ComboBox::from_id_salt("local_model")
+                        .width(260.0)
+                        .selected_text(
+                            crate::local_stt::model(&self.draft.local_model)
+                                .map(|m| m.label)
+                                .unwrap_or("Unknown"),
+                        )
+                        .show_ui(ui, |ui| {
+                            for spec in crate::local_stt::MODELS {
+                                ui.selectable_value(
+                                    &mut self.draft.local_model,
+                                    spec.id.to_string(),
+                                    spec.label,
+                                )
+                                .on_hover_text(spec.detail);
+                            }
+                        });
+                });
+                ui.add_space(7.0);
+                for spec in crate::local_stt::MODELS {
+                    let snapshot = crate::local_stt::install_snapshot(spec.id);
+                    if snapshot.busy() {
+                        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                    }
+                    ui.horizontal(|ui| {
+                        let selected = self.draft.local_model == spec.id;
+                        if selected {
+                            chip(ui, "selected", accent());
+                        } else if ui.small_button("Use").clicked() {
+                            self.draft.local_model = spec.id.to_string();
+                        }
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new(spec.label).color(text()));
+                            ui.label(RichText::new(spec.detail).size(11.5).color(muted()));
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            match &snapshot.phase {
+                                crate::local_stt::InstallPhase::Installed => {
+                                    if ui
+                                        .button(delete_glyph())
+                                        .on_hover_text(
+                                            "Delete this downloaded model from this PC. \
+                                             You can install it again later.",
+                                        )
+                                        .clicked()
+                                    {
+                                        if let Err(e) = crate::local_stt::start_remove(spec.id) {
+                                            self.status = e;
+                                        }
+                                    }
+                                }
+                                crate::local_stt::InstallPhase::NotInstalled
+                                | crate::local_stt::InstallPhase::Failed(_) => {
+                                    if accent_button(ui, "Install").clicked() {
+                                        if let Err(e) = crate::local_stt::start_install(spec.id) {
+                                            self.status = e;
+                                        }
+                                    }
+                                }
+                                crate::local_stt::InstallPhase::DownloadingRuntime
+                                | crate::local_stt::InstallPhase::DownloadingModel => {
+                                    if ui.button("Cancel").clicked() {
+                                        if let Err(e) = crate::local_stt::cancel_install(spec.id) {
+                                            self.status = e;
+                                        }
+                                    }
+                                    let pct = snapshot
+                                        .downloaded
+                                        .saturating_mul(100)
+                                        .checked_div(snapshot.total)
+                                        .unwrap_or(0);
+                                    ui.label(
+                                        RichText::new(format!("{pct}%")).size(12.0).color(muted()),
+                                    );
+                                    ui.add(egui::Spinner::new().size(14.0));
+                                }
+                                crate::local_stt::InstallPhase::InstallingRuntime
+                                | crate::local_stt::InstallPhase::VerifyingDownload => {
+                                    if ui.button("Cancel").clicked() {
+                                        if let Err(e) = crate::local_stt::cancel_install(spec.id) {
+                                            self.status = e;
+                                        }
+                                    }
+                                    let label = if matches!(
+                                        snapshot.phase,
+                                        crate::local_stt::InstallPhase::VerifyingDownload
+                                    ) {
+                                        "verifying\u{2026}"
+                                    } else {
+                                        "installing runtime\u{2026}"
+                                    };
+                                    ui.label(RichText::new(label).size(12.0).color(muted()));
+                                    ui.add(egui::Spinner::new().size(14.0));
+                                }
+                                crate::local_stt::InstallPhase::Cancelling => {
+                                    ui.label(
+                                        RichText::new("cancelling\u{2026}")
+                                            .size(12.0)
+                                            .color(muted()),
+                                    );
+                                    ui.add(egui::Spinner::new().size(14.0));
+                                }
+                                crate::local_stt::InstallPhase::Removing => {
+                                    ui.label(
+                                        RichText::new("removing\u{2026}").size(12.0).color(muted()),
+                                    );
+                                    ui.add(egui::Spinner::new().size(14.0));
+                                }
+                            }
+                        });
+                    });
+                    if let crate::local_stt::InstallPhase::Failed(message) = &snapshot.phase {
+                        ui.label(
+                            RichText::new(format!("Install problem: {message}"))
+                                .size(11.5)
+                                .color(bad()),
+                        );
+                    }
+                    ui.add_space(4.0);
+                }
+            }
+
+            // DashScope's region toggle only applies to that provider, so it
+            // sits on its own line and only when DashScope is selected.
+            if self.draft.stt_provider == "dashscope" {
+                ui.add_space(6.0);
+                blue_check(ui, &mut self.draft.dashscope_intl, "International account")
+                    .on_hover_text(
+                        "Use DashScope's international endpoint instead of the mainland-China one.",
+                    );
+            }
+
+            // (The "N key(s) configured" line was removed as noise — the
+            // Manage keys… modal shows the actual keys and their verdicts.)
+            let ok_count = self.verdicts.iter().filter(|(_, ok)| *ok).count();
+            let fail_count = self.verdicts.iter().filter(|(_, ok)| !*ok).count();
+            if ok_count > 0 || fail_count > 0 || testing {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ok_count > 0 {
+                        chip(ui, &format!("{ok_count} working"), good());
+                    }
+                    if fail_count > 0 {
+                        chip(ui, &format!("{fail_count} failing"), bad());
+                    }
+                    if testing {
+                        ui.add(egui::Spinner::new().size(14.0));
+                        ui.label(RichText::new("testing\u{2026}").color(muted()));
+                    }
+                });
+            }
+        });
+    }
+    /// A hotkey text field with a small, subtle "record" dot tucked into its
+    /// right edge (instead of a separate wide button). Click the dot to arm
+    /// capture — the next keypress fills the field; click again (or Esc) to
+    /// cancel. Armed = a solid accent dot; the field greys while listening so
+    /// the keypress can't also land in the text well. `width` matches this
+    /// field to the control directly above it (Language / Mode) so the 2×2
+    /// block reads as two clean columns instead of the hotkey wells jutting
+    /// out wider.
+    pub(crate) fn hotkey_field_ui(&mut self, ui: &mut egui::Ui, field: HotkeyField, width: f32) {
+        let recording = self.recording == Some(field);
+        let value = match field {
+            HotkeyField::Toggle => &mut self.draft.toggle_hotkey,
+            HotkeyField::Hold => &mut self.draft.hold_hotkey,
+        };
+        // The record dot floats over the field's right edge; padding-right on
+        // the well keeps typed text from sliding under it.
+        let resp = ui.add_enabled(
+            !recording,
+            styled_input(value).desired_width(width).margin(Margin {
+                left: 6,
+                // Right padding reserves room for the record dot so typed text
+                // (even a long combo) never slides under it.
+                right: 26,
+                top: CTRL_PAD,
+                bottom: CTRL_PAD,
+            }),
+        );
+        let resp = resp.on_hover_text(match field {
+            HotkeyField::Toggle => TIP_TOGGLE_HOTKEY,
+            HotkeyField::Hold => TIP_HOLD_HOTKEY,
+        });
+
+        let side = (resp.rect.height() - 6.0).max(12.0);
+        let dot_rect = egui::Rect::from_center_size(
+            egui::pos2(resp.rect.right() - side / 2.0 - 4.0, resp.rect.center().y),
+            egui::vec2(side, side),
+        );
+        let tag = match field {
+            HotkeyField::Toggle => "toggle",
+            HotkeyField::Hold => "hold",
+        };
+        let id = ui.make_persistent_id(("hotkey_record", tag));
+        // Sense the click on the dot's rect. Added AFTER the text field, so it
+        // sits on top and wins the click over the well beneath it.
+        let hit = ui.interact(dot_rect, id, egui::Sense::click());
+        let center = dot_rect.center();
+        let r = side * 0.26;
+        {
+            let p = ui.painter();
+            if recording {
+                p.circle_filled(center, r, accent());
+                p.circle_stroke(
+                    center,
+                    r + 2.5,
+                    Stroke::new(1.5, accent().gamma_multiply(0.45)),
+                );
+            } else {
+                let col = if hit.hovered() { accent() } else { muted() };
+                p.circle_stroke(center, r, Stroke::new(1.6, col));
+                p.circle_filled(center, r * 0.5, col);
+            }
+        }
+        let hit = hit
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(if recording {
+                "Listening — press a key (Esc to cancel)"
+            } else {
+                "Record hotkey"
+            });
+        if hit.clicked() {
+            self.recording = if recording { None } else { Some(field) };
+        }
+    }
+    pub(crate) fn dictation_card(&mut self, ui: &mut egui::Ui) {
+        card(ui, |ui| {
+            section_title(ui, "\u{E765}", "Dictation");
+
+            // ---- Top: a 2×2 block of labeled inputs / dropdowns ----------
+            // Two independent columns, each a [label | control] mini-grid, so
+            // the left half's widths never couple to the right half's (a single
+            // 4-column grid let the wide Mode/Hold side squeeze the Language/
+            // Toggle side). Visually: Language / Mode on top, hotkeys below.
+            ui.columns(2, |cols| {
+                egui::Grid::new("dict_left")
+                    .num_columns(2)
+                    .spacing([10.0, 10.0])
+                    .show(&mut cols[0], |ui| {
+                        ui.label("Language (BCP-47)").on_hover_text(TIP_LANGUAGE);
+                        ui.add(styled_input(&mut self.draft.language).desired_width(130.0))
+                            .on_hover_text(TIP_LANGUAGE);
+                        ui.end_row();
+                        ui.label("Toggle hotkey").on_hover_text(TIP_TOGGLE_HOTKEY);
+                        self.hotkey_field_ui(ui, HotkeyField::Toggle, 130.0);
+                        ui.end_row();
+                    });
+                egui::Grid::new("dict_right")
+                    .num_columns(2)
+                    .spacing([10.0, 10.0])
+                    .show(&mut cols[1], |ui| {
+                        ui.label("Mode").on_hover_text(TIP_MODE);
+                        egui::ComboBox::from_id_salt("mode")
+                            .width(120.0)
+                            .selected_text(self.draft.mode.clone())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.draft.mode,
+                                    "toggle".into(),
+                                    "toggle",
+                                );
+                                ui.selectable_value(&mut self.draft.mode, "hold".into(), "hold");
+                            })
+                            .response
+                            .on_hover_text(TIP_MODE);
+                        ui.end_row();
+                        ui.label("Hold hotkey").on_hover_text(TIP_HOLD_HOTKEY);
+                        self.hotkey_field_ui(ui, HotkeyField::Hold, 120.0);
+                        ui.end_row();
+                    });
+            });
+
+            // Windows only grants a hotkey to the first process that asks for
+            // it; if another app got there first, `RegisterHotKey` fails and
+            // that failure otherwise only reaches a log file. Surface it here
+            // so a combo Windows won't grant is never silently invisible.
+            if crate::hotkeys::hotkeys_blocked() {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "Another app is holding one of these hotkeys \u{2014} try a different \
+                         combination.",
+                    )
+                    .size(11.5)
+                    .color(bad()),
+                );
+            }
+
+            // No separator here: the timing row sits snug under the 2×2 block
+            // above so it reads as one group and the card stays short.
+            ui.add_space(4.0);
+
+            // ---- Timing levers ------------------------------------------
+            // Two "how long" knobs users asked to tune (both stored in ms),
+            // laid out label|control in two columns to match the inputs above
+            // (they used to be long full-width sliders):
+            //  • Hold-to-re-paste: how long holding the toggle hotkey replays
+            //    your last dictation. It's a hotkey timing, wired up at launch,
+            //    so it applies after a restart.
+            //  • Keep-listening tail: how long QuickDictate keeps capturing
+            //    after you stop talking before finalizing. Read per session,
+            //    so it applies on your next dictation — no restart needed.
+            ui.columns(2, |cols| {
+                egui::Grid::new("dict_timing_left")
+                    .num_columns(2)
+                    .spacing([10.0, 10.0])
+                    .show(&mut cols[0], |ui| {
+                        ui.label("Hold to re-paste").on_hover_text(TIP_REPASTE);
+                        secs_input(
+                            ui,
+                            &mut self.draft.reinsert_hold_ms,
+                            0.5..=4.0,
+                            "reinsert_hold",
+                        )
+                        .on_hover_text(TIP_REPASTE);
+                        ui.end_row();
+                    });
+                egui::Grid::new("dict_timing_right")
+                    .num_columns(2)
+                    .spacing([10.0, 10.0])
+                    .show(&mut cols[1], |ui| {
+                        ui.label("Keep listening after")
+                            .on_hover_text(TIP_LISTEN_TAIL);
+                        secs_input(ui, &mut self.draft.listen_tail_ms, 0.3..=3.0, "listen_tail")
+                            .on_hover_text(TIP_LISTEN_TAIL);
+                        ui.end_row();
+                    });
+            });
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(8.0);
+
+            // ---- Bottom: two columns of checkboxes ----------------------
+            // Left column carries the longer labels; the right column ends
+            // with the Text-replacements editor button.
+            let repl_count = self.draft.text_replacements.len();
+            ui.columns(2, |cols| {
+                let left = &mut cols[0];
+                blue_check(
+                    left,
+                    &mut self.draft.auto_space,
+                    "Auto space between pastes",
+                )
+                .on_hover_text(
+                    "Insert a space before each pasted result so words don't run together.",
+                );
+                blue_check(
+                    left,
+                    &mut self.draft.auto_newline,
+                    "Auto newline after pastes",
+                )
+                .on_hover_text("Add a line break after each pasted result.");
+                blue_check(
+                    left,
+                    &mut self.draft.delay_output_till_release,
+                    "Hold pastes until release (hybrid)",
+                )
+                .on_hover_text(
+                    "Buffer the transcription and paste it all when you release the hotkey, \
+                     instead of streaming words as you speak.",
+                );
+                blue_check(
+                    left,
+                    &mut self.draft.enable_text_replacements,
+                    "Enable text replacements",
+                )
+                .on_hover_text(
+                    "Apply your misheard-phrase \u{2192} replacement rules to every transcription.",
+                );
+
+                let right = &mut cols[1];
+                blue_check(right, &mut self.draft.auto_punct, "Auto punctuation").on_hover_text(
+                    "Let the provider add commas, periods, and capitalization automatically.",
+                );
+                blue_check(
+                    right,
+                    &mut self.draft.mouse_follower_enabled,
+                    "Show the cursor pip",
+                )
+                .on_hover_text("Show a small dot near your text cursor while dictation is active.");
+                blue_check(right, &mut self.draft.enable_sound, "Start/stop sounds")
+                    .on_hover_text("Play a short sound when dictation starts and stops.");
+                right.add_space(4.0);
+                // A plain button in a column would stretch full-width (columns
+                // use a justified layout); a horizontal wrapper lets it size to
+                // its content instead.
+                let mut open = false;
+                right.horizontal(|ui| {
+                    if text_replacements_button(ui, repl_count)
+                        .on_hover_text("Edit your misheard-phrase \u{2192} replacement rules.")
+                        .clicked()
+                    {
+                        open = true;
+                    }
+                });
+                if open {
+                    self.open_replacements_modal();
+                }
+            });
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new("Custom vocabulary")
+                    .font(semibold(13.0))
+                    .color(text()),
+            );
+            ui.label(
+                RichText::new(
+                    "Words and phrases sent to the provider to bias recognition toward them \
+                     \u{2014} names, jargon, product names it keeps mishearing. This is \
+                     different from text replacements above, which repair the text *after* \
+                     recognition. One term per line.",
+                )
+                .size(11.5)
+                .color(muted()),
+            );
+            ui.add_space(6.0);
+            ui.add(
+                egui::TextEdit::multiline(&mut self.vocabulary_text)
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(4)
+                    .margin(Margin::symmetric(6, CTRL_PAD))
+                    .hint_text("Supabase\nCloudflare\nQuickDictate"),
+            );
+        });
+    }
+    pub(crate) fn application_card(&mut self, ui: &mut egui::Ui) {
+        card(ui, |ui| {
+            section_title(ui, "\u{E713}", "Application");
+            // Eight toggles split across two columns. The wordiest options are
+            // trimmed to short labels with the detail moved into their hover
+            // tooltips. "Enable per-app profiles" lives here too — it used to
+            // sit in its own near-empty card.
+            ui.columns(2, |cols| {
+                let left = &mut cols[0];
+                blue_check(
+                    left,
+                    &mut self.draft.prewarm_keys,
+                    "Probe keys at startup (prewarm)",
+                )
+                .on_hover_text("On launch, warm up your API keys so the first dictation is fast.");
+                blue_check(left, &mut self.draft.run_at_startup, "Start with Windows")
+                    .on_hover_text(
+                        "Launch QuickDictate automatically when you sign in to Windows.",
+                    );
+                blue_check(left, &mut self.draft.hide_tray_icon, "Hide tray icon").on_hover_text(
+                    "QuickDictate keeps running in the background with no icon shown. \
+                         To get back in, launch QuickDictate again -- it will reopen this \
+                         Settings window instead of starting a second copy, and you can \
+                         re-enable the icon here.",
+                );
+                blue_check(
+                    left,
+                    &mut self.draft.update_auto_check,
+                    "Check for updates daily",
+                )
+                .on_hover_text("Automatically check for a newer QuickDictate release once a day.");
+                // Only meaningful once auto-check is on; hidden otherwise
+                // rather than shown-but-inert.
+                if self.draft.update_auto_check {
+                    blue_check(
+                        left,
+                        &mut self.draft.update_auto_install,
+                        "Install updates automatically without asking",
+                    )
+                    .on_hover_text(
+                        "By default a newer release only shows as \u{201c}available\u{201d} \u{2014} \
+                         you click to install it (About window). Turn this on to install \
+                         automatically as soon as the daily check finds one, with no confirmation.",
+                    );
+                }
+
+                let right = &mut cols[1];
+                blue_check(
+                    right,
+                    &mut self.draft.enable_logging,
+                    "Write quickdictate.log",
+                )
+                .on_hover_text("Write troubleshooting diagnostics in the app's logs folder.");
+                blue_check(
+                    right,
+                    &mut self.draft.log_transcripts,
+                    "Log full dictated text",
+                )
+                .on_hover_text(
+                    "Deep debugging only \u{2014} records the actual text you dictate into \
+                         the log file. Leave off for privacy.",
+                );
+                blue_check(
+                    right,
+                    &mut self.draft.voice_commands,
+                    "\u{201c}Scratch that\u{201d} voice command",
+                )
+                .on_hover_text(
+                    "Say \u{201c}scratch that\u{201d} to automatically undo your last paste.",
+                );
+                blue_check(
+                    right,
+                    &mut self.draft.profiles_enabled,
+                    "Enable per-app profiles",
+                )
+                .on_hover_text(
+                    "Apply per-application overrides for punctuation, spacing, and \
+                     replacements based on the app you're typing into.",
+                );
+            });
+
+            // "Active profiles" editor — shown only when a power user has
+            // actually added `profiles` to settings.json. With none
+            // configured, the toggle above is the whole story and we don't
+            // waste a row on a "None configured" line. Only Language,
+            // Provider, and vocabulary are editable here; the name, match
+            // list, and text replacements still require settings.json (a
+            // full add/remove/reorder editor is out of scope for this pass).
+            if !self.draft.profiles.is_empty() {
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(6.0);
+                ui.label(RichText::new("Active profiles").size(12.0).color(muted()));
+                ui.label(
+                    RichText::new(
+                        "Language, provider, and vocabulary can be tuned here. Edit \
+                         settings.json to add, remove, rename, or reorder profiles, or to \
+                         change their match list or text replacements.",
+                    )
+                    .size(11.0)
+                    .color(muted()),
+                );
+                ui.add_space(4.0);
+
+                // `draft.profiles` and `profile_vocab_text` are disjoint
+                // fields, so both can be borrowed mutably at once; keep them
+                // in lockstep defensively in case a hand-edit (via the
+                // settings.json-changed prompt's Reload) changed the profile
+                // count out from under the scratch buffers.
+                if self.profile_vocab_text.len() != self.draft.profiles.len() {
+                    self.profile_vocab_text
+                        .resize(self.draft.profiles.len(), String::new());
+                }
+                let profiles = &mut self.draft.profiles;
+                let vocab_bufs = &mut self.profile_vocab_text;
+                for (idx, (p, vocab_buf)) in
+                    profiles.iter_mut().zip(vocab_bufs.iter_mut()).enumerate()
+                {
+                    egui::Frame::new()
+                        .fill(input_bg())
+                        .stroke(Stroke::new(1.0, border()))
+                        .corner_radius(CornerRadius::same(8))
+                        .inner_margin(Margin::same(8))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(&p.name).font(semibold(13.0)).color(text()));
+                                ui.label(
+                                    RichText::new(p.match_.join(", ")).size(11.5).color(muted()),
+                                );
+                            });
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.label("Language").on_hover_text(
+                                    "Recognition language for this app. Leave blank to use the \
+                                     global language.",
+                                );
+                                let mut lang_buf = p.language.clone().unwrap_or_default();
+                                if ui
+                                    .add(
+                                        styled_input(&mut lang_buf)
+                                            .hint_text("Use global")
+                                            .desired_width(90.0),
+                                    )
+                                    .changed()
+                                {
+                                    p.language = (!lang_buf.trim().is_empty()).then_some(lang_buf);
+                                }
+                                ui.add_space(8.0);
+                                ui.label("Provider");
+                                egui::ComboBox::from_id_salt(("profile_provider", idx))
+                                    .width(150.0)
+                                    .selected_text(
+                                        p.stt_provider
+                                            .as_deref()
+                                            .map(provider_label)
+                                            .unwrap_or("Use global"),
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        if ui
+                                            .selectable_label(
+                                                p.stt_provider.is_none(),
+                                                "Use global",
+                                            )
+                                            .clicked()
+                                        {
+                                            p.stt_provider = None;
+                                        }
+                                        for (id, label) in providers() {
+                                            let selected = p.stt_provider.as_deref() == Some(id);
+                                            if ui.selectable_label(selected, label).clicked() {
+                                                p.stt_provider = Some(id.to_string());
+                                            }
+                                        }
+                                    });
+                            });
+                            ui.add_space(4.0);
+                            let mut override_vocab = p.custom_vocabulary.is_some();
+                            if blue_check(
+                                ui,
+                                &mut override_vocab,
+                                "Override vocabulary for this app",
+                            )
+                            .on_hover_text(
+                                "Unchecked: use the global custom vocabulary. Checked with \
+                                     an empty list: no vocabulary biasing at all in this app.",
+                            )
+                            .changed()
+                            {
+                                p.custom_vocabulary = if override_vocab {
+                                    Some(parse_vocabulary(vocab_buf))
+                                } else {
+                                    None
+                                };
+                            }
+                            if p.custom_vocabulary.is_some() {
+                                ui.add(
+                                    egui::TextEdit::multiline(vocab_buf)
+                                        .desired_width(f32::INFINITY)
+                                        .desired_rows(2)
+                                        .margin(Margin::symmetric(6, CTRL_PAD))
+                                        .hint_text("One term per line"),
+                                );
+                            }
+                        });
+                    ui.add_space(4.0);
+                }
+            }
+        });
+    }
+}

@@ -13,6 +13,7 @@ quickdictate.log
 quickdictate-panic.log
 quickdictate-dev-port.txt
 quickdictate-update.txt
+quickdictate-stats.json
 key-health.json
 
 # Connections settings-sync: DPAPI-sealed refresh token (machine+user bound).
