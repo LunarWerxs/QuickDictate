@@ -20,7 +20,7 @@ A clear, concise description of what's wrong.
 - `mode`: <!-- toggle / hold -->
 - Any other non-default settings you changed:
 
-**Do not paste your key arrays.** If a key is involved (e.g. "invalid key" error), just say which provider and whether the key is new/old — do not paste the key value itself.
+**Do not paste your key arrays.** If a key is involved (e.g. "invalid key" error), just say which provider and whether the key is new/old, do not paste the key value itself.
 
 ### Steps to reproduce
 
@@ -50,4 +50,4 @@ paste log excerpt here
 
 ### QuickDictate version
 
-<!-- e.g. v0.5.1, or the commit hash you built from -->
+<!-- e.g. v0.5.4, or the commit hash you built from -->
