@@ -115,7 +115,27 @@ fn provider_label(id: &str) -> &str {
         .unwrap_or("Unknown")
 }
 
+/// `keys_of` id for the cleanup pass's own pool. It is not an STT provider,
+/// but it is edited by the very same key manager, so it rides the same path
+/// rather than growing a second, near-identical keys editor. NUL-prefixed so
+/// `@`-prefixed so it can never collide with a real provider id.
+pub(crate) const KEYS_TARGET_POLISH: &str = "@polish";
+/// `keys_of` id meaning "whatever STT provider the draft currently selects",
+/// resolved at use time so switching providers with the modal shut cannot
+/// leave the target pointing at the old one.
+pub(crate) const KEYS_TARGET_PROVIDER: &str = "@provider";
+
 fn keys_of<'a>(cfg: &'a mut Config, id: &str) -> &'a mut Vec<String> {
+    if id == KEYS_TARGET_POLISH {
+        return &mut cfg.polish_keys;
+    }
+    let selected;
+    let id = if id == KEYS_TARGET_PROVIDER {
+        selected = cfg.stt_provider.clone();
+        selected.as_str()
+    } else {
+        id
+    };
     match id {
         "deepgram" => &mut cfg.deepgram_keys,
         "openai" => &mut cfg.openai_keys,
@@ -365,6 +385,24 @@ const TIP_REPASTE: &str = "Hold your toggle hotkey this long to re-paste your mo
 const TIP_LISTEN_TAIL: &str = "After you stop talking, QuickDictate keeps listening this long \
      before finalizing — raise it if trailing words get cut off, lower it for a snappier finish. \
      Applies to your next dictation.";
+const TIP_POLISH: &str = "Before pasting, have an AI repair the sentence breaks a pause made \
+     the recognizer invent, plus obviously misheard words. It never rewords you: it can only \
+     return small exact-match edits, and anything that rewrites more than a quarter of what you \
+     said is thrown away. While you are still talking it runs in the background on what you have \
+     said so far, so it usually costs nothing at all.";
+const TIP_POLISH_WAIT: &str = "The longest a paste will ever wait for that cleanup. If it is \
+     not ready in time your text is pasted unpolished — it can never make dictation slower than \
+     this.";
+/// The setup instructions, kept in one place because they are the whole
+/// answer to "I ticked the box and nothing happened".
+const TIP_POLISH_KEYS: &str = "Get a free key at aistudio.google.com/apikey, then paste it here \
+     (one per line — several keys from different Google projects are rotated, which multiplies \
+     your rate limit).\n\nThe key's project needs the \"Generative Language API\" enabled, which \
+     is on by default for keys created in AI Studio. A Google key made for Speech-to-Text will \
+     NOT work here; they are separate APIs.\n\nRecommended model: gemini-3.5-flash-lite. \
+     Measured at ~0.56 s with the best results of everything tested — about 3x faster than \
+     GPT-4.1-mini, and faster than the bigger Gemini models, which think before answering and \
+     lose the race for no benefit.";
 
 // ---- State ----------------------------------------------------------------
 
@@ -682,6 +720,11 @@ struct SettingsApp {
     /// Which page the nav rail is showing. Kept across a hide/reveal so
     /// reopening Settings lands where you left off.
     tab: nav::Tab,
+    /// Which key pool the key manager edits: a provider id,
+    /// [`KEYS_TARGET_PROVIDER`], or [`KEYS_TARGET_POLISH`]. Set by
+    /// [`SettingsApp::open_keys_modal`] and read by `active_keys` and the
+    /// modal's commit, so one editor serves both pools.
+    keys_target: String,
 }
 
 impl eframe::App for SettingsApp {

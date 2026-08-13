@@ -8,7 +8,14 @@ static SPACE_BEFORE_PUNCT: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+([,.;:?!])
 // them via capture groups. (The previous `(?=...)` look-ahead form is not
 // supported by the `regex` crate and panicked at runtime.)
 static AFTER_PUNCT: Lazy<Regex> = Lazy::new(|| Regex::new(r"([,.;:?!])([A-Za-z])").unwrap());
-static SENTENCE_GAP: Lazy<Regex> = Lazy::new(|| Regex::new(r"([.?!]\s+)([a-z])").unwrap());
+// Capitalize the first letter of the next sentence. `regex` has no
+// look-behind, so the character BEFORE the terminator is captured and
+// re-emitted verbatim; excluding `.` there stops the LAST dot of an ellipsis
+// from reading as a sentence end. Streaming providers (ElevenLabs Scribe
+// especially) render a speaker's mid-thought pause as a trailing "...", so
+// without that exclusion every pause turned into "trailed off... New Sentence".
+// `[^.]` rather than `[^.?!]` so a genuine "Really?! ok" still capitalizes.
+static SENTENCE_GAP: Lazy<Regex> = Lazy::new(|| Regex::new(r"(^|[^.])([.?!]\s+)([a-z])").unwrap());
 static SENTENCE_GLUE: Lazy<Regex> = Lazy::new(|| Regex::new(r"([.?!])([A-Z])").unwrap());
 static LONE_I: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b(i)\b").unwrap());
 static FILLER_PHRASES: Lazy<Regex> = Lazy::new(|| {
@@ -124,7 +131,27 @@ impl TextProcessor {
         Regex::new(&pattern).ok().map(|re| (re, values))
     }
 
+    /// Shorthand for the standalone case. Production always knows whether the
+    /// chunk continues the previous one and calls [`Self::process_chunk`]
+    /// directly, so this exists for the tests that predate that flag.
+    #[cfg(test)]
     pub fn process(&self, raw: &str) -> String {
+        self.process_chunk(raw, false)
+    }
+
+    /// Turn one raw transcript chunk into the text that gets pasted.
+    ///
+    /// `continuing` says this chunk carries on the sentence the PREVIOUS chunk
+    /// left unfinished, so its first letter is left exactly as the provider
+    /// transcribed it.
+    ///
+    /// The hybrid paste flow delivers every post-release commit as its own
+    /// paste, and each one used to be capitalized as if it opened a sentence.
+    /// A single spoken thought broken by a pause ("...so I don't want to" /
+    /// "significantly slow down the process") therefore came out as
+    /// "...so I don't want to... Significantly slow down the process."
+    /// See [`ends_mid_sentence`], which is how the caller decides this flag.
+    pub fn process_chunk(&self, raw: &str, continuing: bool) -> String {
         if raw.is_empty() {
             return String::new();
         }
@@ -135,7 +162,7 @@ impl TextProcessor {
         t = self.fix_developer_terms(&t);
         t = self.cleanup_punctuation(&t);
         if self.auto_punct {
-            t = self.smart_punctuation(&t);
+            t = self.smart_punctuation(&t, continuing);
         }
         if self.auto_newline {
             t.push('\n');
@@ -228,23 +255,30 @@ impl TextProcessor {
         SENTENCE_GLUE.replace_all(&out, "$1 $2").into_owned()
     }
 
-    fn smart_punctuation(&self, t: &str) -> String {
+    fn smart_punctuation(&self, t: &str, continuing: bool) -> String {
         let mut s = SPACE_BEFORE_PUNCT.replace_all(t, "$1").into_owned();
         s = AFTER_PUNCT.replace_all(&s, "$1 $2").into_owned();
-        // Capitalize first letter.
-        if let Some(first) = s.chars().next() {
-            if first.is_lowercase() {
-                let mut chars = s.chars();
-                let upper: String = chars.next().unwrap().to_uppercase().collect();
-                s = format!("{upper}{}", chars.as_str());
+        // Capitalize first letter -- unless this chunk resumes a sentence the
+        // previous one left hanging, in which case it is mid-sentence and a
+        // capital would invent a sentence break the speaker never made.
+        if !continuing {
+            if let Some(first) = s.chars().next() {
+                if first.is_lowercase() {
+                    let mut chars = s.chars();
+                    let upper: String = chars.next().unwrap().to_uppercase().collect();
+                    s = format!("{upper}{}", chars.as_str());
+                }
             }
         }
-        // Capitalize letter after sentence-ending punct.
+        // Capitalize letter after sentence-ending punct. Group 1 is the
+        // character preceding the terminator (possibly empty at the start of
+        // the string) and is passed through untouched; see `SENTENCE_GAP`.
         s = SENTENCE_GAP
             .replace_all(&s, |c: &regex::Captures| {
-                let punct = c.get(1).unwrap().as_str();
-                let letter = c.get(2).unwrap().as_str().to_ascii_uppercase();
-                format!("{punct}{letter}")
+                let before = c.get(1).unwrap().as_str();
+                let punct = c.get(2).unwrap().as_str();
+                let letter = c.get(3).unwrap().as_str().to_ascii_uppercase();
+                format!("{before}{punct}{letter}")
             })
             .into_owned();
         // Append a period if the sentence looks finished but has no closer.
@@ -258,6 +292,31 @@ impl TextProcessor {
         }
         s
     }
+}
+
+/// Did this already-processed chunk stop mid-thought, so whatever is pasted
+/// next continues the same sentence?
+///
+/// Streaming providers commit a segment at every pause, and ElevenLabs Scribe
+/// spells a mid-thought pause out as a trailing "..." -- an explicit "I wasn't
+/// finished" marker, not a full stop. A dangling comma, colon, semicolon or
+/// hyphen means the same thing. Anything else (a period, a question mark, a
+/// bare word the auto-period already closed) is treated as finished, so the
+/// next chunk opens a new sentence exactly as before.
+///
+/// Deliberately conservative: a false negative costs one wrong capital, which
+/// is the behavior that shipped before this existed, while a false positive
+/// would swallow the capital on a genuinely new sentence.
+pub fn ends_mid_sentence(processed: &str) -> bool {
+    // `auto_space` / `auto_newline` append a trailer, so compare on the text.
+    let t = processed.trim_end();
+    if t.ends_with("...") || t.ends_with('\u{2026}') {
+        return true;
+    }
+    matches!(
+        t.chars().last(),
+        Some(',') | Some(';') | Some(':') | Some('-')
+    )
 }
 
 #[cfg(test)]
@@ -399,6 +458,90 @@ mod tests {
             p.process("nothing to replace here"),
             "nothing to replace here"
         );
+    }
+
+    #[test]
+    fn an_ellipsis_is_a_pause_not_a_sentence_end() {
+        // ElevenLabs Scribe commits a segment at every pause and writes the
+        // pause as a trailing "...". `SENTENCE_GAP` used to see that last dot
+        // as a full stop and capitalize straight through the speaker's
+        // mid-sentence breath.
+        assert_eq!(
+            processor().process("it's quite clear that... the pause was not a full stop"),
+            "It's quite clear that... the pause was not a full stop."
+        );
+        // A real full stop still capitalizes, and so does "?!".
+        assert_eq!(
+            processor().process("that is done. next we ship it"),
+            "That is done. Next we ship it."
+        );
+        assert_eq!(
+            processor().process("really?! ok then let's go"),
+            "Really?! Ok then let's go."
+        );
+    }
+
+    #[test]
+    fn a_continuing_chunk_keeps_its_lower_case_opening() {
+        let p = processor();
+        // The hybrid paste flow delivers each post-release commit separately,
+        // so the continuation flag is the only thing that can tell this chunk
+        // it is mid-sentence.
+        assert_eq!(
+            p.process_chunk("significantly slow down the process", true),
+            "significantly slow down the process."
+        );
+        // Same text with no preceding fragment still opens a sentence.
+        assert_eq!(
+            p.process_chunk("significantly slow down the process", false),
+            "Significantly slow down the process."
+        );
+        // Continuation never suppresses capitalization LATER in the chunk.
+        assert_eq!(
+            p.process_chunk("way over there. then we stop", true),
+            "way over there. Then we stop."
+        );
+    }
+
+    #[test]
+    fn mid_sentence_endings_are_recognized_but_finished_ones_are_not() {
+        // Trailer-insensitive: auto_space/auto_newline append one before this
+        // ever runs.
+        assert!(ends_mid_sentence("so I don't want to... "));
+        assert!(ends_mid_sentence("and I also was just fascinated\u{2026}"));
+        assert!(ends_mid_sentence("the pause didn't intend to have a-"));
+        assert!(ends_mid_sentence("first, "));
+        assert!(!ends_mid_sentence("That is the whole point."));
+        assert!(!ends_mid_sentence("Is that right?"));
+        assert!(!ends_mid_sentence(""));
+    }
+
+    #[test]
+    fn a_paused_dictation_reads_as_one_sentence_end_to_end() {
+        // Verbatim ElevenLabs commits from a real session (log epoch 717),
+        // exactly as the hybrid paste flow hands them over: the first four
+        // were held until release and joined, the fifth arrived after release
+        // and was pasted on its own.
+        let p = processor();
+        let held = [
+            "One of the things I noticed, um, I default to using the ElevenLabs model right now, is often if I pause for too long, the AI will put a bunch of space between my sentences, even though it's quite clear that...",
+            "the pause didn't intend to have a-",
+            "... uh, punctuation and spacing.",
+            "But, for example, if I paste, it will...",
+        ];
+        let first = p.process(&held.join(" "));
+        // The three pause boundaries stay lower-case; the real sentence break
+        // after "spacing." still gets its capital.
+        assert!(first.contains("quite clear that... the pause didn't intend"));
+        assert!(first.contains("to have a-... punctuation and spacing."));
+        assert!(first.contains("spacing. But, for example"));
+
+        // The trailing "..." is what tells the caller the next paste continues.
+        assert!(ends_mid_sentence(&first));
+        let second = p.process_chunk("Immediately paste, but if I wait an extra.", true);
+        assert!(second.starts_with("Immediately"), "{second}");
+        let third = p.process_chunk("immediately paste, but if I wait an extra.", true);
+        assert!(third.starts_with("immediately"), "{third}");
     }
 
     #[test]

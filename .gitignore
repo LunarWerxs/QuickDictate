@@ -63,3 +63,6 @@ ui-*.png
 # Local investigation / handoff notes (not for the repo).
 *_HANDOFF.md
 SCRIBE_HALLUCINATION_HANDOFF.md
+
+# Local AI memory for this repo. Deliberately NOT published.
+/.claude/memory/

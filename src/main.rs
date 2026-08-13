@@ -12,6 +12,7 @@ mod keys;
 mod local_stt;
 mod onboarding;
 mod output;
+mod polish;
 mod secretstore;
 mod settings_ui;
 mod sound;

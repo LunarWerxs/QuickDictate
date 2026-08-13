@@ -23,8 +23,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 
 use crate::focus;
+use crate::polish;
 use crate::state::{App, ErrorKind};
-use crate::text::TextProcessor;
+use crate::text::{self, TextProcessor};
 use crate::voice_commands::{self, ScratchThat};
 
 /// KEYEVENTF_UNICODE (0x0004): wScan carries the Unicode character; wVk must
@@ -67,6 +68,19 @@ fn run(app: Arc<App>) {
     let mut current_cfg = app.config.load_full();
     let mut cache = ProcessorCache::new(&current_cfg);
 
+    // Set to the dictation epoch whose last paste stopped mid-thought (see
+    // [`text::ends_mid_sentence`]). The NEXT transcript from that same epoch
+    // then continues that sentence instead of opening a new one.
+    //
+    // Gated on the epoch, not on a timer or on window focus, because one
+    // hotkey press is exactly the span over which continuation is meaningful:
+    // the hybrid paste flow can split a single press into a release flush plus
+    // several live-append commits, and pressing the hotkey again is the user
+    // starting a new thought. If the epoch has already moved on by the time we
+    // get here (they re-pressed while this transcript was in flight) the flag
+    // simply doesn't apply, which is the pre-existing behavior.
+    let mut continue_within: Option<u64> = None;
+
     while !app.shutdown.load(Ordering::Acquire) {
         crossbeam_channel::select! {
             recv(app.transcript_rx) -> raw => {
@@ -89,6 +103,9 @@ fn run(app: Arc<App>) {
                 // phrase itself never goes through replacements/punctuation.
                 match voice_commands::detect(&raw, current_cfg.voice_commands) {
                     ScratchThat::Triggered { remaining_raw } => {
+                        // The chunk this would have continued is being deleted,
+                        // so there is nothing left to continue.
+                        continue_within = None;
                         handle_scratch_that(&app, &remaining_raw, &mut cache, &current_cfg);
                         continue;
                     }
@@ -99,13 +116,35 @@ fn run(app: Arc<App>) {
                 // when the hotkey was pressed) -- the user may well have
                 // switched windows mid-dictation.
                 let exe_name = focus::foreground_exe_name();
+
+                // The optional LLM cleanup pass, on the RAW transcript and
+                // before the deterministic rules below -- the user's own
+                // replacements, dev-term casing and punctuation settings are
+                // explicit instructions and must win over a model's opinion.
+                // Bounded by `polish_deadline_ms`, usually already answered by
+                // the speculation the session runner started while they were
+                // still talking, and falls back to `raw` on any problem.
+                let raw = match polish::settings_for(&current_cfg, exe_name.as_deref()) {
+                    Some(settings) => app.polish.resolve(&settings, &raw).unwrap_or(raw),
+                    None => raw,
+                };
+
                 let processor = cache.get_or_build(&current_cfg, exe_name.as_deref());
 
-                let Some(processed) = process_guarded(processor, &raw) else { continue; };
+                let epoch = app.current_session_epoch();
+                let continuing = continue_within == Some(epoch);
+                let Some(processed) = process_guarded(processor, &raw, continuing) else {
+                    continue_within = None;
+                    continue;
+                };
                 if processed.is_empty() { continue; }
+                continue_within = text::ends_mid_sentence(&processed).then_some(epoch);
                 paste_processed(&app, &processed, true, current_cfg.log_transcripts);
             }
             recv(app.replay_rx) -> replay => {
+                // A replay re-pastes finished history, so it neither continues
+                // the previous chunk nor leaves one open.
+                continue_within = None;
                 let index = match replay {
                     Ok(index) => index,
                     Err(_) => break,
@@ -213,7 +252,7 @@ fn handle_scratch_that(
 
     let exe_name = focus::foreground_exe_name();
     let processor = cache.get_or_build(cfg, exe_name.as_deref());
-    let Some(processed) = process_guarded(processor, remaining_raw) else {
+    let Some(processed) = process_guarded(processor, remaining_raw, false) else {
         return;
     };
     if processed.is_empty() {
@@ -226,8 +265,10 @@ fn handle_scratch_that(
 /// it runs on network-derived transcript text, so a pathological input must
 /// cost one paste, not the output thread. `None` means the processing
 /// panicked (already logged).
-fn process_guarded(processor: &TextProcessor, raw: &str) -> Option<String> {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| processor.process(raw))) {
+fn process_guarded(processor: &TextProcessor, raw: &str, continuing: bool) -> Option<String> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        processor.process_chunk(raw, continuing)
+    })) {
         Ok(p) => Some(p),
         Err(_) => {
             tracing::error!("text processing PANICKED (caught; thread continues)");

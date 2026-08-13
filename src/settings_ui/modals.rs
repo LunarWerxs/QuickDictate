@@ -12,7 +12,11 @@ pub(crate) enum ModalAction {
 }
 
 impl super::SettingsApp {
-    pub(crate) fn open_keys_modal(&mut self) {
+    /// Open the key manager over one key pool: a provider id,
+    /// [`KEYS_TARGET_PROVIDER`] for whichever STT provider is selected, or
+    /// [`KEYS_TARGET_POLISH`] for the AI cleanup pass's own keys.
+    pub(crate) fn open_keys_modal(&mut self, target: &str) {
+        self.keys_target = target.to_string();
         let rows = self
             .active_keys()
             .into_iter()
@@ -429,7 +433,12 @@ impl super::SettingsApp {
                 bulk_note,
                 bulk_error,
             } => {
-                let title = format!("{} API keys", provider_label(&self.draft.stt_provider));
+                let polish_pool = self.keys_target == KEYS_TARGET_POLISH;
+                let title = if polish_pool {
+                    "AI cleanup API keys".to_string()
+                } else {
+                    format!("{} API keys", provider_label(&self.draft.stt_provider))
+                };
                 let backdrop = Self::modal_frame(ctx, &title, 460.0, |ui| {
                     if rows.is_empty() {
                         ui.label(RichText::new("No keys yet — paste one below.").color(muted()));
@@ -740,7 +749,7 @@ impl super::SettingsApp {
         match action {
             ModalAction::Commit | ModalAction::CommitAndSave => match self.modal.take() {
                 Some(Modal::Keys { rows, .. }) => {
-                    let id = self.draft.stt_provider.clone();
+                    let id = self.keys_target.clone();
                     *keys_of(&mut self.draft, &id) = deduped_key_values(&rows);
                 }
                 Some(Modal::Replacements {
@@ -778,7 +787,7 @@ impl super::SettingsApp {
         if save_after_commit && !self.save_and_sync(ctx) {
             // Keep the imported keys editable if validation or disk I/O made
             // the requested save fail. The draft already contains them.
-            self.open_keys_modal();
+            self.open_keys_modal(KEYS_TARGET_PROVIDER);
         }
 
         // ---- Confirmations that were armed above, applied now that the

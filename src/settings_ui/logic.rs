@@ -47,7 +47,19 @@ impl super::SettingsApp {
             shot_path: std::env::var("QUICKDICTATE_UI_SHOT").ok(),
             frames: 0,
             shot_requested: false,
-            tab: nav::Tab::Application,
+            // `QUICKDICTATE_UI_PAGE=dictation` opens straight to that page, so
+            // the headless screenshot hook above can capture any page and not
+            // just the one the window happens to open on.
+            keys_target: KEYS_TARGET_PROVIDER.to_string(),
+            tab: match std::env::var("QUICKDICTATE_UI_PAGE")
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "dictation" => nav::Tab::Dictation,
+                "history" => nav::Tab::History,
+                _ => nav::Tab::Application,
+            },
         };
         this.resync_vocabulary_scratch();
         this
@@ -292,8 +304,11 @@ impl super::SettingsApp {
             )
         });
     }
+    /// The key list the key manager is currently pointed at: the selected STT
+    /// provider normally, or the cleanup pass's own pool when it was opened
+    /// from there. See `SettingsApp::keys_target`.
     pub(crate) fn active_keys(&mut self) -> Vec<String> {
-        let id = self.draft.stt_provider.clone();
+        let id = self.keys_target.clone();
         keys_of(&mut self.draft, &id).clone()
     }
     /// While a hotkey field is recording, capture the next real keypress into
@@ -555,15 +570,24 @@ impl super::SettingsApp {
             }
         }
         let repaint = ctx.clone();
-        crate::stt::spawn_key_test(
-            &self.app,
-            cfg,
-            keys,
-            Arc::new(move |key, ok| {
-                let _ = tx.send((key, ok));
-                repaint.request_repaint();
-            }),
-        );
+        let report = Arc::new(move |key, ok| {
+            let _ = tx.send((key, ok));
+            repaint.request_repaint();
+        });
+        // The cleanup keys authenticate against `polish_endpoint`, not against
+        // the speech provider, so they need their own probe. Same button, same
+        // verdict channel, different API.
+        if self.keys_target == KEYS_TARGET_POLISH {
+            let settings = crate::polish::PolishSettings {
+                endpoint: cfg.polish_endpoint.clone(),
+                model: cfg.polish_model.clone(),
+                keys: keys.clone(),
+                deadline: std::time::Duration::from_millis(cfg.polish_deadline_ms),
+            };
+            crate::polish::spawn_key_test(&self.app, settings, keys, report);
+        } else {
+            crate::stt::spawn_key_test(&self.app, cfg, keys, report);
+        }
     }
     pub(crate) fn drain_verdicts(&mut self) {
         let mut done = Vec::new();
@@ -607,9 +631,11 @@ impl super::SettingsApp {
         // Let fonts/layout settle, optionally auto-open a modal for the shot.
         if self.frames == 5 {
             match mode.as_str() {
-                "keys" | "keys-test" => self.open_keys_modal(),
+                "keys" | "keys-test" => self.open_keys_modal(KEYS_TARGET_PROVIDER),
+                // Proves the one editor really does target two different pools.
+                "keys-polish" | "keys-polish-test" => self.open_keys_modal(KEYS_TARGET_POLISH),
                 "keys-bulk" => {
-                    self.open_keys_modal();
+                    self.open_keys_modal(KEYS_TARGET_PROVIDER);
                     if let Some(Modal::Keys { bulk, .. }) = &mut self.modal {
                         *bulk = true;
                     }
@@ -634,11 +660,11 @@ impl super::SettingsApp {
         }
         // keys-test: also press "Test all" and shoot once the (parallel)
         // verdicts are in — a headless end-to-end test of the probe pipeline.
-        if mode == "keys-test" && self.frames == 20 {
+        if mode.ends_with("-test") && self.frames == 20 {
             let keys = self.active_keys();
             self.start_key_test(ctx, keys);
         }
-        let ready = if mode == "keys-test" {
+        let ready = if mode.ends_with("-test") {
             self.frames > 25 && self.test_rx.is_none() && !self.verdicts.is_empty()
         } else {
             self.frames == 14

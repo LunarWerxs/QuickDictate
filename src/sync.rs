@@ -142,6 +142,13 @@ pub const SYNCED_KEYS: &[&str] = &[
     "profiles_enabled",
     "voice_commands",
     "custom_vocabulary",
+    // The LLM cleanup pass. Portable and secret-free: whether you want it,
+    // how long the paste may wait for it, and which endpoint/model answers.
+    // Its key is a secret and stays in NEVER_SYNCED with the others.
+    "polish_enabled",
+    "polish_deadline_ms",
+    "polish_endpoint",
+    "polish_model",
 ];
 
 /// Every `Config` field that is deliberately **never** synced: secrets and
@@ -162,6 +169,7 @@ const NEVER_SYNCED: &[&str] = &[
     "assemblyai_keys",      // secret API key array
     "dashscope_keys",       // secret API key array
     "google_keys",          // secret API key array
+    "polish_keys",          // secret API key array (LLM cleanup endpoint)
     "local_keys",           // legacy secret API key array, folds into elevenlabs_keys
     "window_width",         // machine-local window geometry
     "window_height",        // machine-local window geometry

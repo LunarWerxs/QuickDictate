@@ -30,6 +30,7 @@ use tokio::time::Instant;
 
 use crate::config::Config;
 use crate::keys::{FailKind, KeyPool};
+use crate::polish;
 use crate::state::{App, Status};
 use provider::{ProviderSession, ProviderSink, SttEvent, SttProvider, SttSessionOpts};
 
@@ -938,6 +939,23 @@ async fn run_session(
     // sites (and see `output.rs` for the paste-side log lines it also gates).
     let log_transcripts = cfg.log_transcripts;
 
+    // Cleanup-pass settings for the SPECULATIVE passes below. Which app the
+    // text lands in isn't known until paste time (the user may alt-tab
+    // mid-dictation), so speculation uses the globals and `output.rs` makes
+    // the authoritative per-app call. A speculated answer for an app that
+    // turns the pass off is simply never collected.
+    let polish_settings = cfg.polish_possible().then(|| polish::PolishSettings {
+        endpoint: cfg.polish_endpoint.clone(),
+        model: cfg.polish_model.clone(),
+        // `polish_possible` already established this is non-empty.
+        keys: cfg.polish_key_pool(),
+        deadline: Duration::from_millis(cfg.polish_deadline_ms),
+    });
+    // Only worth speculating when commits actually pile up unpasted. With
+    // `delay_output_till_release` off every commit is pasted the moment it
+    // lands, so there is no held prefix to work ahead on.
+    let speculate_polish = polish_settings.is_some() && delay_until_release;
+
     // Shared accumulators that survive even if we drop the recv JoinHandle on
     // timeout, so any chunks/partials the task already processed stay readable.
     let chunks_buf: Arc<parking_lot::Mutex<Vec<String>>> =
@@ -969,6 +987,10 @@ async fn run_session(
 
     // Reset the live word counter at the start of every session.
     app.word_count.store(0, Ordering::Release);
+    // Drop any answer speculated for the PREVIOUS press. It is keyed by exact
+    // text so it could not be misapplied anyway, but a new dictation should
+    // not be racing against a stale in-flight request either.
+    app.polish.reset();
     let mut recv_task = tokio::spawn(async move {
         let mut events: usize = 0;
         let mut committed_words: u32 = 0;
@@ -1113,7 +1135,23 @@ async fn run_session(
                                 final_text.chars().count()
                             );
                         }
-                        chunks_for_task.lock().push(final_text);
+                        let prefix = {
+                            let mut held = chunks_for_task.lock();
+                            held.push(final_text);
+                            // Same join the release flush will do, so a hit is
+                            // an exact-text hit rather than a near miss.
+                            speculate_polish.then(|| held.join(" "))
+                        };
+                        // Free time: the user is still talking and none of
+                        // this is on screen yet, so run the cleanup pass over
+                        // everything committed so far. If they release while
+                        // it is still thinking, the deadline race takes over
+                        // and nothing here has cost them anything.
+                        if let Some(prefix) = prefix {
+                            if let Some(settings) = polish_settings.as_ref() {
+                                recv_app.polish.speculate(settings, &prefix);
+                            }
+                        }
                     } else {
                         if log_transcripts {
                             tracing::info!(

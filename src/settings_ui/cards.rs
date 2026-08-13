@@ -42,7 +42,7 @@ impl super::SettingsApp {
                 );
                 ui.add_space(8.0);
                 if accent_button(ui, "Manage keys\u{2026}").clicked() {
-                    self.open_keys_modal();
+                    self.open_keys_modal(KEYS_TARGET_PROVIDER);
                 }
             });
         ui.add_space(10.0);
@@ -110,7 +110,7 @@ impl super::SettingsApp {
                         .on_hover_text("Add, remove, or paste API keys for the selected provider.")
                         .clicked()
                     {
-                        self.open_keys_modal();
+                        self.open_keys_modal(KEYS_TARGET_PROVIDER);
                     }
                     if ui
                         .add_enabled(!testing, egui::Button::new("Test all keys"))
@@ -477,6 +477,23 @@ impl super::SettingsApp {
                         secs_input(ui, &mut self.draft.listen_tail_ms, 0.3..=3.0, "listen_tail")
                             .on_hover_text(TIP_LISTEN_TAIL);
                         ui.end_row();
+
+                        // Meaningless with the cleanup pass off, so gray it
+                        // out rather than letting it read as a live budget.
+                        let polish_on = self.draft.polish_enabled;
+                        ui.add_enabled_ui(polish_on, |ui| {
+                            ui.label("AI cleanup waits").on_hover_text(TIP_POLISH_WAIT);
+                        });
+                        ui.add_enabled_ui(polish_on, |ui| {
+                            secs_input(
+                                ui,
+                                &mut self.draft.polish_deadline_ms,
+                                0.1..=2.0,
+                                "polish_deadline",
+                            )
+                            .on_hover_text(TIP_POLISH_WAIT);
+                        });
+                        ui.end_row();
                     });
             });
 
@@ -661,6 +678,12 @@ impl super::SettingsApp {
                 );
                 blue_check(
                     right,
+                    &mut self.draft.polish_enabled,
+                    "Clean up with AI before pasting",
+                )
+                .on_hover_text(TIP_POLISH);
+                blue_check(
+                    right,
                     &mut self.draft.profiles_enabled,
                     "Enable per-app profiles",
                 )
@@ -669,6 +692,68 @@ impl super::SettingsApp {
                      replacements based on the app you're typing into.",
                 );
             });
+
+            // ---- AI cleanup setup ---------------------------------------
+            // Only shown once the box above is ticked: with it off this is
+            // noise, and with it on the missing key is the single thing most
+            // likely to make the feature look broken.
+            if self.draft.polish_enabled {
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("AI cleanup").size(12.0).color(muted()));
+                    let keys = self
+                        .draft
+                        .polish_keys
+                        .iter()
+                        .filter(|k| !k.trim().is_empty())
+                        .count();
+                    if keys == 0 {
+                        ui.label(
+                            RichText::new(
+                                "\u{2014} needs an API key, until then pastes are unchanged",
+                            )
+                            .size(12.0)
+                            .color(bad()),
+                        );
+                    } else {
+                        ui.label(
+                            RichText::new(format!(
+                                "\u{2014} {keys} key{}",
+                                if keys == 1 { "" } else { "s" }
+                            ))
+                            .size(12.0)
+                            .color(good()),
+                        );
+                    }
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if accent_button(ui, "Manage keys\u{2026}")
+                        .on_hover_text(TIP_POLISH_KEYS)
+                        .clicked()
+                    {
+                        self.open_keys_modal(KEYS_TARGET_POLISH);
+                    }
+                    ui.label("Model").on_hover_text(TIP_POLISH_KEYS);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.draft.polish_model)
+                            .desired_width(200.0)
+                            .margin(Margin::symmetric(6, CTRL_PAD)),
+                    )
+                    .on_hover_text(TIP_POLISH_KEYS);
+                });
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "Free key: aistudio.google.com/apikey \u{2014} hover any control here \
+                         for which API to enable and which model to pick.",
+                    )
+                    .size(11.0)
+                    .color(muted()),
+                );
+            }
 
             // "Active profiles" editor — shown only when a power user has
             // actually added `profiles` to settings.json. With none

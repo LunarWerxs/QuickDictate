@@ -228,10 +228,15 @@ pub struct App {
     /// Global pre-warmed audio source. Sessions subscribe to get an
     /// already-running audio feed instead of opening WASAPI per session.
     pub audio: Arc<AudioSource>,
+    /// Optional LLM cleanup pass, shared so the session runner can speculate
+    /// on the held transcript while the user is still talking and the paste
+    /// path can collect the answer. Inert unless configured.
+    pub polish: Arc<crate::polish::Polisher>,
 }
 
 impl App {
     pub fn new(config: Config, rt: TokioHandle, audio: Arc<AudioSource>) -> Arc<Self> {
+        let rt_for_polish = rt.clone();
         let (transcript_tx, transcript_rx) = crossbeam_channel::bounded(64);
         let (replay_tx, replay_rx) = crossbeam_channel::bounded(8);
         Arc::new(Self {
@@ -251,6 +256,7 @@ impl App {
             word_count: AtomicU32::new(0),
             stats: Arc::new(StatsStore::load()),
             audio,
+            polish: Arc::new(crate::polish::Polisher::new(rt_for_polish)),
         })
     }
 

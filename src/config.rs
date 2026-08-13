@@ -135,10 +135,59 @@ pub struct Profile {
     /// therefore means "no biasing in this app", which is deliberate).
     #[serde(default)]
     pub custom_vocabulary: Option<Vec<String>>,
+
+    /// LLM cleanup pass for this app (see `Config::polish_enabled`). `None`
+    /// follows the global setting. This is the override worth setting: the
+    /// pass can repaste nothing, but it does spend a bounded wait, and a
+    /// terminal or a code editor wants raw text and instant pastes far more
+    /// than it wants tidy prose.
+    #[serde(default)]
+    pub polish: Option<bool>,
 }
 
 fn default_replacements_mode() -> String {
     "extend".into()
+}
+
+fn default_polish_deadline_ms() -> u64 {
+    300
+}
+
+fn default_polish_endpoint() -> String {
+    "https://api.openai.com/v1/chat/completions".into()
+}
+
+/// The default is the best OpenAI option, because `polish_keys` falls back to
+/// `openai_keys` and that is the key most people already have. **It is not the
+/// best option overall.** Measured 2026-08-13, same 520-character dictation
+/// and same edit-list prompt for every row, median of 3:
+///
+/// | model                 | median  | result                                |
+/// |-----------------------|---------|---------------------------------------|
+/// | gemini-3.5-flash-lite | ~0.56 s | 4 edits, all correct. **Best.**       |
+/// | gemini-flash-lite-latest | ~0.63 s | 3 edits, all correct.              |
+/// | gemini-3.6-flash      | ~0.99 s | 3 edits, all correct.                 |
+/// | gemini-3.1-flash-lite | ~1.07 s | 3 edits, all correct.                 |
+/// | gpt-4.1-nano          | ~1.7 s  | 3 edits, every one a no-op. Useless.  |
+/// | gpt-4.1-mini          | ~2.0 s  | 3 edits, all correct.                 |
+/// | gemini-3.7-flash      | ~2.1 s  | 3 edits, all correct. Overkill here.  |
+/// | gemini-3.5-flash      | ~3.3 s  | 3 edits, all correct.                 |
+/// | gpt-5-nano            | ~7.1 s  | spent the whole token budget thinking |
+/// | gpt-5-mini            | ~10.4 s | same, worse.                          |
+///
+/// Three things that keep being true: the *lite* tiers win outright (this is
+/// a small mechanical edit, not a reasoning problem, and the biggest model is
+/// the slowest for no gain); never pick a model that thinks before answering,
+/// which is what buried both gpt-5 rows; and `-nano`-class OpenAI models are
+/// too weak to produce a single real edit.
+///
+/// Point `polish_endpoint` at
+/// `https://generativelanguage.googleapis.com/v1beta/openai/chat/completions`
+/// with `polish_model: "gemini-3.5-flash-lite"` and `polish_keys` to get the
+/// top row. At ~0.6 s the deadline race is winnable outright rather than
+/// depending on the speculative pass.
+fn default_polish_model() -> String {
+    "gpt-4.1-mini".into()
 }
 
 impl Profile {
@@ -417,6 +466,46 @@ pub struct Config {
     /// that sealed them.
     #[serde(default = "default_false")]
     pub protect_keys_at_rest: bool,
+
+    /// Run an LLM cleanup pass over the transcript before pasting it (see
+    /// [`crate::polish`]). Off by default: it is the only part of the paste
+    /// path that talks to a third party, and everything else here works with
+    /// no network at all once the transcript has landed.
+    ///
+    /// It cannot make dictation slower than `polish_deadline_ms`, and while
+    /// the hotkey is still down it usually costs nothing at all -- the pass
+    /// runs against the held transcript in the background, so by the time you
+    /// release, the answer is already waiting.
+    #[serde(default = "default_false")]
+    pub polish_enabled: bool,
+
+    /// The longest the paste will wait for that pass. Whichever finishes
+    /// first wins, so a slow model costs exactly this and never the round
+    /// trip. Speculation during a held dictation usually beats it to zero.
+    #[serde(default = "default_polish_deadline_ms")]
+    pub polish_deadline_ms: u64,
+
+    /// OpenAI-compatible chat-completions endpoint. Any provider speaking
+    /// that shape works by changing this one line -- e.g. Groq
+    /// (`https://api.groq.com/openai/v1/chat/completions`) or Cerebras
+    /// (`https://api.cerebras.ai/v1/chat/completions`), both of which are
+    /// several times faster than the default and much likelier to win the
+    /// race on a long dictation.
+    #[serde(default = "default_polish_endpoint")]
+    pub polish_endpoint: String,
+
+    /// Model for the cleanup pass. Pick the fastest one that can follow the
+    /// instructions: the reply is a short edit list, so latency here is
+    /// dominated by how quickly the model starts talking, not by how hard the
+    /// text is.
+    #[serde(default = "default_polish_model")]
+    pub polish_model: String,
+
+    /// Key for `polish_endpoint`. Empty falls back to `openai_keys`, which is
+    /// the right thing when the endpoint is OpenAI's and wrong for anyone
+    /// else -- set this explicitly when you point it somewhere new.
+    #[serde(default)]
+    pub polish_keys: Vec<String>,
 }
 
 impl Default for Config {
@@ -467,6 +556,11 @@ impl Default for Config {
             profiles_enabled: true,
             voice_commands: false,
             custom_vocabulary: Vec::new(),
+            polish_enabled: false,
+            polish_deadline_ms: default_polish_deadline_ms(),
+            polish_endpoint: default_polish_endpoint(),
+            polish_model: default_polish_model(),
+            polish_keys: Vec::new(),
             update_auto_install: false,
             protect_keys_at_rest: false,
         }
@@ -882,6 +976,47 @@ impl Config {
         }
     }
 
+    /// Is the LLM cleanup pass on for a paste landing in `exe_name`? A
+    /// profile overrides the global flag in both directions, matching how
+    /// every other per-app setting folds in.
+    pub fn polish_for_exe(&self, exe_name: Option<&str>) -> bool {
+        self.active_profile(exe_name)
+            .and_then(|p| p.polish)
+            .unwrap_or(self.polish_enabled)
+    }
+
+    /// Could the cleanup pass run for *some* app? Used by the session runner,
+    /// which speculates while the hotkey is still down and does not yet know
+    /// where the text will land.
+    pub fn polish_possible(&self) -> bool {
+        if self.polish_key_pool().is_empty() {
+            return false;
+        }
+        if self.polish_enabled {
+            return true;
+        }
+        self.profiles_enabled && self.profiles.iter().any(|p| p.polish == Some(true))
+    }
+
+    /// Keys for `polish_endpoint`, round-robined per request: the dedicated
+    /// list if set, else the OpenAI pool (right for the default endpoint, and
+    /// the reason `polish_keys` exists for everyone else). Falls back rather
+    /// than merging, since keys for two different providers cannot both
+    /// authenticate against one endpoint.
+    pub fn polish_key_pool(&self) -> Vec<String> {
+        let source = if self.polish_keys.iter().any(|k| !k.trim().is_empty()) {
+            &self.polish_keys
+        } else {
+            &self.openai_keys
+        };
+        source
+            .iter()
+            .map(|k| k.trim())
+            .filter(|k| !k.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
     /// The STT provider to use for a dictation started while `exe_name` is in
     /// the foreground. A profile may override the global provider, but only to
     /// one that actually has a key (or to the keyless local provider) -- an
@@ -1152,7 +1287,64 @@ mod tests {
             language: None,
             stt_provider: None,
             custom_vocabulary: None,
+            polish: None,
         }
+    }
+
+    #[test]
+    fn polish_is_off_without_a_key_no_matter_what_is_enabled() {
+        let mut cfg = Config {
+            polish_enabled: true,
+            ..Default::default()
+        };
+        // Enabled but unauthenticated is not "possible" -- the session runner
+        // must not fire speculative requests that can only 401.
+        assert!(!cfg.polish_possible());
+        cfg.openai_keys = vec!["  ".into()];
+        assert!(!cfg.polish_possible(), "a blank key is not a key");
+        cfg.openai_keys = vec!["sk-test".into(), "sk-two".into()];
+        assert!(cfg.polish_possible());
+        assert_eq!(cfg.polish_key_pool(), vec!["sk-test", "sk-two"]);
+        // A dedicated list REPLACES the OpenAI pool rather than extending it:
+        // once `polish_endpoint` points somewhere else, an OpenAI key mixed
+        // into the rotation would just 401 every other request.
+        cfg.polish_keys = vec!["gem-one".into(), "gem-two".into()];
+        assert_eq!(cfg.polish_key_pool(), vec!["gem-one", "gem-two"]);
+    }
+
+    #[test]
+    fn a_profile_overrides_polish_in_both_directions() {
+        let mut cfg = Config {
+            openai_keys: vec!["sk-test".into()],
+            polish_enabled: true,
+            ..Default::default()
+        };
+        let mut off = profile("Terminal", &["windowsterminal.exe"]);
+        off.polish = Some(false);
+        cfg.profiles = vec![off];
+
+        assert!(
+            cfg.polish_for_exe(Some("slack.exe")),
+            "global still applies"
+        );
+        assert!(
+            !cfg.polish_for_exe(Some("windowsterminal.exe")),
+            "a terminal wants raw text and an instant paste"
+        );
+
+        // Off globally, on for one app: still possible, so speculation runs.
+        cfg.polish_enabled = false;
+        let mut on = profile("Slack", &["slack.exe"]);
+        on.polish = Some(true);
+        cfg.profiles = vec![on];
+        assert!(cfg.polish_possible());
+        assert!(cfg.polish_for_exe(Some("slack.exe")));
+        assert!(!cfg.polish_for_exe(Some("code.exe")));
+
+        // `profiles_enabled: false` takes the per-app opt-in with it.
+        cfg.profiles_enabled = false;
+        assert!(!cfg.polish_possible());
+        assert!(!cfg.polish_for_exe(Some("slack.exe")));
     }
 
     #[test]

@@ -82,8 +82,19 @@ impl SttProvider for DeepgramProvider {
 /// only when the vocabulary is non-empty and the model is one of those two --
 /// Deepgram returns a Bad Request for `keyterm` on other models.
 fn build_url(model: &str, opts: &SttSessionOpts) -> String {
+    // `smart_format` is Deepgram's own formatting layer -- punctuation,
+    // sentence casing, and number/date/currency shaping -- and it was simply
+    // never switched on. Verified against a fixture: without it the transcript
+    // comes back "the quick brown fox ... testing one two three four five",
+    // with it "The quick brown fox ... Testing 12345." `punctuate` is implied
+    // by `smart_format` but is passed explicitly so the intent survives anyone
+    // later turning smart formatting off.
+    //
+    // The number shaping is the part to know about: spoken digit sequences get
+    // merged ("one two three" -> "123"), which is right for phone numbers and
+    // wrong if you were counting. Turn `smart_format` off here if that bites.
     let mut url = format!(
-        "{WS_URL}?model={model}&encoding=linear16&sample_rate={rate}&interim_results=true&language={lang}",
+        "{WS_URL}?model={model}&encoding=linear16&sample_rate={rate}&interim_results=true&language={lang}&smart_format=true&punctuate=true",
         rate = opts.sample_rate,
         lang = opts.language,
     );
@@ -292,9 +303,22 @@ mod tests {
         assert_eq!(
             url,
             format!(
-                "{WS_URL}?model={MODEL_ID}&encoding=linear16&sample_rate=16000&interim_results=true&language=en"
+                "{WS_URL}?model={MODEL_ID}&encoding=linear16&sample_rate=16000&interim_results=true&language=en&smart_format=true&punctuate=true"
             )
         );
+    }
+
+    #[test]
+    fn deepgram_does_its_own_formatting() {
+        // Verified live against tests/fixtures/speech_16k.wav: without these
+        // Deepgram returns unpunctuated lower-case text and we threw away
+        // formatting it was willing to do for free.
+        let url = build_url(MODEL_ID, &test_opts(vec![]));
+        assert!(url.contains("&smart_format=true"));
+        assert!(url.contains("&punctuate=true"));
+        // Including for models that take no keyterms, since formatting is
+        // orthogonal to vocabulary biasing.
+        assert!(build_url("nova-2", &test_opts(vec![])).contains("&smart_format=true"));
     }
 
     #[test]
