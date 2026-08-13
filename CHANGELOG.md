@@ -8,120 +8,68 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [0.7.2] - 2026-08-13
 
-### Added
-
-- **"Test all" works for the AI cleanup keys**, instead of being hidden. It
-  probes `polish_endpoint` with the configured model rather than the speech
-  provider, which is the only check that means anything here: a Google key can
-  be perfectly valid and still be rejected, because Gemini and Speech-to-Text
-  are separate APIs enabled separately.
-
-### Changed
-
-- **Speculation no longer re-asks after every pause.** Each pass covers the
-  whole transcript so far, and the cache is keyed on exact text, so every pass
-  except the last one before you release is discarded by construction. A
-  stop-start dictation was therefore firing one full request per pause and
-  throwing all but one away. A pause now has to have added about a sentence
-  (120 characters) before it re-asks; below that, the answer already in hand
-  covers everything but the tail, and the release still asks for real if it
-  matters. One request in flight at a time, as before.
-
-## [0.7.1] - 2026-08-13
-
-### Changed
-
-- **The AI cleanup pass now has a real setup surface**, instead of only
-  existing if you hand-edited settings.json. Settings → Application shows it
-  under the checkbox: how many keys are configured (in red while it has none,
-  since that is the one state where ticking the box does nothing), the model,
-  and **"Manage keys…", the same key manager every provider uses** rather than
-  a second bespoke editor. Hovering any of it explains where to get a free key,
-  that the key's project needs the Generative Language API rather than
-  Speech-to-Text, and which model to pick and why.
-- "Test all" is hidden for the cleanup keys. The probe behind it talks to the
-  selected *speech* provider, so it would have failed every Gemini key and put
-  a red cross next to keys that are perfectly good.
-- `QUICKDICTATE_UI_PAGE=dictation|history` opens the settings window straight
-  to a page, so the headless screenshot hook can capture any of them and not
-  just whichever one it opens on.
-
-## [0.7.0] - 2026-08-13
-
-### Changed
-
-- **Deepgram now does its own formatting.** We were never passing
-  `smart_format` / `punctuate`, so Deepgram returned unpunctuated lower-case
-  text that our own rules then had to guess at. Verified against the test
-  fixture: "the quick brown fox ... testing one two three four five" became
-  "The quick brown fox ... Testing 12345." Note the number handling in that
-  example, spoken digit runs get merged, which is right for a phone number and
-  wrong if you were counting.
-- The cleanup pass **rotates across every configured key** instead of always
-  using the first. These endpoints rate-limit per project, so keys from
-  different projects multiply the requests per minute available.
-- Gemini models are sent `reasoning_effort: "low"`. They think before
-  answering by default, and the same model that replies in 0.6 s takes 3 s
-  when left to it. `"none"` is faster still but several current models reject
-  it outright, so it isn't worth the risk of a silent 400.
-
-### Fixed
-
-- The recommended cleanup model, after benchmarking the whole current Gemini
-  and OpenAI lineup on the same real dictation: **gemini-3.5-flash-lite at
-  ~0.56 s with the most complete edit set**, against ~2.0 s for gpt-4.1-mini.
-  The full table lives on `default_polish_model`. The pattern worth
-  remembering is that the *lite* tiers beat the big ones outright here, since
-  this is a small mechanical edit rather than a reasoning problem, and the
-  slowest models tested were the two that insisted on thinking first.
-
-## [0.6.0] - 2026-08-13
-
-### Added
-
-- **Optional AI cleanup pass before pasting** (Settings → Dictation → "Clean up
-  with AI before pasting"; off by default). It repairs the sentence breaks a
-  pause made the recognizer invent, plus obviously misheard words, and nothing
-  else. Two things keep it off the critical path. While you are still talking,
-  committed chunks sit in the held buffer with nothing on screen yet, so the
-  pass runs in the background over the transcript so far and is usually
-  **already answered** by the time you release. When it isn't, the paste waits
-  at most `polish_deadline_ms` (default 300 ms) and pastes unpolished if the
-  answer misses. Because a waiting paste attaches to the pass already running
-  rather than starting a fresh one, that budget only has to cover what is left
-  of it. No key, no network, a malformed reply, or a model that
-  tried to rewrite you all fall back to the text that would have been pasted
-  anyway.
-- The model returns an **edit list**, not a rewritten transcript: ~10x fewer
-  output tokens (latency here tracks output length, not difficulty), and every
-  edit must quote its target verbatim and unambiguously or the whole set is
-  discarded. An edit set that changes more than a quarter of what you said is
-  refused outright, because the one unacceptable failure here is pasting
-  fluent text you never said.
-- `polish_endpoint` takes any OpenAI-compatible chat-completions URL, so
-  pointing it at Groq or Cerebras is a one-line change; on that silicon the
-  deadline race is winnable from cold, which it mostly isn't against OpenAI.
-  Per-app profiles take a `"polish"` override, which is how you keep it out of
-  terminals and editors. Everything but the key syncs.
-
-## [0.5.7] - 2026-08-13
+Everything below shipped as one release. 0.5.7 through 0.7.1 were version bumps
+made while building it and were never published, so they are folded in here
+rather than left as five same-day entries for releases nobody could install.
 
 ### Fixed
 
 - **Pausing mid-sentence no longer starts a new sentence.** Every streaming
   provider commits a segment whenever you pause, and ElevenLabs Scribe writes
-  that pause out as a trailing "...". Two separate rules then treated it as a
-  full stop: the sentence-capitalization regex saw the last dot of the ellipsis
-  as a sentence end, and the hybrid paste flow processes each post-release
-  commit as its own standalone paste, capitalizing its first word. So one
-  spoken thought with two breaths in it came back as "so I don't want to...
-  Significantly slow down the process." Both are fixed: an ellipsis is now read
-  as a pause rather than a terminator, and a chunk that follows one left
-  unfinished (trailing "...", comma, colon, semicolon or hyphen) keeps its
-  lower-case opening. Continuation is scoped to a single hotkey press, so the
-  next dictation still starts a fresh sentence. A real "." or "?" and even
-  "?!" capitalize exactly as before, and nothing about this touches paste
-  latency.
+  that pause out as a trailing "...". Two rules then treated it as a full stop:
+  the sentence-capitalization regex read the last dot of the ellipsis as a
+  sentence end, and the hybrid paste flow processed each post-release commit as
+  its own standalone sentence, capitalizing its first word regardless of what
+  came before. So one spoken thought with two breaths in it came back as "so I
+  don't want to... Significantly slow down the process." An ellipsis is now read
+  as a pause, and a chunk following an unfinished one keeps its lower-case
+  opening. Continuation is scoped to a single hotkey press, so the next
+  dictation still opens a fresh sentence; a real "." or "?" and even "?!"
+  capitalize exactly as before. No network, no added latency.
+
+### Added
+
+- **Optional AI cleanup pass** (Settings -> Application -> "Clean up with AI
+  before pasting"; off by default). It repairs the sentence boundaries a pause
+  made the recognizer invent, plus obviously misheard words, and nothing else.
+  Two things keep it off the critical path: while you are still talking the
+  held transcript is unpasted, so the pass runs in that free time and is usually
+  **already answered** by the time you release; when it is not, the paste waits
+  at most `polish_deadline_ms` (default 300 ms) and pastes unpolished if the
+  answer misses. A waiting paste attaches to the request already in flight
+  rather than starting a fresh one, so that budget only has to cover what is
+  left of it. Speculation also has a growth floor, since every pass except the
+  last is discarded by construction and a stop-start dictation would otherwise
+  fire one full request per pause.
+- The model returns an **edit list**, not a rewritten transcript: ~10x fewer
+  output tokens, and every edit must quote its target verbatim and unambiguously
+  or the whole set is discarded. An edit set changing more than a quarter of
+  what you said is refused outright, measured on what actually differs rather
+  than on how much context the model quoted to stay unambiguous. No key, no
+  network, a malformed reply, or a model that tried to rewrite you all fall back
+  to the text that would have been pasted anyway.
+- `polish_endpoint` takes any OpenAI-compatible chat-completions URL. Measured
+  against a real dictation, **gemini-3.5-flash-lite answered in ~0.56 s with the
+  most complete edit set**, against ~2.0 s for gpt-4.1-mini; the full table is
+  on `default_polish_model`. The *lite* tiers win outright here, since this is a
+  small mechanical edit rather than a reasoning problem, and the slowest models
+  tested were the two that insist on thinking first. Keys live in the same key
+  manager every provider uses, several are rotated to spread per-project rate
+  limits, and "Test all" probes the cleanup endpoint rather than the speech
+  provider (a Google key can be valid and still be rejected by it). Per-app
+  profiles take a `"polish"` override, which is how you keep it out of terminals
+  and editors. Everything but the key syncs.
+
+### Changed
+
+- **Deepgram now does its own formatting.** `smart_format` / `punctuate` were
+  never being sent, so it returned unpunctuated lower-case text that our own
+  rules then had to guess at. The same fixture went from "the quick brown fox
+  ... testing one two three four five" to "The quick brown fox ... Testing
+  12345." Note the number handling there: spoken digit runs get merged, which is
+  right for a phone number and wrong if you were counting.
+- `QUICKDICTATE_UI_PAGE=dictation|history` opens the settings window straight to
+  a page, so the headless screenshot hook can capture any of them.
 
 ## [0.5.6] - 2026-08-10
 
