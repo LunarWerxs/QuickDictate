@@ -82,6 +82,10 @@ fn port_file_path_in(dir: &Path) -> PathBuf {
     dir.join("quickdictate-dev-port.txt")
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "a thread that cannot be spawned is unrecoverable; the panic message is the only diagnostic there is"
+)]
 pub fn maybe_spawn(app: Arc<App>, tx: Sender<HotkeyEvent>) -> Option<std::thread::JoinHandle<()>> {
     let port_str = std::env::var(ENV_PORT).ok()?;
     let port: u16 = port_str.trim().parse().ok()?;
@@ -110,9 +114,7 @@ pub fn maybe_spawn(app: Arc<App>, tx: Sender<HotkeyEvent>) -> Option<std::thread
 }
 
 fn port_file_path() -> Option<PathBuf> {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(port_file_path_in))
+    Some(port_file_path_in(&crate::paths::data_dir()))
 }
 
 fn run(app: Arc<App>, tx: Sender<HotkeyEvent>, socket: UdpSocket) {

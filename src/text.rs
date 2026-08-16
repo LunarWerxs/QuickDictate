@@ -3,11 +3,27 @@ use std::collections::BTreeMap;
 use once_cell::sync::Lazy;
 use regex::{Regex, Replacer};
 
-static SPACE_BEFORE_PUNCT: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+([,.;:?!])").unwrap());
+/// Compile a pattern that is a literal in this source file.
+///
+/// These are not user input: they are baked into the binary, so "does it
+/// compile" is fixed at build time, not at paste time. The panic is therefore
+/// unreachable in a shipped build -- and `every_static_pattern_compiles` below
+/// forces every one of them, so a bad pattern fails `cargo test` rather than
+/// reaching a user. (User-supplied patterns do NOT come through here: text
+/// replacements are escaped literals, see `TextProcessor::new`.)
+#[allow(
+    clippy::expect_used,
+    reason = "the pattern is a compile-time literal and every one is forced by a test"
+)]
+fn literal_regex(pattern: &str) -> Regex {
+    Regex::new(pattern).expect("a literal pattern in text.rs failed to compile")
+}
+
+static SPACE_BEFORE_PUNCT: Lazy<Regex> = Lazy::new(|| literal_regex(r"\s+([,.;:?!])"));
 // Match a punctuation char followed by a letter; we'll splice a space between
 // them via capture groups. (The previous `(?=...)` look-ahead form is not
 // supported by the `regex` crate and panicked at runtime.)
-static AFTER_PUNCT: Lazy<Regex> = Lazy::new(|| Regex::new(r"([,.;:?!])([A-Za-z])").unwrap());
+static AFTER_PUNCT: Lazy<Regex> = Lazy::new(|| literal_regex(r"([,.;:?!])([A-Za-z])"));
 // Capitalize the first letter of the next sentence. `regex` has no
 // look-behind, so the character BEFORE the terminator is captured and
 // re-emitted verbatim; excluding `.` there stops the LAST dot of an ellipsis
@@ -15,11 +31,11 @@ static AFTER_PUNCT: Lazy<Regex> = Lazy::new(|| Regex::new(r"([,.;:?!])([A-Za-z])
 // especially) render a speaker's mid-thought pause as a trailing "...", so
 // without that exclusion every pause turned into "trailed off... New Sentence".
 // `[^.]` rather than `[^.?!]` so a genuine "Really?! ok" still capitalizes.
-static SENTENCE_GAP: Lazy<Regex> = Lazy::new(|| Regex::new(r"(^|[^.])([.?!]\s+)([a-z])").unwrap());
-static SENTENCE_GLUE: Lazy<Regex> = Lazy::new(|| Regex::new(r"([.?!])([A-Z])").unwrap());
-static LONE_I: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b(i)\b").unwrap());
+static SENTENCE_GAP: Lazy<Regex> = Lazy::new(|| literal_regex(r"(^|[^.])([.?!]\s+)([a-z])"));
+static SENTENCE_GLUE: Lazy<Regex> = Lazy::new(|| literal_regex(r"([.?!])([A-Z])"));
+static LONE_I: Lazy<Regex> = Lazy::new(|| literal_regex(r"\b(i)\b"));
 static FILLER_PHRASES: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)\b(?:m+[-\s]?h+m+|uh[-\s]?huh|um+|uh+|erm+)\b(?:[,.!?;:]+\s*|\s+|$)").unwrap()
+    literal_regex(r"(?i)\b(?:m+[-\s]?h+m+|uh[-\s]?huh|um+|uh+|erm+)\b(?:[,.!?;:]+\s*|\s+|$)")
 });
 
 /// Acronyms that should always be uppercased.
@@ -35,22 +51,17 @@ static DEV_TERMS_UPPER: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
     terms
         .iter()
         .zip(uppered.iter())
-        .map(|(t, u)| {
-            (
-                Regex::new(&format!(r"(?i)\b{}\b", regex::escape(t))).unwrap(),
-                *u,
-            )
-        })
+        .map(|(t, u)| (literal_regex(&format!(r"(?i)\b{}\b", regex::escape(t))), *u))
         .collect()
 });
 
 /// Mixed-case proper-noun substitutions.
 static DEV_TERMS_MIXED: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
     vec![
-        (Regex::new(r"(?i)\bjavascript\b").unwrap(), "JavaScript"),
-        (Regex::new(r"(?i)\btypescript\b").unwrap(), "TypeScript"),
-        (Regex::new(r"(?i)\bpython\b").unwrap(), "Python"),
-        (Regex::new(r"(?i)\bvs ?code\b").unwrap(), "VS Code"),
+        (literal_regex(r"(?i)\bjavascript\b"), "JavaScript"),
+        (literal_regex(r"(?i)\btypescript\b"), "TypeScript"),
+        (literal_regex(r"(?i)\bpython\b"), "Python"),
+        (literal_regex(r"(?i)\bvs ?code\b"), "VS Code"),
     ]
 });
 
@@ -265,7 +276,8 @@ impl TextProcessor {
             if let Some(first) = s.chars().next() {
                 if first.is_lowercase() {
                     let mut chars = s.chars();
-                    let upper: String = chars.next().unwrap().to_uppercase().collect();
+                    chars.next();
+                    let upper: String = first.to_uppercase().collect();
                     s = format!("{upper}{}", chars.as_str());
                 }
             }
@@ -275,9 +287,11 @@ impl TextProcessor {
         // the string) and is passed through untouched; see `SENTENCE_GAP`.
         s = SENTENCE_GAP
             .replace_all(&s, |c: &regex::Captures| {
-                let before = c.get(1).unwrap().as_str();
-                let punct = c.get(2).unwrap().as_str();
-                let letter = c.get(3).unwrap().as_str().to_ascii_uppercase();
+                // All three groups are non-optional in SENTENCE_GAP, so each is
+                // always present; `map_or("")` says that without a panic path.
+                let before = c.get(1).map_or("", |m| m.as_str());
+                let punct = c.get(2).map_or("", |m| m.as_str());
+                let letter = c.get(3).map_or("", |m| m.as_str()).to_ascii_uppercase();
                 format!("{before}{punct}{letter}")
             })
             .into_owned();
@@ -325,6 +339,31 @@ mod tests {
 
     fn processor() -> TextProcessor {
         TextProcessor::new(&BTreeMap::new(), true, false, false)
+    }
+
+    /// `literal_regex` is allowed to panic only because every pattern it is
+    /// handed is a literal in this file that something forces at build time.
+    /// This is that something. Each static is `Lazy`, so a broken pattern would
+    /// otherwise stay dormant until the first paste that reached it -- on a
+    /// background thread, in a build with no console.
+    ///
+    /// Add a static above, add it here.
+    #[test]
+    fn every_static_pattern_compiles() {
+        // Forcing the Lazy is the assertion: construction is where a bad
+        // pattern panics.
+        assert!(SPACE_BEFORE_PUNCT.is_match(" ,"));
+        assert!(AFTER_PUNCT.is_match(",a"));
+        assert!(SENTENCE_GAP.is_match("a. b"));
+        assert!(SENTENCE_GLUE.is_match(".A"));
+        assert!(LONE_I.is_match("i"));
+        assert!(FILLER_PHRASES.is_match("um "));
+        assert_eq!(DEV_TERMS_UPPER.len(), 10);
+        assert!(DEV_TERMS_UPPER
+            .iter()
+            .all(|(re, _)| re.is_match("json") || re.is_match("api") || !re.as_str().is_empty()));
+        assert_eq!(DEV_TERMS_MIXED.len(), 4);
+        assert!(DEV_TERMS_MIXED[0].0.is_match("javascript"));
     }
 
     fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {

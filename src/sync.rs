@@ -96,6 +96,9 @@ fn store_cache() -> std::sync::MutexGuard<'static, Option<CachedRemoteDoc>> {
 ///   * `enable_logging` / `log_transcripts` — local diagnostics toggles;
 ///   * `max_log_mb` — a per-install log-size cap, machine-local like
 ///     `enable_logging`, not a portable preference;
+///   * `data_dir` — an absolute path on *this* PC. Syncing it would point a
+///     second machine at a folder that may not exist there (or, worse, at
+///     somebody else's folder that does);
 ///   * `install_id` — this install's anonymous update-check id; syncing it
 ///     would merge two machines' identities into one;
 ///   * `update_auto_install` — a machine-local policy choice (whether *this*
@@ -177,6 +180,7 @@ const NEVER_SYNCED: &[&str] = &[
     "window_y",             // machine-local window geometry
     "run_at_startup",       // per-machine registry (Run key) behavior
     "hide_tray_icon",       // a property of this install, not a portable preference
+    "data_dir",             // an absolute path on THIS PC; meaningless (or wrong) on another
     "enable_logging",       // local diagnostics toggle
     "max_log_mb",           // per-install log-size cap, machine-local like enable_logging
     "log_transcripts",      // local diagnostics toggle; must never leave the machine
@@ -215,48 +219,58 @@ pub fn synced_stats(remote: &Value) -> Option<&Value> {
     remote.as_object()?.get(STATS_KEY)
 }
 
+/// The raw (pattern, label) pairs behind [`credential_patterns`], named so the
+/// compiled list can be checked against it: a pattern that fails to compile is
+/// dropped rather than panicking (right for a background thread), and a
+/// silently-dropped pattern is a silently-disabled arm of the scanner. See
+/// `every_credential_pattern_compiles`.
+const CREDENTIAL_PATTERNS: &[(&str, &str)] = &[
+    (r"^(sk|pk|rk)_(live|test)_[A-Za-z0-9]{16,}", "a Stripe key"),
+    // ElevenLabs keys begin `sk_` (underscore) followed by a long
+    // hex string — distinct from OpenAI's `sk-` (hyphen) below.
+    (r"^sk_[A-Za-z0-9]{32,}$", "an ElevenLabs API key"),
+    // DashScope (Alibaba Cloud / Qwen) keys are `sk-` followed by
+    // a 32+ character lowercase-hex id. Checked before the
+    // generic OpenAI-style pattern below (which would otherwise
+    // also match) so a DashScope key is labeled correctly.
+    (r"^sk-[0-9a-f]{32,}$", "a DashScope API key"),
+    (r"^sk-[A-Za-z0-9_-]{20,}", "an OpenAI-style API key"),
+    (r"^(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}", "a GitHub token"),
+    (
+        r"^github_pat_[A-Za-z0-9_]{22,}",
+        "a GitHub fine-grained token",
+    ),
+    (r"^xox[baprs]-[A-Za-z0-9-]{10,}", "a Slack token"),
+    (r"^AKIA[0-9A-Z]{16}$", "an AWS access key id"),
+    (r"^AIza[0-9A-Za-z_-]{35}$", "a Google API key"),
+    // Deepgram and AssemblyAI keys have NO distinguishing prefix:
+    // they are undifferentiated lowercase-hex blobs (40 and 32
+    // chars). Deliberately NOT matched here. A bare-hex pattern
+    // also matches every git SHA-1, MD5 hash, and dashless GUID,
+    // and one such string in a synced text field (a replacement
+    // value, a vocabulary term) would block EVERY future settings
+    // push for that user, silently, until they found and removed
+    // it. This scanner is defense-in-depth behind the SYNCED_KEYS
+    // allowlist, which already keeps all key arrays off the wire;
+    // it must never cost a legitimate sync.
+    (
+        r"^ey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}$",
+        "a JWT",
+    ),
+    (r"-----BEGIN [A-Z ]*PRIVATE KEY-----", "a private key"),
+];
+
 fn credential_patterns() -> &'static [(Regex, &'static str)] {
     static PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
     PATTERNS
         .get_or_init(|| {
-            [
-                (r"^(sk|pk|rk)_(live|test)_[A-Za-z0-9]{16,}", "a Stripe key"),
-                // ElevenLabs keys begin `sk_` (underscore) followed by a long
-                // hex string — distinct from OpenAI's `sk-` (hyphen) below.
-                (r"^sk_[A-Za-z0-9]{32,}$", "an ElevenLabs API key"),
-                // DashScope (Alibaba Cloud / Qwen) keys are `sk-` followed by
-                // a 32+ character lowercase-hex id. Checked before the
-                // generic OpenAI-style pattern below (which would otherwise
-                // also match) so a DashScope key is labeled correctly.
-                (r"^sk-[0-9a-f]{32,}$", "a DashScope API key"),
-                (r"^sk-[A-Za-z0-9_-]{20,}", "an OpenAI-style API key"),
-                (r"^(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}", "a GitHub token"),
-                (
-                    r"^github_pat_[A-Za-z0-9_]{22,}",
-                    "a GitHub fine-grained token",
-                ),
-                (r"^xox[baprs]-[A-Za-z0-9-]{10,}", "a Slack token"),
-                (r"^AKIA[0-9A-Z]{16}$", "an AWS access key id"),
-                (r"^AIza[0-9A-Za-z_-]{35}$", "a Google API key"),
-                // Deepgram and AssemblyAI keys have NO distinguishing prefix:
-                // they are undifferentiated lowercase-hex blobs (40 and 32
-                // chars). Deliberately NOT matched here. A bare-hex pattern
-                // also matches every git SHA-1, MD5 hash, and dashless GUID,
-                // and one such string in a synced text field (a replacement
-                // value, a vocabulary term) would block EVERY future settings
-                // push for that user, silently, until they found and removed
-                // it. This scanner is defense-in-depth behind the SYNCED_KEYS
-                // allowlist, which already keeps all key arrays off the wire;
-                // it must never cost a legitimate sync.
-                (
-                    r"^ey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}$",
-                    "a JWT",
-                ),
-                (r"-----BEGIN [A-Z ]*PRIVATE KEY-----", "a private key"),
-            ]
-            .into_iter()
-            .map(|(pattern, label)| (Regex::new(pattern).expect("static credential regex"), label))
-            .collect()
+            CREDENTIAL_PATTERNS
+                .iter()
+                // Dropping a bad pattern beats panicking here: this runs on the
+                // sync worker, where a panic is silent. The drop is what
+                // `every_credential_pattern_compiles` exists to catch.
+                .filter_map(|(pattern, label)| Regex::new(pattern).ok().map(|re| (re, *label)))
+                .collect()
         })
         .as_slice()
 }
@@ -385,15 +399,8 @@ pub struct Creds {
     pub picture: String,
 }
 
-fn exe_dir() -> Option<PathBuf> {
-    std::env::current_exe()
-        .ok()?
-        .parent()
-        .map(|p| p.to_path_buf())
-}
-
 fn creds_path() -> Option<PathBuf> {
-    exe_dir().map(|d| d.join(CREDS_FILE))
+    Some(crate::paths::data_file(CREDS_FILE))
 }
 
 pub fn save_creds(c: &Creds) -> Result<()> {
@@ -1235,6 +1242,21 @@ mod tests {
     use super::*;
     use crate::stats::{DeviceStats, PeriodStats, ProviderStats, UsageStats};
     use std::collections::BTreeMap;
+
+    /// `credential_patterns` drops a pattern that fails to compile rather than
+    /// panicking, which is right for a background thread and wrong to leave
+    /// unchecked: a silently-dropped pattern is a silently-disabled arm of the
+    /// scanner that stops secrets reaching the sync endpoint. Pin the count so
+    /// a typo in a literal fails here instead of shipping a hole.
+    #[test]
+    fn every_credential_pattern_compiles() {
+        let compiled: Vec<&str> = credential_patterns().iter().map(|(_, l)| *l).collect();
+        let declared: Vec<&str> = CREDENTIAL_PATTERNS.iter().map(|(_, l)| *l).collect();
+        assert_eq!(
+            compiled, declared,
+            "a credential pattern failed to compile and was silently dropped"
+        );
+    }
 
     #[test]
     fn synced_snapshot_carries_prefs_but_no_secrets_or_geometry() {

@@ -90,6 +90,14 @@ key or an internet connection. Microphone audio stays on your PC.
 > Prefer files to forms? QuickDictate still keeps one readable `settings.json` next
 > to the executable. Start from `settings.example.json` or edit the generated file.
 
+> [!TIP]
+> **Keeping the exe on your Desktop?** By default QuickDictate writes its `logs\`
+> folder, usage stats, and update cache next to itself, which turns the Desktop
+> into a scratch directory. **Settings ▸ Application ▸ Files** moves them: click
+> **Use AppData** for `%LOCALAPPDATA%\QuickDictate`, or **Browse…** for anywhere
+> you like. Existing files are moved across on the next start. (Or set `data_dir`
+> in `settings.json`; `%VARIABLES%` are expanded.)
+
 ## 📚 Learn more
 
 Every setting, per-provider setup, and the privacy details live in the

@@ -5,29 +5,36 @@ on:
     branches: [main]
   pull_request:
   schedule:
-    # Weekly dependency audit (see the `audit` job below). Cron is UTC.
+    # Weekly supply-chain sweep (see the `deny` job). Cron is UTC. This is the
+    # one gate whose verdict changes with NO code change: a crate the lockfile
+    # already pins can pick up an advisory at any time.
     - cron: "0 6 * * 1"
   workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
 
+# The local mirror of this file is `scripts\check.ps1`. Keep them in step: a
+# gate that only exists in one of the two is a gate somebody will discover the
+# slow way, after a push.
 jobs:
   check:
     name: fmt · clippy · build · test
-    # Push/PR/manual only. The weekly `schedule` trigger exists solely to
-    # drive the `audit` job below; it must not re-run the full build+test
-    # pipeline every week for no code change.
+    # Push/PR/manual only. The weekly `schedule` trigger exists solely to drive
+    # the `deny` job below; it must not re-run the full build+test pipeline
+    # every week for no code change.
     if: github.event_name != 'schedule'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
-      - name: Install Rust (stable + rustfmt + clippy)
-        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          toolchain: stable
-          components: rustfmt, clippy
+      # rust-toolchain.toml pins stable-x86_64-pc-windows-msvc + clippy/rustfmt,
+      # which rustup installs on the first cargo invocation. Setting up a
+      # toolchain here as well would silently override that pin, which is the
+      # drift the pin exists to stop -- so this job deliberately has no
+      # toolchain action, and prints what it resolved instead.
+      - name: Toolchain
+        run: rustup show
 
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -35,11 +42,16 @@ jobs:
       - name: Format check
         run: cargo fmt --all --check
 
+      # `clippy::unwrap_used` / `expect_used` are warned at the crate root (see
+      # src/main.rs and clippy.toml) and promoted to errors here: in a
+      # `windows_subsystem = "windows"` build a panicked worker thread has no
+      # stderr, so an unwrap is a SILENT failure. Exceptions carry a local
+      # `#[allow(..., reason = "...")]`.
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Build release
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Validate release executable
         shell: pwsh
@@ -52,51 +64,68 @@ jobs:
 
       # Unit tests only. The live provider tests are #[ignore] — they need real
       # API keys + network and are run locally, never in CI.
+      #
+      # This also runs the mutation-fuzz suite (`src/fuzz.rs`), which is wired
+      # in as ordinary tests rather than a named job precisely so it cannot be
+      # skipped: every parser that reads a network response gets thousands of
+      # mutated and truncated inputs on every push, for about a second.
       - name: Test
-        run: cargo test
+        run: cargo test --locked
 
-  audit:
-    name: cargo audit (dependency vulnerabilities)
-    # Weekly + on-demand always; on a pull_request only when Cargo.lock
-    # actually changed (checked below), since a push/PR that doesn't touch
-    # the lockfile can't change what's reachable from published advisories.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request'
+  deny:
+    name: cargo-deny (advisories · licenses · sources)
+    # Always: unlike every other gate, this one's verdict changes without a code
+    # change, because the advisory database moves under a lockfile that did not.
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          fetch-depth: 0
-
-      - name: Check whether Cargo.lock changed
-        id: lockfile
-        shell: pwsh
-        run: |
-          $shouldRun = "true"
-          if ("${{ github.event_name }}" -eq "pull_request") {
-            $changed = git diff --name-only "origin/${{ github.base_ref }}...HEAD"
-            if (-not ($changed -contains "Cargo.lock")) {
-              $shouldRun = "false"
-            }
-          }
-          "should_run=$shouldRun" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-
-      - name: Install Rust (stable)
-        if: steps.lockfile.outputs.should_run == 'true'
-        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          toolchain: stable
 
       - name: Cache cargo
-        if: steps.lockfile.outputs.should_run == 'true'
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
-      # cargo-audit has no first-party GitHub Action; the community
-      # actions-rs/audit-check action is archived/unmaintained, so install
-      # the tool directly instead of depending on a dead action.
-      - name: Install cargo-audit
-        if: steps.lockfile.outputs.should_run == 'true'
-        run: cargo install cargo-audit --locked
+      # Replaces the old `cargo audit` job. cargo-audit answered only "is
+      # anything in the lockfile vulnerable"; cargo-deny answers that plus
+      # "may we ship this license", "did a wildcard or duplicate creep in", and
+      # "did a dependency start coming from a registry or git remote nobody
+      # approved" — the supply-chain question, which nothing here was asking.
+      # Its config is deny.toml; the old .cargo/audit.toml is gone, so there is
+      # no second ignore list to drift.
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
 
-      - name: Run cargo audit
-        if: steps.lockfile.outputs.should_run == 'true'
-        run: cargo audit
+      - name: cargo deny check
+        run: cargo deny check
+
+  msrv:
+    name: MSRV (Rust 1.93)
+    if: github.event_name != 'schedule'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      # `cargo +1.93` overrides rust-toolchain.toml's `stable` pin for these
+      # commands only; installing it as the default would defeat the pin for
+      # everything else in the job.
+      - name: Install the MSRV toolchain
+        run: rustup toolchain install 1.93-x86_64-pc-windows-msvc --profile minimal
+      # Keep this in step with Cargo.toml's `rust-version`. The job is what makes
+      # that field a tested fact rather than a hopeful comment: without it,
+      # `rust-version` drifts the moment anyone uses a newer std API.
+      - name: Check on the MSRV
+        run: cargo +1.93-x86_64-pc-windows-msvc check --locked --all-targets
+
+  unused-deps:
+    name: cargo-machete (unused dependencies)
+    if: github.event_name != 'schedule'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install cargo-machete
+        run: cargo install cargo-machete --locked
+      # A dependency nobody uses is still compiled, still shipped, still
+      # scanned for advisories, and still a supply-chain entry.
+      - name: cargo machete
+        run: cargo machete

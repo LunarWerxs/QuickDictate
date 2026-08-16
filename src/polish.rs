@@ -122,7 +122,7 @@ pub struct PolishSettings {
 }
 
 #[derive(Debug, Deserialize)]
-struct Edit {
+pub(crate) struct Edit {
     before: String,
     after: String,
 }
@@ -426,7 +426,7 @@ async fn request_edits(
 /// Pull the edit list out of an OpenAI-shaped chat completion. Written
 /// against the wire format rather than a typed client so any OpenAI-compatible
 /// endpoint (Groq, Cerebras, a local server) works by changing one URL.
-fn parse_reply(raw: &str) -> Result<Vec<Edit>, String> {
+pub(crate) fn parse_reply(raw: &str) -> Result<Vec<Edit>, String> {
     let v: serde_json::Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
     let content = v["choices"][0]["message"]["content"]
         .as_str()

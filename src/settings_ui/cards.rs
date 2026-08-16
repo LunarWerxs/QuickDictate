@@ -597,6 +597,157 @@ impl super::SettingsApp {
             );
         });
     }
+    /// Where QuickDictate writes its runtime files.
+    ///
+    /// This exists because the default -- "next to the exe" -- is actively bad
+    /// for the very common case of an exe kept on the Desktop: the logs folder,
+    /// the stats json, the sync credential blob, and the update cache all land
+    /// on the Desktop with it.
+    ///
+    /// The field edits `draft.data_dir`, so it saves through the same Save
+    /// button as everything else and takes effect on the next start (the data
+    /// folder is resolved once, at boot -- see [`crate::paths`]). The blurb
+    /// under the row says so rather than pretending it is live.
+    pub(crate) fn data_folder_section(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(6.0);
+
+        // Both of these are cached OnceLock reads, deliberately: this runs on
+        // every repaint, and the obvious spelling of "the default folder"
+        // (`Config::settings_path().parent()`) stats the filesystem up to eight
+        // times per call.
+        let default_dir = crate::paths::default_dir();
+        let live_dir = crate::paths::data_dir();
+
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Files").size(12.0).color(muted()));
+            ui.label(
+                RichText::new("\u{2014} folder for the logs, stats, sync, and update files")
+                    .size(12.0)
+                    .color(muted()),
+            );
+        });
+        ui.add_space(4.0);
+
+        // Clicks are captured here and acted on after the row closes, so no
+        // handler borrows `self` while the text edit holds `draft.data_dir`.
+        let mut browse = false;
+        let mut use_app_data = false;
+        let mut use_default = false;
+        let mut open_folder = false;
+
+        ui.horizontal(|ui| {
+            ui.add(
+                styled_input(&mut self.draft.data_dir)
+                    .hint_text(default_dir.to_string_lossy().to_string())
+                    .desired_width(330.0),
+            )
+            .on_hover_text(
+                "Leave empty to keep everything next to QuickDictate.exe (the default). \
+                 %VARIABLES% are expanded, so %LOCALAPPDATA%\\QuickDictate works. \
+                 The path must be a full one, starting with a drive letter.\n\n\
+                 settings.json itself stays where it is \u{2014} QuickDictate has to find it \
+                 before it can read this setting out of it. Don't move that file by hand; \
+                 \u{201c}Use AppData\u{201d} is the one place it is also looked for.",
+            );
+            browse = ui.button("Browse\u{2026}").clicked();
+            open_folder = ui
+                .button("Open")
+                .on_hover_text("Show the folder currently in use in Explorer.")
+                .clicked();
+        });
+
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            use_app_data = ui
+                .button("Use AppData")
+                .on_hover_text(
+                    "%LOCALAPPDATA%\\QuickDictate \u{2014} the usual place for an app's own \
+                     files, and the one that leaves QuickDictate's own folder empty.",
+                )
+                .clicked();
+            use_default = ui
+                .button("Next to the app")
+                .on_hover_text("Back to the default: alongside QuickDictate.exe.")
+                .clicked();
+        });
+
+        // Shape check only -- pure, so it can run every frame. Whether the
+        // folder is actually writable is checked when Browse returns and again
+        // at startup, which is the only moment it can be acted on.
+        let typed = self.draft.data_dir.trim();
+        if !typed.is_empty() && crate::paths::expand(typed).is_none() {
+            ui.add_space(2.0);
+            ui.label(
+                RichText::new(
+                    "Not a usable path. It needs to be a full path (C:\\\u{2026}) and any \
+                     %VARIABLE% in it has to exist \u{2014} QuickDictate will keep using the \
+                     current folder until it is.",
+                )
+                .size(11.0)
+                .color(bad()),
+            );
+        }
+
+        ui.add_space(2.0);
+        ui.label(
+            RichText::new(format!(
+                "In use now: {}{} \u{2014} a change applies after Save and restart, and \
+                 QuickDictate moves the existing files across for you.",
+                live_dir.display(),
+                // Describes LIVE_DIR, so it must be decided by live_dir. Reading
+                // the draft here labelled a still-active custom folder "(the
+                // default)" the moment the field was cleared and before any save.
+                if live_dir == default_dir {
+                    " (the default)"
+                } else {
+                    ""
+                }
+            ))
+            .size(11.0)
+            .color(muted()),
+        );
+
+        if browse {
+            let start = crate::paths::expand(&self.draft.data_dir).unwrap_or(live_dir.clone());
+            if let Some(dir) = crate::paths::pick_folder(Some(&start)) {
+                match crate::paths::check_writable(&dir) {
+                    Ok(()) => {
+                        self.draft.data_dir = dir.to_string_lossy().into_owned();
+                        // Accept the choice either way, but say so if the folder
+                        // is already somebody else's.
+                        self.status = crate::paths::folder_caution(&dir).unwrap_or_default();
+                    }
+                    Err(e) => self.status = format!("Can't use that folder: {e}"),
+                }
+            }
+        }
+        if use_app_data {
+            match crate::paths::app_data_dir() {
+                Some(dir) => {
+                    self.draft.data_dir = dir.to_string_lossy().into_owned();
+                    // Clear any "can't use that folder" left by an earlier
+                    // Browse: it describes a choice that is no longer selected.
+                    self.status.clear();
+                }
+                None => {
+                    self.status = "Windows did not report a LOCALAPPDATA folder.".to_string();
+                }
+            }
+        }
+        if use_default {
+            self.draft.data_dir.clear();
+            self.status.clear();
+        }
+        if open_folder {
+            let _ = std::fs::create_dir_all(&live_dir);
+            let _ = std::process::Command::new("explorer.exe")
+                .arg(&live_dir)
+                .spawn();
+        }
+    }
+
     pub(crate) fn application_card(&mut self, ui: &mut egui::Ui) {
         card(ui, |ui| {
             // Eight toggles split across two columns. The wordiest options are
@@ -692,6 +843,8 @@ impl super::SettingsApp {
                      replacements based on the app you're typing into.",
                 );
             });
+
+            self.data_folder_section(ui);
 
             // ---- AI cleanup setup ---------------------------------------
             // Only shown once the box above is ticked: with it off this is

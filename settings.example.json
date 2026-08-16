@@ -19,6 +19,7 @@
   "delay_output_till_release": true,
   "clipboard_restore_delay_ms": 300,
   "spinner_type": "star_wars",
+  "data_dir": "",
   "enable_logging": false,
   "log_transcripts": false,
   "max_log_mb": 5,

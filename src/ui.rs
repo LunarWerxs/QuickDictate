@@ -111,6 +111,10 @@ fn activate_message_id() -> u32 {
     id
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "a thread that cannot be spawned at startup is unrecoverable; the panic message is the only diagnostic there is"
+)]
 pub fn spawn(app: Arc<App>) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("qd-ui".into())
@@ -669,6 +673,10 @@ fn build_tray() -> Result<TrayState> {
     Ok(TrayState { tray, history_menu })
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "the bytes are include_bytes! of a committed PNG, and embedded_artwork_decodes forces this path in the test suite"
+)]
 fn make_icon() -> tray_icon::Icon {
     // The tray/notification variant (transparent glyph, not the filled tile — see
     // `crate::icon`), pre-scaled to 32² so Windows' notification area has a crisp

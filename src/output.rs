@@ -51,6 +51,10 @@ const MAX_SNAPSHOT_TOTAL_BYTES: usize = 48 * 1024 * 1024;
 /// text. Set by [`paste_processed`], read by [`handle_scratch_that`].
 static LAST_PASTE_TARGET: Mutex<Option<(isize, Option<String>)>> = Mutex::new(None);
 
+#[allow(
+    clippy::expect_used,
+    reason = "a thread that cannot be spawned at startup is unrecoverable; the panic message is the only diagnostic there is"
+)]
 pub fn spawn(app: Arc<App>) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("qd-output".into())
@@ -376,7 +380,10 @@ impl ProcessorCache {
         tracing::debug!("output: building TextProcessor for profile {:?}", key);
         self.entries
             .push((key.clone(), build_processor(cfg, exe_name)));
-        &self.entries.last().unwrap().1
+        // Index the slot just pushed rather than `.last().unwrap()`: same
+        // element, no panic path, and it cannot go stale if this grows a
+        // capacity bound later.
+        &self.entries[self.entries.len() - 1].1
     }
 }
 

@@ -109,6 +109,10 @@ impl AudioSource {
         let channels = Arc::new(AtomicUsize::new(supported.channels() as usize));
         let channels_cb = Arc::clone(&channels);
 
+        #[allow(
+            clippy::expect_used,
+            reason = "a capture thread that cannot be spawned is unrecoverable; the panic message is the only diagnostic there is"
+        )]
         let join = std::thread::Builder::new()
             .name("qd-audio".into())
             .spawn(move || {

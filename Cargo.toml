@@ -4,6 +4,10 @@ version = "0.7.2"
 edition = "2021"
 description = "Fast Windows dictation with cloud and optional local speech recognition"
 license = "MIT"
+# The oldest compiler this is TESTED against (CI's `msrv` job builds it), not a
+# claim about the oldest that happens to work. Raise it deliberately, and only
+# when something actually needs a newer feature.
+rust-version = "1.93"
 
 [[bin]]
 name = "quickdictate"
@@ -29,10 +33,12 @@ codegen-units = 1
 panic = "unwind"
 # Strip both debuginfo and the symbol table for a slightly smaller binary. The
 # panic hook's useful output (thread, `file:line`, message) is compile-time
-# embedded and unaffected. Only the `{backtrace:?}` frame *names* are lost
-# (this is the gnu toolchain — DWARF/symbols are in-binary, no external .pdb),
-# so shipped crash logs show addresses instead of names for those frames; that's
-# an acceptable trade for release. Rebuild unstripped to symbolicate if needed.
+# embedded and unaffected. Only the `{backtrace:?}` frame *names* are lost, so
+# shipped crash logs show addresses instead of names for those frames; that's an
+# acceptable trade for release. Rebuild unstripped to symbolicate if needed.
+# (The toolchain is MSVC — pinned in rust-toolchain.toml, matching CI and the
+# release workflow. An earlier note here claimed GNU, which was true of one
+# developer machine's default and never of the binary that shipped.)
 strip = true
 
 [profile.release.package."*"]

@@ -18,8 +18,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::config::Config;
-
 const STATS_FILE: &str = "quickdictate-stats.json";
 const HOUR_SECS: u64 = 60 * 60;
 const RECENT_HISTORY_HOURS: u64 = 24 * 8;
@@ -840,10 +838,7 @@ impl Drop for StatsSessionGuard {
 }
 
 fn stats_path() -> PathBuf {
-    Config::settings_path()
-        .parent()
-        .map(|dir| dir.join(STATS_FILE))
-        .unwrap_or_else(|| PathBuf::from(STATS_FILE))
+    crate::paths::data_file(STATS_FILE)
 }
 
 fn save_atomic(path: &Path, stats: &UsageStats) -> Result<(), String> {

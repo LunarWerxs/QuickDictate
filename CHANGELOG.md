@@ -6,6 +6,73 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Choose where QuickDictate keeps its files.** Until now the `logs\` folder,
+  the usage stats, the settings-sync credential blob, and the update cache were
+  all written next to the executable. That is fine when the exe has its own
+  folder and unpleasant when it does not: an exe kept on the Desktop turned the
+  Desktop into a scratch directory. **Settings ▸ Application ▸ Files** now
+  points them anywhere, with **Use AppData** as a one-click preset
+  (`%LOCALAPPDATA%\QuickDictate`) and **Next to the app** to go back. Existing
+  files are moved across on the next start, and nothing is ever overwritten.
+
+  Equivalent to the new `data_dir` key in `settings.json` (`%VARIABLES%` are
+  expanded; the path must be absolute). The environment variable
+  `QUICKDICTATE_DATA_DIR` overrides both, for scripted portable installs.
+
+  Moving the folder a second time works too: the folder in use is recorded in
+  `%LOCALAPPDATA%\QuickDictate\active-data-dir.txt`, so going from one custom
+  location to another carries the stats and sync credentials along instead of
+  stranding them in the folder being abandoned.
+
+  `settings.json` itself stays where it is, since it has to be found before it
+  can be read, but it is now also looked for in `%LOCALAPPDATA%\QuickDictate` so
+  the executable's own folder can be left completely empty. `data_dir` is a path
+  on one PC, so it is never synced.
+
+### Changed
+
+- **`cargo deny` replaced `cargo audit`.** It checks the same advisories plus
+  dependency licenses, duplicate and wildcard versions, and crate sources.
+  Config moved from `.cargo/audit.toml` to `deny.toml`, and the old ten-entry
+  advisory ignore list is gone rather than migrated: every entry was reachable
+  only through a non-Windows target, and pinning the Windows triples removes
+  those crates from the scanned graph outright.
+- **The toolchain is pinned** (`rust-toolchain.toml`,
+  `stable-x86_64-pc-windows-msvc`), matching CI and the release build. A
+  developer machine defaulting to the GNU host was building a different thing
+  from the one that ships. `Cargo.toml` now also declares a tested `rust-version`.
+- CI gained `deny`, `msrv`, and `unused-deps` jobs; `scripts\check.ps1` mirrors
+  all of them, and `scripts\install-hooks.ps1` wires it in as a pre-push hook.
+
+### Fixed
+
+- **`webbrowser` updated to 1.2.4** (RUSTSEC-2026-0257, browser argument
+  injection via the `BROWSER` variable). Not exploitable here (the flaw is in
+  the crate's Unix path and QuickDictate is Windows-only), patched anyway.
+- **Panics that would have been invisible.** `clippy::unwrap_used` and
+  `clippy::expect_used` are now enabled crate-wide and enforced by CI. A release
+  build has no console, so a panic on a background thread stops dictation with
+  no error and nothing on screen. Every site was either rewritten to return an
+  error or annotated with the reason it cannot fire; the ones rewritten include
+  the local-STT engine handle, its GPU-to-CPU retry path, the Google provider's
+  retry loop, and a mutex in the About window that could carry another thread's
+  panic into a dead window.
+
+### Security
+
+- **The parsers that read untrusted network responses are now fuzzed on every
+  test run** (`src/fuzz.rs`). Speech-to-text frames, the AI-cleanup endpoint's
+  replies, the release-check payload that decides which binary gets downloaded
+  and executed, and the settings-sync document each take thousands of
+  deterministic mutations plus an exhaustive truncation sweep, inside
+  `catch_unwind`. Wired in as ordinary tests so it cannot be skipped.
+- **The local-STT archive extractor has a traversal test.** The downloaded
+  runtime is a `.tar.gz` unpacked to disk; a crafted entry escaping it would be
+  an arbitrary file write. Relative `..` walks, absolute paths, and Windows
+  drive-qualified paths are all proven not to escape.
+
 ## [0.7.2] - 2026-08-13
 
 Everything below shipped as one release. 0.5.7 through 0.7.1 were version bumps

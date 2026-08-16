@@ -282,7 +282,11 @@ unsafe fn cached_font<K: Copy + PartialEq>(
     fallback: impl FnOnce() -> HFONT,
 ) -> HFONT {
     let cache = cache.get_or_init(|| std::sync::Mutex::new(Vec::new()));
-    let mut guard = cache.lock().unwrap();
+    // This runs inside a wndproc. A poisoned lock means some other thread
+    // panicked while holding it; the cached font handles are still perfectly
+    // valid, so take the contents and carry on rather than turning someone
+    // else's panic into a dead About window.
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(&(_, p)) = guard.iter().find(|(k, _)| *k == key) {
         return HFONT(p as *mut c_void);
     }
@@ -508,6 +512,10 @@ unsafe fn about_state(hwnd: HWND) -> *mut About {
 /// see `crate::icon`), decoded and scaled to `size`² and flattened onto the
 /// card background so the tile's rounded corners match the card. Mirrors
 /// `lw_logo_hbitmap` above.
+#[allow(
+    clippy::expect_used,
+    reason = "the bytes are include_bytes! of a committed PNG, and embedded_artwork_decodes forces this path in the test suite"
+)]
 fn qd_logo_rgba(size: u32) -> Vec<u8> {
     let base = DARK_BG();
     let sz = size.max(1);

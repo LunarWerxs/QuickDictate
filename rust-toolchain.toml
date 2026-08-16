@@ -1,0 +1,20 @@
+# Pin the host toolchain so local builds, CI, and the shipped release binary are
+# all the same compiler.
+#
+# They were NOT, before this file existed. CI (`dtolnay/rust-toolchain@stable` on
+# `windows-latest`) and the release workflow both resolve to the MSVC host, while
+# a developer machine here defaulted to `stable-x86_64-pc-windows-gnu`. Same
+# `cargo build`, two different backends, two different linkers, two different
+# debug-info formats -- which is precisely the "green locally, red in CI" class a
+# pin removes. MSVC is the side that ships, so MSVC is what gets pinned.
+#
+# The channel deliberately floats on `stable` to pick up compiler fixes;
+# Cargo.lock keeps dependencies reproducible. Verify with `rustup show` --
+# `rustc --version --verbose` should report `host: x86_64-pc-windows-msvc`.
+#
+# Switching an existing checkout costs one full dependency rebuild, once.
+[toolchain]
+channel = "stable-x86_64-pc-windows-msvc"
+# Travel with the repo, so a fresh clone (and CI) has the lint/format tools
+# without a separate `rustup component add`.
+components = ["clippy", "rustfmt"]

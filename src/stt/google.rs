@@ -233,7 +233,12 @@ where
             }
         }
     }
-    Err(last_err.expect("loop runs at least once, so an Err always sets this"))
+    // MAX_RETRIES is a constant >= 0, so the loop always runs at least once and
+    // every failing arm sets `last_err` -- the fallback is unreachable. It is a
+    // value rather than an `.expect()` because this runs on a tokio worker,
+    // where a panic takes the runtime down silently. `Transient` is the right
+    // default: it retries later instead of condemning a healthy key.
+    Err(last_err.unwrap_or(FailKind::Transient))
 }
 
 /// Decide what a segment's final (post-retry) failure means for the session:

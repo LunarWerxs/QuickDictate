@@ -367,8 +367,31 @@ pub struct Config {
     #[serde(default)]
     pub local_keys: Vec<String>,
 
-    /// When true, the app writes `logs\quickdictate.log` beside the exe.
-    /// Off by default; flip this on if you need to diagnose anything.
+    /// Where QuickDictate keeps its runtime files: the `logs\` folder, the
+    /// stats json, the settings-sync credential blob, and the update-check
+    /// cache. Empty (the default) means "the folder settings.json is in",
+    /// which for a shipped exe is the folder the exe sits in -- the historical
+    /// behaviour. Set it to move that clutter somewhere else, which is the
+    /// point: an exe on the Desktop otherwise turns the Desktop into a scratch
+    /// directory.
+    ///
+    /// `%VARIABLES%` are expanded, so `%LOCALAPPDATA%\QuickDictate` is a valid
+    /// value. The path must be absolute; a relative one is refused (it would
+    /// resolve against whatever working directory Explorer or the Run key
+    /// happened to hand us). The environment variable `QUICKDICTATE_DATA_DIR`
+    /// overrides this. See [`crate::paths`] for the full resolution order.
+    ///
+    /// settings.json itself is NOT moved by this -- it has to be found before
+    /// it can be read. [`Config::settings_path`] also looks in
+    /// `%LOCALAPPDATA%\QuickDictate`, which is how the exe's own folder can be
+    /// left completely empty.
+    ///
+    /// Machine-local (a path on this PC), so it is not synced.
+    #[serde(default)]
+    pub data_dir: String,
+
+    /// When true, the app writes `logs\quickdictate.log` into the data folder
+    /// above. Off by default; flip this on if you need to diagnose anything.
     /// (The env var `QUICKDICTATE_LOG` also forces it on.)
     #[serde(default = "default_false")]
     pub enable_logging: bool,
@@ -547,6 +570,7 @@ impl Default for Config {
             hide_tray_icon: false,
             prewarm_keys: true,
             local_keys: Vec::new(),
+            data_dir: String::new(),
             enable_logging: false,
             max_log_mb: default_max_log_mb(),
             log_transcripts: false,
@@ -586,11 +610,35 @@ impl Config {
             .unwrap_or(false)
     }
 
+    /// `settings.json` inside the folder named by `QUICKDICTATE_DATA_DIR`, if
+    /// that variable names a usable absolute path. Checked first so the
+    /// environment override is a COMPLETE relocation lever: without this, a
+    /// scripted portable install could move every runtime file and still be
+    /// forced to leave settings.json behind next to the exe.
+    fn env_settings_path() -> Option<PathBuf> {
+        let raw = std::env::var(crate::paths::DATA_DIR_ENV).ok()?;
+        crate::paths::expand(&raw).map(|dir| dir.join("settings.json"))
+    }
+
     pub fn settings_path() -> PathBuf {
         // Search order:
+        //   0. %QUICKDICTATE_DATA_DIR%\settings.json
         //   1. settings.json next to the .exe (packaged install)
         //   2. walk up from the exe dir (covers `target/release/exe` -> project root)
-        //   3. current working directory
+        //   3. %LOCALAPPDATA%\QuickDictate\settings.json (the well-known
+        //      location, so the exe's own folder can be left empty)
+        //   4. current working directory
+        //
+        // The exe-adjacent file deliberately outranks the AppData one: a
+        // settings.json sitting next to the exe IS the portable install's
+        // config, and an upgrade must never silently move such a user onto a
+        // different file.
+        if let Some(path) = Self::env_settings_path() {
+            if path.exists() {
+                return path;
+            }
+        }
+
         let exe = std::env::current_exe().ok();
         let exe_dir = exe
             .as_ref()
@@ -623,11 +671,25 @@ impl Config {
             }
         }
 
+        // The well-known off-exe location. Only adopted when the file is really
+        // there, so this can never redirect an install that has its own copy.
+        if let Some(path) = crate::paths::app_data_dir().map(|d| d.join("settings.json")) {
+            if path.exists() {
+                return path;
+            }
+        }
+
         let cwd = PathBuf::from("settings.json");
         if cwd.exists() {
             return cwd;
         }
 
+        // Nothing exists yet, so this is where a NEW settings.json goes. An
+        // explicit environment override wins; otherwise, next to the exe as
+        // always.
+        if let Some(path) = Self::env_settings_path() {
+            return path;
+        }
         exe_dir.map(|p| p.join("settings.json")).unwrap_or(cwd)
     }
 
@@ -687,13 +749,21 @@ impl Config {
         }
 
         // File missing: write the embedded template (settings.example.json,
-        // baked into the exe) to the canonical location next to the exe, so the
-        // first launch leaves a real, nicely-formatted file to edit.
-        let target = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-            .map(|d| d.join("settings.json"))
-            .unwrap_or_else(|| PathBuf::from("settings.json"));
+        // baked into the exe) to the canonical location, so the first launch
+        // leaves a real, nicely-formatted file to edit. `settings_path` already
+        // decided where that is (next to the exe, unless the environment
+        // override names somewhere else), so don't re-derive it here -- the two
+        // answers drifting apart would write the template to a file the next
+        // launch does not read.
+        let target = path;
+        if let Some(parent) = target.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                diags.push(format!(
+                    "WARN: could not create {} for settings.json: {e}",
+                    parent.display()
+                ));
+            }
+        }
 
         // Parse the template so the running config matches what we just wrote;
         // fall back to Config::default() if the bundled template can't parse

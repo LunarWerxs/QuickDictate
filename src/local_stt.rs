@@ -1374,15 +1374,11 @@ fn worker_loop(rx: mpsc::Receiver<WorkerCommand>) {
                     if !is_installed(&model_id) {
                         return Err(format!("local model '{model_id}' is not installed"));
                     }
-                    if engine.is_none() {
-                        engine = Some(unsafe { NativeEngine::load()? });
-                    }
-                    unsafe {
-                        engine
-                            .as_mut()
-                            .expect("initialized above")
-                            .prewarm(&model_id)
-                    }
+                    let loaded = match engine.as_mut() {
+                        Some(e) => e,
+                        None => engine.insert(unsafe { NativeEngine::load()? }),
+                    };
+                    unsafe { loaded.prewarm(&model_id) }
                 })();
                 match result {
                     Ok(warmed) if warmed => tracing::info!(
@@ -1406,17 +1402,11 @@ fn worker_loop(rx: mpsc::Receiver<WorkerCommand>) {
                             job.model_id
                         ));
                     }
-                    if engine.is_none() {
-                        engine = Some(unsafe { NativeEngine::load()? });
-                    }
-                    unsafe {
-                        engine.as_mut().expect("initialized above").run(
-                            &job.model_id,
-                            &job.language,
-                            &job.pcm,
-                            &job.cancel,
-                        )
-                    }
+                    let loaded = match engine.as_mut() {
+                        Some(e) => e,
+                        None => engine.insert(unsafe { NativeEngine::load()? }),
+                    };
+                    unsafe { loaded.run(&job.model_id, &job.language, &job.pcm, &job.cancel) }
                 })();
                 tracing::info!(
                     "local STT processed {audio_seconds:.1}s of audio in {:.2}s",
@@ -1714,7 +1704,15 @@ impl NativeEngine {
             .as_ref()
             .map(|s| s.as_ptr())
             .unwrap_or(std::ptr::null());
-        let session = self.loaded.as_ref().expect("model loaded").session;
+        // `run_one` is only reached through `run`, which calls `ensure_model`
+        // first -- but "only reached through" is an invariant a future caller
+        // can break, and breaking it here would abort a background thread with
+        // no console to print to. Report it as the error it is instead.
+        let session = self
+            .loaded
+            .as_ref()
+            .ok_or("no local model is loaded")?
+            .session;
         unsafe {
             (self.api.set_abort)(
                 session,
@@ -1729,7 +1727,11 @@ impl NativeEngine {
         if status == 8 {
             tracing::warn!("local STT GPU run failed; retrying this model on CPU");
             self.ensure_model(model_id, true)?;
-            let session = self.loaded.as_ref().expect("CPU model loaded").session;
+            let session = self
+                .loaded
+                .as_ref()
+                .ok_or("the CPU reload left no local model loaded")?
+                .session;
             unsafe {
                 (self.api.set_abort)(
                     session,
@@ -1739,7 +1741,12 @@ impl NativeEngine {
             };
             status = unsafe { (self.api.run)(session, pcm.as_ptr(), pcm.len() as c_int, &params) };
         }
-        let session = self.loaded.as_ref().expect("model loaded").session;
+        // Re-read: the GPU-failure branch above may have swapped the session.
+        let session = self
+            .loaded
+            .as_ref()
+            .ok_or("no local model is loaded")?
+            .session;
         if status == 13 || cancel.load(Ordering::Acquire) {
             return Err("local transcription was cancelled".into());
         }
@@ -1785,6 +1792,110 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::thread::JoinHandle;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// RED TEAM: the local-STT runtime arrives as a downloaded `.tar.gz` and is
+    /// unpacked to disk. `install_runtime` relies on `tar::Archive::unpack`
+    /// routing every entry through the traversal-safe `unpack_in`, and says so
+    /// in a comment. A comment is not a guarantee -- it is a claim about a
+    /// dependency that a version bump or a swap to another crate could quietly
+    /// invalidate, and the blast radius is arbitrary file write as the user.
+    ///
+    /// So: build the hostile archive by hand and prove nothing escapes. The
+    /// three shapes below are the whole classic family -- a relative `..` walk,
+    /// an absolute path, and a Windows drive-qualified path (which a
+    /// Unix-oriented guard can miss, and this is a Windows-only app).
+    #[test]
+    fn archive_extraction_cannot_escape_its_directory() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let root = test_path("tarsafe").with_extension("");
+        let staging = root.join("staging");
+        let outside = root.join("outside");
+        fs::create_dir_all(&staging).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        let hostile_names = [
+            "../outside/escaped-relative.txt",
+            "../../outside/escaped-deeper.txt",
+            "/outside/escaped-absolute.txt",
+            "C:/Windows/Temp/quickdictate-escaped-drive.txt",
+            r"..\outside\escaped-backslash.txt",
+        ];
+
+        // The name goes into the header's raw 100-byte field, NOT through
+        // `append_data`. This is load-bearing, and getting it wrong is how this
+        // test was first written: `append_data` VALIDATES the path and refuses
+        // every name above, so the archive ended up containing only the benign
+        // entry and the test passed while extracting nothing hostile at all. A
+        // real attacker writes header bytes; so does this.
+        fn hostile_header(name: &str, size: usize) -> tar::Header {
+            let mut header = tar::Header::new_gnu();
+            let raw = &mut header.as_old_mut().name;
+            let bytes = name.as_bytes();
+            assert!(bytes.len() < raw.len(), "name too long for a tar header");
+            raw[..bytes.len()].copy_from_slice(bytes);
+            header.set_size(size as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            header
+        }
+
+        let payload = b"pwned";
+        let mut archive = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::fast()));
+        for name in hostile_names {
+            archive
+                .append(&hostile_header(name, payload.len()), &payload[..])
+                .unwrap();
+        }
+        // One legitimate entry, so "the guard rejected the whole archive" stays
+        // distinguishable from "the guard filtered the bad entries".
+        let benign = b"ok";
+        archive
+            .append(
+                &hostile_header("transcribe-native/contract.json", benign.len()),
+                &benign[..],
+            )
+            .unwrap();
+        let gz = archive.into_inner().unwrap().finish().unwrap();
+
+        // THE HONESTY CHECK: read the archive back and prove the hostile names
+        // are really in it. Without this, anything that silently drops them
+        // makes the test green and vacuous again.
+        let mut present: Vec<String> = Vec::new();
+        let mut verify = tar::Archive::new(GzDecoder::new(std::io::Cursor::new(gz.clone())));
+        for entry in verify.entries().unwrap() {
+            present.push(String::from_utf8_lossy(&entry.unwrap().path_bytes()).into_owned());
+        }
+        for name in hostile_names {
+            assert!(
+                present.iter().any(|p| p == name),
+                "the archive does not actually contain the hostile entry {name:?}, so this test \
+                 proves nothing. Present: {present:?}"
+            );
+        }
+        assert_eq!(present.len(), hostile_names.len() + 1);
+
+        // Exactly the call `install_runtime` makes.
+        let mut reader = tar::Archive::new(GzDecoder::new(std::io::Cursor::new(gz)));
+        let _ = reader.unpack(&staging);
+
+        let escaped: Vec<PathBuf> = fs::read_dir(&outside)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .collect();
+        assert!(
+            escaped.is_empty(),
+            "a tar entry escaped the staging directory: {escaped:?}"
+        );
+        assert!(
+            !Path::new(r"C:\Windows\Temp\quickdictate-escaped-drive.txt").exists(),
+            "a drive-qualified tar entry escaped to an absolute path"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_file(r"C:\Windows\Temp\quickdictate-escaped-drive.txt");
+    }
 
     fn test_path(name: &str) -> PathBuf {
         let nonce = SystemTime::now()

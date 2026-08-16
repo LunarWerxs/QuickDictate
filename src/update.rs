@@ -116,7 +116,7 @@ pub enum UpdateCheck {
 /// to say "this is newer than the identical-looking thing you have", which is
 /// exactly the input an attacker controls. Republishing therefore requires a
 /// version bump; `docs/RELEASING.md` says so.
-fn parse_ver(s: &str) -> Option<(u32, u32, u32, u8)> {
+pub(crate) fn parse_ver(s: &str) -> Option<(u32, u32, u32, u8)> {
     let trimmed = s.trim().trim_start_matches(['v', 'V']);
     // Strip build metadata first, then split off any prerelease tag.
     let no_build = trimmed.split('+').next().unwrap_or(trimmed);
@@ -271,15 +271,8 @@ pub fn init_install_id(app: &App) {
 // Throttle cache
 // ---------------------------------------------------------------------------
 
-fn exe_dir() -> Option<PathBuf> {
-    std::env::current_exe()
-        .ok()?
-        .parent()
-        .map(|p| p.to_path_buf())
-}
-
 fn cache_path() -> Option<PathBuf> {
-    exe_dir().map(|d| d.join(CACHE_FILE))
+    Some(crate::paths::data_file(CACHE_FILE))
 }
 
 fn now_secs() -> u64 {
@@ -325,13 +318,13 @@ fn write_cache_failed() {
 // Download, verify, swap, relaunch
 // ---------------------------------------------------------------------------
 
-struct Asset {
+pub(crate) struct Asset {
     url: String,
     size: u64,
     sha256: String,
 }
 
-fn trusted_asset_url(raw: &str) -> bool {
+pub(crate) fn trusted_asset_url(raw: &str) -> bool {
     let Ok(url) = url::Url::parse(raw) else {
         return false;
     };
@@ -347,7 +340,7 @@ fn trusted_asset_url(raw: &str) -> bool {
 /// Resolve only the stable, human-facing `quickdictate.exe` asset. Exact naming keeps the
 /// updater independent of GitHub upload order and prevents a future helper/debug executable
 /// from being mistaken for the portable application.
-fn exe_asset_from_json(json: &serde_json::Value) -> Option<(String, Asset)> {
+pub(crate) fn exe_asset_from_json(json: &serde_json::Value) -> Option<(String, Asset)> {
     let tag = json
         .get("tag_name")?
         .as_str()?

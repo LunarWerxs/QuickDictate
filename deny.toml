@@ -1,0 +1,106 @@
+# cargo-deny configuration for QuickDictate.
+#
+# Run locally with:
+#     cargo deny check
+# (or `pwsh scripts\check.ps1`, which runs it as one of the gates)
+#
+# CI runs the same thing in the `deny` job of .github/workflows/ci.yml.
+#
+# This supersedes `.cargo/audit.toml` as the advisory gate. `cargo audit` only
+# ever answered "is anything in Cargo.lock vulnerable"; cargo-deny answers that
+# AND "is every dependency's license one we may ship", "did a duplicate or a
+# wildcard version sneak in", and "did anything start coming from a registry or
+# git remote we never approved". The last one is the supply-chain question, and
+# nothing in this repo was asking it before.
+
+# ----------------------------------------------------------------------------
+[graph]
+# QuickDictate ships a Windows executable and nothing else. Pinning the targets
+# is what makes the scan HONEST: without it, cargo-deny walks the whole
+# dependency graph including the Linux-only GTK tray backend and the
+# Wayland-only window decorations, then reports advisories against crates that
+# are never compiled into anything we ship. That noise is exactly why the old
+# `.cargo/audit.toml` needed a ten-entry ignore list; with the targets pinned,
+# most of those entries stop being reachable rather than being waved through.
+#
+# Both Windows hosts are listed because the two disagree in practice: local
+# development has historically run the GNU host while CI and the release build
+# run MSVC (see rust-toolchain.toml, which now pins that down).
+targets = [
+    { triple = "x86_64-pc-windows-msvc" },
+    { triple = "x86_64-pc-windows-gnu" },
+]
+# The crate has no optional features (`[features] default = []`), so the default
+# graph IS the shipped graph. If a feature is ever added that ships in a
+# release, name it here or its dependencies silently leave the scan.
+all-features = false
+
+# ----------------------------------------------------------------------------
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# A yanked crate in a COMMITTED lockfile is a real problem: the pin is
+# reproducible right up until it isn't.
+yanked = "deny"
+# No entries. Every advisory the old `.cargo/audit.toml` had to ignore was
+# reachable only through a non-Windows target (the GTK tray backend via
+# `tray-icon -> libappindicator/gtk -> glib`, and Wayland decorations via
+# `eframe/winit -> sctk-adwaita -> ab_glyph -> ttf-parser`), and the pinned
+# `targets` above remove them from the graph outright instead.
+#
+# If a real, unfixable advisory ever lands here, add it with a DATE and the
+# reason it cannot be patched. Never blanket-ignore: an ignore list nobody can
+# explain is how a genuine vulnerability hides among nine irrelevant ones.
+ignore = []
+
+# ----------------------------------------------------------------------------
+[licenses]
+# QuickDictate itself is MIT (see LICENSE). This list is about DEPENDENCIES, and
+# is deliberately kept to exactly what the lockfile actually resolves to on the
+# Windows targets, so a new crate arriving under a surprising license fails the
+# build rather than sliding in under a permissive catch-all.
+#
+# Every entry below is a license the current lockfile really contains. An
+# unmatched allowance is itself reported (as a warning), so this list stays a
+# description of the tree rather than a wish list.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",         # via the TLS / cert stack
+    "Zlib",        # foldhash and the adler-family crates
+    "Unicode-3.0", # unicode-ident; an ANDed term in its SPDX expression
+    "BSL-1.0",     # Boost: clipboard-win, error-code (the clipboard path)
+    # epaint_default_fonts is "(MIT OR Apache-2.0) AND OFL-1.1 AND
+    # Ubuntu-font-1.0" -- the ANDed font licenses cover the typeface DATA egui
+    # embeds, not code, and both permit redistribution in a binary.
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+]
+# A crate whose SPDX expression ANDs several ids needs EVERY term allowed.
+confidence-threshold = 0.93
+# Only dependency licenses are in question; skip the workspace member itself.
+private = { ignore = true }
+
+# ----------------------------------------------------------------------------
+[bans]
+# A duplicated version is a smell (bigger binary, slower build), not a hard
+# failure: the eframe/winit/image/windows stacks legitimately overlap on a
+# couple of minor versions. Surface them without breaking the build.
+multiple-versions = "warn"
+# A wildcard ("*") requirement makes the lockfile non-reproducible.
+wildcards = "warn"
+deny = []
+skip = []
+
+# ----------------------------------------------------------------------------
+[sources]
+# The supply-chain gate. QuickDictate downloads and EXECUTES a native runtime at
+# the user's request (`local_stt`), so "where did this code come from" is not an
+# academic question here.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# No git dependencies. Adding one means adding it here on purpose, pinned by
+# rev, with a note saying why crates.io was not enough.
+allow-git = []

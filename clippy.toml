@@ -1,0 +1,20 @@
+# Clippy configuration for QuickDictate.
+#
+# QuickDictate is built with `windows_subsystem = "windows"`, so it has NO
+# console: a panic on any of its background threads (audio capture, the hotkey
+# pump, the STT websocket workers, the settings-sync thread, the updater) prints
+# to a stderr that goes nowhere. The user sees dictation stop working, with no
+# error and nothing on screen. That is the reason `clippy::unwrap_used` and
+# `clippy::expect_used` are enabled at the crate root in `src/main.rs`: in a
+# GUI-subsystem app an `.unwrap()` is not a loud failure, it is a SILENT one.
+#
+# The escape hatch is a local `#[allow(clippy::unwrap_used, reason = "...")]` on
+# a site that is provably infallible -- a compile-time-constant regex, a lock
+# whose poisoning is already handled. The reason string is the point: it is the
+# argument for why this one cannot fire.
+#
+# Tests are exempt, and that is not a loophole. An unwrap in a test IS the
+# assertion, and a panic there fails the test, which is exactly the intended
+# behaviour.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

@@ -1,4 +1,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// A release build has no console (`windows_subsystem = "windows"` above), so a
+// panic on a background thread writes to a stderr that goes nowhere: dictation
+// just stops, with no error and nothing on screen. `.unwrap()`/`.expect()` are
+// therefore SILENT failure here, not loud ones, and are linted crate-wide.
+// Tests are exempt via clippy.toml (an unwrap there IS the assertion). A
+// genuinely infallible site takes a local `#[allow(..., reason = "...")]`,
+// where the reason string is the argument for why it cannot fire.
+#![warn(clippy::unwrap_used, clippy::expect_used)]
 
 mod about;
 mod audio;
@@ -6,12 +14,17 @@ mod autostart;
 mod config;
 mod dev_trigger;
 mod focus;
+/// Mutation fuzzing of the untrusted-input parsers, wired in as ordinary tests
+/// so it runs on every `cargo test` (and therefore in CI) without a named job.
+#[cfg(test)]
+mod fuzz;
 mod hotkeys;
 mod icon;
 mod keys;
 mod local_stt;
 mod onboarding;
 mod output;
+mod paths;
 mod polish;
 mod secretstore;
 mod settings_ui;
@@ -183,13 +196,10 @@ fn single_instance_guard() -> bool {
 /// Directory containing QuickDictate diagnostics. Settings opens this folder
 /// directly so the active, rotated, panic, and migrated logs are all visible.
 ///
-/// Falls back to `./logs` if the executable directory cannot be located.
+/// Lives inside the configured data folder (see [`crate::paths`]), which
+/// defaults to the folder holding settings.json exactly as it always did.
 pub(crate) fn logs_dir() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(LOGS_DIR_NAME)
+    paths::data_dir().join(LOGS_DIR_NAME)
 }
 
 /// Path of the active application log. Kept alongside [`logs_dir`] so Settings
@@ -256,11 +266,33 @@ fn prepare_logs_dir_at(exe_dir: &Path, logs_dir: &Path) -> Vec<String> {
 
 fn prepare_logs_dir() -> Vec<String> {
     let logs_dir = logs_dir();
-    let exe_dir = logs_dir
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    prepare_logs_dir_at(&exe_dir, &logs_dir)
+    // Older releases dropped loose `quickdictate*.log` files in the folder they
+    // ran from. Sweep BOTH candidates: the data folder's own parent (the
+    // historical case) and the exe folder (which is a different place once the
+    // user relocates the data folder, and is where those legacy files are).
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for root in [
+        logs_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(".")),
+        paths::exe_dir(),
+    ] {
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+
+    let mut diagnostics = Vec::new();
+    for root in &roots {
+        diagnostics.extend(prepare_logs_dir_at(root, &logs_dir));
+        if !logs_dir.is_dir() {
+            // The folder could not be created. A second sweep would only
+            // repeat the identical warning.
+            break;
+        }
+    }
+    diagnostics
 }
 
 /// Install a panic hook that writes panic info to a dedicated unbuffered
@@ -481,15 +513,40 @@ impl Write for SizeCappedLogWriter {
     }
 }
 
+/// Turn `QUICKDICTATE_LOG` into a tracing filter.
+///
+/// The variable does double duty: merely SETTING it turns file logging on (see
+/// `main`), and its VALUE is a `tracing` filter directive. Those two jobs
+/// disagreed for the obvious value. `QUICKDICTATE_LOG=1` switched logging on
+/// and then handed "1" to `EnvFilter`, which is not a level or a target, so the
+/// filter matched nothing and the log file was created and stayed EMPTY: the
+/// documented way to turn logging on produced no logging at all.
+///
+/// So the switch-like values are recognised as "just turn it on, at the default
+/// level", and everything else is still passed through verbatim, which keeps
+/// `QUICKDICTATE_LOG=info,quickdictate=debug` working for anyone who wants
+/// per-partial detail. An unparseable directive falls back to `info` rather
+/// than silencing the log, for the same reason.
+fn log_filter(raw: Option<&str>) -> EnvFilter {
+    const DEFAULT: &str = "info";
+    let Some(value) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return EnvFilter::new(DEFAULT);
+    };
+    // "I want logs", spelled the handful of ways people actually spell it.
+    if matches!(
+        value.to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on" | "y"
+    ) {
+        return EnvFilter::new(DEFAULT);
+    }
+    EnvFilter::try_new(value).unwrap_or_else(|_| EnvFilter::new(DEFAULT))
+}
+
 fn init_logging(
     file_logging: bool,
     max_log_mb: u64,
 ) -> Option<tracing_appender::non_blocking::WorkerGuard> {
-    let filter = EnvFilter::try_from_env("QUICKDICTATE_LOG")
-        // File logging is a user-facing diagnostic, so keep the default at
-        // summaries. Developers can opt into verbose per-frame/per-partial
-        // detail with QUICKDICTATE_LOG=info,quickdictate=debug.
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = log_filter(std::env::var("QUICKDICTATE_LOG").ok().as_deref());
 
     let stdout_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
@@ -636,14 +693,31 @@ fn main() -> Result<()> {
         std::process::exit(0);
     }
 
+    // Load (and possibly generate) settings.json before initializing tracing,
+    // because `enable_logging` is read out of the config. This now also has to
+    // come before the diagnostics folder is prepared: `data_dir` decides where
+    // that folder IS, and settings.json is the only place it is recorded.
+    let (mut cfg, mut startup_diags) = Config::load_or_create();
+
+    // Resolve the data folder and move anything left behind in the old one.
+    // Everything past this line (logging, stats, sync credentials, the update
+    // cache) resolves through `paths::data_dir`, so nothing may write to disk
+    // before it runs.
+    // `Path::parent` of a bare relative name like "settings.json" is `Some("")`,
+    // NOT `None` -- so an `unwrap_or_else` alone would hand the empty path
+    // through as if it were a real folder and every data file would land on a
+    // relative path in whatever directory the process happened to start in.
+    // Filter the empty case out explicitly.
+    let settings_root = Config::settings_path()
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(paths::exe_dir);
+    startup_diags.extend(paths::init(&cfg.data_dir, &settings_root));
+
     // Prepare the diagnostics folder before either logger can open a file.
     // Migration messages are replayed once tracing is initialized below.
-    let mut startup_diags = prepare_logs_dir();
-
-    // Load (and possibly generate) settings.json before initializing tracing,
-    // because `enable_logging` is read out of the config.
-    let (mut cfg, config_diags) = Config::load_or_create();
-    startup_diags.extend(config_diags);
+    startup_diags.extend(prepare_logs_dir());
 
     // `--provider <id>` overrides settings.json's stt_provider for this run,
     // which is useful for local provider testing and automation.
@@ -961,6 +1035,40 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod logging_tests {
     use super::*;
+
+    /// `QUICKDICTATE_LOG=1` is how anyone would turn logging on, and it used to
+    /// produce an empty log file: setting the variable enabled file logging,
+    /// while its value went to `EnvFilter` as a directive, where "1" matches
+    /// nothing.
+    #[test]
+    fn switch_like_log_values_mean_the_default_level_not_silence() {
+        for on in ["1", "true", "TRUE", "yes", "on", "y", " 1 "] {
+            let filter = log_filter(Some(on)).to_string();
+            assert!(
+                filter.contains("info"),
+                "QUICKDICTATE_LOG={on:?} produced the filter {filter:?}, which is not 'info' \
+                 and would leave the log file empty"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_directive_is_still_passed_through_verbatim() {
+        // The documented power-user form has to keep working.
+        let filter = log_filter(Some("info,quickdictate=debug")).to_string();
+        assert!(filter.contains("quickdictate"), "{filter}");
+        assert!(filter.contains("debug"), "{filter}");
+    }
+
+    #[test]
+    fn an_unset_or_broken_value_falls_back_to_info_rather_than_silence() {
+        assert!(log_filter(None).to_string().contains("info"));
+        assert!(log_filter(Some("")).to_string().contains("info"));
+        assert!(log_filter(Some("   ")).to_string().contains("info"));
+        // Garbage must not silence the log; that is the failure mode this whole
+        // function exists to remove.
+        assert!(log_filter(Some("=====")).to_string().contains("info"));
+    }
 
     fn temp_log_test_dir(label: &str) -> PathBuf {
         let unique = std::time::SystemTime::now()

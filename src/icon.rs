@@ -26,6 +26,10 @@ fn clamp_size(size: u32) -> u32 {
 
 /// Decode `png` to raw RGBA8 at `size`² (Lanczos-resampled). Native transparency
 /// is preserved. Returns `(rgba, size, size)`.
+#[allow(
+    clippy::expect_used,
+    reason = "the bytes are include_bytes! of a committed PNG, and embedded_artwork_decodes forces this path in the test suite"
+)]
 fn decode(png: &[u8], size: u32) -> (Vec<u8>, u32, u32) {
     let s = clamp_size(size);
     let img = image::load_from_memory(png)
@@ -48,6 +52,29 @@ pub fn notification_rgba(size: u32) -> (Vec<u8>, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `decode` is allowed to `.expect()` because its input is `include_bytes!`
+    /// of a committed PNG. That is only true while SOMETHING forces the decode
+    /// at build time -- otherwise a corrupt or replaced asset ships and aborts
+    /// the tray thread on first paint, with no console to say why. This is that
+    /// something; the same guarantee covers `about::qd_logo_rgba` and
+    /// `ui::make_icon`, which decode the same two assets.
+    #[test]
+    fn embedded_artwork_decodes() {
+        for (name, bytes) in [("icon-256", PNG), ("notification-256", NOTIFICATION_PNG)] {
+            let img = image::load_from_memory(bytes)
+                .unwrap_or_else(|e| panic!("embedded {name}.png failed to decode: {e}"));
+            assert!(
+                img.width() > 0 && img.height() > 0,
+                "embedded {name}.png decoded to an empty image"
+            );
+        }
+        // And through the real entry points, at the sizes the app asks for.
+        let (rgba, w, h) = rgba(32);
+        assert_eq!(rgba.len(), (w * h * 4) as usize);
+        let (rgba, w, h) = notification_rgba(32);
+        assert_eq!(rgba.len(), (w * h * 4) as usize);
+    }
 
     #[test]
     fn clamp_size_raises_zero_to_one() {

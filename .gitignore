@@ -1,5 +1,9 @@
 # Rust build output (massive; regenerated on `cargo build`).
 /target/
+# `cargo mutants` results (see CONTRIBUTING.md). A local diagnostic, not a
+# reviewed artifact.
+/mutants.out/
+/mutants.out.old/
 
 # Local runtime/tooling output.
 /.saydeploy/
@@ -8,7 +12,10 @@
 # Generated symbol digest (rebuilt in under a second, never reviewed).
 /.claude/codemap/
 
-# Per-run files written next to the exe.
+# Per-run files written into the data folder (by default beside the exe, but
+# relocatable via the `data_dir` setting -- see src/paths.rs). A dev run
+# resolves that folder to the working tree, so `logs/` lands here.
+/logs/
 quickdictate.log
 quickdictate-panic.log
 quickdictate-dev-port.txt
