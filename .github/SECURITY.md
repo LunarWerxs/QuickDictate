@@ -2,11 +2,11 @@
 
 ## Supported Versions
 
-QuickDictate is under active development, and security fixes are made against the **latest release only** (currently the `0.5.x` line), please update to the newest release before reporting an issue.
+QuickDictate is under active development, and security fixes are made against the **latest release only** (currently the `0.8.x` line), please update to the newest release before reporting an issue.
 
 | Version | Supported |
 | ------- | --------- |
-| 0.5.x (latest release) | Yes |
+| 0.8.x (latest release) | Yes |
 | Older releases | No |
 
 ## Reporting a Vulnerability

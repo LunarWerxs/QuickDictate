@@ -54,8 +54,24 @@ function RequireTool($exe, $installHint) {
 $skipped = @()
 
 try {
+    # Every cargo step below passes `--locked`, exactly as CI does, so a stale
+    # Cargo.lock fails the build. That is right, but the raw cargo error
+    # ("cannot update the lock file ... because --locked was passed") does not
+    # say WHY it went stale or how to fix it. A version bump is the usual cause:
+    # Cargo.toml says 0.8.0 while the committed lock still records the old
+    # version. Name it up front instead of making someone decode it.
+    Step 'Cargo.lock matches Cargo.toml' {
+        # NOT --no-deps: that skips dependency resolution, so it happily
+        # succeeds against a stale lock and the guard never fires.
+        cargo metadata --locked --format-version 1 *> $null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "  Cargo.lock is STALE - it does not match Cargo.toml." -ForegroundColor Yellow
+            Write-Host "  Fix: cargo check   (refreshes the lock), then commit Cargo.lock." -ForegroundColor Yellow
+        }
+    }
+
     # Mirrors ci.yml -> `check` job, in the same order.
-    Step 'fmt --check'  { cargo fmt --all --check }
+    if (-not $fail) { Step 'fmt --check'  { cargo fmt --all --check } }
     Step 'clippy'       { cargo clippy --locked --all-targets -- -D warnings }
     # Includes the mutation-fuzz suite in src/fuzz.rs (thousands of mutated and
     # truncated inputs through every parser that reads a network response) and
