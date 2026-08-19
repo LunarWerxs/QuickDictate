@@ -55,6 +55,18 @@ use crate::state::{App, Status};
 pub const RELEASES_API: &str = "https://studio.connections.icu/v1/app/quickdictate/latest";
 pub const RELEASES_URL: &str = "https://github.com/LunarWerxs/QuickDictate/releases";
 
+/// Resilience backstop for the check above, used only when the Studio proxy fails (see
+/// [`fetch_github_fallback_json`]). GitHub's own releases/latest is the right one to fall back
+/// to precisely because it is the only URL here a rename cannot orphan: GitHub redirects both
+/// owner and repo renames, so this keeps resolving even if either changes.
+///
+/// Why this exists (YTSort, 2026-08): a shipped artifact whose single baked-in update URL later
+/// stopped resolving left every install silently polling a dead link for six months, with no
+/// signal to the users or the maintainer. One hardcoded endpoint and no second opinion is that
+/// same failure waiting to happen, and a compiled binary cannot be repointed after the fact.
+pub const GITHUB_LATEST_API: &str =
+    "https://api.github.com/repos/LunarWerxs/QuickDictate/releases/latest";
+
 /// GitHub rejects requests without a User-Agent (the release download still
 /// goes there directly); the Studio proxy sees the same header.
 const USER_AGENT: &str = concat!("QuickDictate/", env!("CARGO_PKG_VERSION"));
@@ -169,16 +181,41 @@ fn fetch_latest_json() -> Option<serde_json::Value> {
     if let Some(id) = INSTALL_ID.get() {
         req = req.header("X-Install-Id", id.as_str());
     }
-    let resp = req.send().ok()?;
-    if !resp.status().is_success() {
-        tracing::info!("update: releases API returned HTTP {}", resp.status());
-        return None;
-    }
-    let json: serde_json::Value = resp.json().ok()?;
+    let primary = match req.send() {
+        Ok(resp) if resp.status().is_success() => resp.json::<serde_json::Value>().ok(),
+        Ok(resp) => {
+            tracing::info!("update: releases API returned HTTP {}", resp.status());
+            None
+        }
+        Err(e) => {
+            tracing::info!("update: releases API unreachable: {e}");
+            None
+        }
+    };
+    // Studio did not answer usefully. Ask GitHub directly rather than leaving this install
+    // unable to ever discover a release again.
+    let json = match primary {
+        Some(j) => j,
+        None => fetch_github_fallback_json()?,
+    };
     if let Ok(mut cached) = LAST_LATEST_JSON.lock() {
         *cached = Some(json.clone());
     }
     Some(json)
+}
+
+/// Ask GitHub directly when the Studio proxy fails.
+///
+/// Deliberately carries no `X-Install-Id` and no `?v=`: this is a plain unauthenticated read,
+/// so it stays inside GitHub's anonymous rate limit and logs no analytics row, which keeps the
+/// SECURITY.md promise of one anonymous row per check intact (a fallback logs none at all).
+fn fetch_github_fallback_json() -> Option<serde_json::Value> {
+    let resp = client()?.get(GITHUB_LATEST_API).send().ok()?;
+    if !resp.status().is_success() {
+        tracing::info!("update: GitHub fallback returned HTTP {}", resp.status());
+        return None;
+    }
+    resp.json().ok()
 }
 
 /// One real network check: latest tag vs compiled-in version.
@@ -806,20 +843,42 @@ mod tests {
 
     #[test]
     #[ignore = "live network"]
-    fn live_github_latest_release_parses() {
-        // The Studio endpoint proxies GitHub's releases/latest verbatim, so
-        // GitHub's shape is still the contract; validate the fetch + tag-parse
-        // path against the sibling LunarWerx project's public releases.
+    fn live_github_fallback_parses() {
+        // Exercises the REAL fallback URL a shipped binary uses when the Studio proxy fails,
+        // not a stand-in. This used to point at the sibling SageThumbs repo purely to sample
+        // GitHub's response shape, which validated the shape but never the address this binary
+        // actually falls back to, and that address is the one thing here that can go wrong.
         let resp = client()
             .unwrap()
-            .get("https://api.github.com/repos/LunarWerxs/SageThumbs-2k/releases/latest")
+            .get(GITHUB_LATEST_API)
             .send()
             .expect("GitHub API reachable");
         assert!(resp.status().is_success(), "HTTP {}", resp.status());
         let json: serde_json::Value = resp.json().unwrap();
         let tag = json.get("tag_name").and_then(|v| v.as_str()).unwrap();
-        println!("latest SageThumbs tag = {tag}");
+        println!("latest QuickDictate tag via GitHub fallback = {tag}");
         assert!(parse_ver(tag).is_some(), "tag {tag} should parse");
+    }
+
+    #[test]
+    fn github_fallback_url_targets_this_projects_releases() {
+        // Offline guard so CI catches a typo in the fallback address without needing network.
+        // A compiled binary cannot be repointed after release: if this constant is wrong,
+        // every install that outlives the Studio proxy is stranded permanently, which is
+        // precisely the YTSort failure this fallback exists to prevent.
+        assert!(
+            GITHUB_LATEST_API.starts_with("https://api.github.com/repos/"),
+            "fallback must be GitHub's API, got {GITHUB_LATEST_API}"
+        );
+        assert!(
+            GITHUB_LATEST_API.ends_with("/LunarWerxs/QuickDictate/releases/latest"),
+            "fallback must target this project's releases, got {GITHUB_LATEST_API}"
+        );
+        // If the primary were also api.github.com there would be no second opinion at all.
+        assert!(
+            !RELEASES_API.starts_with("https://api.github.com/"),
+            "primary and fallback must be different services"
+        );
     }
 
     #[test]
