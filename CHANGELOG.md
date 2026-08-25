@@ -32,6 +32,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   suppress it system-wide, including the clicks needed to get back into Settings
   and undo it.
 
+  Mouse hotkeys also answer to *injected* clicks, not just physical ones. That
+  sounds like a detail and is the difference between the feature working and
+  silently doing nothing in two common setups: a Remote Desktop session, where
+  every click is delivered by the RDP stack rather than a local device, and a
+  mouse whose vendor driver (G HUB and friends) remaps a button by synthesizing
+  it. QuickDictate only ever injects keystrokes, never mouse input, so there is
+  no feedback loop to guard against here.
+
+  When a bound button is pressed but the held modifiers don't match, the log now
+  says so, with both the expected and the actual modifiers. A stuck Ctrl or
+  Shift (which RDP sessions produce routinely) otherwise makes a correctly
+  configured hotkey look dead for no visible reason.
+
+  Note that Remote Desktop cannot carry the two thumb buttons at all: its base
+  protocol has left/right/middle and the wheel, and the extension that adds the
+  others is not sent by most clients, including the mobile apps. Bind and test
+  thumb buttons at the physical machine. See docs/GUIDE.md.
+
 ## [0.8.0] - 2026-08-15
 
 ### Added

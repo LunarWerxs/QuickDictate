@@ -199,6 +199,10 @@ Three things worth knowing:
 
 Windows only reports these three buttons to applications. If your mouse has more, its own driver software maps the extras, usually to a keystroke you can then bind here as a normal hotkey.
 
+**On a gaming mouse (G502, Razer, and friends):** only the middle button and the two thumb buttons arrive as *mouse buttons*. Everything else, the sniper button, the DPI buttons, the tilt-wheel, the extra thumb cluster, is handled inside the vendor's software (Logitech G HUB and the like) and Windows never sees it as a button at all. Map one to a keyboard combination there, then bind that combination here as an ordinary hotkey; that route also works everywhere the mouse route doesn't.
+
+**Testing over Remote Desktop won't work properly, test at the physical machine.** Remote Desktop's base protocol only carries left, right, middle and the wheel. The two thumb buttons need an optional extension that most clients, including the Android and iOS apps, simply never send, so a Back/Forward press on your local mouse is *discarded before it reaches Windows*. Nothing on this end can recover it. Recording will appear to work for middle-click and do nothing at all for the thumb buttons, which looks like a QuickDictate bug and isn't one. Mouse hotkeys themselves work fine in an RDP session, it is only the recording and pressing of thumb buttons *through* that session that cannot.
+
 Under the hood these take a different route than keyboard hotkeys: Windows' `RegisterHotKey` is keyboard-only, so mouse bindings run through a low-level mouse hook instead. It self-heals on the same one-minute timer as the keyboard hotkeys.
 
 ## Build from source

@@ -249,6 +249,20 @@ fn handle_down(vk: u32, mods: u32) -> bool {
         .find(|b| b.vk == vk && b.mods == mods)
         .copied()
     else {
+        // A button we DO have a binding for, pressed with the wrong modifiers
+        // held, is the likeliest cause of "the hook installed but my mouse
+        // hotkey does nothing" — and a stuck Ctrl/Alt/Shift, which Remote
+        // Desktop sessions produce routinely, causes exactly this while being
+        // invisible to the person pressing the button. Say so rather than
+        // failing silently; the modifier match itself is deliberate (see
+        // `MouseBinding::mods`).
+        if let Some(b) = cfg.bindings.iter().find(|b| b.vk == vk) {
+            tracing::info!(
+                "mouse hotkey vk=0x{vk:02X} not fired: modifiers held are 0x{mods:02X}, \
+                 the binding needs exactly 0x{:02X} (a stuck modifier key will do this)",
+                b.mods
+            );
+        }
         return false; // not ours — pass it through untouched
     };
 
@@ -311,6 +325,20 @@ fn spawn_long_press_poller(slot: usize, toggle_id: i32, tx: Sender<HotkeyEvent>,
     });
 }
 
+/// Whether we have already remarked that mouse input is arriving injected.
+/// Logged once per run: it is diagnostic colour (RDP session, or a vendor
+/// driver remapping buttons), not a problem in itself.
+static NOTED_INJECTED: AtomicBool = AtomicBool::new(false);
+
+fn note_injected(vk: u32) {
+    if !NOTED_INJECTED.swap(true, Ordering::AcqRel) {
+        tracing::info!(
+            "mouse button vk=0x{vk:02X} arrived as injected input (Remote Desktop, or a mouse \
+             driver remapping buttons). Handled normally \u{2014} this is only noted once."
+        );
+    }
+}
+
 /// A button went down while a [capture lease](capture_lease) may be held.
 ///
 /// The lease makes us passive to **new presses only**: the settings window is
@@ -329,28 +357,39 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
     // hook contract.
     if code == HC_ACTION as i32 {
         let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
-        // Ignore anything synthesized by SendInput — ours or another tool's.
-        // A hotkey should answer to a physical press, and consuming injected
-        // events invites feedback loops with our own output path.
-        if info.flags & LLMHF_INJECTED == 0 {
-            if let Some((vk, is_down)) = decode(wparam.0 as u32, info.mouseData) {
-                let suppress = if is_down {
-                    dispatch_down(vk, current_modifiers(), capture_active())
-                } else {
-                    // A release is NEVER gated by the capture lease. `handle_up`
-                    // is already a no-op unless we claimed the matching press,
-                    // and a press we *did* claim has to be completed no matter
-                    // what happened in between: skipping it would leak an
-                    // unpaired button-up into whatever app has focus (we ate its
-                    // button-down) and would never emit `HoldReleased`, leaving
-                    // a hold-mode dictation running with nothing to stop it.
-                    // Reachable for real: hold a mouse-bound hotkey, then open
-                    // Settings and arm a recorder before letting go.
-                    handle_up(vk)
-                };
-                if suppress {
-                    return LRESULT(1); // suppressed: goes no further
-                }
+        if let Some((vk, is_down)) = decode(wparam.0 as u32, info.mouseData) {
+            // Injected events are deliberately NOT filtered out.
+            //
+            // The instinct is to ignore anything that did not come from physical
+            // hardware, but here it is wrong and the cost is total: this app
+            // injects keystrokes only, never mouse input (`output.rs` builds
+            // `INPUT_KEYBOARD` records exclusively), so there is no feedback loop
+            // for such a filter to prevent. What it *would* prevent is the
+            // feature working at all in the two setups most likely to want it: a
+            // Remote Desktop session, where every click is delivered by the RDP
+            // stack rather than a local device, and a mouse whose vendor driver
+            // (Logitech G HUB and friends) remaps a physical button by
+            // synthesizing one. Both would present as "the hook installed and
+            // the button does nothing" — silent, and near-impossible to guess.
+            if info.flags & LLMHF_INJECTED != 0 {
+                note_injected(vk);
+            }
+            let suppress = if is_down {
+                dispatch_down(vk, current_modifiers(), capture_active())
+            } else {
+                // A release is NEVER gated by the capture lease. `handle_up` is
+                // already a no-op unless we claimed the matching press, and a
+                // press we *did* claim has to be completed no matter what
+                // happened in between: skipping it would leak an unpaired
+                // button-up into whatever app has focus (we ate its button-down)
+                // and would never emit `HoldReleased`, leaving a hold-mode
+                // dictation running with nothing to stop it. Reachable for real:
+                // hold a mouse-bound hotkey, then open Settings and arm a
+                // recorder before letting go.
+                handle_up(vk)
+            };
+            if suppress {
+                return LRESULT(1); // suppressed: goes no further
             }
         }
     }
