@@ -247,9 +247,9 @@ fn egui_key_name(key: egui::Key) -> Option<&'static str> {
     })
 }
 
-/// Build a combo string ("ctrl+shift+f14") from a captured key + modifiers.
-fn combo_from_event(key: egui::Key, mods: egui::Modifiers) -> Option<String> {
-    let name = egui_key_name(key)?;
+/// Prefix a key/button name with whichever modifiers were held, in the fixed
+/// order `parse_combo` reads back.
+fn with_modifiers(name: &str, mods: egui::Modifiers) -> String {
     let mut parts: Vec<&str> = Vec::new();
     if mods.ctrl || mods.command {
         parts.push("ctrl");
@@ -261,7 +261,31 @@ fn combo_from_event(key: egui::Key, mods: egui::Modifiers) -> Option<String> {
         parts.push("shift");
     }
     parts.push(name);
-    Some(parts.join("+"))
+    parts.join("+")
+}
+
+/// Build a combo string ("ctrl+shift+f14") from a captured key + modifiers.
+fn combo_from_event(key: egui::Key, mods: egui::Modifiers) -> Option<String> {
+    Some(with_modifiers(egui_key_name(key)?, mods))
+}
+
+/// Build a combo string ("mouse4", "ctrl+mouse3") from a captured mouse
+/// button + modifiers, or `None` for a button we refuse to bind.
+///
+/// Primary and Secondary are deliberately unbindable: binding a mouse button
+/// also *suppresses* it system-wide (see [`crate::mouse_hook`]), and someone
+/// who loses left-click can no longer click their way back here to undo it.
+/// `hotkeys::parse_combo` rejects them for the same reason, so a hand-edited
+/// `settings.json` can't sneak one in either. Useful side effect: the Primary
+/// click that arms recording is never itself recordable.
+fn combo_from_pointer(button: egui::PointerButton, mods: egui::Modifiers) -> Option<String> {
+    let name = match button {
+        egui::PointerButton::Middle => "mouse3",
+        egui::PointerButton::Extra1 => "mouse4",
+        egui::PointerButton::Extra2 => "mouse5",
+        egui::PointerButton::Primary | egui::PointerButton::Secondary => return None,
+    };
+    Some(with_modifiers(name, mods))
 }
 
 // ---- Text-replacement bulk editor ------------------------------------------
@@ -377,9 +401,13 @@ const TIP_LANGUAGE: &str = "BCP-47 language tag for transcription, e.g. en-US, e
 const TIP_MODE: &str = "toggle: tap the hotkey to start, tap again to stop.  \
      hold: dictate only while the hotkey is held down.";
 const TIP_TOGGLE_HOTKEY: &str = "Tap this key to start dictating; tap again to stop. \
-     Click the dot in the field to record a new key.";
+     Click the dot in the field to record a new one \u{2014} a key, or a mouse button \
+     (middle, or a thumb button: mouse3 / mouse4 / mouse5). A bound mouse button stops \
+     reaching other apps; left and right click can't be bound.";
 const TIP_HOLD_HOTKEY: &str = "Hold this key to dictate; release to stop. \
-     Click the dot in the field to record a new key.";
+     Click the dot in the field to record a new one \u{2014} a key, or a mouse button \
+     (middle, or a thumb button: mouse3 / mouse4 / mouse5). A bound mouse button stops \
+     reaching other apps; left and right click can't be bound.";
 const TIP_REPASTE: &str = "Hold your toggle hotkey this long to re-paste your most recent \
      dictation. Takes effect after a restart.";
 const TIP_LISTEN_TAIL: &str = "After you stop talking, QuickDictate keeps listening this long \
@@ -1013,6 +1041,67 @@ mod tests {
 
         // Keys the parser can't use are rejected up front.
         assert!(combo_from_event(egui::Key::F35, egui::Modifiers::default()).is_none());
+    }
+
+    #[test]
+    fn recorded_mouse_buttons_round_trip_through_the_parser() {
+        // The bug this feature fixes: a mouse button pressed while a field was
+        // recording produced nothing, because only `Key` events were read.
+        // Every capturable button must now yield a combo the engine accepts.
+        for (button, expected) in [
+            (egui::PointerButton::Middle, "mouse3"),
+            (egui::PointerButton::Extra1, "mouse4"),
+            (egui::PointerButton::Extra2, "mouse5"),
+        ] {
+            let combo = combo_from_pointer(button, egui::Modifiers::default())
+                .unwrap_or_else(|| panic!("{button:?} must be capturable"));
+            assert_eq!(combo, expected);
+            assert!(
+                crate::hotkeys::parse_combo(&combo).is_ok(),
+                "the capture UI and the hotkey engine must agree on {combo}"
+            );
+        }
+
+        // Modifiers ride along exactly as they do for keys.
+        let mods = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+        let combo = combo_from_pointer(egui::PointerButton::Extra1, mods).unwrap();
+        assert_eq!(combo, "ctrl+shift+mouse4");
+        assert!(crate::hotkeys::parse_combo(&combo).is_ok());
+    }
+
+    #[test]
+    fn left_and_right_click_are_never_captured() {
+        // Two jobs at once: they are unsafe to bind (a bound button is a
+        // suppressed button), and refusing Primary here is what stops the very
+        // click that ARMS recording from being recorded as the binding.
+        for button in [egui::PointerButton::Primary, egui::PointerButton::Secondary] {
+            assert!(
+                combo_from_pointer(button, egui::Modifiers::default()).is_none(),
+                "{button:?} must not be capturable"
+            );
+            let mods = egui::Modifiers {
+                ctrl: true,
+                ..Default::default()
+            };
+            assert!(
+                combo_from_pointer(button, mods).is_none(),
+                "{button:?} must not become capturable just because a modifier is held"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mouse_bound_toggle_and_hold_are_a_reported_conflict() {
+        // Two identical mouse bindings are as unusable as two identical
+        // keyboard ones, and must be caught by the same check.
+        assert!(hotkeys_conflict("mouse4", "mouse4"));
+        assert!(hotkeys_conflict("mouse4", "x1")); // same button, different spelling
+        assert!(!hotkeys_conflict("mouse4", "mouse5"));
+        assert!(!hotkeys_conflict("mouse4", "f14"));
     }
 
     #[test]

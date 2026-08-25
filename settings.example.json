@@ -16,6 +16,7 @@
   "window_x": null,
   "window_y": null,
   "mouse_follower_enabled": true,
+  "mouse_hotkey_passthrough": false,
   "delay_output_till_release": true,
   "clipboard_restore_delay_ms": 300,
   "spinner_type": "star_wars",

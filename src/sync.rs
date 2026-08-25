@@ -128,6 +128,7 @@ pub const SYNCED_KEYS: &[&str] = &[
     "enable_sound",
     "close_behavior",
     "mouse_follower_enabled",
+    "mouse_hotkey_passthrough",
     "delay_output_till_release",
     "spinner_type",
     "stt_provider",

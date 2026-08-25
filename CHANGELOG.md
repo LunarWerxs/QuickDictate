@@ -6,6 +6,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Mouse buttons can be hotkeys.** The middle button and the two thumb buttons
+  (the ones usually labelled Back and Forward) can now drive dictation, on their
+  own or with modifiers: `mouse3`, `mouse4`, `mouse5`, or e.g. `ctrl+mouse4`.
+  Record one exactly as you record a key, by clicking the dot in the hotkey field
+  and pressing the button.
+
+  Previously this was impossible in three separate ways, all fixed: the recorder
+  only listened for key presses and ignored mouse buttons entirely; the combo
+  parser had no names for them; and Windows' `RegisterHotKey`, which every
+  hotkey rode on, is keyboard-only and cannot bind a mouse button at all. Mouse
+  bindings now take a different route, a low-level mouse hook, which re-arms
+  itself on the same one-minute timer that keeps the keyboard hotkeys alive
+  through sleep, session locks, and RDP reconnects.
+
+  A bound mouse button is **claimed**: it stops reaching whatever is under your
+  cursor, so a thumb button bound to dictation no longer also navigates your
+  browser back. Set `"mouse_hotkey_passthrough": true` to share the button
+  instead of claiming it. Modifiers must match exactly, as they do for keyboard
+  hotkeys, so binding plain `mouse3` leaves Ctrl+middle-click alone.
+
+  Left and right click are deliberately not bindable: claiming one would
+  suppress it system-wide, including the clicks needed to get back into Settings
+  and undo it.
+
 ## [0.8.0] - 2026-08-15
 
 ### Added

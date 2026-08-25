@@ -22,6 +22,7 @@ mod hotkeys;
 mod icon;
 mod keys;
 mod local_stt;
+mod mouse_hook;
 mod onboarding;
 mod output;
 mod paths;
@@ -894,7 +895,12 @@ fn main() -> Result<()> {
         None
     };
     let reinsert_hold_duration = Duration::from_millis(cfg_now.reinsert_hold_ms);
-    let hotkeys = HotkeyManager::start(toggle_combo, hold_combo, reinsert_hold_duration)?;
+    let hotkeys = HotkeyManager::start(
+        toggle_combo,
+        hold_combo,
+        reinsert_hold_duration,
+        cfg_now.mouse_hotkey_passthrough,
+    )?;
     let _dev_trigger = dev_trigger::maybe_spawn(Arc::clone(&app), hotkeys.external_tx.clone());
 
     tracing::info!(

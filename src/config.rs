@@ -269,6 +269,17 @@ pub struct Config {
     pub window_y: Option<i32>,
     #[serde(default = "default_true")]
     pub mouse_follower_enabled: bool,
+    /// When a hotkey is bound to a mouse button, whether that button ALSO
+    /// still reaches the app under the cursor.
+    ///
+    /// Default `false` (the button is consumed): a thumb button bound to
+    /// dictation that also navigated your browser back would be a bug, not a
+    /// feature. Set `true` if you would rather share the button than claim it
+    /// — the hotkey still fires, the click just passes through as well.
+    /// Only affects mouse-bound hotkeys; keyboard hotkeys are unaffected
+    /// either way. Applies after a restart.
+    #[serde(default)]
+    pub mouse_hotkey_passthrough: bool,
     #[serde(default = "default_true")]
     pub delay_output_till_release: bool,
     #[serde(default = "default_spinner")]
@@ -552,6 +563,7 @@ impl Default for Config {
             window_x: None,
             window_y: None,
             mouse_follower_enabled: true,
+            mouse_hotkey_passthrough: false,
             delay_output_till_release: true,
             spinner_type: default_spinner(),
             stt_provider: default_provider(),

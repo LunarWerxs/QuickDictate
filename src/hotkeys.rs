@@ -13,6 +13,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetMessageW, KillTimer, PostThreadMessageW, SetTimer, MSG, WM_HOTKEY, WM_QUIT, WM_TIMER,
 };
 
+use crate::mouse_hook::{
+    self, is_mouse_vk, MouseBinding, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON, VK_XBUTTON1, VK_XBUTTON2,
+};
+
 /// How often the loop re-registers its hotkeys. `RegisterHotKey` bindings can
 /// silently die across sleep/resume, session lock/unlock, RDP reconnects, and
 /// display changes; periodically re-arming them (SageThumbs-style self-healing)
@@ -126,6 +130,7 @@ impl HotkeyManager {
         toggle_combo: Option<String>,
         hold_combo: Option<String>,
         reinsert_hold_duration: Duration,
+        mouse_passthrough: bool,
     ) -> Result<Self> {
         let (tx, rx) = crossbeam_channel::unbounded();
         let external_tx = tx.clone();
@@ -145,6 +150,7 @@ impl HotkeyManager {
                     toggle_combo,
                     hold_combo,
                     reinsert_hold_duration,
+                    mouse_passthrough,
                     tx,
                     stop_flag2,
                 ) {
@@ -272,6 +278,7 @@ fn run_hotkey_loop(
     toggle_combo: Option<String>,
     hold_combo: Option<String>,
     reinsert_hold_duration: Duration,
+    mouse_passthrough: bool,
     tx: Sender<HotkeyEvent>,
     stop_flag: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -294,7 +301,50 @@ fn run_hotkey_loop(
         hold = Some((combo.to_string(), mods, vk));
     }
 
-    register_initial(toggle_id, toggle.as_ref(), hold_id, hold.as_ref());
+    // Two mechanisms, split by what the binding actually is. `RegisterHotKey`
+    // is keyboard-only -- it cannot express a mouse button at all -- so a
+    // mouse-bound hotkey goes to the low-level hook in `mouse_hook` instead.
+    // Everything downstream (the event enum, the ids, main's handling) is
+    // identical either way; only the acquisition differs.
+    let kb_toggle = toggle.as_ref().filter(|(_, _, vk)| !is_mouse_vk(*vk));
+    let kb_hold = hold.as_ref().filter(|(_, _, vk)| !is_mouse_vk(*vk));
+    let mouse_bindings: Vec<MouseBinding> =
+        [(toggle_id, toggle.as_ref()), (hold_id, hold.as_ref())]
+            .into_iter()
+            .filter_map(|(id, binding)| {
+                let (_, mods, vk) = binding?;
+                is_mouse_vk(*vk).then_some(MouseBinding {
+                    id,
+                    vk: *vk,
+                    // MOD_NOREPEAT is a RegisterHotKey concept with no meaning to
+                    // a hook; strip it so the hook's exact-match compare works.
+                    mods: *mods & !MOD_NOREPEAT.0,
+                })
+            })
+            .collect();
+    let has_mouse = !mouse_bindings.is_empty();
+
+    register_initial(toggle_id, kb_toggle, hold_id, kb_hold);
+
+    if has_mouse {
+        for (combo, _, vk) in [toggle.as_ref(), hold.as_ref()].into_iter().flatten() {
+            if is_mouse_vk(*vk) {
+                tracing::info!("Binding mouse hotkey {combo} (vk=0x{vk:02X})");
+            }
+        }
+        mouse_hook::configure(
+            mouse_bindings,
+            tx.clone(),
+            mouse_passthrough,
+            reinsert_hold_duration,
+            toggle_id,
+            hold_id,
+        );
+        // Installed from *this* thread on purpose: Windows dispatches a
+        // low-level hook's callback onto the installing thread while it pumps
+        // messages, and the loop below is that pump.
+        mouse_hook::ensure_installed();
+    }
 
     // Self-healing re-arm: RegisterHotKey bindings can silently die across
     // sleep/resume, session lock, and RDP reconnects. A thread-queue timer
@@ -322,12 +372,19 @@ fn run_hotkey_loop(
         if msg.message == WM_TIMER {
             let mut all_registered = true;
             unsafe {
-                if let Some((combo, mods, vk)) = toggle.as_ref() {
+                if let Some((combo, mods, vk)) = kb_toggle {
                     all_registered &= register_one(toggle_id, combo, *mods, *vk, true);
                 }
-                if let Some((combo, mods, vk)) = hold.as_ref() {
+                if let Some((combo, mods, vk)) = kb_hold {
                     all_registered &= register_one(hold_id, combo, *mods, *vk, true);
                 }
+            }
+            if has_mouse {
+                // Windows silently removes a low-level hook that overruns
+                // LowLevelHooksTimeout, so the mouse side needs the same
+                // periodic re-arm the keyboard side gets. No-op when the hook
+                // is still live.
+                all_registered &= mouse_hook::ensure_installed();
             }
             note_rearm_result(all_registered);
             tracing::debug!("hotkeys re-armed");
@@ -338,15 +395,18 @@ fn run_hotkey_loop(
         }
         let id = msg.wParam.0 as i32;
         tracing::info!("WM_HOTKEY received: id={id}");
+        // Only a keyboard binding can produce WM_HOTKEY; a mouse binding
+        // drives its own press/release/long-press entirely inside the hook,
+        // so the pollers here stay on the keyboard vk they were written for.
         if id == toggle_id {
             let _ = tx.send(HotkeyEvent::TogglePressed);
-            if let Some((_, _, vk)) = toggle {
-                spawn_long_press_poller(vk, tx.clone(), reinsert_hold_duration);
+            if let Some((_, _, vk)) = kb_toggle {
+                spawn_long_press_poller(*vk, tx.clone(), reinsert_hold_duration);
             }
         } else if id == hold_id {
             let _ = tx.send(HotkeyEvent::HoldPressed);
-            if let Some((_, _, vk)) = hold {
-                spawn_release_poller(vk, tx.clone());
+            if let Some((_, _, vk)) = kb_hold {
+                spawn_release_poller(*vk, tx.clone());
             }
         }
     }
@@ -356,12 +416,18 @@ fn run_hotkey_loop(
         if rearm_timer != 0 {
             let _ = KillTimer(null_hwnd, rearm_timer);
         }
-        if toggle.is_some() {
+        if kb_toggle.is_some() {
             let _ = UnregisterHotKey(null_hwnd, toggle_id);
         }
-        if hold.is_some() {
+        if kb_hold.is_some() {
             let _ = UnregisterHotKey(null_hwnd, hold_id);
         }
+    }
+    // Drop the hook before we return, so a replacement process (Save &
+    // Restart, or the self-updater) isn't racing a stale hook of ours for the
+    // same buttons.
+    if has_mouse {
+        mouse_hook::uninstall();
     }
     Ok(())
 }
@@ -423,6 +489,15 @@ pub(crate) fn parse_combo(combo: &str) -> Result<(u32, u32)> {
         }
         let candidate =
             vk_for(&part).ok_or_else(|| anyhow!("unknown key '{part}' in '{combo}'"))?;
+        if let Some(label) = forbidden_mouse_label(candidate) {
+            bail!(
+                "{label} can't be used as a hotkey \u{2014} binding a mouse button also \
+                 suppresses it everywhere else, and losing {label} would take the \
+                 machine away from you, including the clicks needed to come back \
+                 here and undo it. Use the middle button or a thumb button \
+                 (mouse3 / mouse4 / mouse5) instead."
+            );
+        }
         if vk != 0 {
             bail!("multiple non-modifier keys in '{combo}'");
         }
@@ -434,7 +509,41 @@ pub(crate) fn parse_combo(combo: &str) -> Result<(u32, u32)> {
     Ok((modifiers | MOD_NOREPEAT.0, vk))
 }
 
+/// Mouse buttons we deliberately refuse to bind, mapped to a human label for
+/// the error message. Binding a mouse button *suppresses* it system-wide (see
+/// [`crate::mouse_hook`]), and a person who loses left- or right-click can no
+/// longer click their way back into Settings to undo it. The middle and thumb
+/// buttons are safe to claim; these two never are.
+///
+/// Keyed on the **virtual-key code**, not the spelling, so every alias route
+/// into `vk_for` lands on the same policy — a new alias can never accidentally
+/// open a back door to binding left-click.
+fn forbidden_mouse_label(vk: u32) -> Option<&'static str> {
+    Some(match vk {
+        VK_LBUTTON => "Left click",
+        VK_RBUTTON => "Right click",
+        _ => return None,
+    })
+}
+
 fn vk_for(name: &str) -> Option<u32> {
+    // Mouse buttons. These are real virtual-key codes, but `RegisterHotKey`
+    // rejects them, so `run_hotkey_loop` routes anything matching
+    // `is_mouse_vk` to the low-level hook instead. Canonical spellings are
+    // mouse3/mouse4/mouse5; the aliases cover what mouse vendors and Windows
+    // itself call them. Left/right resolve here too — honestly, rather than by
+    // omission — and `parse_combo` is what refuses them, so the error explains
+    // itself instead of reading as "unknown key".
+    match name {
+        "mouse1" | "leftclick" | "leftmouse" | "lmb" | "lbutton" => return Some(VK_LBUTTON),
+        "mouse2" | "rightclick" | "rightmouse" | "rmb" | "rbutton" => return Some(VK_RBUTTON),
+        "mouse3" | "middleclick" | "middlemouse" | "mousemiddle" | "mmb" | "mbutton" => {
+            return Some(VK_MBUTTON)
+        }
+        "mouse4" | "mouseback" | "backmouse" | "xbutton1" | "x1" => return Some(VK_XBUTTON1),
+        "mouse5" | "mouseforward" | "forwardmouse" | "xbutton2" | "x2" => return Some(VK_XBUTTON2),
+        _ => {}
+    }
     // Letters a-z
     if name.len() == 1 {
         let c = name.as_bytes()[0];
@@ -549,6 +658,95 @@ mod tests {
             let (mods, _) = parse_combo(combo).unwrap();
             assert_ne!(mods & MOD_NOREPEAT.0, 0, "combo {combo} missing NOREPEAT");
         }
+    }
+
+    #[test]
+    fn parses_the_bindable_mouse_buttons() {
+        // The whole point of the feature: these used to be unparsable, so a
+        // mouse button could not be a hotkey even by hand-editing settings.json.
+        assert_eq!(parse_combo("mouse3").unwrap(), (MOD_NOREPEAT.0, VK_MBUTTON));
+        assert_eq!(
+            parse_combo("mouse4").unwrap(),
+            (MOD_NOREPEAT.0, VK_XBUTTON1)
+        );
+        assert_eq!(
+            parse_combo("mouse5").unwrap(),
+            (MOD_NOREPEAT.0, VK_XBUTTON2)
+        );
+        // Aliases land on the same VKs, so what a mouse vendor calls "Back"
+        // and what Windows calls XBUTTON1 are the same binding.
+        for alias in ["mouseback", "backmouse", "xbutton1", "x1"] {
+            assert_eq!(parse_combo(alias).unwrap().1, VK_XBUTTON1, "alias {alias}");
+        }
+        for alias in ["mouseforward", "forwardmouse", "xbutton2", "x2"] {
+            assert_eq!(parse_combo(alias).unwrap().1, VK_XBUTTON2, "alias {alias}");
+        }
+        for alias in [
+            "middleclick",
+            "middlemouse",
+            "mousemiddle",
+            "mmb",
+            "mbutton",
+        ] {
+            assert_eq!(parse_combo(alias).unwrap().1, VK_MBUTTON, "alias {alias}");
+        }
+    }
+
+    #[test]
+    fn mouse_buttons_take_modifiers_like_any_other_key() {
+        let (mods, vk) = parse_combo("ctrl+shift+mouse4").unwrap();
+        assert_eq!(vk, VK_XBUTTON1);
+        assert_eq!(mods, MOD_CONTROL.0 | MOD_SHIFT.0 | MOD_NOREPEAT.0);
+    }
+
+    #[test]
+    fn left_and_right_click_are_refused_through_every_alias() {
+        // Binding one of these would suppress it system-wide, including the
+        // clicks needed to get back into Settings and undo it. The refusal is
+        // keyed on the VK, so no alias is a back door.
+        for name in [
+            "mouse1",
+            "leftclick",
+            "leftmouse",
+            "lmb",
+            "lbutton",
+            "mouse2",
+            "rightclick",
+            "rightmouse",
+            "rmb",
+            "rbutton",
+        ] {
+            let err = parse_combo(name)
+                .expect_err("left/right click must never bind")
+                .to_string();
+            assert!(
+                err.contains("can't be used as a hotkey"),
+                "{name} should explain itself, got: {err}"
+            );
+        }
+        // Including with modifiers, and inside a longer combo.
+        assert!(parse_combo("ctrl+alt+mouse1").is_err());
+    }
+
+    #[test]
+    fn mouse_and_keyboard_bindings_are_told_apart() {
+        // This split is what routes a binding to the hook instead of
+        // RegisterHotKey; getting it wrong means silently registering nothing.
+        assert!(is_mouse_vk(parse_combo("mouse4").unwrap().1));
+        assert!(is_mouse_vk(parse_combo("ctrl+mouse3").unwrap().1));
+        assert!(!is_mouse_vk(parse_combo("f14").unwrap().1));
+        assert!(!is_mouse_vk(parse_combo("ctrl+shift+d").unwrap().1));
+    }
+
+    #[test]
+    fn a_mouse_button_still_conflicts_with_itself() {
+        // Toggle and hold both on mouse4 must be caught by the settings-window
+        // conflict check, exactly as two identical keyboard combos are.
+        assert_eq!(parse_combo("mouse4").unwrap(), parse_combo("x1").unwrap());
+        assert_ne!(
+            parse_combo("mouse4").unwrap(),
+            parse_combo("mouse5").unwrap()
+        );
     }
 
     #[test]

@@ -307,8 +307,8 @@ impl super::SettingsApp {
     }
     /// A hotkey text field with a small, subtle "record" dot tucked into its
     /// right edge (instead of a separate wide button). Click the dot to arm
-    /// capture — the next keypress fills the field; click again (or Esc) to
-    /// cancel. Armed = a solid accent dot; the field greys while listening so
+    /// capture — the next keypress *or mouse button* fills the field; click
+    /// again (or Esc) to cancel. Armed = a solid accent dot; the field greys while listening so
     /// the keypress can't also land in the text well. `width` matches this
     /// field to the control directly above it (Language / Mode) so the 2×2
     /// block reads as two clean columns instead of the hotkey wells jutting
@@ -370,7 +370,7 @@ impl super::SettingsApp {
         let hit = hit
             .on_hover_cursor(egui::CursorIcon::PointingHand)
             .on_hover_text(if recording {
-                "Listening — press a key (Esc to cancel)"
+                "Listening — press a key or mouse button (Esc to cancel)"
             } else {
                 "Record hotkey"
             });

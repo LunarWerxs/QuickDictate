@@ -87,7 +87,8 @@ Everything lives in `settings.json` (copied from `settings.example.json`). The f
 | `dashscope_intl` | `false` = mainland-China host (default), `true` = International host |
 | `language` | BCP-47 language tag, e.g. `"en-US"` |
 | `mode` | `"toggle"` or `"hold"` |
-| `toggle_hotkey` / `hold_hotkey` | Default `"f14"` / `"f13"` |
+| `toggle_hotkey` / `hold_hotkey` | Default `"f14"` / `"f13"`. Can be a key (`"f14"`, `"ctrl+shift+d"`) **or a mouse button**, see [Mouse buttons as hotkeys](#mouse-buttons-as-hotkeys) |
+| `mouse_hotkey_passthrough` | When a hotkey is bound to a mouse button, whether that button *also* still reaches the app under your cursor (bool, default `false` = the button is claimed) |
 | `reinsert_hold_ms` | How long a hold-mode key press must last before re-arming reinsert behavior, in ms (default `1500`) |
 | `listen_tail_ms` | Extra trailing listen time after you stop talking, in ms (default `800`) |
 | `delay_output_till_release` | Hybrid paste policy (bool) |
@@ -177,6 +178,28 @@ Pick which one is live with `"mode": "toggle"` or `"mode": "hold"`, and change t
 The tray menu is deliberately bare, **Settings…**, **Hide tray icon** (asks first, then tucks QuickDictate away with no icon at all; hotkeys keep working, and launching QuickDictate again brings Settings back so you can untick it), a **Recent transcriptions** submenu (click any entry to **copy it to the clipboard**, up to the last 50, newest first), and **Quit**. Everything else is inside the Settings window, which is organised as a nav rail down the left (**Application**, **Dictation**, **History**) showing one page at a time: the provider picker, the key manager (including **Bulk add** for one key per line and a live parallel "Test all" that hits the real APIs), the text-replacement editor, a per-field hotkey recorder, all the toggles, **Stats**, **About**, and **Save / Save & Restart** in the pinned bottom bar, and a **⋯ menu** (next to About) holding **Check for updates**, **Open log folder**, and **Edit settings.json** (for the advanced fields, in Notepad).
 
 One nice touch: the global hotkeys re-register themselves every minute, so dictation keeps working after sleep/resume, a session lock, or an RDP reconnect, the usual moments where global hotkeys quietly die.
+
+### Mouse buttons as hotkeys
+
+A hotkey doesn't have to be a key. The middle button and the two thumb buttons most mice carry can each drive dictation, on their own or with modifiers:
+
+| Write this | Button |
+|---|---|
+| `mouse3` | Middle button (clicking the scroll wheel). Aliases: `middleclick`, `mmb`, `mbutton` |
+| `mouse4` | First thumb button, usually labelled **Back**. Aliases: `mouseback`, `xbutton1`, `x1` |
+| `mouse5` | Second thumb button, usually labelled **Forward**. Aliases: `mouseforward`, `xbutton2`, `x2` |
+
+Record one the same way you record a key: click the dot inside the hotkey field in Settings, then press the button. Modifiers work too, so `"hold_hotkey": "ctrl+mouse4"` is valid.
+
+Three things worth knowing:
+
+- **A bound mouse button stops reaching other apps.** Bind `mouse4` and your browser will no longer go Back when you press it, which is almost certainly the point. If you'd rather share the button than claim it, set `"mouse_hotkey_passthrough": true` and the click passes through as well as firing the hotkey.
+- **Modifiers must match exactly**, the same rule keyboard hotkeys follow. With plain `mouse3` bound, Ctrl+middle-click still opens links in a new tab, because that isn't your binding.
+- **Left and right click can't be bound.** Claiming one would suppress it everywhere, including the clicks you'd need to come back into Settings and undo it. QuickDictate refuses them and says so.
+
+Windows only reports these three buttons to applications. If your mouse has more, its own driver software maps the extras, usually to a keystroke you can then bind here as a normal hotkey.
+
+Under the hood these take a different route than keyboard hotkeys: Windows' `RegisterHotKey` is keyboard-only, so mouse bindings run through a low-level mouse hook instead. It self-heals on the same one-minute timer as the keyboard hotkeys.
 
 ## Build from source
 
