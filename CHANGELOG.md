@@ -53,17 +53,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Pick which microphone to record from**, with the new `input_device` setting.
   Empty (the default) keeps the old behaviour of following the Windows default
   recording device; any part of a device name pins that one (`"yeti"`).
+  Matching is case-insensitive, and a named device that isn't present falls
+  back to the default rather than failing, because an absent microphone must
+  never be the reason dictation stops working.
 
-  The interesting value is `"remote"`: use the microphone redirected from a
-  Remote Desktop client whenever one is connected, and the default device
-  otherwise. That makes dictating *into* your PC from a phone or laptop
-  actually work, since QuickDictate would otherwise record the microphone on
-  the desk and faithfully capture an empty room. The same config then dictates
-  through the desk mic again when you sit back down.
-
-  A named device that isn't currently present falls back to the default rather
-  than failing: an absent microphone must never be the reason dictation stops
-  working.
+  Useful for dictating from another machine, with one caveat worth stating
+  plainly: an app can only record a microphone that exists on the machine it
+  runs on. Your voice reaches the PC only if the remote-desktop tool publishes
+  your local mic there as an audio input device. Microsoft's client does when
+  you enable it; RustDesk and Chrome Remote Desktop do not forward the client
+  microphone at all. When such a device exists, name it here like any other.
+  There is deliberately no transport detection or per-product special-casing:
+  the substring match already covers every case, and no amount of
+  session-sniffing can make absent audio appear.
 
 - **The running capture now follows microphone changes.** Previously the stream
   was rebuilt only after it *failed*, so a device that merely appeared next to a

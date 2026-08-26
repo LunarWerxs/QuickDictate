@@ -89,7 +89,7 @@ Everything lives in `settings.json` (copied from `settings.example.json`). The f
 | `mode` | `"toggle"` or `"hold"` |
 | `toggle_hotkey` / `hold_hotkey` | Default `"f14"` / `"f13"`. Can be a key (`"f14"`, `"ctrl+shift+d"`) **or a mouse button**, see [Mouse buttons as hotkeys](#mouse-buttons-as-hotkeys) |
 | `mouse_hotkey_passthrough` | When a hotkey is bound to a mouse button, whether that button *also* still reaches the app under your cursor (bool, default `false` = the button is claimed) |
-| `input_device` | Which microphone to record from. Empty (default) follows the Windows default; any substring of a device name pins that one (`"yeti"`); `"remote"` uses a Remote Desktop client's microphone when connected. See [Dictating over Remote Desktop](#dictating-over-remote-desktop) |
+| `input_device` | Which microphone to record from. Empty (default) follows the Windows default; any part of a device name pins that one (`"yeti"`). See [Dictating from another machine](#dictating-from-another-machine-remote-desktop-rustdesk-and-friends) |
 | `reinsert_hold_ms` | How long a hold-mode key press must last before re-arming reinsert behavior, in ms (default `1500`) |
 | `listen_tail_ms` | Extra trailing listen time after you stop talking, in ms (default `800`) |
 | `delay_output_till_release` | Hybrid paste policy (bool) |
@@ -206,22 +206,25 @@ Windows only reports these three buttons to applications. If your mouse has more
 
 Under the hood these take a different route than keyboard hotkeys: Windows' `RegisterHotKey` is keyboard-only, so mouse bindings run through a low-level mouse hook instead. It self-heals on the same one-minute timer as the keyboard hotkeys.
 
-## Dictating over Remote Desktop
+## Dictating from another machine (Remote Desktop, RustDesk, and friends)
 
-You can dictate into your PC from somewhere else, phone, tablet, laptop, over Remote Desktop. The catch is that by default QuickDictate records the microphone attached to the *PC*, so it would faithfully capture an empty room while you talk into the device in your hand.
+Hotkeys work fine over a remote connection. Audio is the hard part, and the constraint is not QuickDictate's:
 
-The fix is Remote Desktop's microphone redirection plus one setting:
+**An app can only record a microphone that exists on the machine it is running on.** If you are sitting somewhere else talking into a phone or laptop, your voice reaches the PC only if the remote-desktop tool publishes your local microphone on the PC as a real audio input device. If it doesn't, the audio simply never arrives, and no setting in any app on that PC can conjure it.
 
-1. **On the remote client**, turn the microphone on. In Windows App (formerly Microsoft Remote Desktop) on Android, iOS, Mac or the web: long-press the PC, **Edit**, then under **Device & audio redirection** toggle **Microphone** to On. Grant the app microphone permission in the OS settings too, or the toggle has nothing to redirect. On Windows' own `mstsc`, it's **Show Options ▸ Local Resources ▸ Remote audio ▸ Settings ▸ Record from this computer**.
-2. **On the PC**, set `"input_device": "remote"` in `settings.json`.
+Where the common tools stand:
 
-That value means "use the redirected microphone whenever a remote session is connected, otherwise the default device", so the same config dictates through your phone when you're away and through the mic on your desk when you sit back down. QuickDictate re-checks every couple of seconds and switches over on its own; you don't need to restart it, and the log names the device each time it changes.
+| Tool | Forwards your microphone to the host? |
+|---|---|
+| Microsoft Remote Desktop / Windows App | **Yes**, if you enable it client-side. Appears on the PC as "Remote Audio" |
+| RustDesk | **No.** Audio is host-to-client only; its voice-call feature is a separate channel, not an input device |
+| Chrome Remote Desktop | **No** |
 
-You can also pin a specific microphone by putting any part of its name in `input_device` (`"yeti"`, `"realtek"`). Matching is case-insensitive, and **a named device that isn't currently plugged in falls back to the default** rather than failing, because a missing microphone should never be the reason dictation stops working.
+So if your tool forwards a microphone, set `input_device` to any part of its name and QuickDictate will use it, switching over on its own within a couple of seconds and falling back to your normal mic when it disappears. For Microsoft's client that means `"input_device": "remote audio"`, after turning the microphone on in the client (long-press the PC, **Edit**, **Device & audio redirection**, **Microphone** on, and grant the OS-level mic permission).
 
-If the redirected microphone never appears in the session, it is almost always the client-side toggle or the OS-level microphone permission on the client. On the PC side it can also be blocked by policy: **Allow audio recording redirection** under Computer Configuration ▸ Administrative Templates ▸ Windows Components ▸ Remote Desktop Services ▸ Remote Desktop Session Host ▸ Device and Resource Redirection. It is allowed by default.
+If your tool doesn't forward one, the options are to route audio into a virtual input device yourself (VB-Cable and similar create one that any app, including this one, can then record from), or to dictate on the device you're actually holding.
 
-Note this is separate from pressing the hotkey: hotkeys work over Remote Desktop already, with the exception of mouse thumb buttons, which the protocol cannot carry (see above).
+There is deliberately **no** "detect the remote session" logic here. Whether your voice is reachable is decided entirely by whether an input device exists, which the setting above already expresses, and guessing at session state would add code that cannot make absent audio appear.
 
 ## Build from source
 

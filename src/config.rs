@@ -273,20 +273,20 @@ pub struct Config {
     ///
     /// Empty (the default) follows whatever Windows has set as the default
     /// recording device. Otherwise it is matched case-insensitively against
-    /// the start or any part of a device name, so `"yeti"` is enough to pin
-    /// the Yeti.
+    /// any part of a device name, so `"yeti"` is enough to pin the Yeti.
     ///
-    /// The special value `"remote"` means "use the microphone redirected from
-    /// a Remote Desktop client when one is connected, otherwise the default
-    /// device". That endpoint (Windows calls it "Remote Audio") only exists
-    /// while an RDP session with microphone redirection is live, so this
-    /// dictates through your phone or laptop when you are remote and through
-    /// the mic on the desk when you are sitting at it.
+    /// A named device that is not currently present falls back to the default
+    /// rather than failing: an absent microphone must never be the reason
+    /// dictation stops working. Applies without a restart, and the running
+    /// capture switches over within a couple of seconds.
     ///
-    /// A named device that is not currently present always falls back to the
-    /// default rather than failing: an absent microphone must never be the
-    /// reason dictation stops working. Applies without a restart, and the
-    /// running capture switches over within a couple of seconds.
+    /// Worth knowing for remote-desktop use: an app can only record a
+    /// microphone that exists on THIS machine as an audio input device. A
+    /// remote client's microphone is therefore reachable only if the remote
+    /// tool publishes one (Microsoft's RDP does; RustDesk and Chrome Remote
+    /// Desktop do not forward the client mic at all). When one exists, name it
+    /// here like any other device — there is no transport-specific handling,
+    /// because there is nothing useful for it to do.
     #[serde(default)]
     pub input_device: String,
     /// When a hotkey is bound to a mouse button, whether that button ALSO

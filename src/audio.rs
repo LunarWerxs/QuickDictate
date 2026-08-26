@@ -226,13 +226,6 @@ const DEVICE_RECHECK: std::time::Duration = std::time::Duration::from_secs(2);
 static PREFERRED_INPUT: once_cell::sync::Lazy<arc_swap::ArcSwap<String>> =
     once_cell::sync::Lazy::new(|| arc_swap::ArcSwap::from_pointee(String::new()));
 
-/// The `input_device` value meaning "use the microphone redirected from a
-/// Remote Desktop client, when there is one". Windows names that endpoint
-/// "Remote Audio"; it exists only while an RDP session with microphone
-/// redirection is connected, so this preference falls back to the default
-/// device whenever you are sitting at the machine.
-const REMOTE_INPUT_HINT: &str = "remote";
-
 /// Publish the microphone preference from `settings.json`.
 pub fn set_preferred_input(name: &str) {
     let name = name.trim();
@@ -250,21 +243,21 @@ pub fn set_preferred_input(name: &str) {
     }
 }
 
-/// Whether `name` looks like the input endpoint Windows creates for a Remote
-/// Desktop client's redirected microphone.
-fn is_remote_audio(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.contains("remote audio") || lower.contains("remote desktop audio")
-}
-
 /// Pick the input device to capture from, honouring the `input_device`
 /// preference and falling back to the system default whenever the preferred
 /// one is not present.
 ///
-/// The fallback is the important half: the RDP microphone endpoint only exists
-/// while a remote session is connected, so a preference naming it has to mean
-/// "when available" rather than "or fail". Otherwise walking up to the machine
-/// and dictating locally would break.
+/// Matching is a plain case-insensitive substring of the device name, with no
+/// knowledge of any particular vendor or transport. That is deliberate: a
+/// remote-desktop tool can only hand this machine a microphone by publishing a
+/// real audio input device, and once it does, its name is just a name like any
+/// other. Special-casing one product's endpoint would buy nothing the
+/// substring does not already cover, and would go stale.
+///
+/// The fallback is the important half: a device named here may be absent (a
+/// USB mic unplugged, a virtual device that only exists while something is
+/// connected), and an absent microphone must never be the reason dictation
+/// stops working.
 fn resolve_input() -> Result<(cpal::Device, cpal::SupportedStreamConfig)> {
     let host = cpal::default_host();
     let pref = PREFERRED_INPUT.load();
@@ -273,15 +266,13 @@ fn resolve_input() -> Result<(cpal::Device, cpal::SupportedStreamConfig)> {
     let chosen = if pref.is_empty() {
         None
     } else {
-        let want_remote = pref.eq_ignore_ascii_case(REMOTE_INPUT_HINT);
         let needle = pref.to_ascii_lowercase();
         host.input_devices()
             .ok()
             .and_then(|mut devices| {
-                devices.find(|d| match d.name() {
-                    Ok(n) if want_remote => is_remote_audio(&n),
-                    Ok(n) => n.to_ascii_lowercase().contains(&needle),
-                    Err(_) => false,
+                devices.find(|d| {
+                    d.name()
+                        .is_ok_and(|n| n.to_ascii_lowercase().contains(&needle))
                 })
             })
             .or_else(|| {
@@ -964,22 +955,6 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_the_remote_desktop_microphone_endpoint() {
-        // This is what makes `"input_device": "remote"` mean anything: Windows
-        // publishes an RDP client's microphone under a name like these, and it
-        // is the only handle we get on "the mic of whoever is connected".
-        assert!(is_remote_audio("Remote Audio"));
-        assert!(is_remote_audio("Microphone (Remote Audio)"));
-        assert!(is_remote_audio("remote audio")); // case-insensitive
-        assert!(is_remote_audio("Remote Desktop Audio"));
-        // A real local microphone must never be mistaken for it, or dictating
-        // at the desk would capture a device that isn't there.
-        assert!(!is_remote_audio("Microphone (Yeti Classic)"));
-        assert!(!is_remote_audio("Realtek USB Audio"));
-        assert!(!is_remote_audio(""));
-    }
-
-    #[test]
     fn the_microphone_preference_round_trips_and_trims() {
         // Empty means "follow the Windows default", which is the shipped
         // behaviour and must survive being set explicitly.
@@ -987,10 +962,6 @@ mod tests {
         assert_eq!(PREFERRED_INPUT.load().as_str(), "");
         set_preferred_input("  Yeti  ");
         assert_eq!(PREFERRED_INPUT.load().as_str(), "Yeti");
-        set_preferred_input("remote");
-        assert!(PREFERRED_INPUT
-            .load()
-            .eq_ignore_ascii_case(REMOTE_INPUT_HINT));
         set_preferred_input("");
         assert_eq!(PREFERRED_INPUT.load().as_str(), "");
     }
