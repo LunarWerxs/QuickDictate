@@ -50,6 +50,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   others is not sent by most clients, including the mobile apps. Bind and test
   thumb buttons at the physical machine. See docs/GUIDE.md.
 
+- **Pick which microphone to record from**, with the new `input_device` setting.
+  Empty (the default) keeps the old behaviour of following the Windows default
+  recording device; any part of a device name pins that one (`"yeti"`).
+
+  The interesting value is `"remote"`: use the microphone redirected from a
+  Remote Desktop client whenever one is connected, and the default device
+  otherwise. That makes dictating *into* your PC from a phone or laptop
+  actually work, since QuickDictate would otherwise record the microphone on
+  the desk and faithfully capture an empty room. The same config then dictates
+  through the desk mic again when you sit back down.
+
+  A named device that isn't currently present falls back to the default rather
+  than failing: an absent microphone must never be the reason dictation stops
+  working.
+
+- **The running capture now follows microphone changes.** Previously the stream
+  was rebuilt only after it *failed*, so a device that merely appeared next to a
+  perfectly healthy one was never switched to, and a mid-run mic change needed a
+  restart. It now re-checks every couple of seconds and switches over on its
+  own, logging the change; a swap is not treated as a fault, so the error pip
+  stays quiet.
+
 ## [0.8.0] - 2026-08-15
 
 ### Added

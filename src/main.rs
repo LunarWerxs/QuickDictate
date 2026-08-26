@@ -808,6 +808,9 @@ fn main() -> Result<()> {
     // With windows_subsystem="windows" a bare `?` here would exit with no
     // visible trace of why, so a missing/broken microphone gets a message
     // box before we bail.
+    // Publish the microphone preference BEFORE the source opens, so the very
+    // first stream already lands on the right device.
+    audio::set_preferred_input(&cfg_arc.input_device);
     let audio = match AudioSource::new() {
         Ok(a) => Arc::new(a),
         Err(e) => {

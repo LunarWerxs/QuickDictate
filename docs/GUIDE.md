@@ -89,6 +89,7 @@ Everything lives in `settings.json` (copied from `settings.example.json`). The f
 | `mode` | `"toggle"` or `"hold"` |
 | `toggle_hotkey` / `hold_hotkey` | Default `"f14"` / `"f13"`. Can be a key (`"f14"`, `"ctrl+shift+d"`) **or a mouse button**, see [Mouse buttons as hotkeys](#mouse-buttons-as-hotkeys) |
 | `mouse_hotkey_passthrough` | When a hotkey is bound to a mouse button, whether that button *also* still reaches the app under your cursor (bool, default `false` = the button is claimed) |
+| `input_device` | Which microphone to record from. Empty (default) follows the Windows default; any substring of a device name pins that one (`"yeti"`); `"remote"` uses a Remote Desktop client's microphone when connected. See [Dictating over Remote Desktop](#dictating-over-remote-desktop) |
 | `reinsert_hold_ms` | How long a hold-mode key press must last before re-arming reinsert behavior, in ms (default `1500`) |
 | `listen_tail_ms` | Extra trailing listen time after you stop talking, in ms (default `800`) |
 | `delay_output_till_release` | Hybrid paste policy (bool) |
@@ -204,6 +205,23 @@ Windows only reports these three buttons to applications. If your mouse has more
 **Testing over Remote Desktop won't work properly, test at the physical machine.** Remote Desktop's base protocol only carries left, right, middle and the wheel. The two thumb buttons need an optional extension that most clients, including the Android and iOS apps, simply never send, so a Back/Forward press on your local mouse is *discarded before it reaches Windows*. Nothing on this end can recover it. Recording will appear to work for middle-click and do nothing at all for the thumb buttons, which looks like a QuickDictate bug and isn't one. Mouse hotkeys themselves work fine in an RDP session, it is only the recording and pressing of thumb buttons *through* that session that cannot.
 
 Under the hood these take a different route than keyboard hotkeys: Windows' `RegisterHotKey` is keyboard-only, so mouse bindings run through a low-level mouse hook instead. It self-heals on the same one-minute timer as the keyboard hotkeys.
+
+## Dictating over Remote Desktop
+
+You can dictate into your PC from somewhere else, phone, tablet, laptop, over Remote Desktop. The catch is that by default QuickDictate records the microphone attached to the *PC*, so it would faithfully capture an empty room while you talk into the device in your hand.
+
+The fix is Remote Desktop's microphone redirection plus one setting:
+
+1. **On the remote client**, turn the microphone on. In Windows App (formerly Microsoft Remote Desktop) on Android, iOS, Mac or the web: long-press the PC, **Edit**, then under **Device & audio redirection** toggle **Microphone** to On. Grant the app microphone permission in the OS settings too, or the toggle has nothing to redirect. On Windows' own `mstsc`, it's **Show Options ▸ Local Resources ▸ Remote audio ▸ Settings ▸ Record from this computer**.
+2. **On the PC**, set `"input_device": "remote"` in `settings.json`.
+
+That value means "use the redirected microphone whenever a remote session is connected, otherwise the default device", so the same config dictates through your phone when you're away and through the mic on your desk when you sit back down. QuickDictate re-checks every couple of seconds and switches over on its own; you don't need to restart it, and the log names the device each time it changes.
+
+You can also pin a specific microphone by putting any part of its name in `input_device` (`"yeti"`, `"realtek"`). Matching is case-insensitive, and **a named device that isn't currently plugged in falls back to the default** rather than failing, because a missing microphone should never be the reason dictation stops working.
+
+If the redirected microphone never appears in the session, it is almost always the client-side toggle or the OS-level microphone permission on the client. On the PC side it can also be blocked by policy: **Allow audio recording redirection** under Computer Configuration ▸ Administrative Templates ▸ Windows Components ▸ Remote Desktop Services ▸ Remote Desktop Session Host ▸ Device and Resource Redirection. It is allowed by default.
+
+Note this is separate from pressing the hotkey: hotkeys work over Remote Desktop already, with the exception of mouse thumb buttons, which the protocol cannot carry (see above).
 
 ## Build from source
 

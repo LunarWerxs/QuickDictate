@@ -85,7 +85,7 @@ impl AudioSource {
     /// Open the default input device and start streaming on a background
     /// thread. Audio is captured continuously; sessions subscribe to tap in.
     pub fn new() -> Result<Self> {
-        let (device, supported) = open_default_input()?;
+        let (device, supported) = resolve_input()?;
         let sample_format = supported.sample_format();
 
         tracing::info!(
@@ -214,16 +214,112 @@ const HEALTH_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 /// Delay between attempts to reopen the input device after a stream failure.
 const REOPEN_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Open the current default input device and its default config.
-fn open_default_input() -> Result<(cpal::Device, cpal::SupportedStreamConfig)> {
+/// How often the streaming loop re-checks which microphone it *should* be on.
+/// Cheap (a name comparison against the resolved device) and the reason a
+/// microphone that appears mid-run gets picked up at all — see
+/// [`resolve_input`].
+const DEVICE_RECHECK: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The configured microphone preference. Empty means "follow the Windows
+/// default input device". Swapped in at startup and whenever settings are
+/// saved, so a change applies without a restart.
+static PREFERRED_INPUT: once_cell::sync::Lazy<arc_swap::ArcSwap<String>> =
+    once_cell::sync::Lazy::new(|| arc_swap::ArcSwap::from_pointee(String::new()));
+
+/// The `input_device` value meaning "use the microphone redirected from a
+/// Remote Desktop client, when there is one". Windows names that endpoint
+/// "Remote Audio"; it exists only while an RDP session with microphone
+/// redirection is connected, so this preference falls back to the default
+/// device whenever you are sitting at the machine.
+const REMOTE_INPUT_HINT: &str = "remote";
+
+/// Publish the microphone preference from `settings.json`.
+pub fn set_preferred_input(name: &str) {
+    let name = name.trim();
+    let previous = PREFERRED_INPUT.load();
+    if previous.as_str() != name {
+        PREFERRED_INPUT.store(Arc::new(name.to_string()));
+        tracing::info!(
+            "AudioSource: microphone preference set to {}",
+            if name.is_empty() {
+                "<system default>".to_string()
+            } else {
+                format!("'{name}'")
+            }
+        );
+    }
+}
+
+/// Whether `name` looks like the input endpoint Windows creates for a Remote
+/// Desktop client's redirected microphone.
+fn is_remote_audio(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("remote audio") || lower.contains("remote desktop audio")
+}
+
+/// Pick the input device to capture from, honouring the `input_device`
+/// preference and falling back to the system default whenever the preferred
+/// one is not present.
+///
+/// The fallback is the important half: the RDP microphone endpoint only exists
+/// while a remote session is connected, so a preference naming it has to mean
+/// "when available" rather than "or fail". Otherwise walking up to the machine
+/// and dictating locally would break.
+fn resolve_input() -> Result<(cpal::Device, cpal::SupportedStreamConfig)> {
     let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| anyhow!("no default input device"))?;
+    let pref = PREFERRED_INPUT.load();
+    let pref = pref.trim();
+
+    let chosen = if pref.is_empty() {
+        None
+    } else {
+        let want_remote = pref.eq_ignore_ascii_case(REMOTE_INPUT_HINT);
+        let needle = pref.to_ascii_lowercase();
+        host.input_devices()
+            .ok()
+            .and_then(|mut devices| {
+                devices.find(|d| match d.name() {
+                    Ok(n) if want_remote => is_remote_audio(&n),
+                    Ok(n) => n.to_ascii_lowercase().contains(&needle),
+                    Err(_) => false,
+                })
+            })
+            .or_else(|| {
+                tracing::debug!(
+                    "AudioSource: preferred microphone '{pref}' not present; using the default"
+                );
+                None
+            })
+    };
+
+    let device = match chosen {
+        Some(d) => d,
+        None => host
+            .default_input_device()
+            .ok_or_else(|| anyhow!("no default input device"))?,
+    };
     let supported = device
         .default_input_config()
         .map_err(|e| anyhow!("default_input_config: {e}"))?;
     Ok((device, supported))
+}
+
+/// The name [`resolve_input`] would pick right now, or `None` if nothing can
+/// be opened. Used by the streaming loop to notice that the right microphone
+/// has changed underneath it (an RDP session connecting or disconnecting, a
+/// USB mic being plugged in, Windows promoting a new default).
+fn resolved_input_name() -> Option<String> {
+    resolve_input().ok().and_then(|(d, _)| d.name().ok())
+}
+
+/// Why `stream_until_failure` returned without an error.
+enum StreamOutcome {
+    /// The app is shutting down.
+    Shutdown,
+    /// The microphone preference now resolves to a different device; the
+    /// caller should reopen. Distinct from `Err` so a routine swap never
+    /// looks like a fault.
+    DeviceChanged,
 }
 
 /// Outer capture loop: stream from the device until shutdown, and on a stream
@@ -253,7 +349,32 @@ fn run_global_capture(
             &device,
             &supported,
         ) {
-            Ok(()) => return, // clean shutdown
+            Ok(StreamOutcome::Shutdown) => return,
+            // A different microphone should be in use now. Nothing has failed,
+            // so reopen immediately and stay "healthy" throughout — a device
+            // swap is not a degraded state and must not raise the error pip.
+            Ok(StreamOutcome::DeviceChanged) => match resolve_input() {
+                Ok((d, s)) => {
+                    device_rate.store(s.sample_rate().0, Ordering::Release);
+                    channels.store(s.channels() as usize, Ordering::Release);
+                    tracing::info!(
+                        "AudioSource: now on '{}' @ {} Hz, {} ch",
+                        d.name().unwrap_or_default(),
+                        s.sample_rate().0,
+                        s.channels(),
+                    );
+                    device = d;
+                    supported = s;
+                    continue;
+                }
+                Err(e) => {
+                    // The device vanished between deciding to switch and
+                    // opening it. Fall through to the degraded retry loop,
+                    // which re-resolves from scratch.
+                    healthy.store(false, Ordering::Release);
+                    tracing::warn!("AudioSource: switch target unavailable: {e:#}");
+                }
+            },
             Err(e) => {
                 healthy.store(false, Ordering::Release);
                 if stop.load(Ordering::Acquire) {
@@ -276,7 +397,7 @@ fn run_global_capture(
                 std::thread::sleep(HEALTH_POLL);
                 waited += HEALTH_POLL;
             }
-            match open_default_input() {
+            match resolve_input() {
                 Ok((d, s)) => {
                     device_rate.store(s.sample_rate().0, Ordering::Release);
                     channels.store(s.channels() as usize, Ordering::Release);
@@ -307,7 +428,7 @@ fn stream_until_failure(
     channels: &Arc<AtomicUsize>,
     device: &cpal::Device,
     supported: &cpal::SupportedStreamConfig,
-) -> Result<()> {
+) -> Result<StreamOutcome> {
     let sample_format = supported.sample_format();
     let mut config: cpal::StreamConfig = supported.config();
     config.buffer_size = cpal::BufferSize::Default;
@@ -387,6 +508,9 @@ fn stream_until_failure(
     healthy.store(true, Ordering::Release);
     tracing::info!("AudioSource: streaming");
 
+    let open_name = device.name().unwrap_or_default();
+    let mut since_recheck = std::time::Duration::ZERO;
+
     // Idle until shutdown, watching for the error callback.
     while !stop.load(Ordering::Acquire) {
         if !healthy.load(Ordering::Acquire) {
@@ -394,11 +518,32 @@ fn stream_until_failure(
             return Err(anyhow!("stream error callback fired"));
         }
         std::thread::sleep(HEALTH_POLL);
+
+        // Notice when the microphone we *should* be on has changed. Without
+        // this the stream is only ever rebuilt after it fails, so a device
+        // that merely appears alongside a perfectly healthy one is never
+        // switched to. The case that matters: connecting over Remote Desktop
+        // publishes the client's microphone into the session, and the mic on
+        // the desk keeps working, so nothing fails and dictation would go on
+        // recording an empty room while you talk into your phone.
+        since_recheck += HEALTH_POLL;
+        if since_recheck >= DEVICE_RECHECK {
+            since_recheck = std::time::Duration::ZERO;
+            if let Some(want) = resolved_input_name() {
+                if want != open_name {
+                    tracing::info!(
+                        "AudioSource: switching microphone '{open_name}' \u{2192} '{want}'"
+                    );
+                    drop(stream);
+                    return Ok(StreamOutcome::DeviceChanged);
+                }
+            }
+        }
     }
 
     drop(stream);
     tracing::info!("AudioSource: capture stopped");
-    Ok(())
+    Ok(StreamOutcome::Shutdown)
 }
 
 // ---------------------------------------------------------------------------
@@ -816,5 +961,37 @@ mod tests {
             rx.try_recv().expect("final pending fragment"),
             vec![7, 8, 9]
         );
+    }
+
+    #[test]
+    fn recognizes_the_remote_desktop_microphone_endpoint() {
+        // This is what makes `"input_device": "remote"` mean anything: Windows
+        // publishes an RDP client's microphone under a name like these, and it
+        // is the only handle we get on "the mic of whoever is connected".
+        assert!(is_remote_audio("Remote Audio"));
+        assert!(is_remote_audio("Microphone (Remote Audio)"));
+        assert!(is_remote_audio("remote audio")); // case-insensitive
+        assert!(is_remote_audio("Remote Desktop Audio"));
+        // A real local microphone must never be mistaken for it, or dictating
+        // at the desk would capture a device that isn't there.
+        assert!(!is_remote_audio("Microphone (Yeti Classic)"));
+        assert!(!is_remote_audio("Realtek USB Audio"));
+        assert!(!is_remote_audio(""));
+    }
+
+    #[test]
+    fn the_microphone_preference_round_trips_and_trims() {
+        // Empty means "follow the Windows default", which is the shipped
+        // behaviour and must survive being set explicitly.
+        set_preferred_input("  ");
+        assert_eq!(PREFERRED_INPUT.load().as_str(), "");
+        set_preferred_input("  Yeti  ");
+        assert_eq!(PREFERRED_INPUT.load().as_str(), "Yeti");
+        set_preferred_input("remote");
+        assert!(PREFERRED_INPUT
+            .load()
+            .eq_ignore_ascii_case(REMOTE_INPUT_HINT));
+        set_preferred_input("");
+        assert_eq!(PREFERRED_INPUT.load().as_str(), "");
     }
 }

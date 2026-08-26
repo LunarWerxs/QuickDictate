@@ -410,6 +410,10 @@ impl super::SettingsApp {
                 // keys, replacements) apply immediately; hotkeys and logging
                 // initialization still need a restart.
                 self.app.config.store(Arc::new(self.draft.clone()));
+                // The running capture re-resolves its device every couple of
+                // seconds, so a microphone change takes effect on its own
+                // rather than waiting for a restart.
+                crate::audio::set_preferred_input(&self.draft.input_device);
                 if leaving_local {
                     crate::local_stt::request_unload();
                 } else if self.draft.stt_provider.eq_ignore_ascii_case("local") {

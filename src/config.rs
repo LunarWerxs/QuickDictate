@@ -269,6 +269,26 @@ pub struct Config {
     pub window_y: Option<i32>,
     #[serde(default = "default_true")]
     pub mouse_follower_enabled: bool,
+    /// Which microphone to capture from.
+    ///
+    /// Empty (the default) follows whatever Windows has set as the default
+    /// recording device. Otherwise it is matched case-insensitively against
+    /// the start or any part of a device name, so `"yeti"` is enough to pin
+    /// the Yeti.
+    ///
+    /// The special value `"remote"` means "use the microphone redirected from
+    /// a Remote Desktop client when one is connected, otherwise the default
+    /// device". That endpoint (Windows calls it "Remote Audio") only exists
+    /// while an RDP session with microphone redirection is live, so this
+    /// dictates through your phone or laptop when you are remote and through
+    /// the mic on the desk when you are sitting at it.
+    ///
+    /// A named device that is not currently present always falls back to the
+    /// default rather than failing: an absent microphone must never be the
+    /// reason dictation stops working. Applies without a restart, and the
+    /// running capture switches over within a couple of seconds.
+    #[serde(default)]
+    pub input_device: String,
     /// When a hotkey is bound to a mouse button, whether that button ALSO
     /// still reaches the app under the cursor.
     ///
@@ -563,6 +583,7 @@ impl Default for Config {
             window_x: None,
             window_y: None,
             mouse_follower_enabled: true,
+            input_device: String::new(),
             mouse_hotkey_passthrough: false,
             delay_output_till_release: true,
             spinner_type: default_spinner(),
