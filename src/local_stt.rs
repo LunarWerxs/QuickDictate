@@ -448,35 +448,99 @@ fn ensure_runtime(spec: &ModelSpec, cancel: &AtomicBool) -> Result<(), String> {
     }
     fs::create_dir_all(&staging)
         .map_err(|e| format!("could not create {}: {e}", staging.display()))?;
-    let unpack_result = (|| {
-        let file =
-            File::open(&archive).map_err(|e| format!("could not open downloaded runtime: {e}"))?;
-        let mut tar = tar::Archive::new(GzDecoder::new(file));
-        // `unpack` routes every entry through tar's traversal-safe `unpack_in`.
-        tar.unpack(&staging)
-            .map_err(|e| format!("could not extract local runtime: {e}"))?;
-        check_cancelled(cancel)?;
-        let extracted = staging.join(RUNTIME_ARCHIVE_ROOT);
-        if !extracted.join("transcribe.dll").is_file() || !extracted.join("contract.json").is_file()
-        {
-            return Err("downloaded runtime did not contain its required files".into());
-        }
-        write_atomic(
-            &extracted.join(".verified"),
-            expected_runtime_marker().as_bytes(),
-        )?;
-        if final_dir.exists() {
-            fs::remove_dir_all(&final_dir)
-                .map_err(|e| format!("could not replace {}: {e}", final_dir.display()))?;
-        }
-        fs::rename(&extracted, &final_dir)
-            .map_err(|e| format!("could not activate local runtime: {e}"))?;
-        check_cancelled(cancel)?;
-        Ok(())
-    })();
+    let unpack_result = unpack_runtime(&archive, &staging, &final_dir, cancel);
     let _ = fs::remove_file(&archive);
     let _ = fs::remove_dir_all(&staging);
     unpack_result
+}
+
+/// Extract a downloaded runtime archive into `staging` and, once verified,
+/// activate it at `final_dir`. Split out of `ensure_runtime` so callers there
+/// don't have to track its cleanup-on-either-outcome nesting too.
+fn unpack_runtime(
+    archive: &Path,
+    staging: &Path,
+    final_dir: &Path,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let file =
+        File::open(archive).map_err(|e| format!("could not open downloaded runtime: {e}"))?;
+    let mut tar = tar::Archive::new(GzDecoder::new(file));
+    // `unpack` routes every entry through tar's traversal-safe `unpack_in`.
+    tar.unpack(staging)
+        .map_err(|e| format!("could not extract local runtime: {e}"))?;
+    check_cancelled(cancel)?;
+    let extracted = staging.join(RUNTIME_ARCHIVE_ROOT);
+    if !extracted.join("transcribe.dll").is_file() || !extracted.join("contract.json").is_file() {
+        return Err("downloaded runtime did not contain its required files".into());
+    }
+    write_atomic(
+        &extracted.join(".verified"),
+        expected_runtime_marker().as_bytes(),
+    )?;
+    if final_dir.exists() {
+        fs::remove_dir_all(final_dir)
+            .map_err(|e| format!("could not replace {}: {e}", final_dir.display()))?;
+    }
+    fs::rename(&extracted, final_dir)
+        .map_err(|e| format!("could not activate local runtime: {e}"))?;
+    check_cancelled(cancel)?;
+    Ok(())
+}
+
+/// Download `url` into `part`, choosing parallel ranged fetch or a single
+/// stream, and return the resulting file's SHA-256. Split out of
+/// `download_verified` so its choice-of-strategy branching doesn't add to
+/// that function's own retry/cleanup nesting.
+#[allow(clippy::too_many_arguments)]
+fn fetch_to_part(
+    runtime: &tokio::runtime::Runtime,
+    client: &reqwest::Client,
+    id: &str,
+    phase: InstallPhase,
+    url: &str,
+    expected_bytes: u64,
+    part: &Path,
+    display_total: u64,
+    cancel: &AtomicBool,
+) -> Result<String, String> {
+    let parallel = expected_bytes >= PARALLEL_DOWNLOAD_MIN_BYTES
+        && runtime.block_on(server_supports_ranges(client, url, expected_bytes, cancel))?;
+    if parallel {
+        tracing::info!(
+            "downloading {expected_bytes} bytes with {PARALLEL_DOWNLOAD_WORKERS} parallel ranges"
+        );
+        runtime.block_on(download_parallel(
+            client,
+            id,
+            phase,
+            url,
+            expected_bytes,
+            part,
+            display_total,
+            cancel,
+            PARALLEL_DOWNLOAD_WORKERS,
+        ))?;
+        set_state(
+            id,
+            InstallPhase::VerifyingDownload,
+            expected_bytes,
+            display_total,
+        );
+        hash_file(part, cancel)
+    } else {
+        tracing::info!("downloading {expected_bytes} bytes as one HTTP stream");
+        runtime.block_on(download_single(
+            client,
+            id,
+            phase,
+            url,
+            expected_bytes,
+            part,
+            display_total,
+            cancel,
+        ))
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -504,43 +568,17 @@ fn download_verified(
             .build()
             .map_err(|e| format!("could not start download runtime: {e}"))?;
         let client = download_client()?;
-        let parallel = expected_bytes >= PARALLEL_DOWNLOAD_MIN_BYTES
-            && runtime.block_on(server_supports_ranges(&client, url, expected_bytes, cancel))?;
-        let actual = if parallel {
-            tracing::info!(
-                "downloading {expected_bytes} bytes with {PARALLEL_DOWNLOAD_WORKERS} parallel ranges"
-            );
-            runtime.block_on(download_parallel(
-                &client,
-                id,
-                phase,
-                url,
-                expected_bytes,
-                &part,
-                display_total,
-                cancel,
-                PARALLEL_DOWNLOAD_WORKERS,
-            ))?;
-            set_state(
-                id,
-                InstallPhase::VerifyingDownload,
-                expected_bytes,
-                display_total,
-            );
-            hash_file(&part, cancel)?
-        } else {
-            tracing::info!("downloading {expected_bytes} bytes as one HTTP stream");
-            runtime.block_on(download_single(
-                &client,
-                id,
-                phase,
-                url,
-                expected_bytes,
-                &part,
-                display_total,
-                cancel,
-            ))?
-        };
+        let actual = fetch_to_part(
+            &runtime,
+            &client,
+            id,
+            phase,
+            url,
+            expected_bytes,
+            &part,
+            display_total,
+            cancel,
+        )?;
         check_cancelled(cancel)?;
         if actual != expected_sha256 {
             return Err("download failed SHA-256 verification".into());

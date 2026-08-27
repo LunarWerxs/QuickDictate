@@ -220,57 +220,7 @@ impl super::SettingsApp {
         self.sync.rx = None; // one operation per receiver
         for e in events {
             match e {
-                SyncEvent::Connected(Ok(c)) => {
-                    self.sync.phase = SyncPhase::SignedIn;
-                    self.sync.email = c.email.clone();
-                    self.sync.name = c.name.clone();
-                    if let Some((w, h, rgba)) = &c.avatar {
-                        let img = egui::ColorImage::from_rgba_unmultiplied(
-                            [*w as usize, *h as usize],
-                            rgba,
-                        );
-                        self.sync.avatar =
-                            Some(ctx.load_texture("cnx-avatar", img, egui::TextureOptions::LINEAR));
-                    }
-                    self.sync.is_error = false;
-                    // However they got here — the banner, the sync card, or a machine that
-                    // already had credentials — the sign-in campaign is finished. Retire it so it
-                    // can never be asked again, including if they later sign out.
-                    crate::nudge::mark_signed_in();
-                    self.nudge_ask = None;
-                    if let Some(remote) = &c.remote {
-                        let config_changed =
-                            crate::sync::apply_synced_to_config(&mut self.draft, remote);
-                        let stats_changed = crate::sync::synced_stats(remote)
-                            .is_some_and(|stats| self.app.stats.apply_synced(stats));
-                        if config_changed {
-                            // The pull mutated `draft.custom_vocabulary` /
-                            // `draft.profiles[..].custom_vocabulary` directly, bypassing the
-                            // scratch buffers the vocabulary editors actually render (see
-                            // `resync_vocabulary_scratch`'s doc comment). Without this, the
-                            // buffers still hold the pre-pull text: closing untouched shows a
-                            // false "unsaved changes" prompt (`draft_is_dirty` folds the stale
-                            // buffer back over `draft` to compare), and clicking Save would
-                            // fold that stale text back over the just-pulled vocabulary,
-                            // reverting the cloud value right back.
-                            self.resync_vocabulary_scratch();
-                            // Persist + hot-store so the pulled prefs take effect.
-                            let path = Config::settings_path();
-                            let _ = self.draft.save(&path);
-                            self.app.config.store(Arc::new(self.draft.clone()));
-                        }
-                        if config_changed || stats_changed {
-                            self.sync.note = "Updated from your Connections account.".into();
-                        } else {
-                            self.sync.note = "Synced \u{2014} already up to date.".into();
-                        }
-                    } else if c.seeded {
-                        self.sync.note =
-                            "Synced \u{2014} your settings and stats are now backed up.".into();
-                    } else {
-                        self.sync.note = "Synced.".into();
-                    }
-                }
+                SyncEvent::Connected(Ok(c)) => self.apply_connected(ctx, c),
                 SyncEvent::Connected(Err(e)) => {
                     // If creds still decrypt we're really signed in; a failed
                     // resume/pull is non-fatal (local settings keep working).
@@ -298,6 +248,58 @@ impl super::SettingsApp {
                 }
             }
         }
+    }
+    /// Reflect a successful sign-in/resume into the UI + local config. Split
+    /// out of `drain_sync` because this one arm (avatar load, pull-vs-seed
+    /// note, and the vocabulary-scratch resync) carried most of that match's
+    /// nesting on its own.
+    fn apply_connected(&mut self, ctx: &egui::Context, c: crate::sync::Connected) {
+        self.sync.phase = SyncPhase::SignedIn;
+        self.sync.email = c.email.clone();
+        self.sync.name = c.name.clone();
+        if let Some((w, h, rgba)) = &c.avatar {
+            let img = egui::ColorImage::from_rgba_unmultiplied([*w as usize, *h as usize], rgba);
+            self.sync.avatar =
+                Some(ctx.load_texture("cnx-avatar", img, egui::TextureOptions::LINEAR));
+        }
+        self.sync.is_error = false;
+        // However they got here — the banner, the sync card, or a machine that
+        // already had credentials — the sign-in campaign is finished. Retire it so it
+        // can never be asked again, including if they later sign out.
+        crate::nudge::mark_signed_in();
+        self.nudge_ask = None;
+        let Some(remote) = &c.remote else {
+            self.sync.note = if c.seeded {
+                "Synced \u{2014} your settings and stats are now backed up.".into()
+            } else {
+                "Synced.".into()
+            };
+            return;
+        };
+        let config_changed = crate::sync::apply_synced_to_config(&mut self.draft, remote);
+        let stats_changed = crate::sync::synced_stats(remote)
+            .is_some_and(|stats| self.app.stats.apply_synced(stats));
+        if config_changed {
+            // The pull mutated `draft.custom_vocabulary` /
+            // `draft.profiles[..].custom_vocabulary` directly, bypassing the
+            // scratch buffers the vocabulary editors actually render (see
+            // `resync_vocabulary_scratch`'s doc comment). Without this, the
+            // buffers still hold the pre-pull text: closing untouched shows a
+            // false "unsaved changes" prompt (`draft_is_dirty` folds the stale
+            // buffer back over `draft` to compare), and clicking Save would
+            // fold that stale text back over the just-pulled vocabulary,
+            // reverting the cloud value right back.
+            self.resync_vocabulary_scratch();
+            // Persist + hot-store so the pulled prefs take effect.
+            let path = Config::settings_path();
+            let _ = self.draft.save(&path);
+            self.app.config.store(Arc::new(self.draft.clone()));
+        }
+        self.sync.note = if config_changed || stats_changed {
+            "Updated from your Connections account.".into()
+        } else {
+            "Synced \u{2014} already up to date.".into()
+        };
     }
     /// Start an interactive sign-in (opens the system browser).
     pub(crate) fn begin_sign_in(&mut self, ctx: &egui::Context) {

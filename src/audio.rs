@@ -500,9 +500,20 @@ fn stream_until_failure(
     tracing::info!("AudioSource: streaming");
 
     let open_name = device.name().unwrap_or_default();
-    let mut since_recheck = std::time::Duration::ZERO;
+    watch_stream(stream, stop, healthy, &open_name)
+}
 
-    // Idle until shutdown, watching for the error callback.
+/// Idle until shutdown or failure, watching the error callback and (every
+/// `DEVICE_RECHECK`) whether the microphone that should be open has changed.
+/// Split out of `stream_until_failure` so its own format-dispatch match
+/// doesn't also carry this loop's nesting.
+fn watch_stream(
+    stream: cpal::Stream,
+    stop: &Arc<AtomicBool>,
+    healthy: &Arc<AtomicBool>,
+    open_name: &str,
+) -> Result<StreamOutcome> {
+    let mut since_recheck = std::time::Duration::ZERO;
     while !stop.load(Ordering::Acquire) {
         if !healthy.load(Ordering::Acquire) {
             drop(stream);

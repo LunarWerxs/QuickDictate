@@ -23,7 +23,7 @@
 //! stored, DPAPI-sealed, next to the exe as `quickdictate-connections.dat`.
 
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -771,44 +771,10 @@ fn wait_for_callback(listener: &TcpListener, timeout: Duration) -> Result<(Strin
     let deadline = Instant::now() + timeout;
     loop {
         match listener.accept() {
-            Ok((mut stream, _)) => {
-                let _ = stream.set_nonblocking(false);
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-                let mut buf = [0u8; 4096];
-                let n = stream.read(&mut buf).unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..n]);
-                let path = req
-                    .lines()
-                    .next()
-                    .and_then(|l| l.split_whitespace().nth(1))
-                    .unwrap_or("");
-                let (mut code, mut st, mut err) = (String::new(), String::new(), String::new());
-                if let Ok(u) = url::Url::parse(&format!("http://127.0.0.1{path}")) {
-                    // Only the registered callback path carries the OAuth
-                    // response; anything else (favicon, bare "/") is a stray
-                    // request we answer and keep waiting on.
-                    if u.path() == REDIRECT_PATH {
-                        for (k, v) in u.query_pairs() {
-                            match k.as_ref() {
-                                "code" => code = v.into_owned(),
-                                "state" => st = v.into_owned(),
-                                "error" => err = v.into_owned(),
-                                _ => {}
-                            }
-                        }
-                    }
+            Ok((stream, _)) => {
+                if let Some(code_and_state) = handle_loopback_request(stream)? {
+                    return Ok(code_and_state);
                 }
-
-                if !code.is_empty() {
-                    reply(&mut stream, SUCCESS_PAGE);
-                    return Ok((code, st));
-                }
-                if !err.is_empty() {
-                    reply(&mut stream, FAIL_PAGE);
-                    bail!("authorization was denied ({err})");
-                }
-                // Stray request (favicon, preconnect, bare "/") — answer and wait.
-                reply(&mut stream, WAIT_PAGE);
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if Instant::now() >= deadline {
@@ -822,6 +788,53 @@ fn wait_for_callback(listener: &TcpListener, timeout: Duration) -> Result<(Strin
             Err(e) => return Err(anyhow!("loopback accept failed: {e}")),
         }
     }
+}
+
+/// Handle one accepted loopback connection: answer it, and return the OAuth
+/// `(code, state)` once the registered callback path delivers one. `Ok(None)`
+/// means a stray request (favicon, preconnect, bare "/") was answered and the
+/// caller should keep waiting. Split out of `wait_for_callback` so the
+/// accept-loop's own timeout/retry handling doesn't nest inside this
+/// request's parsing too.
+fn handle_loopback_request(mut stream: TcpStream) -> Result<Option<(String, String)>> {
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let mut buf = [0u8; 4096];
+    let n = stream.read(&mut buf).unwrap_or(0);
+    let req = String::from_utf8_lossy(&buf[..n]);
+    let path = req
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .unwrap_or("");
+    let (mut code, mut st, mut err) = (String::new(), String::new(), String::new());
+    if let Ok(u) = url::Url::parse(&format!("http://127.0.0.1{path}")) {
+        // Only the registered callback path carries the OAuth response;
+        // anything else (favicon, bare "/") is a stray request we answer and
+        // keep waiting on.
+        if u.path() == REDIRECT_PATH {
+            for (k, v) in u.query_pairs() {
+                match k.as_ref() {
+                    "code" => code = v.into_owned(),
+                    "state" => st = v.into_owned(),
+                    "error" => err = v.into_owned(),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if !code.is_empty() {
+        reply(&mut stream, SUCCESS_PAGE);
+        return Ok(Some((code, st)));
+    }
+    if !err.is_empty() {
+        reply(&mut stream, FAIL_PAGE);
+        bail!("authorization was denied ({err})");
+    }
+    // Stray request (favicon, preconnect, bare "/") — answer and wait.
+    reply(&mut stream, WAIT_PAGE);
+    Ok(None)
 }
 
 fn reply(stream: &mut std::net::TcpStream, html: &str) {
