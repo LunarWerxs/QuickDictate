@@ -371,12 +371,14 @@ fn run_hotkey_loop(
 
         dispatch_hotkey_message(
             &msg,
-            toggle_id,
-            hold_id,
-            kb_toggle,
-            kb_hold,
-            has_mouse,
-            reinsert_hold_duration,
+            &HotkeyBindings {
+                toggle_id,
+                hold_id,
+                kb_toggle,
+                kb_hold,
+                has_mouse,
+                reinsert_hold_duration,
+            },
             &tx,
         );
     }
@@ -402,20 +404,36 @@ fn run_hotkey_loop(
     Ok(())
 }
 
+/// Everything `dispatch_hotkey_message` needs that does NOT change between
+/// messages: the registered binding ids, the two optional keyboard combos, the
+/// mouse flag and the long-press duration.
+///
+/// Passing these as eight loose parameters tripped `clippy::too_many_arguments`
+/// (8/7), which the pre-push gate treats as an error. Bundling them is not
+/// merely lint appeasement - it says the true thing about the split: seven of
+/// the eight were loop-INVARIANT config, and only `msg` varies per iteration.
+struct HotkeyBindings<'a> {
+    toggle_id: i32,
+    hold_id: i32,
+    kb_toggle: Option<&'a (String, u32, u32)>,
+    kb_hold: Option<&'a (String, u32, u32)>,
+    has_mouse: bool,
+    reinsert_hold_duration: Duration,
+}
+
 /// Handle one message pumped out of `run_hotkey_loop`'s `GetMessageW` loop:
 /// either the periodic re-arm timer or a real `WM_HOTKEY` press. Split out
 /// as its own function purely to keep the loop's cognitive load down; the
 /// behavior is identical to having it inline.
-fn dispatch_hotkey_message(
-    msg: &MSG,
-    toggle_id: i32,
-    hold_id: i32,
-    kb_toggle: Option<&(String, u32, u32)>,
-    kb_hold: Option<&(String, u32, u32)>,
-    has_mouse: bool,
-    reinsert_hold_duration: Duration,
-    tx: &Sender<HotkeyEvent>,
-) {
+fn dispatch_hotkey_message(msg: &MSG, b: &HotkeyBindings<'_>, tx: &Sender<HotkeyEvent>) {
+    let HotkeyBindings {
+        toggle_id,
+        hold_id,
+        kb_toggle,
+        kb_hold,
+        has_mouse,
+        reinsert_hold_duration,
+    } = *b;
     if msg.message == WM_TIMER {
         let mut all_registered = true;
         unsafe {
