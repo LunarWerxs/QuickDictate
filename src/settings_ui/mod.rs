@@ -834,112 +834,10 @@ impl eframe::App for SettingsApp {
         let testing = self.test_rx.is_some();
 
         // ---- Bottom action bar (pinned; removes the old empty bottom gap) ---
-        // About at the far left, Save / Save & Restart at the far right. Clicks
-        // are captured into locals and acted on after the panel closures so we
-        // never call &mut self methods through nested borrows.
-        let mut do_about = false;
-        let mut do_save = false;
-        let mut do_save_restart = false;
-        egui::Panel::bottom("qd_actions")
-            .frame(egui::Frame::new().fill(bg()).inner_margin(Margin {
-                left: 16,
-                right: 16,
-                top: 8,
-                bottom: 10,
-            }))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    if ui.button("About").clicked() {
-                        do_about = true;
-                    }
-                    if ui
-                        .button("Stats")
-                        .on_hover_text("View lifetime dictation words, time, and provider totals.")
-                        .clicked()
-                    {
-                        self.modal = Some(Modal::Stats);
-                    }
-                    // Overflow menu (⋯): the less-used utilities that used to be a
-                    // loose button row at the bottom of the settings body.
-                    ui.menu_button(overflow_glyph(), |ui| {
-                        ui.set_min_width(170.0);
-                        if ui.button("Check for updates").clicked() {
-                            // The About window runs the check and shows the result.
-                            crate::about::show_about();
-                        }
-                        if ui.button("Open log folder").clicked() {
-                            open_log_folder();
-                        }
-                        if ui.button("Edit settings.json").clicked() {
-                            let path = Config::settings_path();
-                            self.note_editor_opened();
-                            let _ = std::process::Command::new("notepad.exe").arg(&path).spawn();
-                        }
-                        ui.separator();
-                        if ui
-                            .button("Default settings")
-                            .on_hover_text(
-                                "Reset every setting back to its default. Your API keys are kept.",
-                            )
-                            .clicked()
-                        {
-                            // A menu closes on any click (egui's default
-                            // `PopupCloseBehavior::CloseOnClick`), so there's
-                            // no room for a two-step confirm in place here —
-                            // open a small confirmation modal instead, styled
-                            // like the Stats modal's own "Reset stats" confirm.
-                            self.modal = Some(Modal::DefaultReset);
-                        }
-                    })
-                    .response
-                    .on_hover_text("More: check for updates, open logs, edit settings.json");
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Zero spacing + complementary corner rounding so Save and
-                        // its dropdown paint as one unified split button: [ Save |▾ ]
-                        // with a single shared outer rounding and a square seam
-                        // where the two segments meet. The arrow half reveals "Save
-                        // and restart".
-                        ui.spacing_mut().item_spacing.x = 0.0;
-                        let arrow_round = CornerRadius {
-                            nw: 0,
-                            ne: ROUND,
-                            sw: 0,
-                            se: ROUND,
-                        };
-                        accent_menu_button(ui, chevron_down_glyph(), arrow_round, |ui| {
-                            ui.set_min_width(150.0);
-                            if ui.button("Save and restart").clicked() {
-                                do_save_restart = true;
-                            }
-                        })
-                        .on_hover_text("More save options");
-                        let save_round = CornerRadius {
-                            nw: ROUND,
-                            ne: 0,
-                            sw: ROUND,
-                            se: 0,
-                        };
-                        if accent_button_rounded(
-                            ui,
-                            "Save",
-                            save_round,
-                            egui::vec2(0.0, SPLIT_BTN_H),
-                        )
-                        .clicked()
-                        {
-                            do_save = true;
-                        }
-                        // Save status fills the gap between the menu and Save. Restore
-                        // normal spacing here since the split button above needed 0.
-                        if !self.status.is_empty() {
-                            ui.spacing_mut().item_spacing.x = 4.0;
-                            ui.add_space(6.0);
-                            ui.label(RichText::new(self.status.clone()).color(muted()));
-                        }
-                    });
-                });
-            });
+        // About at the far left, Save / Save & Restart at the far right. Split
+        // out as `bottom_action_bar` purely to keep `ui`'s cognitive load
+        // down; the returned flags are acted on below with a clean &mut self.
+        let (do_about, do_save, do_save_restart) = self.bottom_action_bar(ui);
 
         // ---- Scrollable settings body ---------------------------------------
         // ---- Nav rail --------------------------------------------------------
@@ -1023,6 +921,128 @@ impl eframe::App for SettingsApp {
         }
 
         self.render_modal(&ctx);
+    }
+}
+
+impl SettingsApp {
+    /// The pinned bottom bar: About / Stats / overflow menu on the left,
+    /// the Save split-button on the right. Returns which of the three
+    /// buttons were clicked this frame; `ui()` acts on them afterwards with
+    /// a clean `&mut self` rather than through a nested closure borrow.
+    fn bottom_action_bar(&mut self, ui: &mut egui::Ui) -> (bool, bool, bool) {
+        let mut do_about = false;
+        let mut do_save = false;
+        let mut do_save_restart = false;
+        egui::Panel::bottom("qd_actions")
+            .frame(egui::Frame::new().fill(bg()).inner_margin(Margin {
+                left: 16,
+                right: 16,
+                top: 8,
+                bottom: 10,
+            }))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("About").clicked() {
+                        do_about = true;
+                    }
+                    if ui
+                        .button("Stats")
+                        .on_hover_text("View lifetime dictation words, time, and provider totals.")
+                        .clicked()
+                    {
+                        self.modal = Some(Modal::Stats);
+                    }
+                    // Overflow menu (⋯): the less-used utilities that used to be a
+                    // loose button row at the bottom of the settings body. Its
+                    // body is `overflow_menu`, split out to keep this function's
+                    // cognitive load down.
+                    ui.menu_button(overflow_glyph(), |ui| self.overflow_menu(ui))
+                        .response
+                        .on_hover_text("More: check for updates, open logs, edit settings.json");
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let (s, sr) = self.save_split_button(ui);
+                        do_save = s;
+                        do_save_restart = sr;
+                    });
+                });
+            });
+        (do_about, do_save, do_save_restart)
+    }
+
+    /// The ⋯ overflow menu's contents: check for updates, open log folder,
+    /// edit settings.json, reset to defaults. Split out of
+    /// `bottom_action_bar` purely to keep its cognitive load down.
+    fn overflow_menu(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(170.0);
+        if ui.button("Check for updates").clicked() {
+            // The About window runs the check and shows the result.
+            crate::about::show_about();
+        }
+        if ui.button("Open log folder").clicked() {
+            open_log_folder();
+        }
+        if ui.button("Edit settings.json").clicked() {
+            let path = Config::settings_path();
+            self.note_editor_opened();
+            let _ = std::process::Command::new("notepad.exe").arg(&path).spawn();
+        }
+        ui.separator();
+        if ui
+            .button("Default settings")
+            .on_hover_text("Reset every setting back to its default. Your API keys are kept.")
+            .clicked()
+        {
+            // A menu closes on any click (egui's default
+            // `PopupCloseBehavior::CloseOnClick`), so there's no room for a
+            // two-step confirm in place here -- open a small confirmation
+            // modal instead, styled like the Stats modal's own "Reset
+            // stats" confirm.
+            self.modal = Some(Modal::DefaultReset);
+        }
+    }
+
+    /// The right-aligned Save split-button: [ Save |▾ ], plus the save
+    /// status label. Returns (do_save, do_save_restart). Split out of
+    /// `bottom_action_bar` purely to keep its cognitive load down.
+    fn save_split_button(&mut self, ui: &mut egui::Ui) -> (bool, bool) {
+        let mut do_save = false;
+        let mut do_save_restart = false;
+        // Zero spacing + complementary corner rounding so Save and its
+        // dropdown paint as one unified split button: [ Save |▾ ] with a
+        // single shared outer rounding and a square seam where the two
+        // segments meet. The arrow half reveals "Save and restart".
+        ui.spacing_mut().item_spacing.x = 0.0;
+        let arrow_round = CornerRadius {
+            nw: 0,
+            ne: ROUND,
+            sw: 0,
+            se: ROUND,
+        };
+        accent_menu_button(ui, chevron_down_glyph(), arrow_round, |ui| {
+            ui.set_min_width(150.0);
+            if ui.button("Save and restart").clicked() {
+                do_save_restart = true;
+            }
+        })
+        .on_hover_text("More save options");
+        let save_round = CornerRadius {
+            nw: ROUND,
+            ne: 0,
+            sw: ROUND,
+            se: 0,
+        };
+        if accent_button_rounded(ui, "Save", save_round, egui::vec2(0.0, SPLIT_BTN_H)).clicked() {
+            do_save = true;
+        }
+        // Save status fills the gap between the menu and Save. Restore
+        // normal spacing here since the split button above needed 0.
+        if !self.status.is_empty() {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.add_space(6.0);
+            ui.label(RichText::new(self.status.clone()).color(muted()));
+        }
+        (do_save, do_save_restart)
     }
 }
 

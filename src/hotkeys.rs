@@ -369,46 +369,16 @@ fn run_hotkey_loop(
             break;
         } // 0 = WM_QUIT, -1 = error
 
-        if msg.message == WM_TIMER {
-            let mut all_registered = true;
-            unsafe {
-                if let Some((combo, mods, vk)) = kb_toggle {
-                    all_registered &= register_one(toggle_id, combo, *mods, *vk, true);
-                }
-                if let Some((combo, mods, vk)) = kb_hold {
-                    all_registered &= register_one(hold_id, combo, *mods, *vk, true);
-                }
-            }
-            if has_mouse {
-                // Windows silently removes a low-level hook that overruns
-                // LowLevelHooksTimeout, so the mouse side needs the same
-                // periodic re-arm the keyboard side gets. No-op when the hook
-                // is still live.
-                all_registered &= mouse_hook::ensure_installed();
-            }
-            note_rearm_result(all_registered);
-            tracing::debug!("hotkeys re-armed");
-            continue;
-        }
-        if msg.message != WM_HOTKEY {
-            continue;
-        }
-        let id = msg.wParam.0 as i32;
-        tracing::info!("WM_HOTKEY received: id={id}");
-        // Only a keyboard binding can produce WM_HOTKEY; a mouse binding
-        // drives its own press/release/long-press entirely inside the hook,
-        // so the pollers here stay on the keyboard vk they were written for.
-        if id == toggle_id {
-            let _ = tx.send(HotkeyEvent::TogglePressed);
-            if let Some((_, _, vk)) = kb_toggle {
-                spawn_long_press_poller(*vk, tx.clone(), reinsert_hold_duration);
-            }
-        } else if id == hold_id {
-            let _ = tx.send(HotkeyEvent::HoldPressed);
-            if let Some((_, _, vk)) = kb_hold {
-                spawn_release_poller(*vk, tx.clone());
-            }
-        }
+        dispatch_hotkey_message(
+            &msg,
+            toggle_id,
+            hold_id,
+            kb_toggle,
+            kb_hold,
+            has_mouse,
+            reinsert_hold_duration,
+            &tx,
+        );
     }
 
     unsafe {
@@ -430,6 +400,62 @@ fn run_hotkey_loop(
         mouse_hook::uninstall();
     }
     Ok(())
+}
+
+/// Handle one message pumped out of `run_hotkey_loop`'s `GetMessageW` loop:
+/// either the periodic re-arm timer or a real `WM_HOTKEY` press. Split out
+/// as its own function purely to keep the loop's cognitive load down; the
+/// behavior is identical to having it inline.
+fn dispatch_hotkey_message(
+    msg: &MSG,
+    toggle_id: i32,
+    hold_id: i32,
+    kb_toggle: Option<&(String, u32, u32)>,
+    kb_hold: Option<&(String, u32, u32)>,
+    has_mouse: bool,
+    reinsert_hold_duration: Duration,
+    tx: &Sender<HotkeyEvent>,
+) {
+    if msg.message == WM_TIMER {
+        let mut all_registered = true;
+        unsafe {
+            if let Some((combo, mods, vk)) = kb_toggle {
+                all_registered &= register_one(toggle_id, combo, *mods, *vk, true);
+            }
+            if let Some((combo, mods, vk)) = kb_hold {
+                all_registered &= register_one(hold_id, combo, *mods, *vk, true);
+            }
+        }
+        if has_mouse {
+            // Windows silently removes a low-level hook that overruns
+            // LowLevelHooksTimeout, so the mouse side needs the same
+            // periodic re-arm the keyboard side gets. No-op when the hook
+            // is still live.
+            all_registered &= mouse_hook::ensure_installed();
+        }
+        note_rearm_result(all_registered);
+        tracing::debug!("hotkeys re-armed");
+        return;
+    }
+    if msg.message != WM_HOTKEY {
+        return;
+    }
+    let id = msg.wParam.0 as i32;
+    tracing::info!("WM_HOTKEY received: id={id}");
+    // Only a keyboard binding can produce WM_HOTKEY; a mouse binding drives
+    // its own press/release/long-press entirely inside the hook, so the
+    // pollers here stay on the keyboard vk they were written for.
+    if id == toggle_id {
+        let _ = tx.send(HotkeyEvent::TogglePressed);
+        if let Some((_, _, vk)) = kb_toggle {
+            spawn_long_press_poller(*vk, tx.clone(), reinsert_hold_duration);
+        }
+    } else if id == hold_id {
+        let _ = tx.send(HotkeyEvent::HoldPressed);
+        if let Some((_, _, vk)) = kb_hold {
+            spawn_release_poller(*vk, tx.clone());
+        }
+    }
 }
 
 fn spawn_long_press_poller(vk: u32, tx: Sender<HotkeyEvent>, hold_duration: Duration) {

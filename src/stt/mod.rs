@@ -259,110 +259,142 @@ pub fn start_session(app: Arc<App>, keys: Arc<KeyPool>) -> SttHandle {
     app.rt.spawn(async move {
         let _stats_session_guard = stats_session_guard;
         let session_usage = Arc::new(parking_lot::Mutex::new(SessionUsage::default()));
-        // Retry shell: a session may fail fast with EXHAUSTED_SIGNAL, in which
-        // case we rotate to the next of the user's keys. After a round of
-        // MAX_KEY_ATTEMPTS failures we pause briefly (POOL_REFRESH_WAIT) in
-        // case a short cooldown lapses, then try another round.
-        let mut final_res: Result<()> = Ok(());
-        let mut attempts_in_round: u32 = 0;
-        let mut rounds_done: u32 = 0;
-        let mut total_attempts: u32 = 0;
-        let user_aborted =
-            || stop.load(Ordering::Acquire) || app2.current_session_epoch() != epoch;
-        loop {
-            if user_aborted() {
-                break;
-            }
-            attempts_in_round += 1;
-            total_attempts += 1;
-            let attempt_res = run_session(
-                app2.clone(),
-                Arc::clone(&keys),
-                Arc::clone(&stop),
-                epoch,
-                Arc::clone(&session_usage),
-            )
-            .await;
-            let is_exhausted =
-                matches!(&attempt_res, Err(e) if e.to_string() == EXHAUSTED_SIGNAL);
-            if !is_exhausted {
-                final_res = attempt_res;
-                break;
-            }
-            if attempts_in_round < MAX_KEY_ATTEMPTS {
-                tracing::warn!(
-                    "session[{epoch}] attempt {total_attempts} (round {round}, key {attempts_in_round}/{MAX_KEY_ATTEMPTS}) hit a bad key; rotating",
-                    round = rounds_done + 1
-                );
-                continue;
-            }
-            rounds_done += 1;
-            if rounds_done >= MAX_RETRY_ROUNDS {
-                tracing::error!(
-                    "session[{epoch}] {total_attempts} attempts across {MAX_RETRY_ROUNDS} rounds all failed; giving up"
-                );
-                final_res = attempt_res;
-                break;
-            }
-            tracing::warn!(
-                "session[{epoch}] round {rounds_done}/{MAX_RETRY_ROUNDS} exhausted; waiting up to {POOL_REFRESH_WAIT:?} for pool refresh"
-            );
-            let refreshed = keys.schedule_refresh_and_wait(POOL_REFRESH_WAIT).await;
-            if user_aborted() {
-                break;
-            }
-            tracing::info!(
-                "session[{epoch}] refresh completed={refreshed}; starting round {round} of {MAX_RETRY_ROUNDS}",
-                round = rounds_done + 1
-            );
-            attempts_in_round = 0;
-        }
-        let usage = session_usage.lock().clone();
-        if usage.words > 0 {
-            app2
-                .stats
-                .record_dictation(&usage.provider, usage.words, usage.audio_ms);
-            crate::sync::schedule_stats_push(Arc::clone(&app2));
-        }
-        if let Err(e) = final_res {
-            let key_shaped = e.to_string() == EXHAUSTED_SIGNAL;
-            if key_shaped {
-                tracing::error!(
-                    "session[{epoch}] tried {MAX_KEY_ATTEMPTS} keys, none worked -- check provider credit / pool health"
-                );
-            } else {
-                tracing::error!("session error: {e:#}");
-            }
-            if app2.current_session_epoch() == epoch {
-                // Name the actual cause, but only when the failure was
-                // actually key-shaped. The pool's `last_failure` outlives the
-                // session (prewarm marks quota-limited keys at startup), so
-                // consulting it for a NON-key failure misattributes: a mic or
-                // network error on a machine whose spare keys sat at Quota
-                // would show "out of credit" for a dictation that never
-                // touched those keys.
-                let kind = if key_shaped {
-                    error_kind_for(&keys)
-                } else {
-                    crate::state::ErrorKind::Generic
-                };
-                app2.raise_error(kind);
-                let app_for_clear = Arc::clone(&app2);
-                app2.rt.spawn(async move {
-                    tokio::time::sleep(ERROR_PIP_VISIBLE).await;
-                    if app_for_clear.current_session_epoch() == epoch {
-                        app_for_clear.clear_status_if(Status::Error, Status::Idle);
-                    }
-                });
-            }
-        } else if app2.current_session_epoch() == epoch {
-            app2.clear_status_if(Status::Processing, Status::Idle);
-        }
+        // The retry-with-key-rotation shell and the post-session outcome
+        // handling are both split into named async fns below, purely to
+        // keep this spawned block's cognitive load down -- see their doc
+        // comments. Behavior is unchanged.
+        let final_res = run_session_with_retries(
+            app2.clone(),
+            Arc::clone(&keys),
+            Arc::clone(&stop),
+            epoch,
+            Arc::clone(&session_usage),
+        )
+        .await;
+        finish_session(app2, keys, epoch, session_usage, final_res).await;
         done.store(true, Ordering::Release);
     });
     SttHandle {
         stop: stop_ret,
         done: done_ret,
+    }
+}
+
+/// Retry shell for one dictation session: a session may fail fast with
+/// EXHAUSTED_SIGNAL, in which case we rotate to the next of the user's keys.
+/// After a round of MAX_KEY_ATTEMPTS failures we pause briefly
+/// (POOL_REFRESH_WAIT) in case a short cooldown lapses, then try another
+/// round. Split out of `start_session`'s spawned block purely to keep its
+/// cognitive load down.
+async fn run_session_with_retries(
+    app2: Arc<App>,
+    keys: Arc<KeyPool>,
+    stop: Arc<AtomicBool>,
+    epoch: u64,
+    session_usage: Arc<parking_lot::Mutex<SessionUsage>>,
+) -> Result<()> {
+    let mut final_res: Result<()> = Ok(());
+    let mut attempts_in_round: u32 = 0;
+    let mut rounds_done: u32 = 0;
+    let mut total_attempts: u32 = 0;
+    let user_aborted = || stop.load(Ordering::Acquire) || app2.current_session_epoch() != epoch;
+    loop {
+        if user_aborted() {
+            break;
+        }
+        attempts_in_round += 1;
+        total_attempts += 1;
+        let attempt_res = run_session(
+            app2.clone(),
+            Arc::clone(&keys),
+            Arc::clone(&stop),
+            epoch,
+            Arc::clone(&session_usage),
+        )
+        .await;
+        let is_exhausted = matches!(&attempt_res, Err(e) if e.to_string() == EXHAUSTED_SIGNAL);
+        if !is_exhausted {
+            final_res = attempt_res;
+            break;
+        }
+        if attempts_in_round < MAX_KEY_ATTEMPTS {
+            tracing::warn!(
+                "session[{epoch}] attempt {total_attempts} (round {round}, key {attempts_in_round}/{MAX_KEY_ATTEMPTS}) hit a bad key; rotating",
+                round = rounds_done + 1
+            );
+            continue;
+        }
+        rounds_done += 1;
+        if rounds_done >= MAX_RETRY_ROUNDS {
+            tracing::error!(
+                "session[{epoch}] {total_attempts} attempts across {MAX_RETRY_ROUNDS} rounds all failed; giving up"
+            );
+            final_res = attempt_res;
+            break;
+        }
+        tracing::warn!(
+            "session[{epoch}] round {rounds_done}/{MAX_RETRY_ROUNDS} exhausted; waiting up to {POOL_REFRESH_WAIT:?} for pool refresh"
+        );
+        let refreshed = keys.schedule_refresh_and_wait(POOL_REFRESH_WAIT).await;
+        if user_aborted() {
+            break;
+        }
+        tracing::info!(
+            "session[{epoch}] refresh completed={refreshed}; starting round {round} of {MAX_RETRY_ROUNDS}",
+            round = rounds_done + 1
+        );
+        attempts_in_round = 0;
+    }
+    final_res
+}
+
+/// Record usage, then report or clear the session's outcome. Split out of
+/// `start_session`'s spawned block purely to keep its cognitive load down.
+async fn finish_session(
+    app2: Arc<App>,
+    keys: Arc<KeyPool>,
+    epoch: u64,
+    session_usage: Arc<parking_lot::Mutex<SessionUsage>>,
+    final_res: Result<()>,
+) {
+    let usage = session_usage.lock().clone();
+    if usage.words > 0 {
+        app2.stats
+            .record_dictation(&usage.provider, usage.words, usage.audio_ms);
+        crate::sync::schedule_stats_push(Arc::clone(&app2));
+    }
+    if let Err(e) = final_res {
+        let key_shaped = e.to_string() == EXHAUSTED_SIGNAL;
+        if key_shaped {
+            tracing::error!(
+                "session[{epoch}] tried {MAX_KEY_ATTEMPTS} keys, none worked -- check provider credit / pool health"
+            );
+        } else {
+            tracing::error!("session error: {e:#}");
+        }
+        if app2.current_session_epoch() == epoch {
+            // Name the actual cause, but only when the failure was actually
+            // key-shaped. The pool's `last_failure` outlives the session
+            // (prewarm marks quota-limited keys at startup), so consulting
+            // it for a NON-key failure misattributes: a mic or network error
+            // on a machine whose spare keys sat at Quota would show "out of
+            // credit" for a dictation that never touched those keys.
+            let kind = if key_shaped {
+                error_kind_for(&keys)
+            } else {
+                crate::state::ErrorKind::Generic
+            };
+            app2.raise_error(kind);
+            let app_for_clear = Arc::clone(&app2);
+            app2.rt.spawn(async move {
+                tokio::time::sleep(ERROR_PIP_VISIBLE).await;
+                if app_for_clear.current_session_epoch() == epoch {
+                    app_for_clear.clear_status_if(Status::Error, Status::Idle);
+                }
+            });
+        }
+    } else if app2.current_session_epoch() == epoch {
+        app2.clear_status_if(Status::Processing, Status::Idle);
     }
 }
 

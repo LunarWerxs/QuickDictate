@@ -220,112 +220,135 @@ fn seeds() -> Vec<Seed> {
 /// Every target takes raw bytes so the same mutated buffer can be fed to all of
 /// them: a JSON mutation is also a perfectly good version-string mutation, and
 /// cross-feeding is free coverage.
+///
+/// Each `run` below is a plain `fn(&[u8])` item (see the definitions further
+/// down), not an inline closure -- so each target's own branching is scored
+/// against ITSELF rather than folding into `targets()`. Behavior is
+/// unchanged; only where the complexity is charged moves.
 fn targets() -> Vec<Target> {
     vec![
         Target {
             name: "config::from_str",
-            run: |b| {
-                if let Ok(text) = std::str::from_utf8(b) {
-                    let _ = serde_json::from_str::<crate::config::Config>(text);
-                }
-            },
+            run: target_config_from_str,
         },
         Target {
             name: "update::parse_ver",
-            run: |b| {
-                if let Ok(text) = std::str::from_utf8(b) {
-                    let _ = crate::update::parse_ver(text);
-                }
-            },
+            run: target_update_parse_ver,
         },
         Target {
             name: "update::trusted_asset_url",
-            run: |b| {
-                if let Ok(text) = std::str::from_utf8(b) {
-                    let _ = crate::update::trusted_asset_url(text);
-                }
-            },
+            run: target_update_trusted_asset_url,
         },
         Target {
             name: "update::exe_asset_from_json",
-            run: |b| {
-                if let Ok(text) = std::str::from_utf8(b) {
-                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
-                        let _ = crate::update::exe_asset_from_json(&value);
-                    }
-                }
-            },
+            run: target_update_exe_asset_from_json,
         },
         Target {
             name: "polish::parse_reply",
-            run: |b| {
-                if let Ok(text) = std::str::from_utf8(b) {
-                    let _ = crate::polish::parse_reply(text);
-                }
-            },
+            run: target_polish_parse_reply,
         },
         Target {
             name: "sync::apply_synced_to_config",
-            run: |b| {
-                if let Ok(text) = std::str::from_utf8(b) {
-                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
-                        let mut cfg = crate::config::Config::default();
-                        let _ = crate::sync::apply_synced_to_config(&mut cfg, &value);
-                    }
-                }
-            },
+            run: target_sync_apply_synced_to_config,
         },
         Target {
             name: "stats::merge_synced_value",
-            run: |b| {
-                if let Ok(text) = std::str::from_utf8(b) {
-                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
-                        let mut stats = crate::stats::UsageStats::default();
-                        let _ = stats.merge_synced_value(&value);
-                    }
-                }
-            },
+            run: target_stats_merge_synced_value,
         },
         Target {
             name: "text::process_chunk",
-            run: |b| {
-                if let Ok(text) = std::str::from_utf8(b) {
-                    let processor = crate::text::TextProcessor::new(
-                        &std::collections::BTreeMap::new(),
-                        true,
-                        true,
-                        true,
-                    );
-                    let _ = processor.process_chunk(text, false);
-                    let _ = processor.process_chunk(text, true);
-                }
-            },
+            run: target_text_process_chunk,
         },
         Target {
             name: "text::ends_mid_sentence",
-            run: |b| {
-                if let Ok(text) = std::str::from_utf8(b) {
-                    let _ = crate::text::ends_mid_sentence(text);
-                }
-            },
+            run: target_text_ends_mid_sentence,
         },
         Target {
             name: "voice_commands::detect",
-            run: |b| {
-                if let Ok(text) = std::str::from_utf8(b) {
-                    let _ = crate::voice_commands::detect(text, true);
-                }
-            },
+            run: target_voice_commands_detect,
         },
         Target {
             name: "paths::expand",
-            run: |b| {
-                if let Ok(text) = std::str::from_utf8(b) {
-                    let _ = crate::paths::expand(text);
-                }
-            },
+            run: target_paths_expand,
         },
     ]
+}
+
+fn target_config_from_str(b: &[u8]) {
+    if let Ok(text) = std::str::from_utf8(b) {
+        let _ = serde_json::from_str::<crate::config::Config>(text);
+    }
+}
+
+fn target_update_parse_ver(b: &[u8]) {
+    if let Ok(text) = std::str::from_utf8(b) {
+        let _ = crate::update::parse_ver(text);
+    }
+}
+
+fn target_update_trusted_asset_url(b: &[u8]) {
+    if let Ok(text) = std::str::from_utf8(b) {
+        let _ = crate::update::trusted_asset_url(text);
+    }
+}
+
+fn target_update_exe_asset_from_json(b: &[u8]) {
+    if let Ok(text) = std::str::from_utf8(b) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+            let _ = crate::update::exe_asset_from_json(&value);
+        }
+    }
+}
+
+fn target_polish_parse_reply(b: &[u8]) {
+    if let Ok(text) = std::str::from_utf8(b) {
+        let _ = crate::polish::parse_reply(text);
+    }
+}
+
+fn target_sync_apply_synced_to_config(b: &[u8]) {
+    if let Ok(text) = std::str::from_utf8(b) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+            let mut cfg = crate::config::Config::default();
+            let _ = crate::sync::apply_synced_to_config(&mut cfg, &value);
+        }
+    }
+}
+
+fn target_stats_merge_synced_value(b: &[u8]) {
+    if let Ok(text) = std::str::from_utf8(b) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+            let mut stats = crate::stats::UsageStats::default();
+            let _ = stats.merge_synced_value(&value);
+        }
+    }
+}
+
+fn target_text_process_chunk(b: &[u8]) {
+    if let Ok(text) = std::str::from_utf8(b) {
+        let processor =
+            crate::text::TextProcessor::new(&std::collections::BTreeMap::new(), true, true, true);
+        let _ = processor.process_chunk(text, false);
+        let _ = processor.process_chunk(text, true);
+    }
+}
+
+fn target_text_ends_mid_sentence(b: &[u8]) {
+    if let Ok(text) = std::str::from_utf8(b) {
+        let _ = crate::text::ends_mid_sentence(text);
+    }
+}
+
+fn target_voice_commands_detect(b: &[u8]) {
+    if let Ok(text) = std::str::from_utf8(b) {
+        let _ = crate::voice_commands::detect(text, true);
+    }
+}
+
+fn target_paths_expand(b: &[u8]) {
+    if let Ok(text) = std::str::from_utf8(b) {
+        let _ = crate::paths::expand(text);
+    }
 }
 
 // ---------------------------------------------------------------------------
