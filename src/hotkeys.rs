@@ -527,34 +527,51 @@ fn forbidden_mouse_label(vk: u32) -> Option<&'static str> {
 }
 
 fn vk_for(name: &str) -> Option<u32> {
-    // Mouse buttons. These are real virtual-key codes, but `RegisterHotKey`
-    // rejects them, so `run_hotkey_loop` routes anything matching
-    // `is_mouse_vk` to the low-level hook instead. Canonical spellings are
-    // mouse3/mouse4/mouse5; the aliases cover what mouse vendors and Windows
-    // itself call them. Left/right resolve here too — honestly, rather than by
-    // omission — and `parse_combo` is what refuses them, so the error explains
-    // itself instead of reading as "unknown key".
+    vk_for_mouse_button(name)
+        .or_else(|| vk_for_alnum(name))
+        .or_else(|| vk_for_function_key(name))
+        .or_else(|| vk_for_editing_key(name))
+        .or_else(|| vk_for_navigation_key(name))
+        .or_else(|| vk_for_numpad_key(name))
+}
+
+// Mouse buttons. These are real virtual-key codes, but `RegisterHotKey`
+// rejects them, so `run_hotkey_loop` routes anything matching
+// `is_mouse_vk` to the low-level hook instead. Canonical spellings are
+// mouse3/mouse4/mouse5; the aliases cover what mouse vendors and Windows
+// itself call them. Left/right resolve here too — honestly, rather than by
+// omission — and `parse_combo` is what refuses them, so the error explains
+// itself instead of reading as "unknown key".
+fn vk_for_mouse_button(name: &str) -> Option<u32> {
     match name {
-        "mouse1" | "leftclick" | "leftmouse" | "lmb" | "lbutton" => return Some(VK_LBUTTON),
-        "mouse2" | "rightclick" | "rightmouse" | "rmb" | "rbutton" => return Some(VK_RBUTTON),
+        "mouse1" | "leftclick" | "leftmouse" | "lmb" | "lbutton" => Some(VK_LBUTTON),
+        "mouse2" | "rightclick" | "rightmouse" | "rmb" | "rbutton" => Some(VK_RBUTTON),
         "mouse3" | "middleclick" | "middlemouse" | "mousemiddle" | "mmb" | "mbutton" => {
-            return Some(VK_MBUTTON)
+            Some(VK_MBUTTON)
         }
-        "mouse4" | "mouseback" | "backmouse" | "xbutton1" | "x1" => return Some(VK_XBUTTON1),
-        "mouse5" | "mouseforward" | "forwardmouse" | "xbutton2" | "x2" => return Some(VK_XBUTTON2),
-        _ => {}
+        "mouse4" | "mouseback" | "backmouse" | "xbutton1" | "x1" => Some(VK_XBUTTON1),
+        "mouse5" | "mouseforward" | "forwardmouse" | "xbutton2" | "x2" => Some(VK_XBUTTON2),
+        _ => None,
     }
-    // Letters a-z
-    if name.len() == 1 {
-        let c = name.as_bytes()[0];
-        if c.is_ascii_lowercase() {
-            return Some((0x41 + (c - b'a')) as u32);
-        }
-        if c.is_ascii_digit() {
-            return Some((0x30 + (c - b'0')) as u32);
-        }
+}
+
+// Letters a-z, digits 0-9.
+fn vk_for_alnum(name: &str) -> Option<u32> {
+    if name.len() != 1 {
+        return None;
     }
-    let v = match name {
+    let c = name.as_bytes()[0];
+    if c.is_ascii_lowercase() {
+        return Some((0x41 + (c - b'a')) as u32);
+    }
+    if c.is_ascii_digit() {
+        return Some((0x30 + (c - b'0')) as u32);
+    }
+    None
+}
+
+fn vk_for_function_key(name: &str) -> Option<u32> {
+    Some(match name {
         "f1" => 0x70,
         "f2" => 0x71,
         "f3" => 0x72,
@@ -579,6 +596,12 @@ fn vk_for(name: &str) -> Option<u32> {
         "f22" => 0x85,
         "f23" => 0x86,
         "f24" => 0x87,
+        _ => return None,
+    })
+}
+
+fn vk_for_editing_key(name: &str) -> Option<u32> {
+    Some(match name {
         "space" => 0x20,
         "enter" | "return" => 0x0D,
         "tab" => 0x09,
@@ -586,6 +609,12 @@ fn vk_for(name: &str) -> Option<u32> {
         "backspace" => 0x08,
         "delete" | "del" => 0x2E,
         "insert" | "ins" => 0x2D,
+        _ => return None,
+    })
+}
+
+fn vk_for_navigation_key(name: &str) -> Option<u32> {
+    Some(match name {
         "home" => 0x24,
         "end" => 0x23,
         "pageup" | "page_up" => 0x21,
@@ -594,6 +623,12 @@ fn vk_for(name: &str) -> Option<u32> {
         "down" => 0x28,
         "left" => 0x25,
         "right" => 0x27,
+        _ => return None,
+    })
+}
+
+fn vk_for_numpad_key(name: &str) -> Option<u32> {
+    Some(match name {
         "numpad0" => 0x60,
         "numpad1" => 0x61,
         "numpad2" => 0x62,
@@ -605,8 +640,7 @@ fn vk_for(name: &str) -> Option<u32> {
         "numpad8" => 0x68,
         "numpad9" => 0x69,
         _ => return None,
-    };
-    Some(v)
+    })
 }
 
 #[cfg(test)]
