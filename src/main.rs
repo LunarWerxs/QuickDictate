@@ -23,6 +23,17 @@ mod icon;
 mod keys;
 mod local_stt;
 mod mouse_hook;
+/// The "you could be signed in" prompt: app glue (persistence, identity, the decision).
+mod nudge;
+/// The shared LunarWerx decision engine, vendored VERBATIM. Never edit it here — see `nudge.rs`.
+///
+/// `dead_code` is allowed for exactly that reason: the file is a byte-for-byte copy of
+/// `packages/connections-connect/ports/nudge.rs`, and it carries the whole API every LunarWerx app
+/// might use (`set_cadence`, the monthly cadence, the discover campaign). QuickDictate uses a
+/// subset. Trimming the unused half would make the copy stop matching upstream, which is the one
+/// property that lets a `diff` prove this app has not silently drifted into asking differently.
+#[allow(dead_code, reason = "verbatim vendored copy; see the module doc above")]
+mod nudge_engine;
 mod onboarding;
 mod output;
 mod paths;
@@ -849,6 +860,16 @@ fn main() -> Result<()> {
     // returns to the window they initiated the restart from.
     let has_usable_key = keys.has_usable_key();
     let is_settings_relaunch = std::env::args().any(|arg| arg == "--relaunch");
+
+    // Count this launch for the "you could be signed in" prompt — but NOT a Save & Restart
+    // hand-off, which is one sitting the user never left. Counting it would inflate the session
+    // total, and worse: the engine treats a session that begins with an unanswered ask as a
+    // decline, so restarting from the Settings window with the banner up would silently spend one
+    // of the user's two declines on an action that was not a refusal at all.
+    if !is_settings_relaunch {
+        nudge::start_session();
+    }
+
     if !has_usable_key {
         onboarding::notify_no_key();
     }

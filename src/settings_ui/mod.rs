@@ -753,6 +753,13 @@ struct SettingsApp {
     /// [`SettingsApp::open_keys_modal`] and read by `active_keys` and the
     /// modal's commit, so one editor serves both pools.
     keys_target: String,
+    /// The "you could be signed in" ask, when one is currently on screen.
+    ///
+    /// Held here rather than re-asked per frame on purpose: [`crate::nudge::consider`] MUTATES —
+    /// it stamps the ask and advances the ladder — so calling it from a paint function would burn
+    /// the user's three lifetime asks in three frames. It is called once, at the moment (a save),
+    /// and what it returns lives here until the user answers it.
+    nudge_ask: Option<crate::nudge_engine::Ask>,
 }
 
 impl eframe::App for SettingsApp {
@@ -964,6 +971,7 @@ impl eframe::App for SettingsApp {
                 // be something you can navigate away from.
                 self.onboarding_banner(ui);
                 self.update_available_banner(ui);
+                self.sign_in_nudge_banner(ui);
                 self.page_header(ui);
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])

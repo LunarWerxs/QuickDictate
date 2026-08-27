@@ -51,6 +51,7 @@ impl super::SettingsApp {
             // the headless screenshot hook above can capture any page and not
             // just the one the window happens to open on.
             keys_target: KEYS_TARGET_PROVIDER.to_string(),
+            nudge_ask: None,
             tab: match std::env::var("QUICKDICTATE_UI_PAGE")
                 .unwrap_or_default()
                 .to_ascii_lowercase()
@@ -85,6 +86,10 @@ impl super::SettingsApp {
         self.editor_opened_at = None;
         self.pending_save_kind = None;
         self.pending_restart = None;
+        // `nudge_ask` is deliberately NOT cleared here. Closing the window is not an answer, and
+        // the ask is already stamped in the engine's persisted state either way — so clearing it
+        // would hide a prompt the user still owes an answer to while spending it anyway. Left up,
+        // a re-open shows the same banner and the user's click still counts.
 
         // Re-seed the sync control from creds on disk and re-arm the one-shot
         // silent resume-pull so a re-open also refreshes from the cloud.
@@ -228,6 +233,11 @@ impl super::SettingsApp {
                             Some(ctx.load_texture("cnx-avatar", img, egui::TextureOptions::LINEAR));
                     }
                     self.sync.is_error = false;
+                    // However they got here — the banner, the sync card, or a machine that
+                    // already had credentials — the sign-in campaign is finished. Retire it so it
+                    // can never be asked again, including if they later sign out.
+                    crate::nudge::mark_signed_in();
+                    self.nudge_ask = None;
                     if let Some(remote) = &c.remote {
                         let config_changed =
                             crate::sync::apply_synced_to_config(&mut self.draft, remote);
@@ -460,6 +470,19 @@ impl super::SettingsApp {
                 "Saved locally \u{2014} a sync operation is already in progress.".into()
             };
         }
+
+        // The moment. Someone who has just tuned their setup is exactly who benefits from those
+        // settings following them to another machine — and the offer to do that is already in
+        // this app, three cards down where it is rarely seen. The engine decides whether this
+        // particular save is one to speak up on (almost always: no), and it will not consider at
+        // all while signed in, so this cannot fire at someone who already took the offer.
+        //
+        // Guarded on there being no ask already on screen: a user who saves twice without
+        // answering should not stack two banners, and `consider` advances the ladder every time
+        // it returns something.
+        if self.nudge_ask.is_none() {
+            self.nudge_ask = crate::nudge::consider("settings-changed");
+        }
         true
     }
     /// "Default settings" (⋯ overflow menu): reset every editable preference
@@ -688,6 +711,16 @@ impl super::SettingsApp {
                     }
                 }
                 "stats" => self.modal = Some(Modal::Stats),
+                // The sign-in banner, which is otherwise unshootable: it fires on a real save,
+                // and only for someone a week in with several sessions behind them, so nothing a
+                // headless capture does on a fresh profile would ever produce it.
+                //
+                // This asks the REAL engine, exactly as `save_and_sync` does. It does not force a
+                // banner into existence — with a fresh state file the gate is shut and this
+                // returns `None`, and the capture then honestly shows no banner. What makes the
+                // shot possible is seeding `quickdictate-nudge.json` with the history of a
+                // long-time user; the calendar is the only thing the harness fakes.
+                "nudge" => self.nudge_ask = crate::nudge::consider("settings-changed"),
                 _ => {}
             }
         }

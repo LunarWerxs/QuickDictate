@@ -154,6 +154,17 @@ pub const SYNCED_KEYS: &[&str] = &[
     "polish_deadline_ms",
     "polish_endpoint",
     "polish_model",
+    // ── Widened 2026-08-25 ──────────────────────────────────────────────────────
+    // Four fields whose exclusion was an assertion rather than a mechanism. Everything
+    // still in NEVER_SYNCED below has an actual reason it cannot travel; these did not.
+    "hide_tray_icon", // "don't show me a tray icon" is a fact about YOU, not about the PC
+    "enable_logging", // a diagnostics preference; the log itself never leaves the machine
+    "max_log_mb",     // the cap that goes with it
+    // "seal my API keys at rest" is a portable intent. It was excluded as "meaningless
+    // elsewhere" because DPAPI binds to one Windows account — but the SETTING is not the
+    // sealed blob: on another machine it seals THAT machine's keys with THAT account,
+    // which is exactly what someone who turned it on here would want.
+    "protect_keys_at_rest",
 ];
 
 /// Every `Config` field that is deliberately **never** synced: secrets and
@@ -168,27 +179,28 @@ pub const SYNCED_KEYS: &[&str] = &[
 /// decision yet.
 #[cfg_attr(not(test), allow(dead_code))]
 const NEVER_SYNCED: &[&str] = &[
-    "elevenlabs_keys",      // secret API key array
-    "deepgram_keys",        // secret API key array
-    "openai_keys",          // secret API key array
-    "assemblyai_keys",      // secret API key array
-    "dashscope_keys",       // secret API key array
-    "google_keys",          // secret API key array
-    "polish_keys",          // secret API key array (LLM cleanup endpoint)
-    "local_keys",           // legacy secret API key array, folds into elevenlabs_keys
-    "window_width",         // machine-local window geometry
-    "window_height",        // machine-local window geometry
-    "window_x",             // machine-local window geometry
-    "window_y",             // machine-local window geometry
-    "run_at_startup",       // per-machine registry (Run key) behavior
-    "hide_tray_icon",       // a property of this install, not a portable preference
-    "data_dir",             // an absolute path on THIS PC; meaningless (or wrong) on another
-    "enable_logging",       // local diagnostics toggle
-    "max_log_mb",           // per-install log-size cap, machine-local like enable_logging
-    "log_transcripts",      // local diagnostics toggle; must never leave the machine
+    "elevenlabs_keys", // secret API key array
+    "deepgram_keys",   // secret API key array
+    "openai_keys",     // secret API key array
+    "assemblyai_keys", // secret API key array
+    "dashscope_keys",  // secret API key array
+    "google_keys",     // secret API key array
+    "polish_keys",     // secret API key array (LLM cleanup endpoint)
+    "local_keys",      // legacy secret API key array, folds into elevenlabs_keys
+    "window_width",    // machine-local window geometry
+    "window_height",   // machine-local window geometry
+    "window_x",        // machine-local window geometry
+    "window_y",        // machine-local window geometry
+    // Writes an HKCU Run entry on whatever machine it lands on. That is a change to the
+    // system, not a preference being read — so it stays a per-machine decision.
+    "run_at_startup",
+    "data_dir", // an absolute path on THIS PC; meaningless (or wrong) on another
+    // The one logging flag that stays: it writes your dictated TEXT to disk. Its companions
+    // above now sync; turning this one on somewhere from somewhere else is a privacy change
+    // being made for you, on a machine you were not looking at.
+    "log_transcripts",
     "install_id", // anonymous per-install id; syncing would merge two machines' identities
     "update_auto_install", // machine-local unattended-update policy choice
-    "protect_keys_at_rest", // controls DPAPI sealing bound to this Windows account; meaningless elsewhere
 ];
 
 // ---- Allowlist transforms (Config <-> synced JSON) -------------------------
@@ -1294,11 +1306,32 @@ mod tests {
             "window_width",
             "window_height",
             "run_at_startup",
-            "enable_logging",
+            // The transcript log is the one diagnostics flag that stays home: it writes your
+            // dictated TEXT to disk, so switching it on from another machine would be a privacy
+            // change made on your behalf somewhere you were not looking. `enable_logging` and
+            // `max_log_mb` DO sync as of 2026-08-25 — they only control an ordinary app log.
+            "log_transcripts",
+            "install_id",
+            "data_dir",
         ] {
             assert!(
                 !obj.contains_key(forbidden),
                 "{forbidden} must never be in the synced snapshot"
+            );
+        }
+
+        // The four widened on 2026-08-25. Asserted by name because the failure they fix was
+        // silent in exactly this direction: a portable preference simply never travelling, with
+        // nothing anywhere going red about it.
+        for widened in [
+            "hide_tray_icon",
+            "enable_logging",
+            "max_log_mb",
+            "protect_keys_at_rest",
+        ] {
+            assert!(
+                obj.contains_key(widened),
+                "{widened} was widened into SYNCED_KEYS and must appear in the snapshot"
             );
         }
     }

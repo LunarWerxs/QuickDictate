@@ -21,6 +21,9 @@ quickdictate-panic.log
 quickdictate-dev-port.txt
 quickdictate-update.txt
 quickdictate-stats.json
+# Sign-in prompt schedule: how long you have had the app and when it last asked.
+# A dev run writes one into the working tree, and it is per-machine state, not source.
+quickdictate-nudge.json
 key-health.json
 
 # Connections settings-sync: DPAPI-sealed refresh token (machine+user bound).
@@ -73,3 +76,7 @@ SCRIBE_HALLUCINATION_HANDOFF.md
 
 # Local AI memory for this repo. Deliberately NOT published.
 /.claude/memory/
+
+# Architect (local audit) - profile + reports stay machine-local
+/.arkitect/
+/tmp/

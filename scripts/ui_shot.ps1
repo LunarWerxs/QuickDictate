@@ -12,7 +12,10 @@ param(
     [string] $Shot = '',
     # keys-test also presses "Test all" and captures once the parallel
     # verdicts land — a headless end-to-end probe test with real keys.
-    [ValidateSet('', 'keys', 'keys-bulk', 'replacements', 'replacements-bulk', 'keys-test', 'stats')]
+    # 'nudge' asks the real sign-in engine whether to show its banner, exactly as a save does.
+    # It cannot conjure one: on a fresh profile the gate is shut and the shot honestly shows no
+    # banner. Seed quickdictate-nudge.json with a long-time user's history to see it.
+    [ValidateSet('', 'keys', 'keys-bulk', 'replacements', 'replacements-bulk', 'keys-test', 'stats', 'nudge')]
     [string] $Open = '',
     # Optional --provider override for the launched exe.
     [string] $Provider = '',
