@@ -867,38 +867,7 @@ impl Overlay {
         if let Some(start_angle) = spinner_angle {
             // Local providers are batch-only, so a word count sits at zero
             // until the final transcript. Draw a rotating 270° ring instead.
-            // Blend it directly into the already-opaque disc so the layered
-            // window keeps correct premultiplied alpha at antialiased edges.
-            let ring_radius = self.size as f32 * 0.22;
-            let ring_half_width = self.size as f32 * 0.034;
-            let sweep = std::f32::consts::TAU * 0.75;
-            for y in 0..self.size {
-                for x in 0..self.size {
-                    let dx = x as f32 - cx;
-                    let dy = y as f32 - cy;
-                    let dist = (dx * dx + dy * dy).sqrt();
-                    let radial =
-                        (ring_half_width + 0.8 - (dist - ring_radius).abs()).clamp(0.0, 1.0);
-                    if radial == 0.0 {
-                        continue;
-                    }
-                    let around = (dy.atan2(dx) - start_angle).rem_euclid(std::f32::consts::TAU);
-                    if around > sweep {
-                        continue;
-                    }
-                    let tip = (around.min(sweep - around) / 0.16).clamp(0.0, 1.0);
-                    let coverage = radial * tip;
-                    let idx = (y * self.size + x) as usize;
-                    let old = pixels[idx];
-                    let blend = |channel: u32| -> u32 {
-                        (channel as f32 + (255.0 - channel as f32) * coverage + 0.5) as u32
-                    };
-                    let red = blend((old >> 16) & 0xff);
-                    let green = blend((old >> 8) & 0xff);
-                    let blue = blend(old & 0xff);
-                    pixels[idx] = (old & 0xff00_0000) | (red << 16) | (green << 8) | blue;
-                }
-            }
+            draw_spinner_ring(pixels, self.size, cx, cy, start_angle);
         } else {
             // Draw the label on top. GDI doesn't touch the alpha channel, but
             // the disc interior already has alpha=255, so text stays opaque.
@@ -987,6 +956,44 @@ impl Overlay {
             // SW_SHOWNA shows without stealing focus.
             let _ = ShowWindow(self.hwnd, SW_SHOWNA);
             self.visible.set(true);
+        }
+    }
+}
+
+/// Blend a rotating 270° ring onto an already-filled disc: `pixels` is the
+/// `size`x`size` BGRA buffer, `(cx, cy)` its center, and `start_angle` the
+/// ring's current rotation. Blended directly into the existing (opaque)
+/// pixels so the layered window keeps correct premultiplied alpha at
+/// antialiased edges. Split out of `Overlay::render` -- the nested scan plus
+/// per-pixel blend closure was most of that function's branching.
+fn draw_spinner_ring(pixels: &mut [u32], size: i32, cx: f32, cy: f32, start_angle: f32) {
+    let ring_radius = size as f32 * 0.22;
+    let ring_half_width = size as f32 * 0.034;
+    let sweep = std::f32::consts::TAU * 0.75;
+    for y in 0..size {
+        for x in 0..size {
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            let dist = (dx * dx + dy * dy).sqrt();
+            let radial = (ring_half_width + 0.8 - (dist - ring_radius).abs()).clamp(0.0, 1.0);
+            if radial == 0.0 {
+                continue;
+            }
+            let around = (dy.atan2(dx) - start_angle).rem_euclid(std::f32::consts::TAU);
+            if around > sweep {
+                continue;
+            }
+            let tip = (around.min(sweep - around) / 0.16).clamp(0.0, 1.0);
+            let coverage = radial * tip;
+            let idx = (y * size + x) as usize;
+            let old = pixels[idx];
+            let blend = |channel: u32| -> u32 {
+                (channel as f32 + (255.0 - channel as f32) * coverage + 0.5) as u32
+            };
+            let red = blend((old >> 16) & 0xff);
+            let green = blend((old >> 8) & 0xff);
+            let blue = blend(old & 0xff);
+            pixels[idx] = (old & 0xff00_0000) | (red << 16) | (green << 8) | blue;
         }
     }
 }

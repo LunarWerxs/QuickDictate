@@ -668,6 +668,48 @@ impl super::SettingsApp {
             self.test_rx = None;
         }
     }
+    // Which auto-opened modal (if any) a headless shot should land on, keyed by
+    // `QUICKDICTATE_UI_OPEN`. Split out of `screenshot_hook` so the frame-timing
+    // logic there isn't buried under this dispatch's own branching.
+    fn apply_shot_mode(&mut self, mode: &str) {
+        match mode {
+            "keys" | "keys-test" => self.open_keys_modal(KEYS_TARGET_PROVIDER),
+            // Proves the one editor really does target two different pools.
+            "keys-polish" | "keys-polish-test" => self.open_keys_modal(KEYS_TARGET_POLISH),
+            "keys-bulk" => {
+                self.open_keys_modal(KEYS_TARGET_PROVIDER);
+                if let Some(Modal::Keys { bulk, .. }) = &mut self.modal {
+                    *bulk = true;
+                }
+            }
+            "replacements" => self.open_replacements_modal(),
+            "replacements-bulk" => {
+                self.open_replacements_modal();
+                if let Some(Modal::Replacements {
+                    rows,
+                    bulk,
+                    bulk_text,
+                    ..
+                }) = &mut self.modal
+                {
+                    *bulk_text = replacements_to_text(rows);
+                    *bulk = true;
+                }
+            }
+            "stats" => self.modal = Some(Modal::Stats),
+            // The sign-in banner, which is otherwise unshootable: it fires on a real save,
+            // and only for someone a week in with several sessions behind them, so nothing a
+            // headless capture does on a fresh profile would ever produce it.
+            //
+            // This asks the REAL engine, exactly as `save_and_sync` does. It does not force a
+            // banner into existence — with a fresh state file the gate is shut and this
+            // returns `None`, and the capture then honestly shows no banner. What makes the
+            // shot possible is seeding `quickdictate-nudge.json` with the history of a
+            // long-time user; the calendar is the only thing the harness fakes.
+            "nudge" => self.nudge_ask = crate::nudge::consider("settings-changed"),
+            _ => {}
+        }
+    }
     pub(crate) fn screenshot_hook(&mut self, ctx: &egui::Context) {
         let Some(path) = self.shot_path.clone() else {
             return;
@@ -688,43 +730,7 @@ impl super::SettingsApp {
         }
         // Let fonts/layout settle, optionally auto-open a modal for the shot.
         if self.frames == 5 {
-            match mode.as_str() {
-                "keys" | "keys-test" => self.open_keys_modal(KEYS_TARGET_PROVIDER),
-                // Proves the one editor really does target two different pools.
-                "keys-polish" | "keys-polish-test" => self.open_keys_modal(KEYS_TARGET_POLISH),
-                "keys-bulk" => {
-                    self.open_keys_modal(KEYS_TARGET_PROVIDER);
-                    if let Some(Modal::Keys { bulk, .. }) = &mut self.modal {
-                        *bulk = true;
-                    }
-                }
-                "replacements" => self.open_replacements_modal(),
-                "replacements-bulk" => {
-                    self.open_replacements_modal();
-                    if let Some(Modal::Replacements {
-                        rows,
-                        bulk,
-                        bulk_text,
-                        ..
-                    }) = &mut self.modal
-                    {
-                        *bulk_text = replacements_to_text(rows);
-                        *bulk = true;
-                    }
-                }
-                "stats" => self.modal = Some(Modal::Stats),
-                // The sign-in banner, which is otherwise unshootable: it fires on a real save,
-                // and only for someone a week in with several sessions behind them, so nothing a
-                // headless capture does on a fresh profile would ever produce it.
-                //
-                // This asks the REAL engine, exactly as `save_and_sync` does. It does not force a
-                // banner into existence — with a fresh state file the gate is shut and this
-                // returns `None`, and the capture then honestly shows no banner. What makes the
-                // shot possible is seeding `quickdictate-nudge.json` with the history of a
-                // long-time user; the calendar is the only thing the harness fakes.
-                "nudge" => self.nudge_ask = crate::nudge::consider("settings-changed"),
-                _ => {}
-            }
+            self.apply_shot_mode(&mode);
         }
         // keys-test: also press "Test all" and shoot once the (parallel)
         // verdicts are in — a headless end-to-end test of the probe pipeline.
