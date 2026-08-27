@@ -827,6 +827,60 @@ async fn download_parallel(
         .map_err(|e| format!("could not flush download: {e}"))
 }
 
+/// Reads one attempt's response body into `file`, chunk by chunk, advancing
+/// `progress` and the write position as it goes. Returns the byte offset
+/// reached, plus a retry reason when the stream ended early (a read failure
+/// or a truncated response) so the caller's retry loop keeps that message to
+/// report if every attempt runs out. `Err` only for the cases that should
+/// abort the whole download outright: cancellation, a sibling range failing,
+/// or the server sending more than was asked for.
+#[allow(clippy::too_many_arguments)]
+async fn write_range_chunks(
+    response: &mut reqwest::Response,
+    file: &mut File,
+    start: u64,
+    end: u64,
+    mut next: u64,
+    id: &str,
+    phase: InstallPhase,
+    display_total: u64,
+    progress: &AtomicU64,
+    cancel: &AtomicBool,
+    failed: &AtomicBool,
+) -> Result<(u64, Option<String>), String> {
+    let mut last_error = Some(format!("response ended before byte {end}"));
+    while next <= end {
+        check_cancelled(cancel)?;
+        if failed.load(Ordering::Acquire) {
+            return Err("parallel download stopped after another range failed".into());
+        }
+        let limit = (end - next + 1).min(DOWNLOAD_BUFFER_BYTES as u64) as usize;
+        let chunk = match next_chunk_with_cancel(response, cancel).await {
+            Ok(None) => break,
+            Ok(Some(chunk)) => chunk,
+            Err(e) => {
+                last_error = Some(format!("read failed at byte {next}: {e}"));
+                break;
+            }
+        };
+        if chunk.len() > limit {
+            return Err(format!(
+                "range {start}-{end} returned more data than requested"
+            ));
+        }
+        let n = chunk.len();
+        file.write_all(&chunk)
+            .map_err(|e| format!("range {start}-{end} write failed: {e}"))?;
+        next += n as u64;
+        let downloaded = progress.fetch_add(n as u64, Ordering::AcqRel) + n as u64;
+        set_state(id, phase.clone(), downloaded, display_total);
+    }
+    if next > end {
+        last_error = None;
+    }
+    Ok((next, last_error))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn download_range(
     client: &reqwest::Client,
@@ -892,36 +946,25 @@ async fn download_range(
             continue;
         }
 
-        last_error = Some(format!("response ended before byte {end}"));
-        while next <= end {
-            check_cancelled(cancel)?;
-            if failed.load(Ordering::Acquire) {
-                return Err("parallel download stopped after another range failed".into());
-            }
-            let limit = (end - next + 1).min(DOWNLOAD_BUFFER_BYTES as u64) as usize;
-            let chunk = match next_chunk_with_cancel(&mut response, cancel).await {
-                Ok(None) => break,
-                Ok(Some(chunk)) => chunk,
-                Err(e) => {
-                    last_error = Some(format!("read failed at byte {next}: {e}"));
-                    break;
-                }
-            };
-            if chunk.len() > limit {
-                return Err(format!(
-                    "range {start}-{end} returned more data than requested"
-                ));
-            }
-            let n = chunk.len();
-            file.write_all(&chunk)
-                .map_err(|e| format!("range {start}-{end} write failed: {e}"))?;
-            next += n as u64;
-            let downloaded = progress.fetch_add(n as u64, Ordering::AcqRel) + n as u64;
-            set_state(id, phase.clone(), downloaded, display_total);
-        }
+        let (updated_next, retry_reason) = write_range_chunks(
+            &mut response,
+            &mut file,
+            start,
+            end,
+            next,
+            id,
+            phase.clone(),
+            display_total,
+            progress,
+            cancel,
+            failed,
+        )
+        .await?;
+        next = updated_next;
         if next > end {
             return Ok(());
         }
+        last_error = retry_reason;
         if attempt < DOWNLOAD_RANGE_ATTEMPTS {
             tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;
         }
@@ -1970,6 +2013,46 @@ mod tests {
         })
     }
 
+    /// Serves one accepted connection: reads the request, answers with either
+    /// a full 200 or a ranged 206 slice of `data`, and paces the body out in
+    /// 16KiB chunks with an optional per-chunk delay for the slow-server tests.
+    fn serve_one_download_request(
+        mut stream: TcpStream,
+        data: Arc<Vec<u8>>,
+        ranged: bool,
+        chunk_delay: Duration,
+    ) {
+        let request = read_request(&mut stream);
+        let (start, end, status) = if ranged {
+            let (start, end) = requested_range(&request).expect("range request expected");
+            (start, end, "206 Partial Content")
+        } else {
+            (0, data.len() - 1, "200 OK")
+        };
+        let body = &data[start..=end];
+        let content_range = if ranged {
+            format!("Content-Range: bytes {start}-{end}/{}\r\n", data.len())
+        } else {
+            String::new()
+        };
+        let headers = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\n{content_range}\
+             Connection: close\r\n\r\n",
+            body.len()
+        );
+        if stream.write_all(headers.as_bytes()).is_err() {
+            return;
+        }
+        for chunk in body.chunks(16 * 1024) {
+            if stream.write_all(chunk).is_err() {
+                return;
+            }
+            if !chunk_delay.is_zero() {
+                std::thread::sleep(chunk_delay);
+            }
+        }
+    }
+
     fn spawn_download_server(
         data: Arc<Vec<u8>>,
         requests: usize,
@@ -1981,39 +2064,10 @@ mod tests {
         let handle = std::thread::spawn(move || {
             let mut handlers = Vec::new();
             for _ in 0..requests {
-                let (mut stream, _) = listener.accept().unwrap();
+                let (stream, _) = listener.accept().unwrap();
                 let data = Arc::clone(&data);
                 handlers.push(std::thread::spawn(move || {
-                    let request = read_request(&mut stream);
-                    let (start, end, status) = if ranged {
-                        let (start, end) =
-                            requested_range(&request).expect("range request expected");
-                        (start, end, "206 Partial Content")
-                    } else {
-                        (0, data.len() - 1, "200 OK")
-                    };
-                    let body = &data[start..=end];
-                    let content_range = if ranged {
-                        format!("Content-Range: bytes {start}-{end}/{}\r\n", data.len())
-                    } else {
-                        String::new()
-                    };
-                    let headers = format!(
-                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\n{content_range}\
-                         Connection: close\r\n\r\n",
-                        body.len()
-                    );
-                    if stream.write_all(headers.as_bytes()).is_err() {
-                        return;
-                    }
-                    for chunk in body.chunks(16 * 1024) {
-                        if stream.write_all(chunk).is_err() {
-                            return;
-                        }
-                        if !chunk_delay.is_zero() {
-                            std::thread::sleep(chunk_delay);
-                        }
-                    }
+                    serve_one_download_request(stream, data, ranged, chunk_delay);
                 }));
             }
             for handler in handlers {
