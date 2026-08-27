@@ -39,6 +39,14 @@ jobs:
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
+      # `mod X;` with no tracked file. This is the one class CI genuinely discovers FIRST,
+      # because every local gate compiles the working tree where the untracked file still
+      # exists - which is exactly how 393c38c pushed a `main` that did not compile. Running it
+      # here makes the failure name the missing files instead of showing a wall of E0583s.
+      - name: Every module declaration has a tracked file
+        shell: pwsh
+        run: ./scripts/check-untracked-mods.ps1
+
       - name: Format check
         run: cargo fmt --all --check
 

@@ -70,6 +70,16 @@ try {
         }
     }
 
+    # A `mod X;` whose file was never `git add`ed. Every other step below compiles the WORKING
+    # TREE, where that file is sitting right there, so all of them go green while the pushed
+    # commit does not build for anyone who clones it - which is exactly what 393c38c did to
+    # `main`. Runs first because it is instant and because a red here explains the E0583s the
+    # later steps would otherwise report from CI.
+    Step 'untracked module files' {
+        & pwsh -NoProfile -File (Join-Path $PSScriptRoot 'check-untracked-mods.ps1')
+        if ($LASTEXITCODE -ne 0) { throw 'check-untracked-mods.ps1 failed' }
+    }
+
     # Mirrors ci.yml -> `check` job, in the same order.
     if (-not $fail) { Step 'fmt --check'  { cargo fmt --all --check } }
     Step 'clippy'       { cargo clippy --locked --all-targets -- -D warnings }
