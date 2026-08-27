@@ -160,26 +160,34 @@ impl super::SettingsApp {
                                 answer = Some(crate::nudge_engine::Outcome::Accepted);
                                 connect = true;
                             }
-                            // Same three answers, same words, as the web banner every other LunarWerx
-                            // app shows (`nudge-banner.ts`): "Not now" is engagement and does NOT
-                            // count toward the two-strike stop, "Don't ask again" is a real opt-out
-                            // offered on the FIRST ask, and the × is a plain dismissal, which does.
+                            // Same answers, same words, as the web banner every other LunarWerx app
+                            // shows (`nudge-banner.ts`). "Not now" and the × are the same thing -
+                            // a dismissal worth one interval - and there is deliberately no
+                            // permanent opt-out: the engine has no state that could express one.
+                            // See `nudge_engine.rs`'s header for the decision and what it costs.
                             if ui
                                 .button(RichText::new("Not now").size(12.0).color(muted()))
                                 .clicked()
                             {
                                 answer = Some(crate::nudge_engine::Outcome::Snoozed);
                             }
-                            if ui
-                                .button(RichText::new("Don't ask again").size(12.0).color(muted()))
-                                .on_hover_text(
-                                    "Stops this prompt permanently. Settings sync stays available \
-                                 on this page.",
-                                )
-                                .clicked()
+                            // The month-long dismissal only exists from the fourth ask on, and the
+                            // ENGINE decides that, never a count re-derived here.
+                            if ask.can_snooze_month
+                                && ui
+                                    .button(
+                                        RichText::new("Remind me in a month")
+                                            .size(12.0)
+                                            .color(muted()),
+                                    )
+                                    .on_hover_text(
+                                        "Hides this for a month. Settings sync stays available on \
+                                 this page in the meantime.",
+                                    )
+                                    .clicked()
                             {
                                 answer = Some(crate::nudge_engine::Outcome::SetCadence(
-                                    crate::nudge_engine::Cadence::Never,
+                                    crate::nudge_engine::Cadence::Monthly,
                                 ));
                             }
                         });
