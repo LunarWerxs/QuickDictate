@@ -126,333 +126,243 @@ pub fn spawn(app: Arc<App>) -> std::thread::JoinHandle<()> {
         .expect("spawn ui thread")
 }
 
-fn run(app: Arc<App>) -> Result<()> {
-    let tray_state = build_tray()?;
-    let menu_rx = MenuEvent::receiver();
+/// Per-tick snapshot of read-only app/config state the loop body branches
+/// on. Recomputed fresh every pass by [`compute_tick_snapshot`]; nothing
+/// here persists across ticks (that's [`UiLoopState`]'s job).
+struct TickSnapshot {
+    status: Status,
+    error_kind: ErrorKind,
+    hotkey_blocked: bool,
+    render_status: Status,
+    render_kind: ErrorKind,
+    active_visible: bool,
+    want_visible: bool,
+    show_spinner: bool,
+    target_count: f32,
+    hide_tray_icon: bool,
+}
 
-    // The auto-reset event this thread idles on. `App::wake_ui` signals it on
-    // every status change; `MsgWaitForMultipleObjectsEx` below also wakes on
-    // any win32 message, so tray clicks and menu commands are handled the
-    // instant they arrive rather than at the next idle tick. Never closed:
-    // it lives exactly as long as the process.
-    let wake_event = unsafe {
-        windows::Win32::System::Threading::CreateEventW(None, false, false, None)
-            .map_err(|e| anyhow::anyhow!("CreateEventW for the UI wake event: {e}"))?
-    };
-    app.register_ui_wake_event(wake_event.0 as isize);
+/// Everything [`run`]'s poll loop carries from one pass to the next -- the
+/// tray, the pip window, and every "last we drew/said X" comparison value
+/// that makes each tick a diff against the previous one. Bundled into one
+/// struct because most phases of the loop body read or write several of
+/// these fields at once; threading a dozen `&mut` locals through free
+/// functions instead would trip clippy's `too_many_arguments` on the first
+/// extraction.
+struct UiLoopState {
+    tray: TrayState,
+    overlay: Overlay,
+    wake_event: windows::Win32::Foundation::HANDLE,
+    default_tooltip: String,
+    last_hide_tray_icon: bool,
+    last_status: Status,
+    last_error_kind: ErrorKind,
+    last_pos: Option<POINT>,
+    last_word_count: u32,
+    last_spinner: bool,
+    spinner_angle: f32,
+    error_tooltip_kind: Option<ErrorKind>,
+    hotkey_tooltip_active: bool,
+    update_tooltip_tag: Option<String>,
+    last_history_version: u64,
+    display_count: f32,
+}
 
-    // Register the cross-instance "show Settings" message before the overlay
-    // window (whose wnd_proc handles it) is created, so there's no window
-    // that could receive WM_CREATE etc. before the id is known. Idempotent.
-    let _ = activate_message_id();
+impl UiLoopState {
+    fn new(app: &App) -> Result<Self> {
+        let tray = build_tray()?;
 
-    // Apply the persisted hide-tray-icon setting immediately, before the
-    // window is ever shown -- otherwise the icon would flash visible for one
-    // frame on every launch. Live changes are picked up below in the poll
-    // loop.
-    let mut last_hide_tray_icon = app.config.load().hide_tray_icon;
-    if last_hide_tray_icon {
-        if let Err(e) = tray_state.tray.set_visible(false) {
-            tracing::warn!("tray: initial set_visible(false) failed: {e}");
+        // The auto-reset event this thread idles on. `App::wake_ui` signals it on
+        // every status change; `MsgWaitForMultipleObjectsEx` below also wakes on
+        // any win32 message, so tray clicks and menu commands are handled the
+        // instant they arrive rather than at the next idle tick. Never closed:
+        // it lives exactly as long as the process.
+        let wake_event = unsafe {
+            windows::Win32::System::Threading::CreateEventW(None, false, false, None)
+                .map_err(|e| anyhow::anyhow!("CreateEventW for the UI wake event: {e}"))?
+        };
+        app.register_ui_wake_event(wake_event.0 as isize);
+
+        // Register the cross-instance "show Settings" message before the overlay
+        // window (whose wnd_proc handles it) is created, so there's no window
+        // that could receive WM_CREATE etc. before the id is known. Idempotent.
+        let _ = activate_message_id();
+
+        // Apply the persisted hide-tray-icon setting immediately, before the
+        // window is ever shown -- otherwise the icon would flash visible for one
+        // frame on every launch. Live changes are picked up below in the poll
+        // loop.
+        let last_hide_tray_icon = app.config.load().hide_tray_icon;
+        if last_hide_tray_icon {
+            if let Err(e) = tray.tray.set_visible(false) {
+                tracing::warn!("tray: initial set_visible(false) failed: {e}");
+            }
+        }
+
+        let overlay = unsafe { Overlay::create(PIP_SIZE)? };
+        tracing::info!("overlay hwnd={:?}", overlay.hwnd.0);
+
+        Ok(Self {
+            tray,
+            overlay,
+            wake_event,
+            // Tray-tooltip explanation for the last dictation error. The 2s error pip
+            // clears fast, so this persists the "why" (one line per cause, from
+            // `ErrorKind::tooltip()`) on the tray icon's hover text until a dictation
+            // actually connects again (or the app restarts).
+            default_tooltip: format!("QuickDictate v{}", env!("CARGO_PKG_VERSION")),
+            last_hide_tray_icon,
+            last_status: Status::Idle,
+            last_error_kind: ErrorKind::Generic,
+            last_pos: None,
+            last_word_count: u32::MAX,
+            last_spinner: false,
+            spinner_angle: 0.0,
+            error_tooltip_kind: None,
+            // Tray-tooltip explanation for a hotkey another process has claimed.
+            // Tracked separately from `error_tooltip_kind` above because it isn't
+            // gated on `Status::Error` at all -- the hotkey re-arm loop in
+            // `hotkeys.rs` polls independently of the dictation session state
+            // machine -- so it clears the instant `hotkeys_blocked()` goes false
+            // instead of waiting for a Listening status.
+            hotkey_tooltip_active: false,
+            // Tag of the update currently advertised on the tooltip, so the text is
+            // only rewritten when it actually changes.
+            update_tooltip_tag: None,
+            // Rebuild the "Recent transcriptions" submenu only when the history has
+            // actually changed since we last drew it (cheap version counter, see
+            // `TranscriptHistory::version`), not on every poll tick.
+            last_history_version: u64::MAX,
+            // Smoothed display counter — lerps toward the live word count so the pip
+            // animates instead of snapping. Asymmetric rates: fast on the way up
+            // (feels responsive), slow on the way down (damps STT revision jitter).
+            display_count: 0.0,
+        })
+    }
+
+    /// Keep the "Recent transcriptions" submenu in sync with the app's
+    /// history. Cheap to check every tick (one lock + an integer compare);
+    /// only rebuilds the actual menu items when it changed.
+    fn refresh_history_menu(&mut self, app: &App) {
+        let version = app.history.lock().version();
+        if version != self.last_history_version {
+            let snapshot = app.history.lock().snapshot();
+            self.tray.rebuild_history_menu(&snapshot);
+            self.last_history_version = version;
         }
     }
 
-    let overlay = unsafe { Overlay::create(PIP_SIZE)? };
-    tracing::info!("overlay hwnd={:?}", overlay.hwnd.0);
-
-    let mut last_status = Status::Idle;
-    let mut last_error_kind = ErrorKind::Generic;
-    let mut last_pos: Option<POINT> = None;
-    let mut last_word_count: u32 = u32::MAX;
-    let mut last_spinner = false;
-    let mut spinner_angle = 0.0_f32;
-    let mut msg = MSG::default();
-
-    // Tray-tooltip explanation for the last dictation error. The 2s error pip
-    // clears fast, so this persists the "why" (one line per cause, from
-    // `ErrorKind::tooltip()`) on the tray icon's hover text until a dictation
-    // actually connects again (or the app restarts).
-    let default_tooltip = format!("QuickDictate v{}", env!("CARGO_PKG_VERSION"));
-    let mut error_tooltip_kind: Option<ErrorKind> = None;
-    // Tray-tooltip explanation for a hotkey another process has claimed.
-    // Tracked separately from `error_tooltip_kind` above because it isn't
-    // gated on `Status::Error` at all -- the hotkey re-arm loop in
-    // `hotkeys.rs` polls independently of the dictation session state
-    // machine -- so it clears the instant `hotkeys_blocked()` goes false
-    // instead of waiting for a Listening status.
-    let mut hotkey_tooltip_active = false;
-    // Tag of the update currently advertised on the tooltip, so the text is
-    // only rewritten when it actually changes.
-    let mut update_tooltip_tag: Option<String> = None;
-    // Rebuild the "Recent transcriptions" submenu only when the history has
-    // actually changed since we last drew it (cheap version counter, see
-    // `TranscriptHistory::version`), not on every poll tick.
-    let mut last_history_version: u64 = u64::MAX;
-
-    // Smoothed display counter — lerps toward the live word count so the pip
-    // animates instead of snapping. Asymmetric rates: fast on the way up
-    // (feels responsive), slow on the way down (damps STT revision jitter).
-    let mut display_count: f32 = 0.0;
-
-    loop {
-        if app.shutdown.load(Ordering::Acquire) {
-            break;
-        }
-
-        while unsafe { PeekMessageW(&mut msg, HWND::default(), 0, 0, PM_REMOVE).as_bool() } {
-            unsafe {
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-            if msg.message == WM_QUIT {
-                app.shutdown.store(true, Ordering::Release);
-                break;
-            }
-        }
-
-        while let Ok(ev) = menu_rx.try_recv() {
-            // The tray is intentionally minimal — Settings, Hide tray icon,
-            // Recent transcriptions, and Quit. About / updates / log / JSON
-            // editing all live inside the Settings window now.
-            let id = ev.id().as_ref();
-            if ev.id() == &MenuId::new("settings") {
-                crate::settings_ui::show_settings(Arc::clone(&app));
-            } else if ev.id() == &MenuId::new("hide_tray") {
-                // Confirm first: this removes the only *visible* way back into
-                // Settings, so the dialog is the one place we can spell out the
-                // way back (the tray-icon crate has no per-item tooltip, unlike
-                // the Settings checkbox this mirrors). Runs on its own thread so
-                // the modal doesn't stall the active poll loop below and
-                // freeze the pip mid-dictation.
-                let app = Arc::clone(&app);
-                std::thread::spawn(move || {
-                    let answer = crate::update::msg_box(
-                        "QuickDictate",
-                        "Hide the tray icon?\n\n\
-                         QuickDictate keeps running in the background and your \
-                         dictation hotkeys keep working; only the notification-area \
-                         icon goes away.\n\n\
-                         To get it back, launch QuickDictate again: it reopens \
-                         Settings instead of starting a second copy, and you can \
-                         untick \"Hide tray icon\" there.",
-                        MB_YESNO | MB_ICONQUESTION,
-                    );
-                    if answer == IDYES {
-                        set_hide_tray_icon(&app, true);
-                    }
-                });
-            } else if ev.id() == &MenuId::new("quit") {
-                tracing::info!("Quit selected from tray menu");
-                app.shutdown.store(true, Ordering::Release);
-            } else if ev.id() == &MenuId::new("history:copyall") {
-                // "Copy all (N)": concatenate every recent transcription and put
-                // the whole batch on the clipboard in one go. Joined oldest-first
-                // so the newest lands at the bottom (the way a transcript reads
-                // and where the eye naturally goes), even though the menu itself
-                // lists them newest-first. A blank line between entries keeps each
-                // dictation a distinct paragraph when pasted.
-                let all: Vec<String> = app
-                    .history
-                    .lock()
-                    .snapshot()
-                    .into_iter()
-                    .rev() // newest-first snapshot -> oldest-first output
-                    .map(|e| e.text)
-                    .filter(|t| !t.is_empty())
-                    .collect();
-                if all.is_empty() {
-                    tracing::warn!("Recent transcriptions: 'Copy all' with nothing to copy");
-                } else {
-                    let joined = all.join("\n\n");
-                    let n = all.len();
-                    match crate::output::copy_to_clipboard(&joined) {
-                        Ok(()) => tracing::info!(
-                            "Recent transcriptions: copied all {n} entries ({} chars) to clipboard",
-                            joined.chars().count()
-                        ),
-                        Err(e) => tracing::warn!(
-                            "Recent transcriptions: 'Copy all' clipboard copy failed: {e:#}"
-                        ),
-                    }
-                }
-            } else if let Some(idx) = id.strip_prefix("history:") {
-                match idx.parse::<usize>() {
-                    Ok(i) => {
-                        // Clicking a recent transcription copies it to the
-                        // clipboard (the user pastes it themselves) rather than
-                        // auto-pasting into the focused window.
-                        let entry = app.history.lock().get(i);
-                        match entry {
-                            Some(entry) if !entry.text.is_empty() => {
-                                match crate::output::copy_to_clipboard(&entry.text) {
-                                    Ok(()) => tracing::info!(
-                                        "Recent transcriptions: copied entry {i} ({} chars) to clipboard",
-                                        entry.text.chars().count()
-                                    ),
-                                    Err(e) => tracing::warn!(
-                                        "Recent transcriptions: clipboard copy failed: {e:#}"
-                                    ),
-                                }
-                            }
-                            _ => tracing::warn!(
-                                "Recent transcriptions: entry {i} is missing or empty"
-                            ),
-                        }
-                    }
-                    Err(_) => tracing::warn!("bad history menu id: {id}"),
-                }
-            }
-        }
-
-        // Keep the "Recent transcriptions" submenu in sync with the app's
-        // history. Cheap to check every tick (one lock + an integer
-        // compare); only rebuilds the actual menu items when it changed.
-        {
-            let version = app.history.lock().version();
-            if version != last_history_version {
-                let snapshot = app.history.lock().snapshot();
-                tray_state.rebuild_history_menu(&snapshot);
-                last_history_version = version;
-            }
-        }
-
-        let status = app.status();
-        let error_kind = app.error_kind();
-        let cfg = app.config.load();
-        let target_count = app.word_count.load(Ordering::Acquire) as f32;
-
-        // A hotkey another process has claimed is surfaced the same way a
-        // dictation error is (tray tooltip text, a pip glyph) even though the
-        // app itself is genuinely Idle -- the re-arm loop in `hotkeys.rs`
-        // polls independently of this session state machine, so it's
-        // synthesized here rather than being a real `Status`/`ErrorKind` pair
-        // out of `App`. Only surfaced while Idle: an active dictation always
-        // wins.
-        let hotkey_blocked = status == Status::Idle && crate::hotkeys::hotkeys_blocked();
-        let (render_status, render_kind) = if hotkey_blocked {
-            (Status::Error, ErrorKind::HotkeyBlocked)
-        } else {
-            (status, error_kind)
-        };
-
-        // `active_visible` (a real dictation in progress) drives the fast
-        // active-poll cadence at the bottom of the loop; `hotkey_pip_visible`
-        // rides whatever cadence the loop is already ticking at instead of
-        // forcing the fast one, since a stuck hotkey has no animation to keep
-        // smooth and could otherwise pin the loop at 16ms indefinitely.
-        let active_visible = cfg.mouse_follower_enabled && status != Status::Idle;
-        let hotkey_pip_visible = cfg.mouse_follower_enabled && hotkey_blocked;
-        let want_visible = active_visible || hotkey_pip_visible;
-
-        let show_spinner = cfg.stt_provider.eq_ignore_ascii_case("local")
-            && matches!(
-                status,
-                Status::Starting | Status::Listening | Status::Processing
-            );
+    fn update_spinner_angle(&mut self, show_spinner: bool) {
         if show_spinner {
-            spinner_angle = (spinner_angle + std::f32::consts::TAU / 48.0) % std::f32::consts::TAU;
+            self.spinner_angle =
+                (self.spinner_angle + std::f32::consts::TAU / 48.0) % std::f32::consts::TAU;
         } else {
-            spinner_angle = 0.0;
+            self.spinner_angle = 0.0;
         }
+    }
 
-        // Persist an explanation of the last dictation error on the tray
-        // tooltip, using `ErrorKind::tooltip()` so every named cause gets
-        // real text instead of collapsing to a bare "!" -- keep it there
-        // until a session actually connects (Listening) so the explanation
-        // outlives the brief error pip. See `error_glyph` below for the
-        // pip's side of the same fix.
-        if !hotkey_blocked {
-            if status == Status::Error {
-                if error_tooltip_kind != Some(error_kind) {
-                    let text = format!("QuickDictate: {}", error_kind.tooltip());
-                    let _ = tray_state.tray.set_tooltip(Some(&text));
-                    error_tooltip_kind = Some(error_kind);
-                }
-            } else if error_tooltip_kind.is_some() && status == Status::Listening {
-                let _ = tray_state.tray.set_tooltip(Some(&default_tooltip));
-                error_tooltip_kind = None;
+    /// Persist an explanation of the last dictation error on the tray
+    /// tooltip, using `ErrorKind::tooltip()` so every named cause gets real
+    /// text instead of collapsing to a bare "!" -- keep it there until a
+    /// session actually connects (Listening) so the explanation outlives the
+    /// brief error pip. See `error_glyph` for the pip's side of the same fix.
+    fn sync_error_tooltip(&mut self, tick: &TickSnapshot) {
+        if tick.hotkey_blocked {
+            return;
+        }
+        if tick.status == Status::Error {
+            if self.error_tooltip_kind != Some(tick.error_kind) {
+                let text = format!("QuickDictate: {}", tick.error_kind.tooltip());
+                let _ = self.tray.tray.set_tooltip(Some(&text));
+                self.error_tooltip_kind = Some(tick.error_kind);
             }
+        } else if self.error_tooltip_kind.is_some() && tick.status == Status::Listening {
+            let _ = self.tray.tray.set_tooltip(Some(&self.default_tooltip));
+            self.error_tooltip_kind = None;
         }
+    }
 
-        // A blocked hotkey isn't a dictation error, so it doesn't share the
-        // persist-until-Listening lifetime above -- it clears the moment
-        // `hotkeys_blocked()` does.
-        if hotkey_blocked {
-            if !hotkey_tooltip_active {
+    /// A blocked hotkey isn't a dictation error, so it doesn't share the
+    /// persist-until-Listening lifetime above -- it clears the moment
+    /// `hotkeys_blocked()` does.
+    fn sync_hotkey_tooltip(&mut self, tick: &TickSnapshot) {
+        if tick.hotkey_blocked {
+            if !self.hotkey_tooltip_active {
                 let text = format!("QuickDictate: {}", ErrorKind::HotkeyBlocked.tooltip());
-                let _ = tray_state.tray.set_tooltip(Some(&text));
-                hotkey_tooltip_active = true;
+                let _ = self.tray.tray.set_tooltip(Some(&text));
+                self.hotkey_tooltip_active = true;
             }
-        } else if hotkey_tooltip_active {
-            let _ = tray_state.tray.set_tooltip(Some(&default_tooltip));
-            hotkey_tooltip_active = false;
+        } else if self.hotkey_tooltip_active {
+            let _ = self.tray.tray.set_tooltip(Some(&self.default_tooltip));
+            self.hotkey_tooltip_active = false;
         }
+    }
 
-        // A waiting update. Since v0.5.4 the daily check reports rather than
-        // installs (see update.rs), so this tooltip is how a user learns an
-        // update exists without opening About. Lowest priority of the three:
-        // an error or a blocked hotkey is more urgent and has already claimed
-        // the tooltip above.
-        if error_tooltip_kind.is_none() && !hotkey_tooltip_active {
-            let waiting = crate::update::pending_update();
-            if waiting != update_tooltip_tag {
-                let text = match waiting.as_deref() {
-                    Some(tag) => format!("QuickDictate: update available (v{tag})"),
-                    None => default_tooltip.clone(),
-                };
-                let _ = tray_state.tray.set_tooltip(Some(&text));
-                update_tooltip_tag = waiting;
+    /// A waiting update. Since v0.5.4 the daily check reports rather than
+    /// installs (see update.rs), so this tooltip is how a user learns an
+    /// update exists without opening About. Lowest priority of the three: an
+    /// error or a blocked hotkey is more urgent and has already claimed the
+    /// tooltip above.
+    fn sync_update_tooltip(&mut self) {
+        if self.error_tooltip_kind.is_some() || self.hotkey_tooltip_active {
+            return;
+        }
+        let waiting = crate::update::pending_update();
+        if waiting != self.update_tooltip_tag {
+            let text = match waiting.as_deref() {
+                Some(tag) => format!("QuickDictate: update available (v{tag})"),
+                None => self.default_tooltip.clone(),
+            };
+            let _ = self.tray.tray.set_tooltip(Some(&text));
+            self.update_tooltip_tag = waiting;
+        }
+    }
+
+    /// Live-apply the hide-tray-icon setting whenever it changes -- no
+    /// restart needed. tray-icon 0.19's set_visible is a thin wrapper over
+    /// Shell_NotifyIconW(NIM_MODIFY) on Windows, so this is cheap enough to
+    /// check every tick.
+    fn apply_hide_tray_icon_live(&mut self, tick: &TickSnapshot) {
+        if tick.hide_tray_icon != self.last_hide_tray_icon {
+            if let Err(e) = self.tray.tray.set_visible(!tick.hide_tray_icon) {
+                tracing::warn!("tray: set_visible({}) failed: {e}", !tick.hide_tray_icon);
             }
+            self.last_hide_tray_icon = tick.hide_tray_icon;
         }
+    }
 
-        // Live-apply the hide-tray-icon setting whenever it changes -- no
-        // restart needed. tray-icon 0.19's set_visible is a thin wrapper over
-        // Shell_NotifyIconW(NIM_MODIFY) on Windows, so this is cheap enough
-        // to check every tick.
-        if cfg.hide_tray_icon != last_hide_tray_icon {
-            if let Err(e) = tray_state.tray.set_visible(!cfg.hide_tray_icon) {
-                tracing::warn!("tray: set_visible({}) failed: {e}", !cfg.hide_tray_icon);
-            }
-            last_hide_tray_icon = cfg.hide_tray_icon;
-        }
-
-        // A second launch (blocked by the single-instance mutex in `main.rs`)
-        // posted the activate message to the overlay window, which set this
-        // flag from `overlay_wnd_proc`. Reveal Settings via the same path the
-        // tray menu's "Settings…" item uses -- this is the guaranteed way
-        // back in even when the tray icon itself is hidden.
-        if SHOW_SETTINGS_REQUESTED.swap(false, Ordering::AcqRel) {
-            crate::settings_ui::show_settings(Arc::clone(&app));
-        }
-
-        // Smooth the counter toward the live word count. Asymmetric lerp:
-        // fast counting up (responsive), slow counting down (damps STT
-        // partial-transcript revision jitter so the pip doesn't snap back).
-        if want_visible && !show_spinner {
-            let rate = if target_count > display_count {
+    /// Smooth the counter toward the live word count. Asymmetric lerp: fast
+    /// counting up (responsive), slow counting down (damps STT
+    /// partial-transcript revision jitter so the pip doesn't snap back).
+    fn update_display_count(&mut self, tick: &TickSnapshot) {
+        if tick.want_visible && !tick.show_spinner {
+            let rate = if tick.target_count > self.display_count {
                 0.50
             } else {
                 0.15
             };
-            display_count += (target_count - display_count) * rate;
+            self.display_count += (tick.target_count - self.display_count) * rate;
         } else {
-            display_count = 0.0;
+            self.display_count = 0.0;
         }
-        let smooth_count = display_count.round() as u32;
+    }
 
+    /// Move the pip to the cursor and repaint it (or hide it) for this tick.
+    fn render_pip_or_hide(&mut self, tick: &TickSnapshot) {
+        let smooth_count = self.display_count.round() as u32;
         unsafe {
-            if want_visible {
+            if tick.want_visible {
                 let mut p = POINT::default();
                 if GetCursorPos(&mut p).is_ok() {
                     let pos_changed =
-                        !matches!(last_pos, Some(prev) if prev.x == p.x && prev.y == p.y);
-                    let status_changed = render_status != last_status;
-                    let count_changed = smooth_count != last_word_count;
-                    let spinner_changed = show_spinner != last_spinner;
+                        !matches!(self.last_pos, Some(prev) if prev.x == p.x && prev.y == p.y);
+                    let status_changed = tick.render_status != self.last_status;
+                    let count_changed = smooth_count != self.last_word_count;
+                    let spinner_changed = tick.show_spinner != self.last_spinner;
                     // The error glyph depends on the kind, so a kind flip while
                     // the status stays Error must still repaint (two back-to-back
                     // errors of different kinds within the 2s pip window).
-                    let kind_changed = render_kind != last_error_kind;
+                    let kind_changed = tick.render_kind != self.last_error_kind;
                     // Render whenever anything changes — the smoothed counter
                     // changes most frames during active dictation, giving a
                     // fluid animation.
@@ -461,42 +371,45 @@ fn run(app: Arc<App>) -> Result<()> {
                         || count_changed
                         || kind_changed
                         || spinner_changed
-                        || show_spinner
+                        || tick.show_spinner
                     {
-                        overlay.render(
-                            render_status,
-                            render_kind,
+                        self.overlay.render(
+                            tick.render_status,
+                            tick.render_kind,
                             smooth_count,
-                            show_spinner.then_some(spinner_angle),
+                            tick.show_spinner.then_some(self.spinner_angle),
                             p.x + PIP_OFFSET_X,
                             p.y + PIP_OFFSET_Y,
                         );
-                        last_pos = Some(p);
-                        last_word_count = smooth_count;
-                        last_error_kind = render_kind;
+                        self.last_pos = Some(p);
+                        self.last_word_count = smooth_count;
+                        self.last_error_kind = tick.render_kind;
                     }
                 }
-            } else if last_status != Status::Idle || last_pos.is_some() {
-                overlay.hide();
-                last_pos = None;
-                last_word_count = u32::MAX;
+            } else if self.last_status != Status::Idle || self.last_pos.is_some() {
+                self.overlay.hide();
+                self.last_pos = None;
+                self.last_word_count = u32::MAX;
             }
         }
-        last_status = render_status;
-        last_spinner = show_spinner;
-        // Fast cadence only while a real dictation needs the pip to track the
-        // cursor smoothly (a plain sleep, deliberately NOT message-woken:
-        // WM_MOUSEMOVE floods the queue while the follower pip is under the
-        // cursor, and waking per mouse message would spin the loop far faster
-        // than the 16 ms render cadence). Idle waits on
-        // MsgWaitForMultipleObjectsEx instead of sleeping, so it wakes
-        // immediately for EITHER a win32 message (tray click, menu command,
-        // the second-launch activate request, paint) or the wake event that
-        // `App::wake_ui` signals on every status change, with the long
-        // timeout purely as a backstop for unsignalled changes (a config
-        // flag flipped by Settings, history growth).
-        let wait = poll_interval(active_visible);
-        if active_visible {
+        self.last_status = tick.render_status;
+        self.last_spinner = tick.show_spinner;
+    }
+
+    /// Fast cadence only while a real dictation needs the pip to track the
+    /// cursor smoothly (a plain sleep, deliberately NOT message-woken:
+    /// WM_MOUSEMOVE floods the queue while the follower pip is under the
+    /// cursor, and waking per mouse message would spin the loop far faster
+    /// than the 16 ms render cadence). Idle waits on
+    /// MsgWaitForMultipleObjectsEx instead of sleeping, so it wakes
+    /// immediately for EITHER a win32 message (tray click, menu command, the
+    /// second-launch activate request, paint) or the wake event that
+    /// `App::wake_ui` signals on every status change, with the long timeout
+    /// purely as a backstop for unsignalled changes (a config flag flipped
+    /// by Settings, history growth).
+    fn wait_for_next_tick(&self, tick: &TickSnapshot) {
+        let wait = poll_interval(tick.active_visible);
+        if tick.active_visible {
             std::thread::sleep(wait);
         } else {
             use windows::Win32::UI::WindowsAndMessaging::{
@@ -508,13 +421,218 @@ fn run(app: Arc<App>) -> Result<()> {
             // would sit unprocessed for the whole timeout.
             let _ = unsafe {
                 MsgWaitForMultipleObjectsEx(
-                    Some(&[wake_event]),
+                    Some(&[self.wake_event]),
                     wait.as_millis() as u32,
                     QS_ALLINPUT,
                     MWMO_INPUTAVAILABLE,
                 )
             };
         }
+    }
+}
+
+/// A hotkey another process has claimed is surfaced the same way a dictation
+/// error is (tray tooltip text, a pip glyph) even though the app itself is
+/// genuinely Idle -- the re-arm loop in `hotkeys.rs` polls independently of
+/// this session state machine, so it's synthesized here rather than being a
+/// real `Status`/`ErrorKind` pair out of `App`. Only surfaced while Idle: an
+/// active dictation always wins.
+fn compute_tick_snapshot(app: &App) -> TickSnapshot {
+    let status = app.status();
+    let error_kind = app.error_kind();
+    let cfg = app.config.load();
+    let target_count = app.word_count.load(Ordering::Acquire) as f32;
+
+    let hotkey_blocked = status == Status::Idle && crate::hotkeys::hotkeys_blocked();
+    let (render_status, render_kind) = if hotkey_blocked {
+        (Status::Error, ErrorKind::HotkeyBlocked)
+    } else {
+        (status, error_kind)
+    };
+
+    // `active_visible` (a real dictation in progress) drives the fast
+    // active-poll cadence at the bottom of the loop; `hotkey_pip_visible`
+    // rides whatever cadence the loop is already ticking at instead of
+    // forcing the fast one, since a stuck hotkey has no animation to keep
+    // smooth and could otherwise pin the loop at 16ms indefinitely.
+    let active_visible = cfg.mouse_follower_enabled && status != Status::Idle;
+    let hotkey_pip_visible = cfg.mouse_follower_enabled && hotkey_blocked;
+    let want_visible = active_visible || hotkey_pip_visible;
+
+    let show_spinner = cfg.stt_provider.eq_ignore_ascii_case("local")
+        && matches!(
+            status,
+            Status::Starting | Status::Listening | Status::Processing
+        );
+
+    TickSnapshot {
+        status,
+        error_kind,
+        hotkey_blocked,
+        render_status,
+        render_kind,
+        active_visible,
+        want_visible,
+        show_spinner,
+        target_count,
+        hide_tray_icon: cfg.hide_tray_icon,
+    }
+}
+
+/// Drain and dispatch the win32 message queue for the hidden overlay window
+/// (tray clicks, menu commands, the second-launch activate message). Also
+/// the mechanism that notices `WM_QUIT` and starts shutdown.
+fn pump_win32_messages(app: &App) {
+    let mut msg = MSG::default();
+    while unsafe { PeekMessageW(&mut msg, HWND::default(), 0, 0, PM_REMOVE).as_bool() } {
+        unsafe {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        if msg.message == WM_QUIT {
+            app.shutdown.store(true, Ordering::Release);
+            break;
+        }
+    }
+}
+
+/// "Copy all (N)": concatenate every recent transcription and put the whole
+/// batch on the clipboard in one go. Joined oldest-first so the newest lands
+/// at the bottom (the way a transcript reads and where the eye naturally
+/// goes), even though the menu itself lists them newest-first. A blank line
+/// between entries keeps each dictation a distinct paragraph when pasted.
+fn handle_history_copy_all(app: &App) {
+    let all: Vec<String> = app
+        .history
+        .lock()
+        .snapshot()
+        .into_iter()
+        .rev() // newest-first snapshot -> oldest-first output
+        .map(|e| e.text)
+        .filter(|t| !t.is_empty())
+        .collect();
+    if all.is_empty() {
+        tracing::warn!("Recent transcriptions: 'Copy all' with nothing to copy");
+        return;
+    }
+    let joined = all.join("\n\n");
+    let n = all.len();
+    match crate::output::copy_to_clipboard(&joined) {
+        Ok(()) => tracing::info!(
+            "Recent transcriptions: copied all {n} entries ({} chars) to clipboard",
+            joined.chars().count()
+        ),
+        Err(e) => tracing::warn!("Recent transcriptions: 'Copy all' clipboard copy failed: {e:#}"),
+    }
+}
+
+/// Clicking a recent transcription copies it to the clipboard (the user
+/// pastes it themselves) rather than auto-pasting into the focused window.
+/// `idx` is `id` with the `"history:"` prefix already stripped.
+fn handle_history_click(app: &App, id: &str, idx: &str) {
+    let i: usize = match idx.parse() {
+        Ok(i) => i,
+        Err(_) => {
+            tracing::warn!("bad history menu id: {id}");
+            return;
+        }
+    };
+    let entry = app.history.lock().get(i);
+    match entry {
+        Some(entry) if !entry.text.is_empty() => {
+            match crate::output::copy_to_clipboard(&entry.text) {
+                Ok(()) => tracing::info!(
+                    "Recent transcriptions: copied entry {i} ({} chars) to clipboard",
+                    entry.text.chars().count()
+                ),
+                Err(e) => tracing::warn!("Recent transcriptions: clipboard copy failed: {e:#}"),
+            }
+        }
+        _ => tracing::warn!("Recent transcriptions: entry {i} is missing or empty"),
+    }
+}
+
+/// Confirm first: this removes the only *visible* way back into Settings, so
+/// the dialog is the one place we can spell out the way back (the tray-icon
+/// crate has no per-item tooltip, unlike the Settings checkbox this
+/// mirrors). Runs on its own thread so the modal doesn't stall the active
+/// poll loop and freeze the pip mid-dictation.
+fn handle_hide_tray_menu_click(app: &Arc<App>) {
+    let app = Arc::clone(app);
+    std::thread::spawn(move || {
+        let answer = crate::update::msg_box(
+            "QuickDictate",
+            "Hide the tray icon?\n\n\
+             QuickDictate keeps running in the background and your \
+             dictation hotkeys keep working; only the notification-area \
+             icon goes away.\n\n\
+             To get it back, launch QuickDictate again: it reopens \
+             Settings instead of starting a second copy, and you can \
+             untick \"Hide tray icon\" there.",
+            MB_YESNO | MB_ICONQUESTION,
+        );
+        if answer == IDYES {
+            set_hide_tray_icon(&app, true);
+        }
+    });
+}
+
+/// Drain pending tray/menu events for this tick and dispatch each to its
+/// handler. The tray is intentionally minimal -- Settings, Hide tray icon,
+/// Recent transcriptions, and Quit. About / updates / log / JSON editing all
+/// live inside the Settings window now.
+fn drain_menu_events(app: &Arc<App>) {
+    let menu_rx = MenuEvent::receiver();
+    while let Ok(ev) = menu_rx.try_recv() {
+        let id = ev.id().as_ref();
+        if ev.id() == &MenuId::new("settings") {
+            crate::settings_ui::show_settings(Arc::clone(app));
+        } else if ev.id() == &MenuId::new("hide_tray") {
+            handle_hide_tray_menu_click(app);
+        } else if ev.id() == &MenuId::new("quit") {
+            tracing::info!("Quit selected from tray menu");
+            app.shutdown.store(true, Ordering::Release);
+        } else if ev.id() == &MenuId::new("history:copyall") {
+            handle_history_copy_all(app);
+        } else if let Some(idx) = id.strip_prefix("history:") {
+            handle_history_click(app, id, idx);
+        }
+    }
+}
+
+/// A second launch (blocked by the single-instance mutex in `main.rs`)
+/// posted the activate message to the overlay window, which set this flag
+/// from `overlay_wnd_proc`. Reveal Settings via the same path the tray
+/// menu's "Settings…" item uses -- this is the guaranteed way back in even
+/// when the tray icon itself is hidden.
+fn check_show_settings_request(app: &Arc<App>) {
+    if SHOW_SETTINGS_REQUESTED.swap(false, Ordering::AcqRel) {
+        crate::settings_ui::show_settings(Arc::clone(app));
+    }
+}
+
+fn run(app: Arc<App>) -> Result<()> {
+    let mut state = UiLoopState::new(&app)?;
+
+    loop {
+        if app.shutdown.load(Ordering::Acquire) {
+            break;
+        }
+
+        pump_win32_messages(&app);
+        drain_menu_events(&app);
+        state.refresh_history_menu(&app);
+
+        let tick = compute_tick_snapshot(&app);
+        state.update_spinner_angle(tick.show_spinner);
+        state.sync_error_tooltip(&tick);
+        state.sync_hotkey_tooltip(&tick);
+        state.sync_update_tooltip();
+        state.apply_hide_tray_icon_live(&tick);
+        check_show_settings_request(&app);
+        state.update_display_count(&tick);
+        state.render_pip_or_hide(&tick);
+        state.wait_for_next_tick(&tick);
     }
     Ok(())
 }

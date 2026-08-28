@@ -32,7 +32,10 @@ use crate::config::Config;
 use crate::keys::{FailKind, KeyPool};
 use crate::polish;
 use crate::state::{App, Status};
-use provider::{ProviderSession, ProviderSink, SttEvent, SttProvider, SttSessionOpts};
+use provider::{
+    AudioFormat, ProviderSession, ProviderSink, ProviderStream, SttEvent, SttProvider,
+    SttSessionOpts,
+};
 
 /// Minimum tail we always capture after hotkey release -- gives WASAPI's
 /// ~10-20 ms hardware buffer and the resampler's pending fragment time to
@@ -817,38 +820,69 @@ async fn run_send_task(mut state: SendTaskState) -> SentAudio {
     sent
 }
 
-async fn run_session(
-    app: Arc<App>,
+/// Everything [`establish_connected_session`] resolved and connected before
+/// [`run_session`] can spawn the send/recv tasks: the config snapshot, the
+/// (possibly per-app-profile overridden) provider id and key pool, the
+/// acquired key, and the split provider connection. Bundled into one struct
+/// because it's all produced together by one phase and consumed together by
+/// the next.
+struct ConnectedSession {
+    cfg: Arc<Config>,
     keys: Arc<KeyPool>,
-    stop: Arc<AtomicBool>,
-    epoch: u64,
-    session_usage: Arc<parking_lot::Mutex<SessionUsage>>,
-) -> Result<()> {
-    tracing::info!("session[{epoch}] starting");
+    key: String,
+    key_suffix: String,
+    requires_api_key: bool,
+    finalize_timeout: Duration,
+    final_transcript_timeout: Duration,
+    suppress_phantom: bool,
+    provider_id: &'static str,
+    fmt: AudioFormat,
+    samples_rx: tokio::sync::mpsc::Receiver<Vec<i16>>,
+    flusher: crate::audio::SessionFlusher,
+    sink: Box<dyn ProviderSink>,
+    stream: Box<dyn ProviderStream>,
+}
 
-    // If the global capture stream has died (mic unplugged, driver error), this
-    // press would silently record nothing while hotkeys/tray/UI still look alive.
-    // Surface the visible error pip and abort instead of pretending to listen;
-    // the audio thread keeps retrying the device, so a later press recovers.
-    // (Mirrors the session-error flash below.)
-    if !app.audio.is_healthy() {
-        tracing::error!(
-            "session[{epoch}] aborted: audio capture is not running (microphone lost?) — device reopen is retried automatically"
-        );
-        if app.current_session_epoch() == epoch {
-            // A lost mic is a generic error (the "!" pip), not a key problem.
-            app.raise_error(crate::state::ErrorKind::Generic);
-            let app_for_clear = Arc::clone(&app);
-            app.rt.spawn(async move {
-                tokio::time::sleep(ERROR_PIP_VISIBLE).await;
-                if app_for_clear.current_session_epoch() == epoch {
-                    app_for_clear.clear_status_if(Status::Error, Status::Idle);
-                }
-            });
-        }
-        return Ok(());
+/// If the global capture stream has died (mic unplugged, driver error), this
+/// press would silently record nothing while hotkeys/tray/UI still look
+/// alive. Surface the visible error pip and abort instead of pretending to
+/// listen; the audio thread keeps retrying the device, so a later press
+/// recovers. Returns `true` when it did (the caller must return `Ok(())`
+/// without going any further).
+fn audio_capture_unhealthy(app: &Arc<App>, epoch: u64) -> bool {
+    if app.audio.is_healthy() {
+        return false;
     }
+    tracing::error!(
+        "session[{epoch}] aborted: audio capture is not running (microphone lost?) — device reopen is retried automatically"
+    );
+    if app.current_session_epoch() == epoch {
+        // A lost mic is a generic error (the "!" pip), not a key problem.
+        app.raise_error(crate::state::ErrorKind::Generic);
+        let app_for_clear = Arc::clone(app);
+        app.rt.spawn(async move {
+            tokio::time::sleep(ERROR_PIP_VISIBLE).await;
+            if app_for_clear.current_session_epoch() == epoch {
+                app_for_clear.clear_status_if(Status::Error, Status::Idle);
+            }
+        });
+    }
+    true
+}
 
+/// Resolve config/per-app-profile overrides, acquire a key, and connect.
+/// `Ok(None)` means the connection succeeded but the press it belongs to is
+/// already superseded (a newer epoch started, or `stop` fired) -- the caller
+/// returns `Ok(())` without spawning anything. Every `Err` arm already
+/// rotates/marks the key exactly as the pre-extraction code did before
+/// returning `EXHAUSTED_SIGNAL` (or, for a no-key-required provider, the raw
+/// error).
+async fn establish_connected_session(
+    app: &Arc<App>,
+    keys: Arc<KeyPool>,
+    stop: &Arc<AtomicBool>,
+    epoch: u64,
+) -> Result<Option<ConnectedSession>> {
     let cfg = app.config.load_full();
     // Resolve Per-App Profile overrides ONCE, at session start. The profile
     // that matters for provider/language is the one for the window the user
@@ -925,7 +959,7 @@ async fn run_session(
     let (samples_rx, flusher) = app.audio.subscribe(fmt.sample_rate);
 
     let connect_start = Instant::now();
-    let ProviderSession { sink, mut stream } = match tokio::time::timeout(
+    let ProviderSession { sink, stream } = match tokio::time::timeout(
         CONNECT_TIMEOUT,
         provider.connect(&key, &opts),
     )
@@ -968,8 +1002,624 @@ async fn run_session(
     );
 
     if app.current_session_epoch() != epoch || stop.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+
+    Ok(Some(ConnectedSession {
+        cfg,
+        keys,
+        key,
+        key_suffix,
+        requires_api_key,
+        finalize_timeout,
+        final_transcript_timeout,
+        suppress_phantom,
+        provider_id,
+        fmt,
+        samples_rx,
+        flusher,
+        sink,
+        stream,
+    }))
+}
+
+/// The accumulators [`run_recv_task`] fills in and the finalize phase reads
+/// back through [`SessionFinalizeCtx`] once the send task's release phase
+/// finishes. Created once, cheaply cloned (every field is an `Arc`) into the
+/// recv task's own [`RecvTaskState`], so a lost/aborted recv task still
+/// leaves whatever it managed to process behind in the originals.
+#[derive(Clone)]
+struct SessionAccumulators {
+    chunks_buf: Arc<parking_lot::Mutex<Vec<String>>>,
+    last_partial_buf: Arc<parking_lot::Mutex<String>>,
+    dropped_phantom_buf: Arc<parking_lot::Mutex<Option<String>>>,
+    committed_flag: Arc<AtomicBool>,
+    /// Text of the most recent KEPT commit, so the end-of-session fallback
+    /// can tell a genuinely-unfinalized trailing partial from a partial
+    /// that merely repeats what was already committed.
+    last_commit_text: Arc<parking_lot::Mutex<String>>,
+    transcribed_words: Arc<AtomicU64>,
+    key_fail_kind: Arc<parking_lot::Mutex<Option<FailKind>>>,
+    provider_failure: Arc<parking_lot::Mutex<Option<String>>>,
+}
+
+impl SessionAccumulators {
+    fn new() -> Self {
+        Self {
+            chunks_buf: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            last_partial_buf: Arc::new(parking_lot::Mutex::new(String::new())),
+            dropped_phantom_buf: Arc::new(parking_lot::Mutex::new(None)),
+            committed_flag: Arc::new(AtomicBool::new(false)),
+            last_commit_text: Arc::new(parking_lot::Mutex::new(String::new())),
+            transcribed_words: Arc::new(AtomicU64::new(0)),
+            key_fail_kind: Arc::new(parking_lot::Mutex::new(None)),
+            provider_failure: Arc::new(parking_lot::Mutex::new(None)),
+        }
+    }
+}
+
+/// State [`run_recv_task`] owns for a session's inbound events: the event
+/// stream itself, the per-session flags/settings the Committed handler
+/// branches on, and the shared accumulators it fills in. Bundled into one
+/// struct for the same reason [`SendTaskState`] is -- the task's match arms
+/// (Committed especially) close over most of it.
+struct RecvTaskState {
+    stream: Box<dyn ProviderStream>,
+    recv_app: Arc<App>,
+    epoch: u64,
+    provider_id: &'static str,
+    log_transcripts: bool,
+    delay_until_release: bool,
+    suppress_phantom: bool,
+    polish_settings: Option<polish::PolishSettings>,
+    speculate_polish: bool,
+    release_pending: Arc<AtomicBool>,
+    speech_shipped: Arc<AtomicU64>,
+    acc: SessionAccumulators,
+}
+
+/// The session's inbound-event task: normalize provider events into
+/// [`RecvTaskState::acc`]. Runs on its own `tokio::spawn` from
+/// [`run_session`], mirroring [`run_send_task`] on the outbound side.
+async fn run_recv_task(mut state: RecvTaskState) {
+    let epoch = state.epoch;
+    let provider_id = state.provider_id;
+    let mut events: usize = 0;
+    let mut committed_words: u32 = 0;
+    // Snapshot of `speech_shipped` taken at the last *kept* commit. Compared
+    // against the live count at each new commit to spot a phantom (equal =>
+    // no speech shipped in between). Starts at 0, so the very first real
+    // commit -- always backed by shipped speech -- is never mistaken for one.
+    let mut last_commit_speech: u64 = 0;
+    loop {
+        let ev = match state.stream.recv_event().await {
+            Ok(Some(ev)) => ev,
+            Ok(None) => break,
+            Err(e) => {
+                // A read error mid-utterance is NOT a clean end of stream.
+                // Recording it in `provider_failure` is what makes
+                // run_session return Err, so the retry shell can rotate or
+                // the pip can show an error. Without this a dropped socket
+                // was indistinguishable from the provider finishing
+                // normally: no retry, no error, and any uncommitted speech
+                // silently gone while the app reported success.
+                //
+                // Recorded unconditionally here, but only SURFACED at the
+                // end of run_session when the session delivered no words.
+                // ElevenLabs routinely resets the socket without a closing
+                // handshake once it has sent the final transcript, and
+                // erroring on that flashed the pip after a dictation the
+                // user watched succeed.
+                tracing::warn!("session[{epoch}] recv error: {e}");
+                let mut slot = state.acc.provider_failure.lock();
+                if slot.is_none() {
+                    *slot = Some(format!("transport failed mid-session: {e}"));
+                }
+                break;
+            }
+        };
+        events += 1;
+        match ev {
+            SttEvent::SessionStarted => {
+                tracing::info!("session[{epoch}] {provider_id} session_started");
+            }
+            SttEvent::Partial(t) => {
+                if state.log_transcripts {
+                    tracing::debug!("session[{epoch}] partial: {t}");
+                } else {
+                    tracing::debug!("session[{epoch}] partial: {} char(s)", t.chars().count());
+                }
+                let partial_words = t.split_whitespace().count() as u32;
+                state
+                    .recv_app
+                    .word_count
+                    .store(committed_words + partial_words, Ordering::Release);
+                *state.acc.last_partial_buf.lock() = t;
+            }
+            SttEvent::Committed(final_text) => {
+                handle_committed_event(
+                    &mut state,
+                    &mut committed_words,
+                    &mut last_commit_speech,
+                    final_text,
+                );
+            }
+            SttEvent::KeyFailure(kind) => {
+                tracing::warn!("session[{epoch}] provider signaled key failure ({kind:?})");
+                *state.acc.key_fail_kind.lock() = Some(kind);
+                // Don't break: the outer wait loop observes key_fail_kind and
+                // tears the session down / rotates keys.
+            }
+            SttEvent::ProviderFailure(message) => {
+                tracing::error!("session[{epoch}] {provider_id} failed: {message}");
+                *state.acc.provider_failure.lock() = Some(message);
+            }
+            SttEvent::Closed(reason) => {
+                match reason {
+                    Some(r) => {
+                        tracing::warn!("session[{epoch}] transport closed by server ({r})")
+                    }
+                    None => tracing::info!("session[{epoch}] transport closed by server"),
+                }
+                break;
+            }
+        }
+    }
+    tracing::info!("session[{epoch}] recv_task ended (events={events})");
+}
+
+/// Handle one `SttEvent::Committed`: the phantom-finalization guard, the
+/// hybrid hold/live paste policy, and the speculative-polish kick-off. Split
+/// out of [`run_recv_task`]'s match on its own -- of the six event arms,
+/// this is the one with real nesting (phantom guard -> hybrid paste ->
+/// speculation).
+fn handle_committed_event(
+    state: &mut RecvTaskState,
+    committed_words: &mut u32,
+    last_commit_speech: &mut u64,
+    final_text: String,
+) {
+    let epoch = state.epoch;
+    // Drop the chunk entirely if a NEWER session has taken over.
+    if state.recv_app.current_session_epoch() != epoch {
+        tracing::debug!("session[{epoch}] dropping late commit (newer session active)");
+        return;
+    }
+
+    let released = state.release_pending.load(Ordering::Acquire);
+    let speech_now = state.speech_shipped.load(Ordering::Acquire);
+
+    // Phantom-finalization guard (ElevenLabs Scribe). A commit
+    // that lands AFTER release with no speech-bearing audio shipped
+    // since the previous commit -- AND whose text is a short
+    // answer-shaped interjection -- is the model's LM prior
+    // "answering" the question out of dead air ("Yes.", "No."),
+    // not anything the user said. A genuinely-spoken trailing word
+    // ships speech first, bumping `speech_now`, so it survives;
+    // pre-release VAD commits have `released == false` and survive
+    // too. The short-text gate bounds a residual race: `speech_now`
+    // counts chunks shipped, not chunks attributable to *this*
+    // commit, so a slow VAD commit that delivers a REAL segment
+    // post-release (after the counter already advanced past it)
+    // could look phantom -- but we then only ever risk dropping a
+    // plausible answer, never a full sentence. See
+    // `is_phantom_finalization`, `looks_like_short_answer`, and
+    // the phantom-finalization regression tests below.
+    if state.suppress_phantom
+        && is_phantom_finalization(released, speech_now, *last_commit_speech)
+        && looks_like_short_answer(&final_text)
+    {
+        *state.acc.dropped_phantom_buf.lock() = Some(final_text.clone());
+        let mut partial = state.acc.last_partial_buf.lock();
+        if transcripts_equivalent(&partial, &final_text) {
+            partial.clear();
+        }
+        if state.log_transcripts {
+            tracing::info!(
+                "session[{epoch}] dropped phantom finalization (no speech since last commit): {final_text}"
+            );
+        } else {
+            tracing::info!(
+                "session[{epoch}] dropped phantom finalization (no speech since last commit): {} char(s)",
+                final_text.chars().count()
+            );
+        }
+        return;
+    }
+
+    // A transcript we're keeping. Mark that we have durable
+    // committed text (disarms the last-partial fallback) and
+    // advance the speech baseline for the next phantom check.
+    // Set ONLY for kept commits: a dropped phantom must not trip
+    // this, or a session whose only real content arrived as a
+    // partial would lose its promotion fallback.
+    state.acc.committed_flag.store(true, Ordering::Release);
+    *last_commit_speech = speech_now;
+
+    // This commit supersedes every partial up to this point, so
+    // clear the buffer. What lands in it AFTER this is speech
+    // from a LATER segment, and that segment deserves the
+    // last-partial fallback even though an earlier commit
+    // already succeeded. The old session-wide `!got_committed`
+    // gate disabled the fallback for the rest of the session
+    // after the first commit, so a final segment whose
+    // finalization timed out was discarded outright.
+    state.acc.last_partial_buf.lock().clear();
+    *state.acc.last_commit_text.lock() = final_text.clone();
+
+    let chunk_words = final_text.split_whitespace().count() as u32;
+    *committed_words = committed_words.saturating_add(chunk_words);
+    state
+        .acc
+        .transcribed_words
+        .fetch_add(chunk_words as u64, Ordering::AcqRel);
+    state
+        .recv_app
+        .word_count
+        .store(*committed_words, Ordering::Release);
+
+    // Hybrid paste flow:
+    //   before release              -> HOLD (accumulate)
+    //   after release               -> LIVE (paste each chunk)
+    //   delay_until_release = false -> LIVE throughout
+    if state.delay_until_release && !released {
+        if state.log_transcripts {
+            tracing::info!("session[{epoch}] committed (held until release): {final_text}");
+        } else {
+            tracing::info!(
+                "session[{epoch}] committed (held until release): {} char(s)",
+                final_text.chars().count()
+            );
+        }
+        let prefix = {
+            let mut held = state.acc.chunks_buf.lock();
+            held.push(final_text);
+            // Same join the release flush will do, so a hit is
+            // an exact-text hit rather than a near miss.
+            state.speculate_polish.then(|| held.join(" "))
+        };
+        // Free time: the user is still talking and none of
+        // this is on screen yet, so run the cleanup pass over
+        // everything committed so far. If they release while
+        // it is still thinking, the deadline race takes over
+        // and nothing here has cost them anything.
+        if let Some(prefix) = prefix {
+            if let Some(settings) = state.polish_settings.as_ref() {
+                state.recv_app.polish.speculate(settings, &prefix);
+            }
+        }
+    } else {
+        if state.log_transcripts {
+            tracing::info!("session[{epoch}] committed (live, append): {final_text}");
+        } else {
+            tracing::info!(
+                "session[{epoch}] committed (live, append): {} char(s)",
+                final_text.chars().count()
+            );
+        }
+        deliver_transcript(&state.recv_app.transcript_tx, final_text);
+    }
+}
+
+/// Everything the finalize phase (the fast-fail abort, or the normal
+/// join/promote/bookkeeping path) needs about the session, independent of
+/// which outcome it turns out to be. Bundled for the same reason
+/// [`ConnectedSession`] and [`RecvTaskState`] are: passing this much state
+/// as individual function parameters trips clippy's `too_many_arguments`.
+struct SessionFinalizeCtx {
+    epoch: u64,
+    provider_id: &'static str,
+    keys: Arc<KeyPool>,
+    key: String,
+    key_suffix: String,
+    requires_api_key: bool,
+    delay_until_release: bool,
+    log_transcripts: bool,
+    enable_sound: bool,
+    fmt: AudioFormat,
+    sent_progress: Arc<parking_lot::Mutex<SentAudio>>,
+    acc: SessionAccumulators,
+    session_usage: Arc<parking_lot::Mutex<SessionUsage>>,
+}
+
+/// Fast-fail: the provider already told us (via `SttEvent::KeyFailure`)
+/// that the key is dead before the session ever reached release. Skip the
+/// entire finalize and hand back to the retry shell to rotate keys.
+async fn abort_for_early_key_failure(
+    ctx: &SessionFinalizeCtx,
+    kind: FailKind,
+    send_task: tokio::task::JoinHandle<SentAudio>,
+    recv_task: tokio::task::JoinHandle<()>,
+) -> Result<()> {
+    let epoch = ctx.epoch;
+    tracing::warn!(
+        "session[{epoch}] aborting finalize early -- key ...{} failed ({kind:?})",
+        ctx.key_suffix
+    );
+    // Do not detach either half while the retry shell rotates keys. Besides
+    // retaining an obsolete audio subscription, a late receiver could paste
+    // into the replacement attempt. Preserve any words that were already
+    // live-pasted (delay=false) and the audio known to have been shipped.
+    send_task.abort();
+    recv_task.abort();
+    let _ = send_task.await;
+    let _ = recv_task.await;
+    if !ctx.delay_until_release {
+        let words = ctx.acc.transcribed_words.load(Ordering::Acquire);
+        if words > 0 {
+            let sent = *ctx.sent_progress.lock();
+            ctx.session_usage.lock().add_fragment(
+                ctx.provider_id,
+                words,
+                audio_duration_ms(sent.samples, ctx.fmt.sample_rate),
+            );
+        }
+    }
+    ctx.keys.mark_failed(&ctx.key, kind);
+    Err(anyhow!(EXHAUSTED_SIGNAL))
+}
+
+/// Flip the release flag so the send/recv tasks switch into their
+/// post-release behavior (dynamic tail; live paste), then flush whatever
+/// commits were held pending release so far, so release feels snappy.
+fn enter_release_phase(
+    app: &Arc<App>,
+    ctx: &SessionFinalizeCtx,
+    tail_quiet: Duration,
+    tail_max: Duration,
+    release_pending: &Arc<AtomicBool>,
+) {
+    let epoch = ctx.epoch;
+    tracing::info!(
+        "session[{epoch}] release pending; entering dynamic tail (min={:?}, quiet={:?}, max={:?})",
+        TAIL_MIN,
+        tail_quiet,
+        tail_max
+    );
+    // Flip the release flag FIRST so recv switches to live-paste mode for any
+    // chunks the server sends from this point on.
+    release_pending.store(true, Ordering::Release);
+
+    // Then flush anything held during the session so release feels snappy.
+    let release_flush: Vec<String> = std::mem::take(&mut *ctx.acc.chunks_buf.lock());
+    if !release_flush.is_empty() {
+        let joined = release_flush.join(" ");
+        if app.current_session_epoch() == epoch {
+            tracing::info!(
+                "session[{epoch}] release flush: {} chunk(s), {} chars",
+                release_flush.len(),
+                joined.chars().count()
+            );
+            deliver_transcript(&app.transcript_tx, joined);
+        } else {
+            tracing::info!(
+                "session[{epoch}] skipping release flush because a newer action superseded it"
+            );
+        }
+    }
+}
+
+/// Join the send task, bounded so a stuck provider can't hang the whole
+/// press. On timeout the task is cancelled and we fall back to whatever
+/// progress it had already published to `sent_progress`.
+async fn join_send_task(
+    mut send_task: tokio::task::JoinHandle<SentAudio>,
+    ctx: &SessionFinalizeCtx,
+    send_deadline: Duration,
+) -> SentAudio {
+    let epoch = ctx.epoch;
+    match tokio::time::timeout(send_deadline, &mut send_task).await {
+        Ok(Ok(sent)) => sent,
+        Ok(Err(e)) => {
+            tracing::warn!("session[{epoch}] send_task join error: {e}");
+            *ctx.sent_progress.lock()
+        }
+        Err(_) => {
+            tracing::warn!(
+                "session[{epoch}] send_task did not finish in {send_deadline:?}; cancelling it"
+            );
+            send_task.abort();
+            let _ = send_task.await;
+            *ctx.sent_progress.lock()
+        }
+    }
+}
+
+/// Wait for recv to drain, bounded by the provider's own final-transcript
+/// grace period. If it doesn't finish in time, cancel it before the caller
+/// inspects the shared accumulators, so it can't emit a second, late final
+/// after the last partial has already been promoted.
+async fn join_recv_task(
+    mut recv_task: tokio::task::JoinHandle<()>,
+    ctx: &SessionFinalizeCtx,
+    final_transcript_timeout: Duration,
+) {
+    let epoch = ctx.epoch;
+    let recv_finished = tokio::time::timeout(final_transcript_timeout, &mut recv_task)
+        .await
+        .is_ok();
+    if !recv_finished {
+        tracing::warn!(
+            "session[{epoch}] recv_task did not finish within {:?}; cancelling it before promoting any partial",
+            final_transcript_timeout
+        );
+        recv_task.abort();
+        let _ = recv_task.await;
+    }
+}
+
+/// Flush any commit chunks still held (recv pushed one between the release
+/// flip and the caller taking the buffer), then decide whether the trailing
+/// partial (if any) should be promoted to a real transcript -- or
+/// suppressed as a dropped phantom / a repeat of the last commit / stale.
+/// Returns whether there was a trailing partial at all, for the caller's
+/// no-transcript-at-all diagnostic.
+fn promote_tail_transcript(app: &Arc<App>, ctx: &SessionFinalizeCtx) -> bool {
+    let epoch = ctx.epoch;
+    // Sweep once more in case recv pushed a chunk between us flipping
+    // release_pending and taking the buffer.
+    let held_chunks = std::mem::take(&mut *ctx.acc.chunks_buf.lock());
+    let last_partial = std::mem::take(&mut *ctx.acc.last_partial_buf.lock());
+    let dropped_phantom = ctx.acc.dropped_phantom_buf.lock().take();
+
+    if !held_chunks.is_empty() {
+        let joined = held_chunks.join(" ");
+        if app.current_session_epoch() == epoch {
+            tracing::info!(
+                "session[{epoch}] flushing {} held commit chunk(s), {} chars total",
+                held_chunks.len(),
+                joined.chars().count()
+            );
+            deliver_transcript(&app.transcript_tx, joined);
+        } else {
+            tracing::info!(
+                "session[{epoch}] skipping held commit flush because a newer action superseded it"
+            );
+        }
+    }
+
+    // The last-partial fallback is now per SEGMENT, not per session: a kept
+    // commit clears the partial buffer, so anything left here is speech that
+    // arrived after the last commit and never got finalized (the provider hit
+    // `final_transcript_timeout`). Gating it on `!got_committed` used to throw
+    // that trailing segment away for the rest of the session as soon as one
+    // earlier sentence committed. `got_committed` still guards the
+    // "no transcript at all" diagnostic in the caller, which is genuinely per
+    // session.
+    let had_partial = !last_partial.is_empty();
+    let partial_was_dropped_phantom = dropped_phantom
+        .as_deref()
+        .is_some_and(|phantom| transcripts_equivalent(phantom, &last_partial));
+    // Belt and braces: if a provider re-emits the committed text as a trailing
+    // partial, promoting it would paste the same words twice.
+    let partial_repeats_last_commit = {
+        let last = ctx.acc.last_commit_text.lock();
+        !last.is_empty() && transcripts_equivalent(&last, &last_partial)
+    };
+    if had_partial && partial_was_dropped_phantom {
+        tracing::info!(
+            "session[{epoch}] suppressing last partial because it matches a dropped phantom finalization"
+        );
+    } else if had_partial && partial_repeats_last_commit {
+        tracing::info!(
+            "session[{epoch}] suppressing last partial because it repeats the last commit"
+        );
+    } else if had_partial && app.current_session_epoch() == epoch {
+        ctx.acc.transcribed_words.fetch_add(
+            last_partial.split_whitespace().count() as u64,
+            Ordering::AcqRel,
+        );
+        if ctx.log_transcripts {
+            tracing::info!("session[{epoch}] promoting last partial: {last_partial}");
+        } else {
+            tracing::info!(
+                "session[{epoch}] promoting last partial: {} char(s)",
+                last_partial.chars().count()
+            );
+        }
+        deliver_transcript(&app.transcript_tx, last_partial);
+    } else if had_partial {
+        tracing::info!(
+            "session[{epoch}] skipping last partial because a newer action superseded it"
+        );
+    }
+
+    had_partial
+}
+
+/// Session bookkeeping once finalize is done: rotate/credit the key,
+/// account any transcribed words toward usage, play the stop chime, and
+/// decide the session's overall `Result` -- including the "transport died
+/// but didn't cost the user anything" downgrade to `Ok(())`.
+fn finish_session_outcome(
+    ctx: &SessionFinalizeCtx,
+    audio_ms: u64,
+    speech_chunks: u64,
+    sent: &SentAudio,
+) -> Result<()> {
+    let epoch = ctx.epoch;
+    // Happy path only reaches here (fast-fail returned above on failure).
+    let key_failure = *ctx.acc.key_fail_kind.lock();
+    if let Some(kind) = key_failure {
+        ctx.keys.mark_failed(&ctx.key, kind);
+        tracing::warn!("session[{epoch}] ended with FAILED key ({kind:?}); pool will rotate");
+    } else if ctx.requires_api_key {
+        ctx.keys.mark_success(&ctx.key, audio_ms);
+    }
+    let words = ctx.acc.transcribed_words.load(Ordering::Acquire);
+    if words > 0 {
+        ctx.session_usage
+            .lock()
+            .add_fragment(ctx.provider_id, words, audio_ms);
+    }
+    crate::sound::play_stop(ctx.enable_sound);
+    tracing::info!("session[{epoch}] ended");
+    if key_failure.is_some() {
+        return Err(anyhow!(EXHAUSTED_SIGNAL));
+    }
+    if let Some(message) = ctx.acc.provider_failure.lock().take() {
+        // A transport that died without costing the user anything is a
+        // teardown, not a failure. ElevenLabs in particular often drops the TCP
+        // connection without a closing handshake, so `recv_event` reports
+        // "Connection reset without closing handshake" on sessions that lost
+        // nothing at all. Raising the error pip for those is a lie. The point
+        // of recording a mid-session transport error is the case where speech
+        // was LOST, so gate on exactly that (see
+        // `transport_failure_lost_speech`).
+        if !transport_failure_lost_speech(words, sent.socket_died) {
+            if words > 0 {
+                tracing::info!(
+                    "session[{epoch}] transport dropped during teardown after delivering \
+                     {words} word(s); not surfacing an error ({message})"
+                );
+            } else {
+                tracing::info!(
+                    "session[{epoch}] transport dropped on an empty dictation -- the provider \
+                     returned no words at all ({speech_chunks} chunk(s) were above our silence \
+                     floor), so there is no transcript to lose; not surfacing an error \
+                     ({message})"
+                );
+            }
+            return Ok(());
+        }
+        return Err(anyhow!(message));
+    }
+    Ok(())
+}
+
+async fn run_session(
+    app: Arc<App>,
+    keys: Arc<KeyPool>,
+    stop: Arc<AtomicBool>,
+    epoch: u64,
+    session_usage: Arc<parking_lot::Mutex<SessionUsage>>,
+) -> Result<()> {
+    tracing::info!("session[{epoch}] starting");
+
+    if audio_capture_unhealthy(&app, epoch) {
         return Ok(());
     }
+
+    let connected = match establish_connected_session(&app, keys, &stop, epoch).await? {
+        Some(connected) => connected,
+        None => return Ok(()),
+    };
+    let ConnectedSession {
+        cfg,
+        keys,
+        key,
+        key_suffix,
+        requires_api_key,
+        finalize_timeout,
+        final_transcript_timeout,
+        suppress_phantom,
+        provider_id,
+        fmt,
+        samples_rx,
+        flusher,
+        sink,
+        stream,
+    } = connected;
 
     if app.promote_starting_to_listening() {
         tracing::info!("session[{epoch}] visible state: Starting -> Listening");
@@ -987,7 +1637,6 @@ async fn run_session(
     // `release_pending` is set the moment the user lets go of the hotkey; the
     // send task uses it as the trigger to enter the dynamic-tail phase.
     let release_pending = Arc::new(AtomicBool::new(false));
-    let release_pending_send = Arc::clone(&release_pending);
     let flusher_send = flusher.clone();
 
     // Running count of speech-bearing chunks (RMS >= SILENCE_RMS) actually
@@ -999,18 +1648,15 @@ async fn run_session(
     // and `is_phantom_finalization`). Counting only speech (not the inter-word
     // silence the live phase also ships) is what makes the equality meaningful.
     let speech_shipped = Arc::new(AtomicU64::new(0));
-    let speech_shipped_send = Arc::clone(&speech_shipped);
-    let speech_shipped_recv = Arc::clone(&speech_shipped);
     let sent_progress = Arc::new(parking_lot::Mutex::new(SentAudio::default()));
-    let sent_progress_send = Arc::clone(&sent_progress);
-    let mut send_task: tokio::task::JoinHandle<SentAudio> =
+    let send_task: tokio::task::JoinHandle<SentAudio> =
         tokio::spawn(run_send_task(SendTaskState {
             samples_rx,
             sink,
             flusher: Some(flusher_send),
-            release_pending: release_pending_send,
-            speech_shipped: speech_shipped_send,
-            sent_progress: sent_progress_send,
+            release_pending: Arc::clone(&release_pending),
+            speech_shipped: Arc::clone(&speech_shipped),
+            sent_progress: Arc::clone(&sent_progress),
             tail_quiet,
             tail_max,
         }));
@@ -1040,34 +1686,22 @@ async fn run_session(
     // lands, so there is no held prefix to work ahead on.
     let speculate_polish = polish_settings.is_some() && delay_until_release;
 
-    // Shared accumulators that survive even if we drop the recv JoinHandle on
-    // timeout, so any chunks/partials the task already processed stay readable.
-    let chunks_buf: Arc<parking_lot::Mutex<Vec<String>>> =
-        Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let last_partial_buf: Arc<parking_lot::Mutex<String>> =
-        Arc::new(parking_lot::Mutex::new(String::new()));
-    let dropped_phantom_buf: Arc<parking_lot::Mutex<Option<String>>> =
-        Arc::new(parking_lot::Mutex::new(None));
-    let committed_flag = Arc::new(AtomicBool::new(false));
-    // Text of the most recent KEPT commit, so the end-of-session fallback can
-    // tell a genuinely-unfinalized trailing partial from a partial that
-    // merely repeats what was already committed.
-    let last_commit_text: Arc<parking_lot::Mutex<String>> =
-        Arc::new(parking_lot::Mutex::new(String::new()));
-    let transcribed_words = Arc::new(AtomicU64::new(0));
-    let key_fail_kind: Arc<parking_lot::Mutex<Option<FailKind>>> =
-        Arc::new(parking_lot::Mutex::new(None));
-    let provider_failure: Arc<parking_lot::Mutex<Option<String>>> =
-        Arc::new(parking_lot::Mutex::new(None));
-    let chunks_for_task = Arc::clone(&chunks_buf);
-    let last_partial_for_task = Arc::clone(&last_partial_buf);
-    let dropped_phantom_for_task = Arc::clone(&dropped_phantom_buf);
-    let committed_for_task = Arc::clone(&committed_flag);
-    let last_commit_text_for_task = Arc::clone(&last_commit_text);
-    let transcribed_words_for_task = Arc::clone(&transcribed_words);
-    let key_fail_for_task = Arc::clone(&key_fail_kind);
-    let provider_failure_for_task = Arc::clone(&provider_failure);
-    let release_pending_recv = Arc::clone(&release_pending);
+    let acc = SessionAccumulators::new();
+    let ctx = SessionFinalizeCtx {
+        epoch,
+        provider_id,
+        keys,
+        key,
+        key_suffix,
+        requires_api_key,
+        delay_until_release,
+        log_transcripts,
+        enable_sound: cfg.enable_sound,
+        fmt,
+        sent_progress,
+        acc: acc.clone(),
+        session_usage,
+    };
 
     // Reset the live word counter at the start of every session.
     app.word_count.store(0, Ordering::Release);
@@ -1075,204 +1709,20 @@ async fn run_session(
     // text so it could not be misapplied anyway, but a new dictation should
     // not be racing against a stale in-flight request either.
     app.polish.reset();
-    let mut recv_task = tokio::spawn(async move {
-        let mut events: usize = 0;
-        let mut committed_words: u32 = 0;
-        // Snapshot of `speech_shipped` taken at the last *kept* commit. Compared
-        // against the live count at each new commit to spot a phantom (equal =>
-        // no speech shipped in between). Starts at 0, so the very first real
-        // commit -- always backed by shipped speech -- is never mistaken for one.
-        let mut last_commit_speech: u64 = 0;
-        loop {
-            let ev = match stream.recv_event().await {
-                Ok(Some(ev)) => ev,
-                Ok(None) => break,
-                Err(e) => {
-                    // A read error mid-utterance is NOT a clean end of stream.
-                    // Recording it in `provider_failure` is what makes
-                    // run_session return Err, so the retry shell can rotate or
-                    // the pip can show an error. Without this a dropped socket
-                    // was indistinguishable from the provider finishing
-                    // normally: no retry, no error, and any uncommitted speech
-                    // silently gone while the app reported success.
-                    //
-                    // Recorded unconditionally here, but only SURFACED at the
-                    // end of run_session when the session delivered no words.
-                    // ElevenLabs routinely resets the socket without a closing
-                    // handshake once it has sent the final transcript, and
-                    // erroring on that flashed the pip after a dictation the
-                    // user watched succeed.
-                    tracing::warn!("session[{epoch}] recv error: {e}");
-                    let mut slot = provider_failure_for_task.lock();
-                    if slot.is_none() {
-                        *slot = Some(format!("transport failed mid-session: {e}"));
-                    }
-                    break;
-                }
-            };
-            events += 1;
-            match ev {
-                SttEvent::SessionStarted => {
-                    tracing::info!("session[{epoch}] {provider_id} session_started");
-                }
-                SttEvent::Partial(t) => {
-                    if log_transcripts {
-                        tracing::debug!("session[{epoch}] partial: {t}");
-                    } else {
-                        tracing::debug!("session[{epoch}] partial: {} char(s)", t.chars().count());
-                    }
-                    let partial_words = t.split_whitespace().count() as u32;
-                    recv_app
-                        .word_count
-                        .store(committed_words + partial_words, Ordering::Release);
-                    *last_partial_for_task.lock() = t;
-                }
-                SttEvent::Committed(final_text) => {
-                    // Drop the chunk entirely if a NEWER session has taken over.
-                    if recv_app.current_session_epoch() != epoch {
-                        tracing::debug!(
-                            "session[{epoch}] dropping late commit (newer session active)"
-                        );
-                        continue;
-                    }
-
-                    let released = release_pending_recv.load(Ordering::Acquire);
-                    let speech_now = speech_shipped_recv.load(Ordering::Acquire);
-
-                    // Phantom-finalization guard (ElevenLabs Scribe). A commit
-                    // that lands AFTER release with no speech-bearing audio shipped
-                    // since the previous commit -- AND whose text is a short
-                    // answer-shaped interjection -- is the model's LM prior
-                    // "answering" the question out of dead air ("Yes.", "No."),
-                    // not anything the user said. A genuinely-spoken trailing word
-                    // ships speech first, bumping `speech_now`, so it survives;
-                    // pre-release VAD commits have `released == false` and survive
-                    // too. The short-text gate bounds a residual race: `speech_now`
-                    // counts chunks shipped, not chunks attributable to *this*
-                    // commit, so a slow VAD commit that delivers a REAL segment
-                    // post-release (after the counter already advanced past it)
-                    // could look phantom -- but we then only ever risk dropping a
-                    // plausible answer, never a full sentence. See
-                    // `is_phantom_finalization`, `looks_like_short_answer`, and
-                    // the phantom-finalization regression tests below.
-                    if suppress_phantom
-                        && is_phantom_finalization(released, speech_now, last_commit_speech)
-                        && looks_like_short_answer(&final_text)
-                    {
-                        *dropped_phantom_for_task.lock() = Some(final_text.clone());
-                        let mut partial = last_partial_for_task.lock();
-                        if transcripts_equivalent(&partial, &final_text) {
-                            partial.clear();
-                        }
-                        if log_transcripts {
-                            tracing::info!(
-                                "session[{epoch}] dropped phantom finalization (no speech since last commit): {final_text}"
-                            );
-                        } else {
-                            tracing::info!(
-                                "session[{epoch}] dropped phantom finalization (no speech since last commit): {} char(s)",
-                                final_text.chars().count()
-                            );
-                        }
-                        continue;
-                    }
-
-                    // A transcript we're keeping. Mark that we have durable
-                    // committed text (disarms the last-partial fallback) and
-                    // advance the speech baseline for the next phantom check.
-                    // Set ONLY for kept commits: a dropped phantom must not trip
-                    // this, or a session whose only real content arrived as a
-                    // partial would lose its promotion fallback.
-                    committed_for_task.store(true, Ordering::Release);
-                    last_commit_speech = speech_now;
-
-                    // This commit supersedes every partial up to this point, so
-                    // clear the buffer. What lands in it AFTER this is speech
-                    // from a LATER segment, and that segment deserves the
-                    // last-partial fallback even though an earlier commit
-                    // already succeeded. The old session-wide `!got_committed`
-                    // gate disabled the fallback for the rest of the session
-                    // after the first commit, so a final segment whose
-                    // finalization timed out was discarded outright.
-                    last_partial_for_task.lock().clear();
-                    *last_commit_text_for_task.lock() = final_text.clone();
-
-                    let chunk_words = final_text.split_whitespace().count() as u32;
-                    committed_words = committed_words.saturating_add(chunk_words);
-                    transcribed_words_for_task.fetch_add(chunk_words as u64, Ordering::AcqRel);
-                    recv_app
-                        .word_count
-                        .store(committed_words, Ordering::Release);
-
-                    // Hybrid paste flow:
-                    //   before release              -> HOLD (accumulate)
-                    //   after release               -> LIVE (paste each chunk)
-                    //   delay_until_release = false -> LIVE throughout
-                    if delay_until_release && !released {
-                        if log_transcripts {
-                            tracing::info!(
-                                "session[{epoch}] committed (held until release): {final_text}"
-                            );
-                        } else {
-                            tracing::info!(
-                                "session[{epoch}] committed (held until release): {} char(s)",
-                                final_text.chars().count()
-                            );
-                        }
-                        let prefix = {
-                            let mut held = chunks_for_task.lock();
-                            held.push(final_text);
-                            // Same join the release flush will do, so a hit is
-                            // an exact-text hit rather than a near miss.
-                            speculate_polish.then(|| held.join(" "))
-                        };
-                        // Free time: the user is still talking and none of
-                        // this is on screen yet, so run the cleanup pass over
-                        // everything committed so far. If they release while
-                        // it is still thinking, the deadline race takes over
-                        // and nothing here has cost them anything.
-                        if let Some(prefix) = prefix {
-                            if let Some(settings) = polish_settings.as_ref() {
-                                recv_app.polish.speculate(settings, &prefix);
-                            }
-                        }
-                    } else {
-                        if log_transcripts {
-                            tracing::info!(
-                                "session[{epoch}] committed (live, append): {final_text}"
-                            );
-                        } else {
-                            tracing::info!(
-                                "session[{epoch}] committed (live, append): {} char(s)",
-                                final_text.chars().count()
-                            );
-                        }
-                        deliver_transcript(&recv_app.transcript_tx, final_text);
-                    }
-                }
-                SttEvent::KeyFailure(kind) => {
-                    tracing::warn!("session[{epoch}] provider signaled key failure ({kind:?})");
-                    *key_fail_for_task.lock() = Some(kind);
-                    // Don't break: the outer wait loop observes key_fail_kind and
-                    // tears the session down / rotates keys.
-                }
-                SttEvent::ProviderFailure(message) => {
-                    tracing::error!("session[{epoch}] {provider_id} failed: {message}");
-                    *provider_failure_for_task.lock() = Some(message);
-                }
-                SttEvent::Closed(reason) => {
-                    match reason {
-                        Some(r) => {
-                            tracing::warn!("session[{epoch}] transport closed by server ({r})")
-                        }
-                        None => tracing::info!("session[{epoch}] transport closed by server"),
-                    }
-                    break;
-                }
-            }
-        }
-        tracing::info!("session[{epoch}] recv_task ended (events={events})");
-    });
+    let recv_task = tokio::spawn(run_recv_task(RecvTaskState {
+        stream,
+        recv_app,
+        epoch,
+        provider_id,
+        log_transcripts,
+        delay_until_release,
+        suppress_phantom,
+        polish_settings,
+        speculate_polish,
+        release_pending: Arc::clone(&release_pending),
+        speech_shipped: Arc::clone(&speech_shipped),
+        acc,
+    }));
 
     while !stop.load(Ordering::Acquire) {
         if app.current_session_epoch() != epoch {
@@ -1280,7 +1730,7 @@ async fn run_session(
         }
         // Break the moment we know the session is unusable so the retry shell
         // sees the failure without waiting for the user to press again.
-        if key_fail_kind.lock().is_some() {
+        if ctx.acc.key_fail_kind.lock().is_some() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1288,61 +1738,12 @@ async fn run_session(
 
     // Fast-fail: if the provider already told us the key is dead, skip the
     // entire finalize and hand back to the retry shell to rotate keys.
-    let early_key_failure = *key_fail_kind.lock();
+    let early_key_failure = *ctx.acc.key_fail_kind.lock();
     if let Some(kind) = early_key_failure {
-        tracing::warn!(
-            "session[{epoch}] aborting finalize early -- key ...{key_suffix} failed ({kind:?})"
-        );
-        // Do not detach either half while the retry shell rotates keys. Besides
-        // retaining an obsolete audio subscription, a late receiver could paste
-        // into the replacement attempt. Preserve any words that were already
-        // live-pasted (delay=false) and the audio known to have been shipped.
-        send_task.abort();
-        recv_task.abort();
-        let _ = send_task.await;
-        let _ = recv_task.await;
-        if !delay_until_release {
-            let words = transcribed_words.load(Ordering::Acquire);
-            if words > 0 {
-                let sent = *sent_progress.lock();
-                session_usage.lock().add_fragment(
-                    provider_id,
-                    words,
-                    audio_duration_ms(sent.samples, fmt.sample_rate),
-                );
-            }
-        }
-        keys.mark_failed(&key, kind);
-        return Err(anyhow!(EXHAUSTED_SIGNAL));
+        return abort_for_early_key_failure(&ctx, kind, send_task, recv_task).await;
     }
 
-    tracing::info!(
-        "session[{epoch}] release pending; entering dynamic tail (min={:?}, quiet={:?}, max={:?})",
-        TAIL_MIN,
-        tail_quiet,
-        tail_max
-    );
-    // Flip the release flag FIRST so recv switches to live-paste mode for any
-    // chunks the server sends from this point on.
-    release_pending.store(true, Ordering::Release);
-
-    // Then flush anything held during the session so release feels snappy.
-    let release_flush: Vec<String> = std::mem::take(&mut *chunks_buf.lock());
-    if !release_flush.is_empty() {
-        let joined = release_flush.join(" ");
-        if app.current_session_epoch() == epoch {
-            tracing::info!(
-                "session[{epoch}] release flush: {} chunk(s), {} chars",
-                release_flush.len(),
-                joined.chars().count()
-            );
-            deliver_transcript(&app.transcript_tx, joined);
-        } else {
-            tracing::info!(
-                "session[{epoch}] skipping release flush because a newer action superseded it"
-            );
-        }
-    }
+    enter_release_phase(&app, &ctx, tail_quiet, tail_max, &release_pending);
 
     // Bound the wait so we never get stuck if something goes wrong. Streaming
     // providers finish within the tail window; batch providers (Google) need
@@ -1352,21 +1753,7 @@ async fn run_session(
     // and drop the final transcript. The provider's own timeout stays the
     // floor (Google's 45 s dwarfs any tail).
     let send_deadline = finalize_timeout.max(tail_max + Duration::from_millis(600));
-    let sent = match tokio::time::timeout(send_deadline, &mut send_task).await {
-        Ok(Ok(sent)) => sent,
-        Ok(Err(e)) => {
-            tracing::warn!("session[{epoch}] send_task join error: {e}");
-            *sent_progress.lock()
-        }
-        Err(_) => {
-            tracing::warn!(
-                "session[{epoch}] send_task did not finish in {send_deadline:?}; cancelling it"
-            );
-            send_task.abort();
-            let _ = send_task.await;
-            *sent_progress.lock()
-        }
-    };
+    let sent = join_send_task(send_task, &ctx, send_deadline).await;
     let audio_ms = audio_duration_ms(sent.samples, fmt.sample_rate);
     // `speech` is the end-of-session gate's evidence that the user actually
     // said something (see `transport_failure_lost_speech`), so log it here
@@ -1386,138 +1773,15 @@ async fn run_session(
     // the shared accumulators so it cannot emit a second, late final after we
     // promote the last partial. OpenAI uses a longer provider-specific grace
     // because its complete result can arrive several seconds after commit.
-    let recv_finished = tokio::time::timeout(final_transcript_timeout, &mut recv_task)
-        .await
-        .is_ok();
-    if !recv_finished {
-        tracing::warn!(
-            "session[{epoch}] recv_task did not finish within {:?}; cancelling it before promoting any partial",
-            final_transcript_timeout
-        );
-        recv_task.abort();
-        let _ = recv_task.await;
-    }
+    join_recv_task(recv_task, &ctx, final_transcript_timeout).await;
 
-    let got_committed = committed_flag.load(Ordering::Acquire);
-    // Sweep once more in case recv pushed a chunk between us flipping
-    // release_pending and taking the buffer.
-    let held_chunks = std::mem::take(&mut *chunks_buf.lock());
-    let last_partial = std::mem::take(&mut *last_partial_buf.lock());
-    let dropped_phantom = dropped_phantom_buf.lock().take();
-
-    if !held_chunks.is_empty() {
-        let joined = held_chunks.join(" ");
-        if app.current_session_epoch() == epoch {
-            tracing::info!(
-                "session[{epoch}] flushing {} held commit chunk(s), {} chars total",
-                held_chunks.len(),
-                joined.chars().count()
-            );
-            deliver_transcript(&app.transcript_tx, joined);
-        } else {
-            tracing::info!(
-                "session[{epoch}] skipping held commit flush because a newer action superseded it"
-            );
-        }
-    }
-
-    // The last-partial fallback is now per SEGMENT, not per session: a kept
-    // commit clears the partial buffer, so anything left here is speech that
-    // arrived after the last commit and never got finalized (the provider hit
-    // `final_transcript_timeout`). Gating it on `!got_committed` used to throw
-    // that trailing segment away for the rest of the session as soon as one
-    // earlier sentence committed. `got_committed` still guards the
-    // "no transcript at all" diagnostic below, which is genuinely per session.
-    let had_partial = !last_partial.is_empty();
-    let partial_was_dropped_phantom = dropped_phantom
-        .as_deref()
-        .is_some_and(|phantom| transcripts_equivalent(phantom, &last_partial));
-    // Belt and braces: if a provider re-emits the committed text as a trailing
-    // partial, promoting it would paste the same words twice.
-    let partial_repeats_last_commit = {
-        let last = last_commit_text.lock();
-        !last.is_empty() && transcripts_equivalent(&last, &last_partial)
-    };
-    if had_partial && partial_was_dropped_phantom {
-        tracing::info!(
-            "session[{epoch}] suppressing last partial because it matches a dropped phantom finalization"
-        );
-    } else if had_partial && partial_repeats_last_commit {
-        tracing::info!(
-            "session[{epoch}] suppressing last partial because it repeats the last commit"
-        );
-    } else if had_partial && app.current_session_epoch() == epoch {
-        transcribed_words.fetch_add(
-            last_partial.split_whitespace().count() as u64,
-            Ordering::AcqRel,
-        );
-        if log_transcripts {
-            tracing::info!("session[{epoch}] promoting last partial: {last_partial}");
-        } else {
-            tracing::info!(
-                "session[{epoch}] promoting last partial: {} char(s)",
-                last_partial.chars().count()
-            );
-        }
-        deliver_transcript(&app.transcript_tx, last_partial);
-    } else if had_partial {
-        tracing::info!(
-            "session[{epoch}] skipping last partial because a newer action superseded it"
-        );
-    }
+    let got_committed = ctx.acc.committed_flag.load(Ordering::Acquire);
+    let had_partial = promote_tail_transcript(&app, &ctx);
     if !got_committed && !had_partial && sent.chunks == 0 {
         tracing::warn!("session[{epoch}] produced no transcript (zero audio chunks sent -- session ended before mic was warm)");
     }
 
-    // Happy path only reaches here (fast-fail returned above on failure).
-    let key_failure = *key_fail_kind.lock();
-    if let Some(kind) = key_failure {
-        keys.mark_failed(&key, kind);
-        tracing::warn!("session[{epoch}] ended with FAILED key ({kind:?}); pool will rotate");
-    } else {
-        if requires_api_key {
-            keys.mark_success(&key, audio_ms);
-        }
-    }
-    let words = transcribed_words.load(Ordering::Acquire);
-    if words > 0 {
-        session_usage
-            .lock()
-            .add_fragment(provider_id, words, audio_ms);
-    }
-    crate::sound::play_stop(cfg.enable_sound);
-    tracing::info!("session[{epoch}] ended");
-    if key_failure.is_some() {
-        return Err(anyhow!(EXHAUSTED_SIGNAL));
-    }
-    if let Some(message) = provider_failure.lock().take() {
-        // A transport that died without costing the user anything is a
-        // teardown, not a failure. ElevenLabs in particular often drops the TCP
-        // connection without a closing handshake, so `recv_event` reports
-        // "Connection reset without closing handshake" on sessions that lost
-        // nothing at all. Raising the error pip for those is a lie. The point
-        // of recording a mid-session transport error is the case where speech
-        // was LOST, so gate on exactly that (see
-        // `transport_failure_lost_speech`).
-        if !transport_failure_lost_speech(words, sent.socket_died) {
-            if words > 0 {
-                tracing::info!(
-                    "session[{epoch}] transport dropped during teardown after delivering \
-                     {words} word(s); not surfacing an error ({message})"
-                );
-            } else {
-                tracing::info!(
-                    "session[{epoch}] transport dropped on an empty dictation -- the provider \
-                     returned no words at all ({speech_chunks} chunk(s) were above our silence \
-                     floor), so there is no transcript to lose; not surfacing an error \
-                     ({message})"
-                );
-            }
-            return Ok(());
-        }
-        return Err(anyhow!(message));
-    }
-    Ok(())
+    finish_session_outcome(&ctx, audio_ms, speech_chunks, &sent)
 }
 
 /// True when a committed transcript is a hallucinated end-of-stream
