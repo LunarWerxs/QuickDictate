@@ -980,171 +980,197 @@ unsafe fn ctlcolor_text(hdc: HDC, color: COLORREF) -> LRESULT {
     LRESULT(dark_bg_brush().0 as isize)
 }
 
+/// `WM_CTLCOLORSTATIC` for the subtitle/license/copyright statics — muted
+/// on-surface colours, handled before the generic static colouring in
+/// `dark_ctlcolor`. `None` when the control isn't one of the muted ones, so
+/// the caller falls through to the generic path.
+unsafe fn on_ctlcolorstatic(wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+    let id = GetDlgCtrlID(HWND(lparam.0 as *mut c_void));
+    let hdc = HDC(wparam.0 as *mut c_void);
+    let muted = match id {
+        ID_SUBTITLE | ID_LICENSE => Some(HEADER_TEXT()),
+        ID_COPYRIGHT => Some(DISABLED_TEXT()),
+        _ => None,
+    };
+    muted.map(|c| ctlcolor_text(hdc, c))
+}
+
+unsafe fn on_wm_create(hwnd: HWND) -> LRESULT {
+    let state = Box::new(About {
+        status: Status::Checking,
+        checking: true,
+        gh_icon: None,
+        ver_pill: 0,
+        status_pill: 0,
+        lw_logo: 0,
+        spinner_angle: 0,
+    });
+    SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
+    build_about(hwnd);
+    start_check(hwnd); // check on open
+    LRESULT(0)
+}
+
+unsafe fn on_wm_drawitem(hwnd: HWND, lparam: LPARAM) -> LRESULT {
+    let d = &*(lparam.0 as *const DRAWITEMSTRUCT);
+    match d.CtlID as i32 {
+        ID_VER_PILL => draw_ver_pill(hwnd, d),
+        ID_STATUS_PILL => draw_status_pill(hwnd, d),
+        _ => {}
+    }
+    LRESULT(1)
+}
+
+unsafe fn on_wm_timer(hwnd: HWND) -> LRESULT {
+    let st = about_state(hwnd);
+    if !st.is_null() && matches!((*st).status, Status::Checking | Status::Updating) {
+        (*st).spinner_angle = ((*st).spinner_angle + SPINNER_STEP_DEG) % 360;
+        invalidate_status(hwnd);
+    } else {
+        // No longer checking / updating — stop animating.
+        let _ = KillTimer(hwnd, SPINNER_TIMER);
+    }
+    LRESULT(0)
+}
+
+unsafe fn on_wm_about_checked(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let _ = KillTimer(hwnd, SPINNER_TIMER);
+    let st = about_state(hwnd);
+    if !st.is_null() {
+        (*st).checking = false;
+        (*st).status = match wparam.0 {
+            1 => {
+                let tag = if lparam.0 != 0 {
+                    *Box::from_raw(lparam.0 as *mut String)
+                } else {
+                    String::new()
+                };
+                Status::Available(tag)
+            }
+            2 => Status::Failed,
+            _ => Status::UpToDate,
+        };
+    } else if lparam.0 != 0 {
+        // Window torn down between post and dispatch — reclaim the tag.
+        drop(Box::from_raw(lparam.0 as *mut String));
+    }
+    invalidate_status(hwnd);
+    LRESULT(0)
+}
+
+unsafe fn on_wm_about_update_failed(hwnd: HWND, lparam: LPARAM) -> LRESULT {
+    let _ = KillTimer(hwnd, SPINNER_TIMER);
+    // Reclaim the tag the worker boxed (dropped harmlessly if the window is
+    // already gone).
+    let tag = if lparam.0 != 0 {
+        *Box::from_raw(lparam.0 as *mut String)
+    } else {
+        String::new()
+    };
+    let st = about_state(hwnd);
+    if !st.is_null() {
+        (*st).checking = false;
+        // Restore the actionable pill so the user can retry.
+        (*st).status = Status::Available(tag);
+    }
+    invalidate_status(hwnd);
+    LRESULT(0)
+}
+
+unsafe fn on_wm_command(hwnd: HWND, wparam: WPARAM) -> LRESULT {
+    let id = (wparam.0 & 0xFFFF) as i32;
+    let notify = ((wparam.0 >> 16) & 0xFFFF) as u32;
+    match id {
+        1 | 2 => {
+            // IDOK / IDCANCEL (Enter / Esc via the dialog manager).
+            let _ = DestroyWindow(hwnd);
+        }
+        ID_LW_LOGO if notify == STN_CLICKED => open_url(LUNARWERX_URL),
+        ID_VER_PILL if notify == STN_CLICKED => open_url(REPO_URL),
+        ID_STATUS_PILL if notify == STN_CLICKED => on_status_click(hwnd),
+        _ => {}
+    }
+    LRESULT(0)
+}
+
+unsafe fn on_wm_setcursor(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // Hand cursor over the three clickables; default elsewhere.
+    let over = wparam.0 as isize;
+    let st = about_state(hwnd);
+    let clickable = !st.is_null()
+        && [(*st).ver_pill, (*st).status_pill, (*st).lw_logo]
+            .iter()
+            .any(|&h| h != 0 && h == over);
+    if clickable {
+        if let Ok(hand) = LoadCursorW(HINSTANCE::default(), IDC_HAND) {
+            SetCursor(hand);
+        }
+        return LRESULT(1);
+    }
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+unsafe fn on_wm_dpichanged(hwnd: HWND, lparam: LPARAM) -> LRESULT {
+    if lparam.0 != 0 {
+        let r = &*(lparam.0 as *const RECT);
+        let _ = SetWindowPos(
+            hwnd,
+            HWND::default(),
+            r.left,
+            r.top,
+            r.right - r.left,
+            r.bottom - r.top,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+    LRESULT(0)
+}
+
+unsafe fn on_wm_ncdestroy(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let _ = KillTimer(hwnd, SPINNER_TIMER);
+    let p = about_state(hwnd);
+    if !p.is_null() {
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        let st = Box::from_raw(p);
+        if let Some(icon) = st.gh_icon {
+            let _ = DeleteObject(icon);
+        }
+    }
+    PostQuitMessage(0);
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
 extern "system" fn about_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         // Muted on-surface colours for the subtitle / license / copyright —
         // handled BEFORE the generic static colouring.
         if msg == WM_CTLCOLORSTATIC {
-            let id = GetDlgCtrlID(HWND(lparam.0 as *mut c_void));
-            let hdc = HDC(wparam.0 as *mut c_void);
-            let muted = match id {
-                ID_SUBTITLE | ID_LICENSE => Some(HEADER_TEXT()),
-                ID_COPYRIGHT => Some(DISABLED_TEXT()),
-                _ => None,
-            };
-            if let Some(c) = muted {
-                return ctlcolor_text(hdc, c);
+            if let Some(r) = on_ctlcolorstatic(wparam, lparam) {
+                return r;
             }
         }
         if let Some(r) = dark_ctlcolor(msg, wparam) {
             return r;
         }
         match msg {
-            WM_CREATE => {
-                let state = Box::new(About {
-                    status: Status::Checking,
-                    checking: true,
-                    gh_icon: None,
-                    ver_pill: 0,
-                    status_pill: 0,
-                    lw_logo: 0,
-                    spinner_angle: 0,
-                });
-                SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
-                build_about(hwnd);
-                start_check(hwnd); // check on open
-                LRESULT(0)
-            }
-            WM_DRAWITEM => {
-                let d = &*(lparam.0 as *const DRAWITEMSTRUCT);
-                match d.CtlID as i32 {
-                    ID_VER_PILL => draw_ver_pill(hwnd, d),
-                    ID_STATUS_PILL => draw_status_pill(hwnd, d),
-                    _ => {}
-                }
-                LRESULT(1)
-            }
-            WM_TIMER if wparam.0 == SPINNER_TIMER => {
-                let st = about_state(hwnd);
-                if !st.is_null() && matches!((*st).status, Status::Checking | Status::Updating) {
-                    (*st).spinner_angle = ((*st).spinner_angle + SPINNER_STEP_DEG) % 360;
-                    invalidate_status(hwnd);
-                } else {
-                    // No longer checking / updating — stop animating.
-                    let _ = KillTimer(hwnd, SPINNER_TIMER);
-                }
-                LRESULT(0)
-            }
-            WM_ABOUT_CHECKED => {
-                let _ = KillTimer(hwnd, SPINNER_TIMER);
-                let st = about_state(hwnd);
-                if !st.is_null() {
-                    (*st).checking = false;
-                    (*st).status = match wparam.0 {
-                        1 => {
-                            let tag = if lparam.0 != 0 {
-                                *Box::from_raw(lparam.0 as *mut String)
-                            } else {
-                                String::new()
-                            };
-                            Status::Available(tag)
-                        }
-                        2 => Status::Failed,
-                        _ => Status::UpToDate,
-                    };
-                } else if lparam.0 != 0 {
-                    // Window torn down between post and dispatch — reclaim the tag.
-                    drop(Box::from_raw(lparam.0 as *mut String));
-                }
-                invalidate_status(hwnd);
-                LRESULT(0)
-            }
-            WM_ABOUT_UPDATE_FAILED => {
-                let _ = KillTimer(hwnd, SPINNER_TIMER);
-                // Reclaim the tag the worker boxed (dropped harmlessly if the
-                // window is already gone).
-                let tag = if lparam.0 != 0 {
-                    *Box::from_raw(lparam.0 as *mut String)
-                } else {
-                    String::new()
-                };
-                let st = about_state(hwnd);
-                if !st.is_null() {
-                    (*st).checking = false;
-                    // Restore the actionable pill so the user can retry.
-                    (*st).status = Status::Available(tag);
-                }
-                invalidate_status(hwnd);
-                LRESULT(0)
-            }
-            WM_COMMAND => {
-                let id = (wparam.0 & 0xFFFF) as i32;
-                let notify = ((wparam.0 >> 16) & 0xFFFF) as u32;
-                match id {
-                    1 | 2 => {
-                        // IDOK / IDCANCEL (Enter / Esc via the dialog manager).
-                        let _ = DestroyWindow(hwnd);
-                    }
-                    ID_LW_LOGO if notify == STN_CLICKED => open_url(LUNARWERX_URL),
-                    ID_VER_PILL if notify == STN_CLICKED => open_url(REPO_URL),
-                    ID_STATUS_PILL if notify == STN_CLICKED => on_status_click(hwnd),
-                    _ => {}
-                }
-                LRESULT(0)
-            }
-            WM_SETCURSOR => {
-                // Hand cursor over the three clickables; default elsewhere.
-                let over = wparam.0 as isize;
-                let st = about_state(hwnd);
-                let clickable = !st.is_null()
-                    && [(*st).ver_pill, (*st).status_pill, (*st).lw_logo]
-                        .iter()
-                        .any(|&h| h != 0 && h == over);
-                if clickable {
-                    if let Ok(hand) = LoadCursorW(HINSTANCE::default(), IDC_HAND) {
-                        SetCursor(hand);
-                    }
-                    return LRESULT(1);
-                }
-                DefWindowProcW(hwnd, msg, wparam, lparam)
-            }
+            WM_CREATE => on_wm_create(hwnd),
+            WM_DRAWITEM => on_wm_drawitem(hwnd, lparam),
+            WM_TIMER if wparam.0 == SPINNER_TIMER => on_wm_timer(hwnd),
+            WM_ABOUT_CHECKED => on_wm_about_checked(hwnd, wparam, lparam),
+            WM_ABOUT_UPDATE_FAILED => on_wm_about_update_failed(hwnd, lparam),
+            WM_COMMAND => on_wm_command(hwnd, wparam),
+            WM_SETCURSOR => on_wm_setcursor(hwnd, msg, wparam, lparam),
             WM_KEYDOWN if wparam.0 == 0x1B => {
                 // Esc closes (plain window — no dialog manager to send IDCANCEL).
                 let _ = DestroyWindow(hwnd);
                 LRESULT(0)
             }
-            WM_DPICHANGED => {
-                if lparam.0 != 0 {
-                    let r = &*(lparam.0 as *const RECT);
-                    let _ = SetWindowPos(
-                        hwnd,
-                        HWND::default(),
-                        r.left,
-                        r.top,
-                        r.right - r.left,
-                        r.bottom - r.top,
-                        SWP_NOZORDER | SWP_NOACTIVATE,
-                    );
-                }
-                LRESULT(0)
-            }
+            WM_DPICHANGED => on_wm_dpichanged(hwnd, lparam),
             WM_CLOSE => {
                 let _ = DestroyWindow(hwnd);
                 LRESULT(0)
             }
-            WM_NCDESTROY => {
-                let _ = KillTimer(hwnd, SPINNER_TIMER);
-                let p = about_state(hwnd);
-                if !p.is_null() {
-                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-                    let st = Box::from_raw(p);
-                    if let Some(icon) = st.gh_icon {
-                        let _ = DeleteObject(icon);
-                    }
-                }
-                PostQuitMessage(0);
-                DefWindowProcW(hwnd, msg, wparam, lparam)
-            }
+            WM_NCDESTROY => on_wm_ncdestroy(hwnd, msg, wparam, lparam),
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
     }

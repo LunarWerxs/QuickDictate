@@ -620,8 +620,8 @@ impl super::SettingsApp {
         let (tx, rx) = mpsc::channel();
         self.test_rx = Some(rx);
         self.testing_left = keys.len();
-        if let Some(Modal::Keys { rows, .. }) = &mut self.modal {
-            for r in rows.iter_mut() {
+        if let Some(Modal::Keys(state)) = &mut self.modal {
+            for r in state.rows.iter_mut() {
                 if keys.contains(&r.value) {
                     r.verdict = Verdict::Testing;
                 }
@@ -658,8 +658,8 @@ impl super::SettingsApp {
             self.testing_left = self.testing_left.saturating_sub(1);
             self.verdicts.retain(|(k, _)| *k != key);
             self.verdicts.push((key.clone(), ok));
-            if let Some(Modal::Keys { rows, .. }) = &mut self.modal {
-                if let Some(r) = rows.iter_mut().find(|r| r.value == key) {
+            if let Some(Modal::Keys(state)) = &mut self.modal {
+                if let Some(r) = state.rows.iter_mut().find(|r| r.value == key) {
                     r.verdict = if ok { Verdict::Ok } else { Verdict::Fail };
                 }
             }
@@ -678,22 +678,16 @@ impl super::SettingsApp {
             "keys-polish" | "keys-polish-test" => self.open_keys_modal(KEYS_TARGET_POLISH),
             "keys-bulk" => {
                 self.open_keys_modal(KEYS_TARGET_PROVIDER);
-                if let Some(Modal::Keys { bulk, .. }) = &mut self.modal {
-                    *bulk = true;
+                if let Some(Modal::Keys(state)) = &mut self.modal {
+                    state.bulk = true;
                 }
             }
             "replacements" => self.open_replacements_modal(),
             "replacements-bulk" => {
                 self.open_replacements_modal();
-                if let Some(Modal::Replacements {
-                    rows,
-                    bulk,
-                    bulk_text,
-                    ..
-                }) = &mut self.modal
-                {
-                    *bulk_text = replacements_to_text(rows);
-                    *bulk = true;
+                if let Some(Modal::Replacements(state)) = &mut self.modal {
+                    state.bulk_text = replacements_to_text(&state.rows);
+                    state.bulk = true;
                 }
             }
             "stats" => self.modal = Some(Modal::Stats),

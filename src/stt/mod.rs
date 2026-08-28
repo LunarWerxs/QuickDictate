@@ -600,6 +600,223 @@ impl TailSilenceGate {
     }
 }
 
+/// State [`run_send_task`] owns for a session's outbound audio: the
+/// resampled-audio receiver, the provider sink, and the counters the recv
+/// task and the end-of-session gate read back. Bundled into one struct
+/// because the send task's phases (live / dynamic tail / drain) all close
+/// over every field.
+struct SendTaskState {
+    samples_rx: tokio::sync::mpsc::Receiver<Vec<i16>>,
+    sink: Box<dyn ProviderSink>,
+    /// Consumed (not just borrowed) by [`send_task_drain_phase`], so it's an
+    /// `Option` rather than a plain field: `SessionFlusher::finish` takes
+    /// `self` by value, which a field behind `&mut SendTaskState` can't hand
+    /// out directly.
+    flusher: Option<crate::audio::SessionFlusher>,
+    release_pending: Arc<AtomicBool>,
+    speech_shipped: Arc<AtomicU64>,
+    sent_progress: Arc<parking_lot::Mutex<SentAudio>>,
+    tail_quiet: Duration,
+    tail_max: Duration,
+}
+
+/// Phase 1 of [`run_send_task`]: forward mic audio to the provider as fast as
+/// it arrives, until the hotkey is released or the socket dies.
+async fn send_task_live_phase(state: &mut SendTaskState, sent: &mut SentAudio, ws_dead: &mut bool) {
+    loop {
+        if state.release_pending.load(Ordering::Acquire) || *ws_dead {
+            break;
+        }
+        let chunk_opt = tokio::select! {
+            v = state.samples_rx.recv() => v,
+            _ = tokio::time::sleep(Duration::from_millis(30)) => continue,
+        };
+        match chunk_opt {
+            Some(chunk) => {
+                // Classify before shipping so the phantom-finalization guard
+                // (recv task) can tell a commit backed by real speech from one
+                // conjured out of the trailing silence the live phase also
+                // forwards. Only speech advances `speech_shipped`.
+                let is_speech = rms_i16(&chunk) >= SILENCE_RMS;
+                if !ship(&mut state.sink, &chunk, ws_dead).await {
+                    break;
+                }
+                sent.record_chunk(&chunk);
+                *state.sent_progress.lock() = *sent;
+                if is_speech {
+                    state.speech_shipped.fetch_add(1, Ordering::Release);
+                }
+            }
+            None => break,
+        }
+    }
+}
+
+/// Phase 2 of [`run_send_task`]: keep listening through the user-configured
+/// tail, but do NOT forward its trailing silence to the provider -- a
+/// streaming model would hallucinate a short answer out of that dead air
+/// (see [`TailSilenceGate`]). The gate holds silent chunks back and flushes
+/// them only when speech resumes, so a real mid-utterance pause is preserved
+/// and only the final never-followed-by-speech silence is dropped.
+/// Endpointing (peak_rms / last_speech / the quiet window) still sees every
+/// chunk; the gate only decides what actually goes on the wire.
+async fn send_task_tail_phase(
+    state: &mut SendTaskState,
+    sent: &mut SentAudio,
+    ws_dead: &mut bool,
+) -> TailSilenceGate {
+    let mut gate = TailSilenceGate::default();
+    let tail_start = tokio::time::Instant::now();
+    let mut last_speech = tail_start;
+    // Last time a real audio frame (or a keepalive) actually went out. While
+    // we're trimming a long silent stretch nothing ships, so this drives the
+    // keepalive that stops an idle server from closing the session mid-tail.
+    let mut last_send = tail_start;
+    let mut tail_chunks: usize = 0;
+    let mut peak_rms: i32 = 0;
+    while !*ws_dead {
+        let elapsed = tail_start.elapsed();
+        if elapsed >= state.tail_max {
+            tracing::info!(
+                "session tail: hit tail_max ({:.0} ms) after {:.0} ms (peak_rms={peak_rms}, {} silent chunk(s) trimmed)",
+                state.tail_max.as_secs_f64() * 1000.0,
+                elapsed.as_secs_f64() * 1000.0,
+                gate.held(),
+            );
+            break;
+        }
+        let chunk_opt = tokio::select! {
+            v = state.samples_rx.recv() => v,
+            _ = tokio::time::sleep(Duration::from_millis(20)) => None,
+        };
+        if let Some(chunk) = chunk_opt {
+            let rms = rms_i16(&chunk);
+            if rms > peak_rms {
+                peak_rms = rms;
+            }
+            let is_speech = rms >= SILENCE_RMS;
+            if is_speech {
+                last_speech = tokio::time::Instant::now();
+            }
+            // Ship speech now (flushing any held pause first); buffer silence.
+            let outgoing = gate.offer(chunk, is_speech);
+            let n = ship_all(&mut state.sink, &outgoing, ws_dead).await;
+            sent.record_prefix(&outgoing, n);
+            *state.sent_progress.lock() = *sent;
+            tail_chunks += n;
+            if n > 0 {
+                last_send = tokio::time::Instant::now();
+                // A speech-bearing tail chunk went out: a genuinely-spoken
+                // trailing word. Count it so its commit isn't mistaken for a
+                // phantom (this is what preserves a real trailing "Yes.").
+                if is_speech {
+                    state.speech_shipped.fetch_add(1, Ordering::Release);
+                }
+            }
+            if *ws_dead {
+                break;
+            }
+        }
+        // Long quiet tail: no audio has gone out for a while (we're trimming
+        // silence). Send a content-free keepalive so the server keeps the
+        // session open. Never fires on a normal-length tail.
+        if last_send.elapsed() >= TAIL_KEEPALIVE_AFTER {
+            if let Err(e) = state.sink.keepalive().await {
+                tracing::debug!("session tail: keepalive failed (socket likely dead): {e}");
+                *ws_dead = true;
+                break;
+            }
+            last_send = tokio::time::Instant::now();
+            tracing::debug!("session tail: sent keepalive during long silent tail");
+        }
+        if elapsed >= TAIL_MIN && last_speech.elapsed() >= state.tail_quiet {
+            tracing::info!(
+                "session tail: ended after {:.0} ms ({} tail chunk(s) shipped, {} silent chunk(s) trimmed, peak_rms={peak_rms}, quiet ={:.0} ms)",
+                elapsed.as_secs_f64() * 1000.0,
+                tail_chunks,
+                gate.held(),
+                last_speech.elapsed().as_secs_f64() * 1000.0
+            );
+            break;
+        }
+    }
+    gate
+}
+
+/// Phase 3 of [`run_send_task`]: flush the session's resampler tail, then
+/// drain it -- same silence gate as the tail, so the flushed fragment and
+/// any last mic chunks are forwarded only if they carry speech. Stops the
+/// capture subscription first, atomically flushing its last resampler
+/// fragment while `samples_rx` is still alive, then drains that fragment;
+/// reversing these drops can clip it and log a false queue warning during
+/// slow local inference.
+async fn send_task_drain_phase(
+    state: &mut SendTaskState,
+    sent: &mut SentAudio,
+    ws_dead: &mut bool,
+    gate: &mut TailSilenceGate,
+) {
+    if let Some(flusher) = state.flusher.take() {
+        flusher.finish();
+    }
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+    while !*ws_dead {
+        let chunk_opt = tokio::select! {
+            v = state.samples_rx.recv() => v,
+            _ = tokio::time::sleep_until(drain_deadline) => None,
+        };
+        match chunk_opt {
+            Some(chunk) => {
+                let is_speech = rms_i16(&chunk) >= SILENCE_RMS;
+                let outgoing = gate.offer(chunk, is_speech);
+                let n = ship_all(&mut state.sink, &outgoing, ws_dead).await;
+                sent.record_prefix(&outgoing, n);
+                *state.sent_progress.lock() = *sent;
+                if is_speech && n > 0 {
+                    state.speech_shipped.fetch_add(1, Ordering::Release);
+                }
+                if *ws_dead {
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    if gate.held() > 0 {
+        tracing::debug!(
+            "session tail: dropped {} trailing silent chunk(s) before commit -- never sent, so the model can't finalize silence into a hallucinated answer",
+            gate.held(),
+        );
+    }
+}
+
+/// The session's outbound-audio task: live phase, dynamic tail, drain, then
+/// commit + close. Runs on its own `tokio::spawn` from [`run_session`].
+async fn run_send_task(mut state: SendTaskState) -> SentAudio {
+    let mut sent = SentAudio::default();
+    let mut ws_dead = false;
+
+    send_task_live_phase(&mut state, &mut sent, &mut ws_dead).await;
+    let mut gate = send_task_tail_phase(&mut state, &mut sent, &mut ws_dead).await;
+    send_task_drain_phase(&mut state, &mut sent, &mut ws_dead, &mut gate).await;
+
+    // Batch/local commit can spend seconds or minutes in inference. Stop
+    // subscribing before awaiting it so the bounded audio queue does not
+    // fill with frames nobody will ever consume.
+    drop(state.samples_rx);
+
+    // Commit + close (only if the socket is still alive).
+    if !ws_dead {
+        let _ = state.sink.commit().await;
+        let _ = state.sink.close().await;
+    }
+    // Carry the socket's fate back with the byte counts: the end-of-session
+    // gate needs it to tell an empty press from one that was cut off.
+    sent.socket_died = ws_dead;
+    *state.sent_progress.lock() = sent;
+    sent
+}
+
 async fn run_session(
     app: Arc<App>,
     keys: Arc<KeyPool>,
@@ -705,7 +922,7 @@ async fn run_session(
     // connect failure still drops the flusher and unregisters cleanly. The
     // provider's required rate (16 kHz streaming, 24 kHz OpenAI) drives the
     // per-session resampler.
-    let (mut samples_rx, flusher) = app.audio.subscribe(fmt.sample_rate);
+    let (samples_rx, flusher) = app.audio.subscribe(fmt.sample_rate);
 
     let connect_start = Instant::now();
     let ProviderSession { sink, mut stream } = match tokio::time::timeout(
@@ -786,182 +1003,17 @@ async fn run_session(
     let speech_shipped_recv = Arc::clone(&speech_shipped);
     let sent_progress = Arc::new(parking_lot::Mutex::new(SentAudio::default()));
     let sent_progress_send = Arc::clone(&sent_progress);
-    let mut send_task: tokio::task::JoinHandle<SentAudio> = tokio::spawn(async move {
-        let mut sink = sink;
-        let mut sent = SentAudio::default();
-        let mut ws_dead = false;
-
-        // === Phase 1: live ===
-        loop {
-            if release_pending_send.load(Ordering::Acquire) || ws_dead {
-                break;
-            }
-            let chunk_opt = tokio::select! {
-                v = samples_rx.recv() => v,
-                _ = tokio::time::sleep(Duration::from_millis(30)) => continue,
-            };
-            match chunk_opt {
-                Some(chunk) => {
-                    // Classify before shipping so the phantom-finalization guard
-                    // (recv task) can tell a commit backed by real speech from one
-                    // conjured out of the trailing silence the live phase also
-                    // forwards. Only speech advances `speech_shipped`.
-                    let is_speech = rms_i16(&chunk) >= SILENCE_RMS;
-                    if !ship(&mut sink, &chunk, &mut ws_dead).await {
-                        break;
-                    }
-                    sent.record_chunk(&chunk);
-                    *sent_progress_send.lock() = sent;
-                    if is_speech {
-                        speech_shipped_send.fetch_add(1, Ordering::Release);
-                    }
-                }
-                None => break,
-            }
-        }
-
-        // === Phase 2: dynamic tail ===
-        //
-        // We keep *listening* for the full user-configured tail, but we do NOT
-        // forward its trailing silence to the provider: a streaming model would
-        // hallucinate a short answer out of that dead air (see TailSilenceGate).
-        // The gate holds silent chunks back and flushes them only when speech
-        // resumes, so a real mid-utterance pause is preserved and only the final
-        // never-followed-by-speech silence is dropped. Endpointing below
-        // (peak_rms / last_speech / the quiet window) is unchanged -- it still
-        // sees every chunk; the gate only decides what actually goes on the wire.
-        let mut gate = TailSilenceGate::default();
-        let tail_start = tokio::time::Instant::now();
-        let mut last_speech = tail_start;
-        // Last time a real audio frame (or a keepalive) actually went out. While
-        // we're trimming a long silent stretch nothing ships, so this drives the
-        // keepalive that stops an idle server from closing the session mid-tail.
-        let mut last_send = tail_start;
-        let mut tail_chunks: usize = 0;
-        let mut peak_rms: i32 = 0;
-        while !ws_dead {
-            let elapsed = tail_start.elapsed();
-            if elapsed >= tail_max {
-                tracing::info!(
-                    "session tail: hit tail_max ({:.0} ms) after {:.0} ms (peak_rms={peak_rms}, {} silent chunk(s) trimmed)",
-                    tail_max.as_secs_f64() * 1000.0,
-                    elapsed.as_secs_f64() * 1000.0,
-                    gate.held(),
-                );
-                break;
-            }
-            let chunk_opt = tokio::select! {
-                v = samples_rx.recv() => v,
-                _ = tokio::time::sleep(Duration::from_millis(20)) => None,
-            };
-            if let Some(chunk) = chunk_opt {
-                let rms = rms_i16(&chunk);
-                if rms > peak_rms {
-                    peak_rms = rms;
-                }
-                let is_speech = rms >= SILENCE_RMS;
-                if is_speech {
-                    last_speech = tokio::time::Instant::now();
-                }
-                // Ship speech now (flushing any held pause first); buffer silence.
-                let outgoing = gate.offer(chunk, is_speech);
-                let n = ship_all(&mut sink, &outgoing, &mut ws_dead).await;
-                sent.record_prefix(&outgoing, n);
-                *sent_progress_send.lock() = sent;
-                tail_chunks += n;
-                if n > 0 {
-                    last_send = tokio::time::Instant::now();
-                    // A speech-bearing tail chunk went out: a genuinely-spoken
-                    // trailing word. Count it so its commit isn't mistaken for a
-                    // phantom (this is what preserves a real trailing "Yes.").
-                    if is_speech {
-                        speech_shipped_send.fetch_add(1, Ordering::Release);
-                    }
-                }
-                if ws_dead {
-                    break;
-                }
-            }
-            // Long quiet tail: no audio has gone out for a while (we're trimming
-            // silence). Send a content-free keepalive so the server keeps the
-            // session open. Never fires on a normal-length tail.
-            if last_send.elapsed() >= TAIL_KEEPALIVE_AFTER {
-                if let Err(e) = sink.keepalive().await {
-                    tracing::debug!("session tail: keepalive failed (socket likely dead): {e}");
-                    ws_dead = true;
-                    break;
-                }
-                last_send = tokio::time::Instant::now();
-                tracing::debug!("session tail: sent keepalive during long silent tail");
-            }
-            if elapsed >= TAIL_MIN && last_speech.elapsed() >= tail_quiet {
-                tracing::info!(
-                    "session tail: ended after {:.0} ms ({} tail chunk(s) shipped, {} silent chunk(s) trimmed, peak_rms={peak_rms}, quiet ={:.0} ms)",
-                    elapsed.as_secs_f64() * 1000.0,
-                    tail_chunks,
-                    gate.held(),
-                    last_speech.elapsed().as_secs_f64() * 1000.0
-                );
-                break;
-            }
-        }
-
-        // === Phase 3: flush the session's resampler tail, then drain ===
-        //
-        // Same silence gate as the tail: the resampler's flushed fragment and any
-        // last mic chunks are forwarded only if they carry speech, so we never
-        // re-introduce trailing silence for the provider to hallucinate on in the
-        // instant before we commit.
-        // Stop the capture subscription first, atomically flushing its last
-        // resampler fragment while `samples_rx` is still alive. Then drain that
-        // fragment. Reversing these drops can clip it and log a false queue
-        // warning during slow local inference.
-        flusher_send.finish();
-        let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(300);
-        while !ws_dead {
-            let chunk_opt = tokio::select! {
-                v = samples_rx.recv() => v,
-                _ = tokio::time::sleep_until(drain_deadline) => None,
-            };
-            match chunk_opt {
-                Some(chunk) => {
-                    let is_speech = rms_i16(&chunk) >= SILENCE_RMS;
-                    let outgoing = gate.offer(chunk, is_speech);
-                    let n = ship_all(&mut sink, &outgoing, &mut ws_dead).await;
-                    sent.record_prefix(&outgoing, n);
-                    *sent_progress_send.lock() = sent;
-                    if is_speech && n > 0 {
-                        speech_shipped_send.fetch_add(1, Ordering::Release);
-                    }
-                    if ws_dead {
-                        break;
-                    }
-                }
-                None => break,
-            }
-        }
-        if gate.held() > 0 {
-            tracing::debug!(
-                "session tail: dropped {} trailing silent chunk(s) before commit -- never sent, so the model can't finalize silence into a hallucinated answer",
-                gate.held(),
-            );
-        }
-        // Batch/local commit can spend seconds or minutes in inference. Stop
-        // subscribing before awaiting it so the bounded audio queue does not
-        // fill with frames nobody will ever consume.
-        drop(samples_rx);
-
-        // === Phase 4: commit + close (only if the socket is still alive) ===
-        if !ws_dead {
-            let _ = sink.commit().await;
-            let _ = sink.close().await;
-        }
-        // Carry the socket's fate back with the byte counts: the end-of-session
-        // gate needs it to tell an empty press from one that was cut off.
-        sent.socket_died = ws_dead;
-        *sent_progress_send.lock() = sent;
-        sent
-    });
+    let mut send_task: tokio::task::JoinHandle<SentAudio> =
+        tokio::spawn(run_send_task(SendTaskState {
+            samples_rx,
+            sink,
+            flusher: Some(flusher_send),
+            release_pending: release_pending_send,
+            speech_shipped: speech_shipped_send,
+            sent_progress: sent_progress_send,
+            tail_quiet,
+            tail_max,
+        }));
 
     let recv_app = Arc::clone(&app);
     let delay_until_release = cfg.delay_output_till_release;

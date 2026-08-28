@@ -164,87 +164,93 @@ fn mask(key: &str) -> String {
 
 // ---- Hotkey recording ------------------------------------------------------
 
+/// `(key, name)` pairs backing [`egui_key_name`]. A plain table, not a
+/// `match`, because every arm here is the same trivial "spell it lowercase"
+/// rule — the table IS the mapping, with no per-key logic to dispatch on.
+const EGUI_KEY_NAMES: &[(egui::Key, &str)] = &[
+    (egui::Key::A, "a"),
+    (egui::Key::B, "b"),
+    (egui::Key::C, "c"),
+    (egui::Key::D, "d"),
+    (egui::Key::E, "e"),
+    (egui::Key::F, "f"),
+    (egui::Key::G, "g"),
+    (egui::Key::H, "h"),
+    (egui::Key::I, "i"),
+    (egui::Key::J, "j"),
+    (egui::Key::K, "k"),
+    (egui::Key::L, "l"),
+    (egui::Key::M, "m"),
+    (egui::Key::N, "n"),
+    (egui::Key::O, "o"),
+    (egui::Key::P, "p"),
+    (egui::Key::Q, "q"),
+    (egui::Key::R, "r"),
+    (egui::Key::S, "s"),
+    (egui::Key::T, "t"),
+    (egui::Key::U, "u"),
+    (egui::Key::V, "v"),
+    (egui::Key::W, "w"),
+    (egui::Key::X, "x"),
+    (egui::Key::Y, "y"),
+    (egui::Key::Z, "z"),
+    (egui::Key::Num0, "0"),
+    (egui::Key::Num1, "1"),
+    (egui::Key::Num2, "2"),
+    (egui::Key::Num3, "3"),
+    (egui::Key::Num4, "4"),
+    (egui::Key::Num5, "5"),
+    (egui::Key::Num6, "6"),
+    (egui::Key::Num7, "7"),
+    (egui::Key::Num8, "8"),
+    (egui::Key::Num9, "9"),
+    (egui::Key::F1, "f1"),
+    (egui::Key::F2, "f2"),
+    (egui::Key::F3, "f3"),
+    (egui::Key::F4, "f4"),
+    (egui::Key::F5, "f5"),
+    (egui::Key::F6, "f6"),
+    (egui::Key::F7, "f7"),
+    (egui::Key::F8, "f8"),
+    (egui::Key::F9, "f9"),
+    (egui::Key::F10, "f10"),
+    (egui::Key::F11, "f11"),
+    (egui::Key::F12, "f12"),
+    (egui::Key::F13, "f13"),
+    (egui::Key::F14, "f14"),
+    (egui::Key::F15, "f15"),
+    (egui::Key::F16, "f16"),
+    (egui::Key::F17, "f17"),
+    (egui::Key::F18, "f18"),
+    (egui::Key::F19, "f19"),
+    (egui::Key::F20, "f20"),
+    (egui::Key::F21, "f21"),
+    (egui::Key::F22, "f22"),
+    (egui::Key::F23, "f23"),
+    (egui::Key::F24, "f24"),
+    (egui::Key::Space, "space"),
+    (egui::Key::Enter, "enter"),
+    (egui::Key::Tab, "tab"),
+    (egui::Key::Backspace, "backspace"),
+    (egui::Key::Delete, "delete"),
+    (egui::Key::Insert, "insert"),
+    (egui::Key::Home, "home"),
+    (egui::Key::End, "end"),
+    (egui::Key::PageUp, "pageup"),
+    (egui::Key::PageDown, "pagedown"),
+    (egui::Key::ArrowUp, "up"),
+    (egui::Key::ArrowDown, "down"),
+    (egui::Key::ArrowLeft, "left"),
+    (egui::Key::ArrowRight, "right"),
+];
+
 /// Map an egui key to QuickDictate's hotkey name (matching `hotkeys::vk_for`);
 /// `None` for keys the parser doesn't support (F25+, symbols, keypad).
 fn egui_key_name(key: egui::Key) -> Option<&'static str> {
-    use egui::Key::*;
-    Some(match key {
-        A => "a",
-        B => "b",
-        C => "c",
-        D => "d",
-        E => "e",
-        F => "f",
-        G => "g",
-        H => "h",
-        I => "i",
-        J => "j",
-        K => "k",
-        L => "l",
-        M => "m",
-        N => "n",
-        O => "o",
-        P => "p",
-        Q => "q",
-        R => "r",
-        S => "s",
-        T => "t",
-        U => "u",
-        V => "v",
-        W => "w",
-        X => "x",
-        Y => "y",
-        Z => "z",
-        Num0 => "0",
-        Num1 => "1",
-        Num2 => "2",
-        Num3 => "3",
-        Num4 => "4",
-        Num5 => "5",
-        Num6 => "6",
-        Num7 => "7",
-        Num8 => "8",
-        Num9 => "9",
-        F1 => "f1",
-        F2 => "f2",
-        F3 => "f3",
-        F4 => "f4",
-        F5 => "f5",
-        F6 => "f6",
-        F7 => "f7",
-        F8 => "f8",
-        F9 => "f9",
-        F10 => "f10",
-        F11 => "f11",
-        F12 => "f12",
-        F13 => "f13",
-        F14 => "f14",
-        F15 => "f15",
-        F16 => "f16",
-        F17 => "f17",
-        F18 => "f18",
-        F19 => "f19",
-        F20 => "f20",
-        F21 => "f21",
-        F22 => "f22",
-        F23 => "f23",
-        F24 => "f24",
-        Space => "space",
-        Enter => "enter",
-        Tab => "tab",
-        Backspace => "backspace",
-        Delete => "delete",
-        Insert => "insert",
-        Home => "home",
-        End => "end",
-        PageUp => "pageup",
-        PageDown => "pagedown",
-        ArrowUp => "up",
-        ArrowDown => "down",
-        ArrowLeft => "left",
-        ArrowRight => "right",
-        _ => return None,
-    })
+    EGUI_KEY_NAMES
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, name)| *name)
 }
 
 /// Prefix a key/button name with whichever modifiers were held, in the fixed
@@ -507,24 +513,31 @@ enum HotkeyField {
     Hold,
 }
 
+/// The key-manager modal's own scratch state, bundled into one struct so the
+/// render function that owns it takes one parameter instead of six.
+struct KeysModalState {
+    rows: Vec<KeyRow>,
+    add_text: String,
+    bulk: bool,
+    bulk_text: String,
+    bulk_note: String,
+    bulk_error: bool,
+}
+
+/// The text-replacements modal's own scratch state.
+struct ReplacementsModalState {
+    rows: Vec<(String, String)>,
+    add_from: String,
+    add_to: String,
+    /// Bulk "text editor" mode: edit all replacements as `from = to` lines
+    /// so a big set can be pasted/copied at once.
+    bulk: bool,
+    bulk_text: String,
+}
+
 enum Modal {
-    Keys {
-        rows: Vec<KeyRow>,
-        add_text: String,
-        bulk: bool,
-        bulk_text: String,
-        bulk_note: String,
-        bulk_error: bool,
-    },
-    Replacements {
-        rows: Vec<(String, String)>,
-        add_from: String,
-        add_to: String,
-        /// Bulk "text editor" mode: edit all replacements as `from = to` lines
-        /// so a big set can be pasted/copied at once.
-        bulk: bool,
-        bulk_text: String,
-    },
+    Keys(KeysModalState),
+    Replacements(ReplacementsModalState),
     Stats,
     /// Confirm-before-destroy for the overflow menu's "Default settings"
     /// (see `SettingsApp::reset_to_defaults`). A plain menu item can't host a

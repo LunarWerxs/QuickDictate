@@ -683,28 +683,26 @@ fn should_open_settings_on_start(is_settings_relaunch: bool, has_usable_key: boo
     is_settings_relaunch || !has_usable_key
 }
 
-fn main() -> Result<()> {
-    // A side-effect-free canary for release CI and the self-updater. Handle it before the
-    // single-instance mutex, settings, microphone, hotkeys, tray, or logging are initialized.
+/// A side-effect-free canary for release CI and the self-updater, handled
+/// before the single-instance mutex, settings, microphone, hotkeys, tray, or
+/// logging are initialized. Returns whether it consumed the invocation.
+fn handle_version_flag() -> bool {
     if std::env::args()
         .nth(1)
         .is_some_and(|arg| arg == "--version" || arg == "version")
     {
         println!("{}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
+        true
+    } else {
+        false
     }
+}
 
-    // Single-instance guard: claims a named mutex before anything else
-    // (settings.json load, logging, audio, hotkeys, tray). If another
-    // QuickDictate is already running, this asks it to reveal Settings and
-    // exits immediately -- no audio/hotkey/tray/logging side effects at all
-    // for the second launch. This is also the guaranteed way back in when
-    // `hide_tray_icon` has hidden the notification-area icon: launching the
-    // exe again always reaches a running instance's Settings window.
-    if !single_instance_guard() {
-        std::process::exit(0);
-    }
-
+/// Load settings.json, resolve the data folder, and bring up logging --
+/// everything from `Config::load_or_create` through the panic hook and
+/// `RUST_BACKTRACE`. Nothing before this point may touch disk; everything
+/// after it reads through the returned `Config`.
+fn init_settings_and_logging() -> (Config, Option<tracing_appender::non_blocking::WorkerGuard>) {
     // Load (and possibly generate) settings.json before initializing tracing,
     // because `enable_logging` is read out of the config. This now also has to
     // come before the diagnostics folder is prepared: `data_dir` decides where
@@ -756,7 +754,7 @@ fn main() -> Result<()> {
     }
 
     let file_logging = cfg.enable_logging || std::env::var_os("QUICKDICTATE_LOG").is_some();
-    let _log_guard = init_logging(file_logging, cfg.max_log_mb);
+    let log_guard = init_logging(file_logging, cfg.max_log_mb);
     if explicit_provider {
         tracing::info!("provider override from command line: {}", cfg.stt_provider);
     }
@@ -766,11 +764,29 @@ fn main() -> Result<()> {
         );
     }
 
-    // Replay the config-loading diagnostics through tracing now that it's up.
-    // "ALERT: " lines (a corrupt settings.json that was backed up and replaced
-    // with defaults) also get a message box — with windows_subsystem="windows"
-    // a log line alone is invisible, and the user must learn their keys/prefs
-    // were sidelined. Shown from a worker thread so startup isn't blocked.
+    replay_startup_diagnostics(startup_diags);
+
+    // The panic FILE honours the same opt-in as every other log. SECURITY.md
+    // promises local logging is opt-in, and a panic hook that always writes to
+    // disk quietly breaks that promise: the payload of a future panic near
+    // key-handling code would land in a file next to settings.json regardless.
+    // The tracing path inside the hook is always installed and stays silent
+    // unless logging is on, so crashes are still diagnosable the moment the
+    // user turns logging on and reproduces.
+    install_panic_hook(cfg.enable_logging || std::env::var_os("QUICKDICTATE_LOG").is_some());
+    if std::env::var_os("RUST_BACKTRACE").is_none() {
+        std::env::set_var("RUST_BACKTRACE", "1");
+    }
+
+    (cfg, log_guard)
+}
+
+/// Replay the config-loading diagnostics through tracing now that it's up.
+/// "ALERT: " lines (a corrupt settings.json that was backed up and replaced
+/// with defaults) also get a message box — with windows_subsystem="windows"
+/// a log line alone is invisible, and the user must learn their keys/prefs
+/// were sidelined. Shown from a worker thread so startup isn't blocked.
+fn replay_startup_diagnostics(startup_diags: Vec<String>) {
     for line in startup_diags {
         if let Some(rest) = line.strip_prefix("INFO: ") {
             tracing::info!("{rest}");
@@ -792,38 +808,18 @@ fn main() -> Result<()> {
             tracing::info!("{line}");
         }
     }
+}
 
-    // The panic FILE honours the same opt-in as every other log. SECURITY.md
-    // promises local logging is opt-in, and a panic hook that always writes to
-    // disk quietly breaks that promise: the payload of a future panic near
-    // key-handling code would land in a file next to settings.json regardless.
-    // The tracing path inside the hook is always installed and stays silent
-    // unless logging is on, so crashes are still diagnosable the moment the
-    // user turns logging on and reproduces.
-    install_panic_hook(cfg.enable_logging || std::env::var_os("QUICKDICTATE_LOG").is_some());
-    if std::env::var_os("RUST_BACKTRACE").is_none() {
-        std::env::set_var("RUST_BACKTRACE", "1");
-    }
-
-    let cfg_arc = Arc::new(cfg);
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .thread_name("qd-tokio")
-        .build()?;
-    let rt_handle = rt.handle().clone();
-
-    // Pre-warm the audio pipeline. The WASAPI stream stays open for the
-    // app's lifetime so sessions never pay mic-initialization latency.
-    // With windows_subsystem="windows" a bare `?` here would exit with no
-    // visible trace of why, so a missing/broken microphone gets a message
-    // box before we bail.
-    // Publish the microphone preference BEFORE the source opens, so the very
-    // first stream already lands on the right device.
-    audio::set_preferred_input(&cfg_arc.input_device);
-    let audio = match AudioSource::new() {
-        Ok(a) => Arc::new(a),
+/// Pre-warm the audio pipeline. The WASAPI stream stays open for the app's
+/// lifetime so sessions never pay mic-initialization latency. With
+/// windows_subsystem="windows" a bare `?` here would exit with no visible
+/// trace of why, so a missing/broken microphone gets a message box before we
+/// bail. Publishes the microphone preference before the source opens, so the
+/// very first stream already lands on the right device.
+fn init_audio_pipeline(cfg: &Config) -> Result<Arc<AudioSource>> {
+    audio::set_preferred_input(&cfg.input_device);
+    match AudioSource::new() {
+        Ok(a) => Ok(Arc::new(a)),
         Err(e) => {
             tracing::error!("audio init failed: {e:#}");
             update::msg_box(
@@ -836,12 +832,34 @@ fn main() -> Result<()> {
                 ),
                 MB_OK | MB_ICONERROR,
             );
-            return Err(e);
+            Err(e)
         }
-    };
+    }
+}
 
-    let app = App::new((*cfg_arc).clone(), rt_handle.clone(), Arc::clone(&audio));
-    let mut keys = KeyPool::new(&app.config.load());
+/// Everything `main` gets back from [`bring_up_app`]: the handles the event
+/// loop needs, plus the background-worker join handles that must simply stay
+/// alive for the app's lifetime (never read again, so each is `_`-prefixed).
+struct Started {
+    app: Arc<App>,
+    keys: Arc<KeyPool>,
+    hotkeys: HotkeyManager,
+    _output_join: std::thread::JoinHandle<()>,
+    _ui_join: std::thread::JoinHandle<()>,
+    _dev_trigger: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Construct the `App`, open Settings if this is a first run or a Save &
+/// Restart hand-off, and start every background worker: install-id
+/// resolution, update housekeeping, autostart sync, key prewarm, output,
+/// tray/UI, and hotkeys.
+fn bring_up_app(
+    cfg: Config,
+    rt_handle: tokio::runtime::Handle,
+    audio: Arc<AudioSource>,
+) -> Result<Started> {
+    let app = App::new(cfg, rt_handle, Arc::clone(&audio));
+    let keys = KeyPool::new(&app.config.load());
 
     // Resolve (or first-generate + persist) the anonymous install id that
     // update checks send as X-Install-Id (see SECURITY.md). Must run before
@@ -934,6 +952,121 @@ fn main() -> Result<()> {
         cfg_now.hold_hotkey
     );
 
+    Ok(Started {
+        app,
+        keys,
+        hotkeys,
+        _output_join,
+        _ui_join,
+        _dev_trigger,
+    })
+}
+
+/// Log the outcome of `handle_processing_hotkey` queuing a hotkey while local
+/// processing was still finishing the previous dictation.
+fn log_processing_hotkey_queue(evt: HotkeyEvent, prior_pending: Option<PendingStart>) {
+    match evt {
+        HotkeyEvent::TogglePressed => {
+            tracing::info!(
+                "queued toggle start while the local model finishes the previous dictation"
+            );
+        }
+        HotkeyEvent::HoldPressed => {
+            tracing::info!(
+                "queued hold start while the local model finishes the previous dictation"
+            );
+        }
+        HotkeyEvent::HoldReleased => {
+            if prior_pending == Some(PendingStart::Hold) {
+                tracing::info!(
+                    "cancelled queued hold start because the key was released before local processing finished"
+                );
+            }
+        }
+        HotkeyEvent::ToggleLongPressed => unreachable!("not consumed above"),
+    }
+}
+
+/// Apply one hotkey event to the live session: start, stop, or trigger a
+/// saved-transcription replay, depending on the event and whether a session
+/// is currently live.
+fn handle_hotkey_event(
+    app: &Arc<App>,
+    keys: &mut Arc<KeyPool>,
+    active: &mut Option<SttHandle>,
+    pending_start: &mut Option<PendingStart>,
+    evt: HotkeyEvent,
+    has_live: bool,
+) {
+    match evt {
+        HotkeyEvent::TogglePressed => {
+            if has_live {
+                app.set_status(status_after_release(&app.config.load().stt_provider));
+                if let Some(h) = active.take() {
+                    tracing::info!("Stopping session (toggle off)");
+                    h.stop();
+                }
+            } else {
+                // Drop any prior completed handle without touching its
+                // shared state; the background task will finish on its own.
+                let _ = active.take();
+                refresh_key_pool(app, keys);
+                tracing::info!("Starting session (toggle on)");
+                app.set_status(Status::Starting);
+                *active = Some(stt::start_session(Arc::clone(app), Arc::clone(keys)));
+            }
+        }
+        HotkeyEvent::ToggleLongPressed => {
+            *pending_start = None;
+            if let Some(h) = active.take() {
+                tracing::info!("Discarding active session for saved-transcription replay");
+                app.invalidate_current_session();
+                h.stop();
+            }
+            app.word_count.store(0, Ordering::Release);
+            app.set_status(Status::Idle);
+            // try_send, never send: this runs on the win32 message-pump
+            // thread. A blocking send on a full queue would freeze the
+            // tray, the hotkeys, and every window this process owns until
+            // the paste worker drained. Dropping one replay request is a
+            // far better outcome than a frozen app.
+            if let Err(e) = app.replay_tx.try_send(None) {
+                tracing::warn!("saved-transcription replay request dropped: {e}");
+            }
+        }
+        HotkeyEvent::HoldPressed => {
+            if !has_live {
+                let _ = active.take();
+                refresh_key_pool(app, keys);
+                tracing::info!("Starting session (hold press)");
+                app.set_status(Status::Starting);
+                *active = Some(stt::start_session(Arc::clone(app), Arc::clone(keys)));
+            }
+        }
+        HotkeyEvent::HoldReleased => {
+            if has_live {
+                app.set_status(status_after_release(&app.config.load().stt_provider));
+                if let Some(h) = active.take() {
+                    tracing::info!("Stopping session (hold release)");
+                    h.stop();
+                }
+            } else {
+                let _ = active.take();
+                app.set_status(Status::Idle);
+            }
+        }
+    }
+}
+
+/// The hotkey/session loop: waits for the next hotkey event (or a queued
+/// session start once local processing frees up), applies it, and repeats
+/// until shutdown is requested. Returns whatever session was still live so
+/// the caller can stop it cleanly.
+fn run_event_loop(
+    app: &Arc<App>,
+    keys: &mut Arc<KeyPool>,
+    hotkeys: &HotkeyManager,
+) -> Option<SttHandle> {
     let mut active: Option<SttHandle> = None;
     let mut pending_start: Option<PendingStart> = None;
 
@@ -941,7 +1074,7 @@ fn main() -> Result<()> {
         if app.shutdown.load(Ordering::Acquire) {
             break;
         }
-        start_queued_session_if_idle(&app, &mut keys, &mut active, &mut pending_start);
+        start_queued_session_if_idle(app, keys, &mut active, &mut pending_start);
         let evt = match hotkeys.events.recv_timeout(Duration::from_millis(50)) {
             Ok(e) => e,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
@@ -950,31 +1083,12 @@ fn main() -> Result<()> {
         // Processing may have completed while recv_timeout was blocked. Start
         // the already-queued session before interpreting a newly arrived event,
         // otherwise `pending_start` could survive into a later session.
-        start_queued_session_if_idle(&app, &mut keys, &mut active, &mut pending_start);
+        start_queued_session_if_idle(app, keys, &mut active, &mut pending_start);
         tracing::info!("hotkey event: {evt:?} (status={:?})", app.status());
         if app.status() == Status::Processing {
             let prior_pending = pending_start;
             if handle_processing_hotkey(&mut pending_start, evt) {
-                match evt {
-                    HotkeyEvent::TogglePressed => {
-                        tracing::info!(
-                        "queued toggle start while the local model finishes the previous dictation"
-                    );
-                    }
-                    HotkeyEvent::HoldPressed => {
-                        tracing::info!(
-                        "queued hold start while the local model finishes the previous dictation"
-                    );
-                    }
-                    HotkeyEvent::HoldReleased => {
-                        if prior_pending == Some(PendingStart::Hold) {
-                            tracing::info!(
-                            "cancelled queued hold start because the key was released before local processing finished"
-                        );
-                        }
-                    }
-                    HotkeyEvent::ToggleLongPressed => unreachable!("not consumed above"),
-                }
+                log_processing_hotkey_queue(evt, prior_pending);
                 continue;
             }
         }
@@ -987,75 +1101,52 @@ fn main() -> Result<()> {
         // flag is set means the session terminated on its own (clean or
         // errored); we treat it as "no live session" for hotkey purposes.
         let has_live = active.as_ref().map(|h| !h.is_done()).unwrap_or(false);
-        match evt {
-            HotkeyEvent::TogglePressed => {
-                if has_live {
-                    app.set_status(status_after_release(&app.config.load().stt_provider));
-                    if let Some(h) = active.take() {
-                        tracing::info!("Stopping session (toggle off)");
-                        h.stop();
-                    }
-                } else {
-                    // Drop any prior completed handle without touching its
-                    // shared state; the background task will finish on its own.
-                    let _ = active.take();
-                    refresh_key_pool(&app, &mut keys);
-                    tracing::info!("Starting session (toggle on)");
-                    app.set_status(Status::Starting);
-                    active = Some(stt::start_session(Arc::clone(&app), Arc::clone(&keys)));
-                }
-            }
-            HotkeyEvent::ToggleLongPressed => {
-                pending_start = None;
-                if let Some(h) = active.take() {
-                    tracing::info!("Discarding active session for saved-transcription replay");
-                    app.invalidate_current_session();
-                    h.stop();
-                }
-                app.word_count.store(0, Ordering::Release);
-                app.set_status(Status::Idle);
-                // try_send, never send: this runs on the win32 message-pump
-                // thread. A blocking send on a full queue would freeze the
-                // tray, the hotkeys, and every window this process owns until
-                // the paste worker drained. Dropping one replay request is a
-                // far better outcome than a frozen app.
-                if let Err(e) = app.replay_tx.try_send(None) {
-                    tracing::warn!("saved-transcription replay request dropped: {e}");
-                }
-            }
-            HotkeyEvent::HoldPressed => {
-                if !has_live {
-                    let _ = active.take();
-                    refresh_key_pool(&app, &mut keys);
-                    tracing::info!("Starting session (hold press)");
-                    app.set_status(Status::Starting);
-                    active = Some(stt::start_session(Arc::clone(&app), Arc::clone(&keys)));
-                }
-            }
-            HotkeyEvent::HoldReleased => {
-                if has_live {
-                    app.set_status(status_after_release(&app.config.load().stt_provider));
-                    if let Some(h) = active.take() {
-                        tracing::info!("Stopping session (hold release)");
-                        h.stop();
-                    }
-                } else {
-                    let _ = active.take();
-                    app.set_status(Status::Idle);
-                }
-            }
-        }
+        handle_hotkey_event(app, keys, &mut active, &mut pending_start, evt, has_live);
     }
 
-    if let Some(h) = active.take() {
+    active
+}
+
+fn main() -> Result<()> {
+    if handle_version_flag() {
+        return Ok(());
+    }
+
+    // Single-instance guard: claims a named mutex before anything else
+    // (settings.json load, logging, audio, hotkeys, tray). If another
+    // QuickDictate is already running, this asks it to reveal Settings and
+    // exits immediately -- no audio/hotkey/tray/logging side effects at all
+    // for the second launch. This is also the guaranteed way back in when
+    // `hide_tray_icon` has hidden the notification-area icon: launching the
+    // exe again always reaches a running instance's Settings window.
+    if !single_instance_guard() {
+        std::process::exit(0);
+    }
+
+    let (cfg, _log_guard) = init_settings_and_logging();
+    let cfg_arc = Arc::new(cfg);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .thread_name("qd-tokio")
+        .build()?;
+    let rt_handle = rt.handle().clone();
+
+    let audio = init_audio_pipeline(&cfg_arc)?;
+    let mut started = bring_up_app((*cfg_arc).clone(), rt_handle, Arc::clone(&audio))?;
+
+    let active = run_event_loop(&started.app, &mut started.keys, &started.hotkeys);
+
+    if let Some(h) = active {
         h.stop();
     }
-    hotkeys.shutdown();
+    started.hotkeys.shutdown();
     // A replacement process waits on our owned single-instance mutex. Keep the
     // runtime alive until every physical dictation has finalized and its stats
     // write is durable, then let process exit hand the mutex to the child.
-    app.stats.finish_sessions_and_flush();
-    sync::flush_before_exit(&app, Duration::from_secs(6));
+    started.app.stats.finish_sessions_and_flush();
+    sync::flush_before_exit(&started.app, Duration::from_secs(6));
     audio.shutdown();
     // Give in-flight pastes a moment to finish.
     std::thread::sleep(Duration::from_millis(50));
