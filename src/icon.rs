@@ -57,7 +57,7 @@ mod tests {
     /// of a committed PNG. That is only true while SOMETHING forces the decode
     /// at build time -- otherwise a corrupt or replaced asset ships and aborts
     /// the tray thread on first paint, with no console to say why. This is that
-    /// something; the same guarantee covers `about::qd_logo_rgba` and
+    /// something; the same guarantee covers `about::art::qd_logo_rgba` and
     /// `ui::make_icon`, which decode the same two assets.
     #[test]
     fn embedded_artwork_decodes() {
