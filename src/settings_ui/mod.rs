@@ -17,9 +17,13 @@
 //! - [`style`]: palette, fonts, glyphs, and the egui style.
 //! - [`widgets`]: reusable controls, cards, and the usage-stats charts.
 //! - [`logic`]: construction, validation, saving, sync, hotkey capture.
-//! - [`cards`]: onboarding, provider/keys, dictation, application.
+//! - [`cards`]: the provider card, its keys, and the local model packs.
+//! - [`banners`]: onboarding, available update, sign-in nudge.
+//! - [`dictation`]: hotkey capture, language, mode, the listen tail.
+//! - [`application`]: data folder, behaviour toggles, Per-App Profiles.
 //! - [`history_sync`]: the transcript-history browser and the sync card.
-//! - [`modals`]: the bulk editors, confirm prompts, and their shared frame.
+//! - [`modals`]: the confirm prompts, the shared frame, and modal dispatch.
+//! - [`keys_modal`] / [`replacements_modal`] / [`stats_modal`]: one each.
 //! - [`keys`]: the provider list and the bulk key editor's parsing.
 //! - [`combo`]: egui events to hotkey combo strings, and conflict detection.
 //! - [`mod@text`]: pure transforms over the settings the window edits.
@@ -54,13 +58,19 @@ use crate::theme;
 // Split out of this file so each surface can be reviewed on its own; the
 // hub keeps the shared state, the window plumbing, and the frame loop.
 mod app;
+mod application;
+mod banners;
 mod cards;
 mod combo;
+mod dictation;
 mod history_sync;
 mod keys;
+mod keys_modal;
 mod logic;
 mod modals;
 mod nav;
+mod replacements_modal;
+mod stats_modal;
 mod style;
 mod text;
 mod widgets;
