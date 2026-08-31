@@ -557,7 +557,7 @@ enum Modal {
 
 /// Reveal the dedicated diagnostics directory in Explorer.
 fn open_log_folder() {
-    let dir = crate::logs_dir();
+    let dir = crate::logging::logs_dir();
     let _ = std::fs::create_dir_all(&dir);
     let _ = std::process::Command::new("explorer.exe").arg(&dir).spawn();
 }
