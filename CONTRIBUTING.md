@@ -133,6 +133,27 @@ has been a while.
 (the `msrv` job), not a guess about the oldest that might work. Raise it
 deliberately.
 
+## Module layout
+
+A source file that outgrows roughly 800 lines becomes a module directory
+instead: `mod.rs` keeps the module docs and the shared state, each sibling
+takes one job, and `#[cfg(test)]` tests move to their own `tests.rs`. Siblings
+reach the shared scope with `use super::*`, so moving code between them needs
+no import churn. `mod.rs` should carry a short "Layout of this module" list
+naming what lives where, because that list is what makes the directory
+navigable without opening every file.
+
+Splits are pure moves. Code is relocated verbatim, visibility widened only
+where a sibling or the tests genuinely reach across the new boundary, and the
+import block divided so each file carries what it uses. A split that changes
+behaviour is two changes wearing one commit.
+
+`src/nudge_engine.rs` is the deliberate exception and should stay one file
+even though it is over the limit. It is a line-for-line port of `nudge.ts`,
+shared with SageThumbs 2K, and its own header asks to be dropped in as a
+single module. Splitting it would break that and let it drift from the
+TypeScript its tests are checked against.
+
 ## Scope
 
 Everything above covers the Rust gates CI enforces. There is no separate
