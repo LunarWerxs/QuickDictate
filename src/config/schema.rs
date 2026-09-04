@@ -413,6 +413,20 @@ pub struct Config {
     #[serde(default = "default_false")]
     pub protect_keys_at_rest: bool,
 
+    /// Opt in to sending LunarWerx one anonymized usage rollup a day: this
+    /// install's lifetime word/audio/dictation totals and which providers
+    /// you use, so the team can see aggregate feature adoption without
+    /// adding a new pipeline. Off by default. Uses [`Self::install_id`] --
+    /// the same anonymous, crypto-random id already sent with update checks
+    /// -- as the only correlating value; no transcript text, hostname,
+    /// username, device id, or IP ever leaves the machine (see
+    /// `stats::report::anonymized_payload`, which builds the exact allowed
+    /// field list rather than serializing the stats store wholesale).
+    /// Turning this off just stops the next send -- it does not recall a
+    /// past one.
+    #[serde(default = "default_false")]
+    pub share_usage_stats: bool,
+
     /// Run an LLM cleanup pass over the transcript before pasting it (see
     /// [`crate::polish`]). Off by default: it is the only part of the paste
     /// path that talks to a third party, and everything else here works with
@@ -512,6 +526,7 @@ impl Default for Config {
             polish_keys: Vec::new(),
             update_auto_install: false,
             protect_keys_at_rest: false,
+            share_usage_stats: false,
         }
     }
 }
