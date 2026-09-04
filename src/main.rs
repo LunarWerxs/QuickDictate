@@ -13,6 +13,10 @@ mod audio;
 mod autostart;
 mod config;
 mod dev_trigger;
+/// An occasional, cadence-gated "how's it going?" feedback prompt - its own small state machine,
+/// adapted from the same pattern `nudge_engine.rs` uses for the sign-in ask. See its module doc
+/// for why this is not a `Campaign` added to the vendored engine.
+mod feedback_survey;
 mod focus;
 /// Mutation fuzzing of the untrusted-input parsers, wired in as ordinary tests
 /// so it runs on every `cargo test` (and therefore in CI) without a named job.

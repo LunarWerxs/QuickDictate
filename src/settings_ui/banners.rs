@@ -212,4 +212,74 @@ impl super::SettingsApp {
             }
         }
     }
+
+    /// The occasional "how's it going?" feedback ask. Same strip, same restraint as
+    /// `sign_in_nudge_banner`: not a modal, closable from the same corner ×, and never asked more
+    /// than the engine in `feedback_survey` allows. Unlike the sign-in ask there is no month-long
+    /// escape hatch to offer, because there is no ladder here to escape - the whole cadence is
+    /// already a quarter apart, see that module's doc for why.
+    pub(crate) fn feedback_survey_banner(&mut self, ui: &mut egui::Ui) {
+        let Some(ask) = self.feedback_ask.clone() else {
+            return;
+        };
+        let mut answer: Option<crate::feedback_survey::Outcome> = None;
+        let mut open_url: Option<String> = None;
+
+        egui::Frame::new()
+            .fill(good().gamma_multiply(0.12))
+            .stroke(Stroke::new(1.0, good().gamma_multiply(0.45)))
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(Margin::same(12))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(ask.headline)
+                                .font(semibold(14.0))
+                                .color(text()),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .button(RichText::new("\u{00D7}").size(14.0).color(muted()))
+                                .on_hover_text("Dismiss")
+                                .clicked()
+                            {
+                                answer = Some(crate::feedback_survey::Outcome::Dismissed);
+                            }
+                        });
+                    });
+                    ui.add_space(2.0);
+                    ui.label(RichText::new(ask.body).size(12.0).color(muted()));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if accent_button(ui, ask.action_label)
+                                .on_hover_text("Opens a new issue on GitHub, pre-filled")
+                                .clicked()
+                            {
+                                answer = Some(crate::feedback_survey::Outcome::Shared);
+                                open_url = Some(ask.url.clone());
+                            }
+                            if ui
+                                .button(RichText::new("Not now").size(12.0).color(muted()))
+                                .clicked()
+                            {
+                                answer = Some(crate::feedback_survey::Outcome::Dismissed);
+                            }
+                        });
+                    });
+                });
+            });
+        ui.add_space(10.0);
+
+        if let Some(outcome) = answer {
+            crate::feedback_survey::record(outcome);
+            self.feedback_ask = None;
+            if let Some(url) = open_url {
+                crate::about::open_url(&url);
+                self.status = "Thanks \u{2014} opening GitHub in your browser\u{2026}".to_string();
+            }
+        }
+    }
 }

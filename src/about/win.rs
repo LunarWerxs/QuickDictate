@@ -245,7 +245,7 @@ pub(super) unsafe fn rgba_to_hbitmap(w: u32, h: u32, rgba: &[u8]) -> Option<HBIT
     Some(hbmp)
 }
 
-pub(super) fn open_url(url: &str) {
+pub(crate) fn open_url(url: &str) {
     let u = wide(url);
     unsafe {
         ShellExecuteW(

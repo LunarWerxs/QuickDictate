@@ -51,6 +51,7 @@ impl SettingsApp {
             // just the one the window happens to open on.
             keys_target: KEYS_TARGET_PROVIDER.to_string(),
             nudge_ask: None,
+            feedback_ask: None,
             tab: match std::env::var("QUICKDICTATE_UI_PAGE")
                 .unwrap_or_default()
                 .to_ascii_lowercase()
@@ -85,10 +86,10 @@ impl SettingsApp {
         self.editor_opened_at = None;
         self.pending_save_kind = None;
         self.pending_restart = None;
-        // `nudge_ask` is deliberately NOT cleared here. Closing the window is not an answer, and
-        // the ask is already stamped in the engine's persisted state either way — so clearing it
-        // would hide a prompt the user still owes an answer to while spending it anyway. Left up,
-        // a re-open shows the same banner and the user's click still counts.
+        // `nudge_ask` and `feedback_ask` are deliberately NOT cleared here. Closing the window is
+        // not an answer, and each ask is already stamped in its own persisted state either way -
+        // so clearing it would hide a prompt the user still owes an answer to while spending it
+        // anyway. Left up, a re-open shows the same banner and the user's click still counts.
 
         // Re-seed the sync control from creds on disk and re-arm the one-shot
         // silent resume-pull so a re-open also refreshes from the cloud.
