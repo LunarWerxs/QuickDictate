@@ -99,6 +99,7 @@ Everything lives in `settings.json` (copied from `settings.example.json`). The f
 | `enable_logging` | Write `logs\quickdictate.log` beside the exe (bool) |
 | `log_transcripts` | Also log your full dictated text, not just summaries (bool, default `false`; deep debugging only) |
 | `max_log_mb` | Log-file rotation cap, in MB, before `quickdictate.log` is rolled over (default `5`) |
+| `error_reporting_enabled` | Show "Create an error report..." in Settings (bool, default `false`). Builds a plain-text report from your version, active provider, and recent redacted log lines for you to review and optionally save to `error-reports\` -- never audio or dictated text, and nothing is ever sent anywhere; see SECURITY.md |
 | `update_auto_check` | Check for a newer release at startup, at most once/day (bool, default `true`). Finding one **reports** it on the tray tooltip and the About pill; clicking the pill installs it |
 | `update_auto_install` | Install a newer release with no prompt (bool, default `false`). Off by default because the download URL and its SHA-256 both come from the same release payload, so a click is the only thing standing between a compromised publish and every install; see SECURITY.md |
 | `protect_keys_at_rest` | Encrypt the API keys in `settings.json` with Windows DPAPI (bool, default `false`). **Costs portability:** a sealed file only decrypts for this Windows account on this machine, so copying the folder elsewhere means pasting the keys in again |

@@ -159,6 +159,11 @@ pub(super) struct SettingsApp {
     pub(super) test_rx: Option<mpsc::Receiver<(String, bool)>>,
     pub(super) testing_left: usize,
     pub(super) status: String,
+    /// The currently-open error-report preview text (editable), or `None`
+    /// when no report is being reviewed. Building the report never writes
+    /// anything to disk; only "Save to file..." does. See
+    /// `application::error_report_section`.
+    pub(super) error_report_preview: Option<String>,
     /// Connections settings-sync control state.
     pub(super) sync: SyncUi,
     pub(super) stats_range: StatsRange,

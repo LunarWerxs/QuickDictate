@@ -8,6 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Local, opt-in error reports.** Off by default; turn on **Enable local
+  error reports** in Settings and a new **Create an error report...** button
+  builds a plain-text report from your version, active provider, and recent
+  `quickdictate.log`/`quickdictate-panic.log` lines, redacted of anything
+  that looks like a key, token, or `Authorization:` header, never audio or
+  dictated text. You review (and can edit) the report before anything
+  happens; there is no LunarWerx error-reporting endpoint, so "Save to
+  file..." is the only action, and it writes a timestamped file under
+  `error-reports\` in your data folder for you to attach to a GitHub issue
+  yourself. Nothing here ever makes a network call.
+
 - **Mouse buttons can be hotkeys.** The middle button and the two thumb buttons
   (the ones usually labelled Back and Forward) can now drive dictation, on their
   own or with modifiers: `mouse3`, `mouse4`, `mouse5`, or e.g. `ctrl+mouse4`.

@@ -245,6 +245,107 @@ impl super::SettingsApp {
         }
     }
 
+    /// Gather the current version/provider/log tails into the plain-text
+    /// report Settings previews. Pure assembly -- see `crate::error_report`
+    /// for the actual (unit-tested) formatting logic; this just wires this
+    /// window's own state into it.
+    fn build_error_report_text(&self) -> String {
+        let logging_enabled = self.draft.enable_logging;
+        let log_tail = if logging_enabled {
+            crate::error_report::tail_redacted(&crate::logging::main_log_path(), 60)
+        } else {
+            Vec::new()
+        };
+        let panic_tail = crate::error_report::tail_redacted(&crate::logging::panic_log_path(), 40);
+        let inputs = crate::error_report::ReportInputs {
+            app_version: env!("CARGO_PKG_VERSION"),
+            provider_label: provider_label(&self.draft.stt_provider),
+            logging_enabled,
+            log_tail: &log_tail,
+            panic_tail: &panic_tail,
+            user_note: "",
+        };
+        crate::error_report::build_report(&inputs)
+    }
+
+    /// "Enable local error reports" is a plain toggle (see
+    /// `application_toggles`); this is the action + preview that only shows
+    /// once it's on. Nothing here ever leaves the machine: building a report
+    /// is pure text assembly, and "Save to file..." is the only line that
+    /// touches disk -- there is no LunarWerx error-reporting endpoint for it
+    /// to call instead.
+    fn error_report_section(&mut self, ui: &mut egui::Ui) {
+        if !self.draft.error_reporting_enabled {
+            return;
+        }
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Error reporting").size(12.0).color(muted()));
+            if accent_button(ui, "Create an error report\u{2026}").clicked() {
+                self.error_report_preview = Some(self.build_error_report_text());
+                self.status.clear();
+            }
+        });
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(
+                "Builds a report from your version, active provider, and recent log lines \
+                 \u{2014} never audio or dictated text, and nothing is sent anywhere. \
+                 Review or edit it below, then save it to a file you can attach to a GitHub \
+                 issue.",
+            )
+            .size(11.0)
+            .color(muted()),
+        );
+
+        let Some(mut preview) = self.error_report_preview.take() else {
+            return;
+        };
+        let mut discard = false;
+        ui.add_space(6.0);
+        ui.add(
+            egui::TextEdit::multiline(&mut preview)
+                .desired_width(f32::INFINITY)
+                .desired_rows(10)
+                .margin(Margin::symmetric(6, CTRL_PAD)),
+        );
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if accent_button(ui, "Save to file\u{2026}").clicked() {
+                match crate::error_report::save_report(&crate::paths::data_dir(), &preview) {
+                    Ok(path) => {
+                        self.status = format!(
+                            "Saved {} \u{2014} attach it to a GitHub issue at {}/issues/new \
+                             if you'd like to share it.",
+                            path.display(),
+                            crate::about::REPO_URL
+                        );
+                        discard = true;
+                    }
+                    Err(e) => self.status = format!("Could not save the report: {e}"),
+                }
+            }
+            if ui.button("Discard").clicked() {
+                self.status.clear();
+                discard = true;
+            }
+            if ui
+                .button("Open folder")
+                .on_hover_text("Show the error-reports folder in Explorer.")
+                .clicked()
+            {
+                let dir = crate::paths::data_dir().join(crate::error_report::REPORTS_DIR_NAME);
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = std::process::Command::new("explorer.exe").arg(&dir).spawn();
+            }
+        });
+        if !discard {
+            self.error_report_preview = Some(preview);
+        }
+    }
+
     pub(crate) fn application_card(&mut self, ui: &mut egui::Ui) {
         card(ui, |ui| {
             // Eight toggles split across two columns. The wordiest options are
@@ -254,6 +355,8 @@ impl super::SettingsApp {
             self.application_toggles(ui);
 
             self.data_folder_section(ui);
+
+            self.error_report_section(ui);
 
             // ---- AI cleanup setup ---------------------------------------
             // Only shown once the box above is ticked: with it off this is
@@ -358,6 +461,18 @@ impl super::SettingsApp {
             .on_hover_text(
                 "Apply per-application overrides for punctuation, spacing, and \
                  replacements based on the app you're typing into.",
+            );
+            blue_check(
+                right,
+                &mut self.draft.error_reporting_enabled,
+                "Enable local error reports",
+            )
+            .on_hover_text(
+                "Off by default. Turn this on to let Settings put together a plain-text \
+                 crash/error report from your version, active provider, and recent log \
+                 lines \u{2014} never audio or dictated text. You always review it before \
+                 anything is saved, and QuickDictate has no server to send it to: saving \
+                 writes a local file you can attach to a GitHub issue yourself.",
             );
         });
     }

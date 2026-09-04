@@ -33,6 +33,7 @@ impl SettingsApp {
             test_rx: None,
             testing_left: 0,
             status: String::new(),
+            error_report_preview: None,
             sync,
             stats_range: StatsRange::AllTime,
             stats_reset_confirm: false,
@@ -77,6 +78,7 @@ impl SettingsApp {
         self.test_rx = None;
         self.testing_left = 0;
         self.status.clear();
+        self.error_report_preview = None;
         self.stats_range = StatsRange::AllTime;
         self.stats_reset_confirm = false;
         self.resync_vocabulary_scratch();
