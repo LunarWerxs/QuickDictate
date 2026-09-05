@@ -25,8 +25,8 @@ use crate::keys::KeyPool;
 use crate::logging::{init_logging, install_panic_hook, prepare_logs_dir};
 use crate::state::App;
 use crate::{
-    autostart, dev_trigger, local_stt, nudge, onboarding, output, paths, settings_ui, stt, ui,
-    update,
+    autostart, dev_trigger, feedback_survey, local_stt, nudge, onboarding, output, paths,
+    settings_ui, stt, ui, update,
 };
 
 /// Name of the named mutex that guards against a second QuickDictate process.
@@ -343,6 +343,7 @@ pub(crate) fn bring_up_app(
     // of the user's two declines on an action that was not a refusal at all.
     if !is_settings_relaunch {
         nudge::start_session();
+        feedback_survey::start_session();
     }
 
     if !has_usable_key {

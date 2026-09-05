@@ -215,6 +215,11 @@ pub(super) struct SettingsApp {
     /// the user's three lifetime asks in three frames. It is called once, at the moment (a save),
     /// and what it returns lives here until the user answers it.
     pub(super) nudge_ask: Option<crate::nudge_engine::Ask>,
+    /// The occasional "how's it going?" feedback ask, when one is currently on screen. Same
+    /// reasoning as `nudge_ask`: [`crate::feedback_survey::consider`] MUTATES (it stamps the ask
+    /// and advances its own quarterly gap), so it is called once, at the moment, and the result
+    /// lives here until answered.
+    pub(super) feedback_ask: Option<crate::feedback_survey::Ask>,
 }
 
 impl eframe::App for SettingsApp {
@@ -325,6 +330,7 @@ impl eframe::App for SettingsApp {
                 self.onboarding_banner(ui);
                 self.update_available_banner(ui);
                 self.sign_in_nudge_banner(ui);
+                self.feedback_survey_banner(ui);
                 self.page_header(ui);
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])

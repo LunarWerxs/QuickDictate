@@ -19,6 +19,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `error-reports\` in your data folder for you to attach to a GitHub issue
   yourself. Nothing here ever makes a network call.
 
+- **An occasional "how's it going?" feedback prompt.** After you've dictated with QuickDictate
+  for a couple of weeks and a handful of sessions, the next time you save Settings you may see a
+  small strip asking for 30 seconds of feedback, at most once a quarter. Saying yes opens a
+  pre-filled GitHub issue in your browser; declining costs nothing and it simply asks again next
+  quarter. Reuses the same cadence-gated approach as the sign-in nudge, kept as its own state
+  machine so the vendored `nudge_engine.rs` stays untouched (see `src/feedback_survey.rs`).
+
 - **Mouse buttons can be hotkeys.** The middle button and the two thumb buttons
   (the ones usually labelled Back and Forward) can now drive dictation, on their
   own or with modifiers: `mouse3`, `mouse4`, `mouse5`, or e.g. `ctrl+mouse4`.

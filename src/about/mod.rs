@@ -43,6 +43,12 @@ use updates::*;
 use win::*;
 
 pub const REPO_URL: &str = "https://github.com/LunarWerxs/QuickDictate";
+
+/// Re-exported so other modules (the feedback survey banner) can open an arbitrary URL in the
+/// system browser without a third copy of `ShellExecuteW` boilerplate - `sync::oauth` already has
+/// a second, private one for its own OAuth redirect and stays that way; this one is reused instead
+/// of adding a fourth.
+pub(crate) use win::open_url;
 const LUNARWERX_URL: &str = "https://lunarwerx.com";
 
 // ---- Control IDs --------------------------------------------------------

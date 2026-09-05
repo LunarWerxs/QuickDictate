@@ -83,6 +83,15 @@ impl SettingsApp {
         if self.nudge_ask.is_none() {
             self.nudge_ask = crate::nudge::consider("settings-changed");
         }
+
+        // Same moment, same "consider, don't force" shape, a separate and much rarer gate: see
+        // `feedback_survey`'s module doc for why this is its own state machine rather than a
+        // second campaign on the nudge engine. Only offered when the sign-in banner isn't already
+        // occupying the strip - two unrelated asks stacked above the page header would be one ask
+        // too many for a single save.
+        if self.nudge_ask.is_none() && self.feedback_ask.is_none() {
+            self.feedback_ask = crate::feedback_survey::consider();
+        }
         true
     }
     /// "Default settings" (⋯ overflow menu): reset every editable preference
