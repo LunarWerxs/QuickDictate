@@ -139,6 +139,15 @@ impl super::SettingsApp {
         ui.add_space(10.0);
 
         if open_report {
+            // WHY force this true: `error_report_section` early-returns (and so never renders
+            // the preview we're about to set) whenever `self.draft.error_reporting_enabled` is
+            // false. That draft field is this window's *unsaved* copy, so a user who unchecked
+            // "Enable local error reports" earlier in this same Settings session -- without
+            // saving -- would otherwise click "Open report..." here and see nothing happen. The
+            // banner only ever appears because the setting was on at launch, so restoring it in
+            // the draft just re-affirms what the user already turned on; Cancel/closing without
+            // Save discards it exactly like any other unsaved draft edit.
+            self.draft.error_reporting_enabled = true;
             self.error_report_preview = Some(self.build_error_report_text());
             self.tab = nav::Tab::Application;
             self.status.clear();

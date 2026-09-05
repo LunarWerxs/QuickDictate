@@ -139,6 +139,19 @@ fn should_open_settings_on_start(is_settings_relaunch: bool, has_usable_key: boo
     is_settings_relaunch || !has_usable_key
 }
 
+/// Pure decision behind [`install_panic_hook`]'s gate, split out so it is unit-testable without
+/// touching a real `Config` or the process-wide panic hook. WHY `error_reporting_enabled` is a
+/// trigger of its own, not just `enable_logging`: both the crash banner (`crash_banner::decide`)
+/// and "Create an error report..." read the panic log, and both are reachable the moment
+/// `error_reporting_enabled` alone is on -- see the call site's comment for the full story.
+fn should_record_panics(
+    enable_logging: bool,
+    error_reporting_enabled: bool,
+    env_override: bool,
+) -> bool {
+    enable_logging || error_reporting_enabled || env_override
+}
+
 /// A side-effect-free canary for release CI and the self-updater, handled
 /// before the single-instance mutex, settings, microphone, hotkeys, tray, or
 /// logging are initialized. Returns whether it consumed the invocation.
@@ -223,14 +236,22 @@ pub(crate) fn init_settings_and_logging(
 
     replay_startup_diagnostics(startup_diags);
 
-    // The panic FILE honours the same opt-in as every other log. SECURITY.md
-    // promises local logging is opt-in, and a panic hook that always writes to
-    // disk quietly breaks that promise: the payload of a future panic near
-    // key-handling code would land in a file next to settings.json regardless.
-    // The tracing path inside the hook is always installed and stays silent
-    // unless logging is on, so crashes are still diagnosable the moment the
-    // user turns logging on and reproduces.
-    install_panic_hook(cfg.enable_logging || std::env::var_os("QUICKDICTATE_LOG").is_some());
+    // The panic FILE honours the same opt-in as every other log -- SECURITY.md promises local
+    // logging is opt-in, and a panic hook that always writes to disk quietly breaks that promise.
+    // WHY both `enable_logging` AND `error_reporting_enabled` gate it (not `enable_logging` alone):
+    // the crash banner (`crash_banner::note_launch`, below) and "Create an error report..." both
+    // read this same panic log, and both are reachable from `error_reporting_enabled` alone -- a
+    // user who turns on "Enable local error reports" but leaves "Write quickdictate.log" off must
+    // still get a panic log to report on, or the banner and the report button silently do nothing
+    // after a real crash. The tracing path inside the hook is always installed and stays silent
+    // unless logging is on, so crashes are still diagnosable the moment the user turns logging on
+    // and reproduces, same as before.
+    let write_panic_file = should_record_panics(
+        cfg.enable_logging,
+        cfg.error_reporting_enabled,
+        std::env::var_os("QUICKDICTATE_LOG").is_some(),
+    );
+    install_panic_hook(write_panic_file);
     if std::env::var_os("RUST_BACKTRACE").is_none() {
         std::env::set_var("RUST_BACKTRACE", "1");
     }
@@ -440,5 +461,28 @@ mod tests {
         assert!(should_open_settings_on_start(true, false));
         assert!(should_open_settings_on_start(false, false));
         assert!(!should_open_settings_on_start(false, true));
+    }
+
+    #[test]
+    fn error_reporting_alone_starts_the_panic_log_without_enable_logging() {
+        // The crash banner and "Create an error report..." both read the panic log the moment
+        // `error_reporting_enabled` is on, so that setting must be enough on its own -- a user
+        // who never turns on "Write quickdictate.log" must still get a panic log to report on.
+        assert!(should_record_panics(false, true, false));
+    }
+
+    #[test]
+    fn enable_logging_alone_still_starts_the_panic_log() {
+        assert!(should_record_panics(true, false, false));
+    }
+
+    #[test]
+    fn env_override_alone_still_starts_the_panic_log() {
+        assert!(should_record_panics(false, false, true));
+    }
+
+    #[test]
+    fn nothing_on_never_starts_the_panic_log() {
+        assert!(!should_record_panics(false, false, false));
     }
 }

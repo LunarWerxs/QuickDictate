@@ -12,7 +12,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   last session, the next time Settings opens you'll see a small dismissible strip offering to
   open the same redacted report "Create an error report..." builds. Only appears when **Enable
   local error reports** is already turned on, and only for a crash from here forward, not any
-  history from before you turned that setting on. Nothing here is sent anywhere.
+  history from before you turned that setting on. Nothing here is sent anywhere. Turning on
+  **Enable local error reports** now also starts the panic log itself recording crashes, so the
+  banner and "Create an error report..." both work even if **Write quickdictate.log** is left off.
 
 - **Local, opt-in error reports.** Off by default; turn on **Enable local
   error reports** in Settings and a new **Create an error report...** button
