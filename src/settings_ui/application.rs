@@ -248,8 +248,9 @@ impl super::SettingsApp {
     /// Gather the current version/provider/log tails into the plain-text
     /// report Settings previews. Pure assembly -- see `crate::error_report`
     /// for the actual (unit-tested) formatting logic; this just wires this
-    /// window's own state into it.
-    fn build_error_report_text(&self) -> String {
+    /// window's own state into it. `pub(crate)` so `banners.rs`'s crash
+    /// banner can build the same preview its "Open report..." button shows.
+    pub(crate) fn build_error_report_text(&self) -> String {
         let logging_enabled = self.draft.enable_logging;
         let log_tail = if logging_enabled {
             crate::error_report::tail_redacted(&crate::logging::main_log_path(), 60)

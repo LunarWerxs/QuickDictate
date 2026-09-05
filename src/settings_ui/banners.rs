@@ -78,6 +78,84 @@ impl super::SettingsApp {
             });
         ui.add_space(10.0);
     }
+    /// A fresh `quickdictate-panic.log` entry the previous run left behind (see
+    /// `crash_banner::note_launch`, called once at startup) — offers to open the same redacted
+    /// preview `error_report_section`'s "Create an error report..." button builds, or dismiss.
+    ///
+    /// Strictly opt-in like the rest of error reporting: `crash_banner::note_launch` never even
+    /// produces an [`crate::crash_banner::Ask`] unless `error_reporting_enabled` was on at
+    /// launch, so this banner cannot appear for anyone who hasn't turned that setting on. Nothing
+    /// here reads the log itself or sends anything anywhere — it only decides whether to show a
+    /// button that opens the same local, redacted preview the settings page already has.
+    pub(crate) fn crash_report_banner(&mut self, ui: &mut egui::Ui) {
+        let Some(ask) = crate::crash_banner::pending_ask() else {
+            return;
+        };
+        let mut open_report = false;
+        let mut dismissed = false;
+
+        egui::Frame::new()
+            .fill(bad().gamma_multiply(0.12))
+            .stroke(Stroke::new(1.0, bad().gamma_multiply(0.45)))
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(Margin::same(12))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(ask.headline)
+                                .font(semibold(14.0))
+                                .color(text()),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .button(RichText::new("\u{00D7}").size(14.0).color(muted()))
+                                .on_hover_text("Dismiss")
+                                .clicked()
+                            {
+                                dismissed = true;
+                            }
+                        });
+                    });
+                    ui.add_space(2.0);
+                    ui.label(RichText::new(ask.body).size(12.0).color(muted()));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if accent_button(ui, "Open report\u{2026}").clicked() {
+                                open_report = true;
+                            }
+                            if ui
+                                .button(RichText::new("Not now").size(12.0).color(muted()))
+                                .clicked()
+                            {
+                                dismissed = true;
+                            }
+                        });
+                    });
+                });
+            });
+        ui.add_space(10.0);
+
+        if open_report {
+            // WHY force this true: `error_report_section` early-returns (and so never renders
+            // the preview we're about to set) whenever `self.draft.error_reporting_enabled` is
+            // false. That draft field is this window's *unsaved* copy, so a user who unchecked
+            // "Enable local error reports" earlier in this same Settings session -- without
+            // saving -- would otherwise click "Open report..." here and see nothing happen. The
+            // banner only ever appears because the setting was on at launch, so restoring it in
+            // the draft just re-affirms what the user already turned on; Cancel/closing without
+            // Save discards it exactly like any other unsaved draft edit.
+            self.draft.error_reporting_enabled = true;
+            self.error_report_preview = Some(self.build_error_report_text());
+            self.tab = nav::Tab::Application;
+            self.status.clear();
+        }
+        if open_report || dismissed {
+            crate::crash_banner::dismiss();
+        }
+    }
     /// The "you could be signed in" banner.
     ///
     /// Sits with the other two banners — above the page header, outside the scroll area — because
