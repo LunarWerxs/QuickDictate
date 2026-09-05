@@ -329,6 +329,7 @@ impl eframe::App for SettingsApp {
                 // be something you can navigate away from.
                 self.onboarding_banner(ui);
                 self.update_available_banner(ui);
+                self.crash_report_banner(ui);
                 self.sign_in_nudge_banner(ui);
                 self.feedback_survey_banner(ui);
                 self.page_header(ui);

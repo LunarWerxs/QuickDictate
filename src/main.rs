@@ -12,6 +12,9 @@ mod about;
 mod audio;
 mod autostart;
 mod config;
+/// On-launch detection of a fresh `quickdictate-panic.log` entry, surfaced to the settings window
+/// as a dismissible banner offering to open the (opt-in) redacted error report. See its module doc.
+mod crash_banner;
 mod dev_trigger;
 /// Opt-in, local-only crash/error report builder. See its module doc.
 mod error_report;

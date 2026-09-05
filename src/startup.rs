@@ -25,8 +25,8 @@ use crate::keys::KeyPool;
 use crate::logging::{init_logging, install_panic_hook, prepare_logs_dir};
 use crate::state::App;
 use crate::{
-    autostart, dev_trigger, feedback_survey, local_stt, nudge, onboarding, output, paths,
-    settings_ui, stats, stt, ui, update,
+    autostart, crash_banner, dev_trigger, feedback_survey, local_stt, nudge, onboarding, output,
+    paths, settings_ui, stats, stt, ui, update,
 };
 
 /// Name of the named mutex that guards against a second QuickDictate process.
@@ -344,6 +344,10 @@ pub(crate) fn bring_up_app(
     if !is_settings_relaunch {
         nudge::start_session();
         feedback_survey::start_session();
+        // Did the PREVIOUS run leave a fresh `quickdictate-panic.log` entry we haven't surfaced
+        // yet? Same "not a relaunch" guard as the two calls above: a Save & Restart hand-off is a
+        // graceful restart of a process that never panicked, not "since the last run".
+        crash_banner::note_launch(app.config.load().error_reporting_enabled);
     }
 
     if !has_usable_key {
