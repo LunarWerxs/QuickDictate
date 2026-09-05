@@ -26,7 +26,7 @@ use crate::logging::{init_logging, install_panic_hook, prepare_logs_dir};
 use crate::state::App;
 use crate::{
     autostart, dev_trigger, feedback_survey, local_stt, nudge, onboarding, output, paths,
-    settings_ui, stt, ui, update,
+    settings_ui, stats, stt, ui, update,
 };
 
 /// Name of the named mutex that guards against a second QuickDictate process.
@@ -360,6 +360,12 @@ pub(crate) fn bring_up_app(
     if app.config.load().update_auto_check {
         update::spawn_startup_check(Arc::clone(&app));
     }
+
+    // Anonymous usage rollup (opt-in, off by default, see
+    // `Config::share_usage_stats`): once a day, send LunarWerx an
+    // aggregated, PII-free snapshot of this install's usage totals. A no-op
+    // (returns immediately) unless the setting is on.
+    stats::spawn_daily_report(Arc::clone(&app));
 
     // Keep the HKCU Run entry in sync with the run_at_startup setting.
     autostart::reconcile(app.config.load().run_at_startup);

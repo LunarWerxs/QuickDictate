@@ -91,6 +91,11 @@ pub(super) const SYNCED_KEYS: &[&str] = &[
     // sealed blob: on another machine it seals THAT machine's keys with THAT account,
     // which is exactly what someone who turned it on here would want.
     "protect_keys_at_rest",
+    // "I'm fine with LunarWerx seeing an anonymized usage rollup" is a stated preference
+    // about the person, same shape as `update_auto_check` — not a machine property. Only
+    // the boolean travels; each machine still reports under its own `install_id` (which
+    // stays in NEVER_SYNCED below), so this can never merge two machines' identities.
+    "share_usage_stats",
 ];
 
 /// Every `Config` field that is deliberately **never** synced: secrets and

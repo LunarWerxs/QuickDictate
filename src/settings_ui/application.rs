@@ -374,7 +374,7 @@ impl super::SettingsApp {
         });
     }
 
-    /// The eight application-behavior toggles, split across two columns.
+    /// The nine application-behavior toggles, split across two columns.
     fn application_toggles(&mut self, ui: &mut egui::Ui) {
         ui.columns(2, |cols| {
             let left = &mut cols[0];
@@ -473,6 +473,17 @@ impl super::SettingsApp {
                  lines \u{2014} never audio or dictated text. You always review it before \
                  anything is saved, and QuickDictate has no server to send it to: saving \
                  writes a local file you can attach to a GitHub issue yourself.",
+            );
+            blue_check(
+                right,
+                &mut self.draft.share_usage_stats,
+                "Share anonymous usage stats with LunarWerx",
+            )
+            .on_hover_text(
+                "Once a day, send an anonymized rollup of your lifetime word/audio/\
+                 dictation totals and which providers you use -- never any dictated \
+                 text, hostname, username, or account info. Helps LunarWerx see which \
+                 features actually get used. Off by default; on or off any time.",
             );
         });
     }

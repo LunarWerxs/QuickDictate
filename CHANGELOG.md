@@ -26,6 +26,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   quarter. Reuses the same cadence-gated approach as the sign-in nudge, kept as its own state
   machine so the vendored `nudge_engine.rs` stays untouched (see `src/feedback_survey.rs`).
 
+- **Optional anonymized usage report to LunarWerx.** A new, off-by-default
+  Settings toggle ("Share anonymous usage stats with LunarWerx") sends one
+  daily rollup of this install's lifetime word/audio/dictation totals and
+  provider mix, aggregated numbers the app already tracks locally for its own
+  Usage statistics charts (`src/stats/usage.rs`). Nothing new is collected: no
+  dictated text, hostname, username, or account identity is ever included, and
+  the only identifier sent is the same anonymous, crypto-random `install_id`
+  already used for update checks. See `src/stats/report.rs`.
+
 - **Mouse buttons can be hotkeys.** The middle button and the two thumb buttons
   (the ones usually labelled Back and Forward) can now drive dictation, on their
   own or with modifiers: `mouse3`, `mouse4`, `mouse5`, or e.g. `ctrl+mouse4`.
