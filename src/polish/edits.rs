@@ -42,8 +42,8 @@ pub(super) async fn request_edits(
     // because OpenAI's non-reasoning models reject the field outright.
     //
     // "low" rather than "none" on purpose. "none" is faster still on the
-    // models that take it, but gemini-3.6-flash, gemini-3.5-flash-lite and
-    // gemini-flash-lite-latest all 400 on it ("Request contains an invalid
+    // models that take it, but gemini-3.6-flash, gemini-3.5-flash-lite,
+    // gemini-flash-latest and gemini-flash-lite-latest all 400 on it ("Request contains an invalid
     // argument"), and silently failing on the best model available would be a
     // poor trade for a couple hundred milliseconds. Measured 2026-08-13.
     if settings.model.starts_with("gemini") {

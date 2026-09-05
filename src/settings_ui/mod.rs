@@ -149,7 +149,7 @@ const TIP_POLISH_KEYS: &str = "Get a free key at aistudio.google.com/apikey, the
      (one per line — several keys from different Google projects are rotated, which multiplies \
      your rate limit).\n\nThe key's project needs the \"Generative Language API\" enabled, which \
      is on by default for keys created in AI Studio. A Google key made for Speech-to-Text will \
-     NOT work here; they are separate APIs.\n\nRecommended model: gemini-3.5-flash-lite. \
+     NOT work here; they are separate APIs.\n\nRecommended model: gemini-flash-lite-latest. \
      Measured at ~0.56 s with the best results of everything tested — about 3x faster than \
      GPT-4.1-mini, and faster than the bigger Gemini models, which think before answering and \
      lose the race for no benefit.";

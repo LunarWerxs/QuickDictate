@@ -93,7 +93,7 @@ pub(super) fn default_polish_endpoint() -> String {
 ///
 /// | model                 | median  | result                                |
 /// |-----------------------|---------|---------------------------------------|
-/// | gemini-3.5-flash-lite | ~0.56 s | 4 edits, all correct. **Best.**       |
+/// | gemini-3.5-flash-lite (historical pin; use gemini-flash-lite-latest) | ~0.56 s | 4 edits, all correct. **Best.**       |
 /// | gemini-flash-lite-latest | ~0.63 s | 3 edits, all correct.              |
 /// | gemini-3.6-flash      | ~0.99 s | 3 edits, all correct.                 |
 /// | gemini-3.1-flash-lite | ~1.07 s | 3 edits, all correct.                 |
@@ -112,7 +112,7 @@ pub(super) fn default_polish_endpoint() -> String {
 ///
 /// Point `polish_endpoint` at
 /// `https://generativelanguage.googleapis.com/v1beta/openai/chat/completions`
-/// with `polish_model: "gemini-3.5-flash-lite"` and `polish_keys` to get the
+/// with `polish_model: "gemini-flash-lite-latest"` and `polish_keys` to get the
 /// top row. At ~0.6 s the deadline race is winnable outright rather than
 /// depending on the speculative pass.
 pub(super) fn default_polish_model() -> String {
