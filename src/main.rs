@@ -13,6 +13,8 @@ mod audio;
 mod autostart;
 mod config;
 mod dev_trigger;
+/// Opt-in, local-only crash/error report builder. See its module doc.
+mod error_report;
 mod focus;
 /// Mutation fuzzing of the untrusted-input parsers, wired in as ordinary tests
 /// so it runs on every `cargo test` (and therefore in CI) without a named job.

@@ -127,6 +127,11 @@ pub(super) const NEVER_SYNCED: &[&str] = &[
     "log_transcripts",
     "install_id", // anonymous per-install id; syncing would merge two machines' identities
     "update_auto_install", // machine-local unattended-update policy choice
+    // Same reasoning as `log_transcripts`: turning this on somewhere from
+    // somewhere else would be a privacy-relevant decision (whether local
+    // diagnostics get assembled into a report you can hand to LunarWerx)
+    // made on a machine you were not looking at.
+    "error_reporting_enabled",
 ];
 
 // ---- Allowlist transforms (Config <-> synced JSON) -------------------------

@@ -54,6 +54,13 @@ pub(crate) fn main_log_path() -> PathBuf {
     logs_dir().join(MAIN_LOG_NAME)
 }
 
+/// Path of the dedicated panic log (see [`install_panic_hook`]). Kept
+/// alongside [`main_log_path`] so `crate::error_report` does not need to
+/// duplicate the filename.
+pub(crate) fn panic_log_path() -> PathBuf {
+    logs_dir().join(PANIC_LOG_NAME)
+}
+
 /// Pick a destination that cannot be touched by active-log rotation and does
 /// not collide with an earlier migration. The first collision gets `.1`, then
 /// `.2`, and so on; existing files are never removed or overwritten.

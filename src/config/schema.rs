@@ -337,6 +337,18 @@ pub struct Config {
     #[serde(default = "default_false")]
     pub log_transcripts: bool,
 
+    /// Strictly opt-in, off by default. When true, Settings offers "Create an
+    /// error report..." (see `settings_ui::application`): it assembles your
+    /// version, active provider, and recent `quickdictate.log`/
+    /// `quickdictate-panic.log` lines (redacted of anything that looks like a
+    /// key or token; never audio or dictated text) into a plain-text preview
+    /// you review, edit, and only then choose to save. There is no
+    /// LunarWerx error-reporting endpoint, so saving writes a local
+    /// `error-reports\` file you can attach to a GitHub issue yourself --
+    /// nothing here ever makes a network call.
+    #[serde(default = "default_false")]
+    pub error_reporting_enabled: bool,
+
     // Note: `delay_output_till_release` (declared above) now means:
     //   true  -> *Hybrid*: hold mid-session VAD commits, flush them as one paste
     //            the instant you release the hotkey, and then live-paste any
@@ -499,6 +511,7 @@ impl Default for Config {
             enable_logging: false,
             max_log_mb: default_max_log_mb(),
             log_transcripts: false,
+            error_reporting_enabled: false,
             text_replacements: default_replacements(),
             enable_text_replacements: true,
             profiles: Vec::new(),
