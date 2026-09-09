@@ -29,6 +29,7 @@ optional local model for fully offline transcription, <b>no QuickDictate subscri
   <img src="https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D6" alt="Windows 10/11 x64">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license">
   <a href="https://github.com/LunarWerxs/QuickDictate/stargazers"><img src="https://img.shields.io/github/stars/LunarWerxs/QuickDictate?color=f6b02e" alt="Stars"></a>
+  <a href="https://discord.gg/PsWpeNUzhk"><img src="https://img.shields.io/badge/Discord-join_the_community-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
 </p>
 
 </div>
