@@ -54,8 +54,13 @@ fn install_silently(app: &App, tag: &str) -> bool {
     };
     if app.status() == Status::Idle {
         // Silent background update: relaunch WITHOUT reopening About — no window
-        // pops up unprompted (that would defeat "silent").
-        match relaunch(&exe, tag, false) {
+        // pops up unprompted (that would defeat "silent"). Settings does come
+        // back if it is on screen: that is restoring, not popping up.
+        let reopen = Reopen {
+            about: false,
+            settings: crate::settings_ui::is_open(),
+        };
+        match relaunch(&exe, tag, reopen) {
             Ok(()) => return true, // relaunched; process on its way out
             Err(e) => tracing::error!("update: {e}"),
         }
@@ -130,8 +135,11 @@ pub fn spawn_startup_check(app: Arc<App>) {
 }
 
 /// Startup housekeeping: delete the `.old` exe left by a previous self-update,
-/// and — when relaunched with `--updated <ver>` — reopen the About window so
-/// the user lands back where they were and sees the new version.
+/// and — when relaunched with `--updated <ver> --show-about` — reopen the About
+/// window so the user lands back where they were and sees the new version.
+/// (Settings, when it was open, is reopened by `startup` on the `--relaunch`
+/// flag the same relaunch carries; it runs before this, so About lands on top
+/// of it exactly as it was.)
 pub fn handle_startup_artifacts() {
     if let Ok(exe) = std::env::current_exe() {
         let old = exe.with_extension("exe.old");

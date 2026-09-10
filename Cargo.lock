@@ -2971,7 +2971,7 @@ dependencies = [
 
 [[package]]
 name = "quickdictate"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "arc-swap",

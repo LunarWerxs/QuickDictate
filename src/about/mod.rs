@@ -19,7 +19,8 @@ mod win;
 mod tests;
 
 use core::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::Mutex;
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -73,6 +74,13 @@ const WM_ABOUT_CHECKED: u32 = WM_APP + 1;
 /// "Update to <tag>" so the user can retry; the worker already showed the error.
 const WM_ABOUT_UPDATE_FAILED: u32 = WM_APP + 2;
 
+/// Posted to an already-open About window by [`show_about_and_install`]: take
+/// the tag waiting in [`PENDING_INSTALL`] and start installing it, exactly as
+/// a click on the "Update to <tag>" pill would. No payload; the tag travels
+/// through the static so the freshly-created and the already-open cases share
+/// one path (see [`begin_pending_install`]).
+const WM_ABOUT_INSTALL: u32 = WM_APP + 3;
+
 /// Timer that spins the "Checking…" arc while a check is in flight.
 const SPINNER_TIMER: usize = 1;
 /// Spinner repaint cadence (ms) and per-tick rotation (degrees).
@@ -101,6 +109,15 @@ const STM_SETIMAGE: u32 = 0x0172;
 /// Single-instance guard for the About window.
 static OPEN: AtomicBool = AtomicBool::new(false);
 
+/// The live About window's handle (0 when none), so another thread can post
+/// it a message. Set in `WM_CREATE`, cleared in `WM_NCDESTROY`.
+static ABOUT_HWND: AtomicIsize = AtomicIsize::new(0);
+
+/// A release tag an outside caller asked About to install as soon as it is
+/// up (the Settings window's "Update" button). Consumed exactly once, by
+/// [`begin_pending_install`].
+static PENDING_INSTALL: Mutex<Option<String>> = Mutex::new(None);
+
 /// The latest update-check outcome, shown by the status pill.
 enum Status {
     Checking,
@@ -127,11 +144,53 @@ struct About {
     spinner_angle: i32,
 }
 
+/// Whether the About box is open right now. The self-updater asks before it
+/// relaunches, so the new process can reopen what the user had on screen.
+pub fn is_open() -> bool {
+    OPEN.load(Ordering::Acquire)
+}
+
 /// Open the About box on its own thread (the tray thread must never block).
 pub fn show_about() {
     if OPEN.swap(true, Ordering::AcqRel) {
         return; // already open
     }
+    spawn_about_thread();
+}
+
+/// Open the About box (or find the open one) and start installing `tag` at
+/// once, as if the user had clicked its "Update to <tag>" pill. The About
+/// window is where the install already lives -- the spinner, the failure
+/// message with the manual-download link, the retry -- so the Settings
+/// banner's "Update" button lands here rather than growing a second copy of
+/// that flow. The click that got us here is the consent, same as the pill.
+pub fn show_about_and_install(tag: String) {
+    if let Ok(mut slot) = PENDING_INSTALL.lock() {
+        *slot = Some(tag);
+    }
+    if OPEN.swap(true, Ordering::AcqRel) {
+        // Already open: ask it to pick the tag up. If its window is not
+        // created yet (the thread is still starting), `WM_CREATE` will find
+        // the pending tag itself and this post simply has nowhere to go.
+        let raw = ABOUT_HWND.load(Ordering::Acquire);
+        if raw != 0 {
+            unsafe {
+                let _ = PostMessageW(
+                    HWND(raw as *mut c_void),
+                    WM_ABOUT_INSTALL,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        }
+        return;
+    }
+    spawn_about_thread();
+}
+
+/// The thread behind [`show_about`] / [`show_about_and_install`]. The caller
+/// has already taken [`OPEN`].
+fn spawn_about_thread() {
     std::thread::Builder::new()
         .name("qd-about".into())
         .spawn(|| {
@@ -251,8 +310,41 @@ unsafe fn on_wm_create(hwnd: HWND) -> LRESULT {
         spinner_angle: 0,
     });
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
+    ABOUT_HWND.store(hwnd.0 as isize, Ordering::Release);
     build_about(hwnd);
-    start_check(hwnd); // check on open
+    // Opened with an install already requested (Settings' "Update" button):
+    // go straight to installing. A network check first would be pure delay
+    // -- the tag came from the same check that put the banner up.
+    if has_pending_install() {
+        begin_pending_install(hwnd);
+    } else {
+        start_check(hwnd); // check on open
+    }
+    LRESULT(0)
+}
+
+fn has_pending_install() -> bool {
+    PENDING_INSTALL
+        .lock()
+        .map(|slot| slot.is_some())
+        .unwrap_or(false)
+}
+
+/// Take the tag [`show_about_and_install`] left and start installing it:
+/// set the pill to "Update to <tag>" and press it. Ignored while an install
+/// is already running (the second click can only be a duplicate).
+unsafe fn begin_pending_install(hwnd: HWND) -> LRESULT {
+    let Some(tag) = PENDING_INSTALL.lock().ok().and_then(|mut slot| slot.take()) else {
+        return LRESULT(0);
+    };
+    let st = about_state(hwnd);
+    if st.is_null() || matches!((*st).status, Status::Updating) {
+        return LRESULT(0);
+    }
+    let _ = KillTimer(hwnd, SPINNER_TIMER);
+    (*st).checking = false;
+    (*st).status = Status::Available(tag);
+    on_status_click(hwnd);
     LRESULT(0)
 }
 
@@ -279,8 +371,17 @@ unsafe fn on_wm_timer(hwnd: HWND) -> LRESULT {
 }
 
 unsafe fn on_wm_about_checked(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    let _ = KillTimer(hwnd, SPINNER_TIMER);
     let st = about_state(hwnd);
+    // A check that lands while an install is running must not overwrite the
+    // "Updating…" pill with a clickable "Update to <tag>" (that would invite
+    // a second install) or stop its spinner. Reclaim the tag and move on.
+    if !st.is_null() && matches!((*st).status, Status::Updating) {
+        if lparam.0 != 0 {
+            drop(Box::from_raw(lparam.0 as *mut String));
+        }
+        return LRESULT(0);
+    }
+    let _ = KillTimer(hwnd, SPINNER_TIMER);
     if !st.is_null() {
         (*st).checking = false;
         (*st).status = match wparam.0 {
@@ -373,6 +474,7 @@ unsafe fn on_wm_dpichanged(hwnd: HWND, lparam: LPARAM) -> LRESULT {
 
 unsafe fn on_wm_ncdestroy(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let _ = KillTimer(hwnd, SPINNER_TIMER);
+    ABOUT_HWND.store(0, Ordering::Release);
     let p = about_state(hwnd);
     if !p.is_null() {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -403,6 +505,7 @@ extern "system" fn about_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             WM_TIMER if wparam.0 == SPINNER_TIMER => on_wm_timer(hwnd),
             WM_ABOUT_CHECKED => on_wm_about_checked(hwnd, wparam, lparam),
             WM_ABOUT_UPDATE_FAILED => on_wm_about_update_failed(hwnd, lparam),
+            WM_ABOUT_INSTALL => begin_pending_install(hwnd),
             WM_COMMAND => on_wm_command(hwnd, wparam),
             WM_SETCURSOR => on_wm_setcursor(hwnd, msg, wparam, lparam),
             WM_KEYDOWN if wparam.0 == 0x1B => {

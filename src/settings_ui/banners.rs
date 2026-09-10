@@ -49,9 +49,12 @@ impl super::SettingsApp {
     }
     /// A newer release the daily auto-check found but hasn't installed (see
     /// `update::pending_update`) — surfaced here too, not just the tray
-    /// tooltip, since Settings is where most people go looking. Installing
-    /// itself still only happens from the About window's pill, matching the
-    /// click-to-consent model everywhere else in the app.
+    /// tooltip, since Settings is where most people go looking. The button
+    /// is the consent: it opens the About window and starts the install
+    /// there at once, on the same download → verify → swap → relaunch path
+    /// the About pill runs, so there is one install flow and not two. It
+    /// used to say "Review…" and only open About, which left the user to find
+    /// and click the pill a second time.
     pub(crate) fn update_available_banner(&mut self, ui: &mut egui::Ui) {
         let Some(tag) = crate::update::pending_update() else {
             return;
@@ -70,8 +73,14 @@ impl super::SettingsApp {
                             .color(text()),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if accent_button(ui, "Review\u{2026}").clicked() {
-                            crate::about::show_about();
+                        if accent_button(ui, "Update")
+                            .on_hover_text(
+                                "Download and install it now. QuickDictate restarts itself \
+                                 when it's done and brings this window back.",
+                            )
+                            .clicked()
+                        {
+                            crate::about::show_about_and_install(tag.clone());
                         }
                     });
                 });

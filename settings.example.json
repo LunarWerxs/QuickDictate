@@ -55,5 +55,7 @@
   "profiles_enabled": true,
   "profiles": [],
 
-  "voice_commands": false
+  "voice_commands": false,
+
+  "persist_history": true
 }

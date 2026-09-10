@@ -6,15 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-09-10
+
+### Fixed
+
+- **Updating no longer wipes your dictation history.** The History list (and the tray's
+  "Recent transcriptions") is now saved to `quickdictate-history.json` in the Files folder
+  after every dictation, so it comes back after a restart and after a self-update. It stays on
+  this PC: never synced, never sent anywhere. A new **Keep dictation history between
+  restarts** switch on the Advanced page (on by default) turns this off and deletes the file.
+
+- **The update banner's button says "Update" and does it.** It used to say "Review…" and
+  only open the About window, leaving you to find and click the pill there. Now it opens
+  About and starts the download at once.
+
+- **After an update started from Settings, Settings comes back.** The relaunched app used to
+  reopen only the About window, so the Settings window you had been using was simply gone.
+  It now reopens whatever was on screen: Settings, with About on top if that was open too.
+
 ## [0.9.0] - 2026-09-10
 
 ### Changed
-
-- **License: PolyForm Noncommercial 1.0.0.** Starting with this release QuickDictate is
-  source-available and free for personal and any other noncommercial use; commercial use
-  needs a separate license from LunarWerx Studios. Releases through v0.8.0 were MIT, and
-  that grant stays in effect for those copies. The badge, the About box, and the exe's
-  version block all say so now.
 
 - **The Settings window has five pages instead of three.** **Vocabulary** gets a page of
   its own, with an editor that fills it, instead of a four-row box at the bottom of
@@ -165,6 +177,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   restart. It now re-checks every couple of seconds and switches over on its
   own, logging the change; a swap is not treated as a fault, so the error pip
   stays quiet.
+
+### License
+
+- **License: PolyForm Noncommercial 1.0.0.** Starting with this release QuickDictate is
+  source-available and free for personal and any other noncommercial use; commercial use
+  needs a separate license from LunarWerx Studios. Releases through v0.8.0 were MIT, and
+  that grant stays in effect for those copies. The badge, the About box, and the exe's
+  version block all say so now.
 
 ## [0.8.0] - 2026-08-15
 

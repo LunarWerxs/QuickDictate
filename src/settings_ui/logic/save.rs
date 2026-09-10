@@ -30,6 +30,10 @@ impl SettingsApp {
                     crate::local_stt::request_prewarm(&self.draft.local_model);
                 }
                 crate::autostart::reconcile(self.draft.run_at_startup);
+                // Make the history file agree with the (possibly just
+                // flipped) `persist_history` toggle: written now if on,
+                // deleted now if off.
+                self.app.sync_history_file();
                 self.status = "Saved. Hotkey and logging changes apply after restart.".into();
                 tracing::info!("settings saved via UI to {}", path.display());
                 true

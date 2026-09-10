@@ -96,6 +96,10 @@ pub(super) const SYNCED_KEYS: &[&str] = &[
     // the boolean travels; each machine still reports under its own `install_id` (which
     // stays in NEVER_SYNCED below), so this can never merge two machines' identities.
     "share_usage_stats",
+    // "keep my dictation history between restarts" is a preference about the person, the
+    // same shape as `enable_logging`. Only the boolean travels; the history file itself
+    // is local-only and never synced (see `history_store`).
+    "persist_history",
 ];
 
 /// Every `Config` field that is deliberately **never** synced: secrets and

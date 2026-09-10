@@ -74,12 +74,13 @@ const ACTIVE_DIR_MARKER: &str = "active-data-dir.txt";
 /// behind in the old folder when the user relocates.
 ///
 /// `logs` is a directory and is handled as one; the rest are plain files.
-pub(crate) const RELOCATABLE: [&str; 5] = [
+pub(crate) const RELOCATABLE: [&str; 6] = [
     "logs",
     "quickdictate-stats.json",
     "quickdictate-connections.dat",
     "quickdictate-update.txt",
     "quickdictate-dev-port.txt",
+    crate::history_store::HISTORY_FILE,
 ];
 
 static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();

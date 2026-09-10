@@ -27,6 +27,7 @@ mod focus;
 /// so it runs on every `cargo test` (and therefore in CI) without a named job.
 #[cfg(test)]
 mod fuzz;
+mod history_store;
 mod hotkeys;
 mod icon;
 mod keys;

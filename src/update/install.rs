@@ -221,24 +221,56 @@ pub(super) fn download_and_swap(tag: &str) -> Result<PathBuf, String> {
     Ok(exe)
 }
 
+/// Which windows the new process should put back after a relaunch: the ones
+/// that were open when the old one went down. Restoring what was on screen
+/// is the whole rule; nothing here opens a window the user did not have.
+#[derive(Copy, Clone, Debug, Default)]
+pub(super) struct Reopen {
+    /// `--show-about`: the About window (see [`handle_startup_artifacts`]).
+    pub about: bool,
+    /// `--relaunch`: the Settings window, on the same hand-off Settings' own
+    /// "Save & Restart" uses (see `startup::should_open_settings_on_start`).
+    /// Before v0.9.1 an update started from Settings came back with only
+    /// About showing and Settings gone, which read as a crash.
+    pub settings: bool,
+}
+
+impl Reopen {
+    /// What is on screen right now.
+    pub(super) fn current() -> Self {
+        Self {
+            about: crate::about::is_open(),
+            settings: crate::settings_ui::is_open(),
+        }
+    }
+}
+
 /// Launch the freshly-swapped `exe` with `--updated <tag>` and signal the
 /// running instance to shut down cleanly. Shutdown goes through the global
 /// [`APP_HANDLE`] so both the auto path (which holds an `Arc<App>`) and the
 /// manual About path (which does not) share one relaunch routine.
 ///
-/// `reopen_about` adds `--show-about` so the new process reopens the About
-/// window (see [`handle_startup_artifacts`]). Only the **manual** update (the
-/// user clicked the About pill) sets it; a silent background auto-update stays
-/// silent — no window pops up unprompted.
-pub(super) fn relaunch(exe: &Path, tag: &str, reopen_about: bool) -> Result<(), String> {
-    tracing::info!("update: swapped to v{tag}; relaunching");
+/// `reopen` names the windows the new process should bring back. The manual
+/// update passes whatever is open (About, and Settings behind it); the silent
+/// background auto-update never reopens About -- no window pops up unprompted
+/// -- but does bring Settings back if it was on screen, because a window the
+/// user was looking at vanishing is not "silent" either.
+pub(super) fn relaunch(exe: &Path, tag: &str, reopen: Reopen) -> Result<(), String> {
+    tracing::info!("update: swapped to v{tag}; relaunching ({reopen:?})");
     if let Some(app) = APP_HANDLE.get() {
         app.stats.flush();
+        // Dictations are written to disk as they land (see
+        // `App::record_history`); this is belt-and-braces for the toggle
+        // having just been flipped on without a dictation since.
+        app.sync_history_file();
     }
     let mut cmd = std::process::Command::new(exe);
     cmd.args(["--updated", tag]);
-    if reopen_about {
+    if reopen.about {
         cmd.arg("--show-about");
+    }
+    if reopen.settings {
+        cmd.arg("--relaunch");
     }
     cmd.spawn().map_err(|e| format!("relaunch: {e}"))?;
     if let Some(app) = APP_HANDLE.get() {
@@ -263,9 +295,11 @@ pub fn download_and_install_now(tag: &str) -> Result<(), String> {
     if IN_FLIGHT.swap(true, Ordering::AcqRel) {
         return Err("an update is already in progress".into());
     }
-    // Manual install from the About window → reopen About after the relaunch so
-    // the user lands back where they were and sees the new version.
-    let result = download_and_swap(tag).and_then(|exe| relaunch(&exe, tag, true));
+    // Manual install from the About window → reopen what is open now (About,
+    // and Settings behind it when it was) after the relaunch, so the user
+    // lands back where they were and sees the new version on the pill.
+    let reopen = Reopen::current();
+    let result = download_and_swap(tag).and_then(|exe| relaunch(&exe, tag, reopen));
     if result.is_ok() {
         if let Ok(mut slot) = PENDING_UPDATE.lock() {
             *slot = None;

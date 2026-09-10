@@ -21,6 +21,10 @@ quickdictate-panic.log
 quickdictate-dev-port.txt
 quickdictate-update.txt
 quickdictate-stats.json
+# Recent dictations, kept across restarts (see src/history_store.rs). Dictated
+# text: per-machine, never source.
+quickdictate-history.json
+quickdictate-history.json.*.tmp
 # Sign-in prompt schedule: how long you have had the app and when it last asked.
 # A dev run writes one into the working tree, and it is per-machine state, not source.
 quickdictate-nudge.json

@@ -136,6 +136,18 @@ impl super::SettingsApp {
                 "Apply per-application overrides for punctuation, spacing, and \
                  replacements based on the app you're typing into.",
             );
+            blue_check(
+                left,
+                &mut self.draft.persist_history,
+                "Keep dictation history between restarts",
+            )
+            .on_hover_text(
+                "Save the History page's list (your last 50 dictations) to \
+                 quickdictate-history.json in the Files folder, so it survives a \
+                 restart or an update. It stays on this PC and is never synced or \
+                 sent anywhere. Turn off to keep history for the current session \
+                 only; the file is deleted when you save.",
+            );
 
             let right = &mut cols[1];
             blue_check(

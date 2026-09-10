@@ -351,6 +351,11 @@ pub(crate) fn bring_up_app(
     audio: Arc<AudioSource>,
 ) -> Result<Started> {
     let app = App::new(cfg, rt_handle, Arc::clone(&audio));
+    // The recent-dictations list from the previous run (the data folder is
+    // resolved by now, so this reads from the right place). Before v0.9.1
+    // history was memory-only, which meant every self-update -- a restart --
+    // silently threw the day's dictations away.
+    app.restore_history();
     let keys = KeyPool::new(&app.config.load());
 
     // Resolve (or first-generate + persist) the anonymous install id that

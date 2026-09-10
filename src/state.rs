@@ -12,8 +12,9 @@ use crate::config::Config;
 use crate::stats::StatsStore;
 
 /// Cap on how many past transcriptions [`TranscriptHistory`] keeps. Old
-/// enough entries just fall off the back -- there's no persistence, so this
-/// only bounds in-memory growth across a long-running session.
+/// enough entries just fall off the back. The same cap bounds the on-disk
+/// copy (see [`crate::history_store`]), which is what lets the list survive a
+/// restart or a self-update.
 const HISTORY_CAP: usize = 50;
 
 /// One past dictation result, kept so it can be re-pasted or browsed from the
@@ -52,6 +53,28 @@ impl TranscriptHistory {
             version: 0,
             next_id: 1,
         }
+    }
+
+    /// Rebuild from a saved list, newest first (the order
+    /// [`crate::history_store::load`] returns). Entries beyond
+    /// [`HISTORY_CAP`] are dropped from the old end; empty texts are skipped.
+    /// Ids are fresh for this process -- they only ever have to be unique
+    /// within a run -- and `version` starts at 1 when anything was loaded so
+    /// a cache primed on an empty history (version 0) notices the change.
+    pub fn from_entries(entries: Vec<(String, SystemTime)>) -> Self {
+        let mut h = Self::new();
+        for (text, when) in entries.into_iter().take(HISTORY_CAP) {
+            if text.is_empty() {
+                continue;
+            }
+            let id = h.next_id;
+            h.next_id = h.next_id.wrapping_add(1);
+            h.entries.push_back(HistoryEntry { id, text, when });
+        }
+        if !h.entries.is_empty() {
+            h.version = 1;
+        }
+        h
     }
 
     /// Record a newly-pasted transcription at the front, evicting the oldest
@@ -279,6 +302,56 @@ impl App {
         Status::from_u8(self.status.load(Ordering::Acquire))
     }
 
+    /// Load the saved recent-dictations list, if `persist_history` is on.
+    /// Called once at startup, after the data folder is resolved. With the
+    /// preference off, any file a previous setting left behind is deleted
+    /// instead, so what the toggle says and what is on disk always agree.
+    pub fn restore_history(&self) {
+        if !self.config.load().persist_history {
+            crate::history_store::remove();
+            return;
+        }
+        let saved = crate::history_store::load();
+        if saved.is_empty() {
+            return;
+        }
+        let n = saved.len();
+        *self.history.lock() = TranscriptHistory::from_entries(saved);
+        tracing::info!("history: restored {n} recent dictation(s)");
+    }
+
+    /// Add a dictation to the history and write the list to disk (when
+    /// `persist_history` is on). The write is synchronous and small -- at most
+    /// 50 short strings -- so the entry is durable before this returns, which
+    /// is what makes a self-update's relaunch safe to run right after a paste.
+    pub fn record_history(&self, text: String) {
+        self.history.lock().push(text);
+        self.sync_history_file();
+    }
+
+    /// Drop the most recent entry ("scratch that") and update the file.
+    pub fn undo_last_history(&self) -> Option<HistoryEntry> {
+        let popped = self.history.lock().pop_most_recent();
+        if popped.is_some() {
+            self.sync_history_file();
+        }
+        popped
+    }
+
+    /// Make the file match the preference: rewrite it from the current list
+    /// when `persist_history` is on, delete it when off. Also called on every
+    /// Settings save, so flipping the toggle off removes the file at once.
+    pub fn sync_history_file(&self) {
+        if !self.config.load().persist_history {
+            crate::history_store::remove();
+            return;
+        }
+        let snapshot = self.history.lock().snapshot();
+        if let Err(e) = crate::history_store::save(&snapshot) {
+            tracing::warn!("history: {e}");
+        }
+    }
+
     /// The key pool for a provider a Per-App Profile selected instead of the
     /// global one. Kept per provider for the life of the process (rebuilt only
     /// when that provider's keys change in `cfg`), so what one attempt learns
@@ -434,6 +507,48 @@ mod tests {
     fn pop_most_recent_on_empty_history_is_a_harmless_none() {
         let mut h = TranscriptHistory::new();
         assert!(h.pop_most_recent().is_none());
+        assert_eq!(h.version(), 0);
+    }
+
+    #[test]
+    fn from_entries_keeps_order_caps_and_gives_fresh_unique_ids() {
+        let when = SystemTime::UNIX_EPOCH;
+        let saved: Vec<(String, SystemTime)> = (0..(HISTORY_CAP + 5))
+            .map(|i| (format!("entry {i}"), when))
+            .collect();
+        let h = TranscriptHistory::from_entries(saved);
+        let snap = h.snapshot();
+        assert_eq!(snap.len(), HISTORY_CAP, "the cap applies on load too");
+        assert_eq!(snap[0].text, "entry 0", "newest-first order is preserved");
+        assert_eq!(
+            snap[HISTORY_CAP - 1].text,
+            format!("entry {}", HISTORY_CAP - 1)
+        );
+        let mut ids: Vec<u64> = snap.iter().map(|e| e.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), HISTORY_CAP, "ids are unique");
+        assert_eq!(h.version(), 1, "a loaded list is not version 0");
+    }
+
+    #[test]
+    fn from_entries_then_push_never_reuses_an_id() {
+        let mut h = TranscriptHistory::from_entries(vec![
+            ("b".into(), SystemTime::UNIX_EPOCH),
+            ("a".into(), SystemTime::UNIX_EPOCH),
+        ]);
+        let before: Vec<u64> = h.snapshot().iter().map(|e| e.id).collect();
+        h.push("c".into());
+        let newest = h.most_recent().unwrap();
+        assert_eq!(newest.text, "c");
+        assert!(!before.contains(&newest.id));
+        assert_eq!(h.version(), 2);
+    }
+
+    #[test]
+    fn from_entries_skips_empty_texts_and_an_empty_list_is_version_0() {
+        let h = TranscriptHistory::from_entries(vec![(String::new(), SystemTime::UNIX_EPOCH)]);
+        assert!(h.most_recent().is_none());
         assert_eq!(h.version(), 0);
     }
 }

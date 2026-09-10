@@ -252,7 +252,7 @@ pub(super) fn handle_scratch_that(
     }
     // Drop the now-undone entry so a second "scratch that" doesn't see the
     // same (already-removed) text as still "most recent" and re-undo it.
-    app.history.lock().pop_most_recent();
+    app.undo_last_history();
 
     if remaining_raw.trim().is_empty() {
         return;
@@ -317,7 +317,7 @@ pub(super) fn paste_processed(
     // clipboard, not replayable); keeping it here means the tray's "Recent
     // transcriptions" can always recover the words the user actually said.
     if save_as_last {
-        app.history.lock().push(processed.to_string());
+        app.record_history(processed.to_string());
     }
     match result {
         Ok(Ok(PasteOutcome::Typed)) => {

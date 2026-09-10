@@ -78,12 +78,12 @@ fn history_row(ui: &mut egui::Ui, entry: &HistoryEntry, is_selected: bool) -> Ro
 }
 
 impl super::SettingsApp {
-    /// Recent-transcriptions browser. `app.history` is in-memory only for this
-    /// session (see `TranscriptHistory`) -- this is a bigger window onto the
-    /// same list the tray's "Recent transcriptions" submenu already shows.
-    /// Button clicks are captured into locals and acted on after the card
-    /// closure, matching the rest of this module's pattern for keeping
-    /// `&mut self` calls unnested.
+    /// Recent-transcriptions browser: a bigger window onto the same list the
+    /// tray's "Recent transcriptions" submenu shows (`app.history`, kept on
+    /// disk between runs unless `persist_history` is off -- see
+    /// `history_store`). Button clicks are captured into locals and acted on
+    /// after the card closure, matching the rest of this module's pattern
+    /// for keeping `&mut self` calls unnested.
     pub(crate) fn history_card(&mut self, ui: &mut egui::Ui) {
         let mut do_copy: Option<usize> = None;
         let mut do_replay: Option<usize> = None;
@@ -92,12 +92,23 @@ impl super::SettingsApp {
         // history is more useful the more of it is on screen, and the page
         // has nothing else to show.
         let page_height = ui.available_height();
+        // Reads the SAVED setting, not the draft: the blurb describes what
+        // the app is doing now, and an unsaved tick is not that yet.
+        let persisted = self.app.config.load().persist_history;
         card(ui, |ui| {
             blurb(
                 ui,
-                "Your recent dictations for this session (not saved to disk). Tick any \
-                 number and copy them together, or use a row's buttons to copy just that \
-                 one or paste it again into whatever's currently focused.",
+                if persisted {
+                    "Your last 50 dictations, kept on this PC so they survive a restart or \
+                     an update (never synced or sent anywhere). Tick any number and copy \
+                     them together, or use a row's buttons to copy just that one or paste \
+                     it again into whatever's currently focused."
+                } else {
+                    "Your recent dictations for this session only (history saving is off \
+                     on the Advanced page). Tick any number and copy them together, or use \
+                     a row's buttons to copy just that one or paste it again into \
+                     whatever's currently focused."
+                },
             );
             ui.add_space(6.0);
 
@@ -106,7 +117,7 @@ impl super::SettingsApp {
 
             if self.history_cache.history_empty {
                 ui.label(
-                    RichText::new("No dictations yet this session.")
+                    RichText::new("No dictations yet.")
                         .size(12.0)
                         .color(muted()),
                 );

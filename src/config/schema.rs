@@ -439,6 +439,17 @@ pub struct Config {
     #[serde(default = "default_false")]
     pub share_usage_stats: bool,
 
+    /// Keep the recent-dictations list (the History page and the tray's
+    /// "Recent transcriptions") across restarts, in `quickdictate-history.json`
+    /// in the data folder. On by default: losing every dictation to a restart
+    /// -- and in particular to a self-update, which restarts the app -- was
+    /// the single most-noticed way the app forgot things. It is a local file
+    /// that never syncs and never leaves the machine (see
+    /// [`crate::history_store`]); turn it off and the file is deleted on the
+    /// next save, after which history is in-memory for the session only.
+    #[serde(default = "default_true")]
+    pub persist_history: bool,
+
     /// Run an LLM cleanup pass over the transcript before pasting it (see
     /// [`crate::polish`]). Off by default: it is the only part of the paste
     /// path that talks to a third party, and everything else here works with
@@ -540,6 +551,7 @@ impl Default for Config {
             update_auto_install: false,
             protect_keys_at_rest: false,
             share_usage_stats: false,
+            persist_history: true,
         }
     }
 }

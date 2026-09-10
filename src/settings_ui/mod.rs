@@ -167,6 +167,14 @@ fn open_log_folder() {
     let _ = std::process::Command::new("explorer.exe").arg(&dir).spawn();
 }
 
+/// Whether the Settings window is on screen right now (not merely launched
+/// and hidden). The self-updater asks this before it relaunches, so the new
+/// process can bring the window back rather than leaving the user staring
+/// at where it used to be.
+pub fn is_open() -> bool {
+    OPEN.load(Ordering::Acquire)
+}
+
 pub fn show_settings(app: Arc<App>) {
     // The window's winit event loop can only be created ONCE per process. If
     // it's already running, don't spawn a second `run_native` (that would fail
