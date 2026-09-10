@@ -21,6 +21,11 @@ const HISTORY_CAP: usize = 50;
 /// already applied) -- exactly what was last sent to the focused window.
 #[derive(Clone, Debug)]
 pub struct HistoryEntry {
+    /// Stable identity for this entry, unique within the process. Positions
+    /// shift every time a new dictation lands at the front, so anything that
+    /// has to remember an entry across frames (the Settings window's
+    /// multi-select) keys on this rather than on an index.
+    pub id: u64,
     pub text: String,
     pub when: SystemTime,
 }
@@ -36,6 +41,8 @@ pub struct TranscriptHistory {
     /// "history changed since I last rebuilt the submenu" without hashing or
     /// cloning the whole list every frame.
     version: u64,
+    /// The `id` the next pushed entry gets. Never reused within a run.
+    next_id: u64,
 }
 
 impl TranscriptHistory {
@@ -43,6 +50,7 @@ impl TranscriptHistory {
         Self {
             entries: VecDeque::new(),
             version: 0,
+            next_id: 1,
         }
     }
 
@@ -52,7 +60,10 @@ impl TranscriptHistory {
         if text.is_empty() {
             return;
         }
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
         self.entries.push_front(HistoryEntry {
+            id,
             text,
             when: SystemTime::now(),
         });
@@ -213,6 +224,9 @@ pub struct App {
     /// yet). Never closed: it lives exactly as long as the process.
     ui_wake_event: std::sync::atomic::AtomicIsize,
     pub current_key: Mutex<Option<String>>,
+    /// Key pools for the providers a Per-App Profile can select INSTEAD of
+    /// the global one, keyed by provider id. See [`App::pool_for_provider`].
+    profile_pools: Mutex<std::collections::HashMap<String, Arc<crate::keys::KeyPool>>>,
     /// Rolling log of recent transcriptions (newest first), the generalized
     /// replacement for the old single "last transcription" slot.
     pub history: Mutex<TranscriptHistory>,
@@ -252,6 +266,7 @@ impl App {
             ui_wake_event: std::sync::atomic::AtomicIsize::new(0),
             replay_rx,
             current_key: Mutex::new(None),
+            profile_pools: Mutex::new(std::collections::HashMap::new()),
             history: Mutex::new(TranscriptHistory::new()),
             word_count: AtomicU32::new(0),
             stats: Arc::new(StatsStore::load()),
@@ -262,6 +277,27 @@ impl App {
 
     pub fn status(&self) -> Status {
         Status::from_u8(self.status.load(Ordering::Acquire))
+    }
+
+    /// The key pool for a provider a Per-App Profile selected instead of the
+    /// global one. Kept per provider for the life of the process (rebuilt only
+    /// when that provider's keys change in `cfg`), so what one attempt learns
+    /// about a key -- rejected, out of credit, rate-limited -- is still known
+    /// by the next attempt and the next press. A fresh pool per attempt, which
+    /// is what this replaced, forgot every rejection the moment it was
+    /// recorded and re-tried the same dead key on every single attempt.
+    pub fn pool_for_provider(&self, cfg: &Config, provider: &str) -> Arc<crate::keys::KeyPool> {
+        let id = provider.trim().to_ascii_lowercase();
+        let mut pools = self.profile_pools.lock();
+        if let Some(pool) = pools.get(&id) {
+            if pool.matches_provider(cfg, &id) {
+                return Arc::clone(pool);
+            }
+            tracing::info!("keys for '{id}' changed; rebuilding that profile's key pool");
+        }
+        let pool = crate::keys::KeyPool::for_provider(cfg, &id);
+        pools.insert(id, Arc::clone(&pool));
+        pool
     }
 
     pub fn set_status(&self, s: Status) {

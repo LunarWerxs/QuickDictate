@@ -41,27 +41,19 @@ impl SettingsApp {
             profile_vocab_text: Vec::new(),
             history_filter: String::new(),
             history_cache: HistoryCache::default(),
+            history_selected: std::collections::HashSet::new(),
             editor_opened_at: None,
             pending_save_kind: None,
             pending_restart: None,
             shot_path: std::env::var("QUICKDICTATE_UI_SHOT").ok(),
             frames: 0,
             shot_requested: false,
-            // `QUICKDICTATE_UI_PAGE=dictation` opens straight to that page, so
-            // the headless screenshot hook above can capture any page and not
-            // just the one the window happens to open on.
             keys_target: KEYS_TARGET_PROVIDER.to_string(),
             nudge_ask: None,
             feedback_ask: None,
-            tab: match std::env::var("QUICKDICTATE_UI_PAGE")
-                .unwrap_or_default()
-                .to_ascii_lowercase()
-                .as_str()
-            {
-                "dictation" => nav::Tab::Dictation,
-                "history" => nav::Tab::History,
-                _ => nav::Tab::Application,
-            },
+            // The landing page. A headless screenshot picks another page via
+            // `QUICKDICTATE_UI_TAB` (see `screenshot_hook`).
+            tab: nav::TABS[0],
         };
         this.resync_vocabulary_scratch();
         this
@@ -85,6 +77,7 @@ impl SettingsApp {
         self.resync_vocabulary_scratch();
         self.history_filter.clear();
         self.history_cache = HistoryCache::default();
+        self.history_selected.clear();
         self.editor_opened_at = None;
         self.pending_save_kind = None;
         self.pending_restart = None;

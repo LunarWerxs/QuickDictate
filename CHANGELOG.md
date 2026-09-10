@@ -6,6 +6,63 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-10
+
+### Changed
+
+- **License: PolyForm Noncommercial 1.0.0.** Starting with this release QuickDictate is
+  source-available and free for personal and any other noncommercial use; commercial use
+  needs a separate license from LunarWerx Studios. Releases through v0.8.0 were MIT, and
+  that grant stays in effect for those copies. The badge, the About box, and the exe's
+  version block all say so now.
+
+- **The Settings window has five pages instead of three.** **Vocabulary** gets a page of
+  its own, with an editor that fills it, instead of a four-row box at the bottom of
+  Dictation. **Advanced** takes the set-and-forget switches off Application: key prewarm,
+  the tray icon, logging, error reports, usage stats, per-app profiles, and the Files
+  folder. Application is now just the provider and keys, the everyday behaviour toggles,
+  and settings sync. Anything that used to say "Settings ▸ Application ▸ Files" means
+  "Settings ▸ Advanced ▸ Files" now.
+
+- **History is taller, and you can copy several dictations at once.** The list takes the
+  whole page. Tick any rows (the box, or the text itself), then **Copy selected** puts
+  them on the clipboard oldest-first with a blank line between each, the same shape the
+  tray's "Copy all" produces. **Select all** ticks what the filter is showing. The per-row
+  Copy and Paste again buttons are icons now.
+
+- **Connect timeout is 6 s, down from 10.** A provider that is not answering shows the
+  network pip after six seconds instead of ten, the same bound the startup key probe
+  already used.
+
+- Dependencies refreshed to their latest compatible versions; the build script moved to
+  embed-resource 3.
+
+### Fixed
+
+- **A dead key could lock you out of dictation for half a minute.** One stalled handshake
+  on a working key benched it for 30 s; with the other key already out of credit, every
+  press for the next half-minute failed with "no API key available", and the log showed
+  the dead key being tried again and again. Now a transient failure benches a key for two
+  seconds, not thirty; a key that is merely cooling is still offered rather than failing
+  the press outright; a handshake that times out is treated as the network's fault (no
+  key is benched, and no other key is sent to wait out the same stall); one press never
+  tries the same key twice; and the failure is named on the pip (rejected keys, out of
+  credit, rate limited, or network) instead of a bare "!".
+
+- **Per-app profiles that pick a different provider forgot every key rejection.** The
+  session built a fresh key pool for the overriding provider on every attempt, so a dead
+  key there was tried again on every single attempt and every press. Those pools are
+  kept per provider now, like the main one.
+
+- **A key rejected while you were letting go of the hotkey was reported as success.** The
+  retry shell stopped rotating once the button was up and quietly returned "ok"; it now
+  reports the rejection so the pip says what happened.
+
+- **The headless screenshot script stopped every running QuickDictate**, including the
+  one you were dictating with. `scripts\ui_shot.ps1` now runs an isolated copy from a
+  scratch folder with its own settings and its own single-instance mutex, and kills only
+  that.
+
 ### Added
 
 - **A crash banner in Settings.** If `quickdictate-panic.log` picked up a fresh entry since your

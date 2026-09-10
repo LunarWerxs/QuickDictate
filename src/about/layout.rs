@@ -96,7 +96,16 @@ pub(super) unsafe fn build_about(hwnd: HWND) {
     );
 
     // Bottom-left: license + copyright (muted via WM_CTLCOLORSTATIC).
-    ctl(hwnd, "MIT License", 0, 22, 250, 210, 16, ID_LICENSE);
+    ctl(
+        hwnd,
+        "PolyForm Noncommercial 1.0.0",
+        0,
+        22,
+        250,
+        210,
+        16,
+        ID_LICENSE,
+    );
     ctl(
         hwnd,
         "\u{00a9} 2026 Lunarwerx",

@@ -17,12 +17,12 @@ That's the whole idea. QuickDictate is a small Windows app that sits in your tra
 <p align="center">
   <a href="https://github.com/LunarWerxs/QuickDictate/releases/latest"><img src="https://img.shields.io/github/v/release/LunarWerxs/QuickDictate?label=release" alt="Latest release"></a>
   <img src="https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D6" alt="Windows 10/11 x64">
-  <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license">
+  <a href="../LICENSE"><img src="https://img.shields.io/badge/license-PolyForm_Noncommercial-3ddc84" alt="PolyForm Noncommercial license"></a>
 </p>
 
 ## Why it exists
 
-Most dictation tools do one of three annoying things: lock you into a monthly subscription, route your microphone through *their* servers, or bury the settings you actually want three menus deep. QuickDictate does the opposite. Bring a key from a speech provider you already trust, drop it in, and go. Your audio goes to that provider and nowhere else, we (the folks at [LunarWerx Studios](https://lunarwerx.com)) never see your voice or your keys. It's a **beta**, it's **MIT-licensed**, and it runs on **Windows 10/11 x64**.
+Most dictation tools do one of three annoying things: lock you into a monthly subscription, route your microphone through *their* servers, or bury the settings you actually want three menus deep. QuickDictate does the opposite. Bring a key from a speech provider you already trust, drop it in, and go. Your audio goes to that provider and nowhere else, we (the folks at [LunarWerx Studios](https://lunarwerx.com)) never see your voice or your keys. It's a **beta**, it's **free for noncommercial use** ([PolyForm Noncommercial](../LICENSE), source available), and it runs on **Windows 10/11 x64**.
 
 See the [changelog](../CHANGELOG.md) for what's changed release to release.
 
@@ -129,7 +129,7 @@ Switching providers later is just: change `stt_provider`, make sure that provide
 
 ## Per-App Profiles
 
-Override punctuation/spacing/replacement behavior per foreground application, resolved from `settings.json`'s `profiles` array, no UI editor for the entries themselves (Settings shows a **read-only** "Active profiles" list; you add/edit/remove profiles directly in `settings.json`, same as text replacements' bulk editor is really just a friendlier view onto the same file).
+Override punctuation/spacing/replacement behavior per foreground application, resolved from `settings.json`'s `profiles` array. Settings ▸ Advanced shows an "Active profiles" editor for each profile's language, provider, and vocabulary; you add/edit/remove profiles themselves, and their match lists and text replacements, directly in `settings.json` (same as text replacements' bulk editor is really just a friendlier view onto the same file).
 
 ```json
 "profiles": [
@@ -155,7 +155,7 @@ Override punctuation/spacing/replacement behavior per foreground application, re
 - **`stt_provider`** is resolved when you press the hotkey, using the window focused at that moment, so switching windows switches backend on the next dictation. A profile naming a provider that has no configured key (or an id that does not exist) logs a warning and falls back to the global provider, so a typo here can never leave you unable to dictate. Handy for dictating into a password manager or a private document through the offline `"local"` provider while everything else stays on a cloud one.
 - Note the asymmetry, and it is on purpose: **provider and language** come from the window focused when you *press* the hotkey, because that is when the connection is opened. **Text handling** (punctuation, spacing, replacements) comes from the window focused when the transcript is *pasted*, because that is where the text lands.
 - No `profiles` array (or an empty one) is byte-identical to today's behavior.
-- **`profiles_enabled`** (bool, default `true`) is the master on/off switch, with a matching "Enable per-app profiles" checkbox on the Active profiles card in Settings -- flip it off to disable profile matching entirely (falling back to global settings) without deleting your `profiles` array.
+- **`profiles_enabled`** (bool, default `true`) is the master on/off switch, with a matching "Enable per-app profiles" checkbox on the Advanced page in Settings -- flip it off to disable profile matching entirely (falling back to global settings) without deleting your `profiles` array.
 
 ## Voice Commands
 
@@ -257,4 +257,4 @@ Bug reports and pull requests are welcome, there are issue templates under [.git
 
 ## License
 
-MIT, see [LICENSE](../LICENSE). Made by [LunarWerx Studios](https://lunarwerx.com).
+[PolyForm Noncommercial 1.0.0](../LICENSE), starting with v0.9.0: free for noncommercial use, with commercial use by separate license from LunarWerx Studios. Releases through v0.8.0 were MIT, and that grant stays in effect for those copies. Made by [LunarWerx Studios](https://lunarwerx.com).

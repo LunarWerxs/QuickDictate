@@ -20,8 +20,11 @@
 //! - [`cards`]: the provider card, its keys, and the local model packs.
 //! - [`banners`]: onboarding, available update, sign-in nudge.
 //! - [`dictation`]: hotkey capture, language, mode, the listen tail.
-//! - [`application`]: data folder, behaviour toggles, Per-App Profiles.
-//! - [`history_sync`]: the transcript-history browser and the sync card.
+//! - [`application`]: the everyday behaviour toggles and the AI-cleanup setup.
+//! - [`vocabulary`]: the custom-vocabulary editor.
+//! - [`history`]: the transcript-history browser (filter, multi-select, copy).
+//! - [`advanced`]: diagnostics, the data folder, and Per-App Profiles.
+//! - [`sync`]: the Connections settings-sync card.
 //! - [`modals`]: the confirm prompts, the shared frame, and modal dispatch.
 //! - [`keys_modal`] / [`replacements_modal`] / [`stats_modal`]: one each.
 //! - [`keys`]: the provider list and the bulk key editor's parsing.
@@ -55,15 +58,16 @@ use crate::state::App;
 use crate::stats::StatsRange;
 use crate::theme;
 
-// Split out of this file so each surface can be reviewed on its own; the
-// hub keeps the shared state, the window plumbing, and the frame loop.
+// One file per surface so each can be reviewed on its own; the hub keeps the
+// shared state, the window plumbing, and the frame loop.
+mod advanced;
 mod app;
 mod application;
 mod banners;
 mod cards;
 mod combo;
 mod dictation;
-mod history_sync;
+mod history;
 mod keys;
 mod keys_modal;
 mod logic;
@@ -72,7 +76,9 @@ mod nav;
 mod replacements_modal;
 mod stats_modal;
 mod style;
+mod sync;
 mod text;
+mod vocabulary;
 mod widgets;
 
 #[cfg(test)]

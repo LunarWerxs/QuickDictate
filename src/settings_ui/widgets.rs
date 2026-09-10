@@ -3,10 +3,52 @@
 
 use super::*;
 
+/// Side of the SageThumbs-style check box, in points.
+const CHECK_BOX_SIDE: f32 = 18.0;
+
+/// Paint one check box into `box_rect`: rounded square, brand-blue fill +
+/// white check when on, input-well + hairline border when off. Shared by the
+/// labelled [`blue_check`] and the bare [`blue_check_box`] so the two can
+/// never drift apart in look.
+fn paint_check_box(
+    p: &egui::Painter,
+    box_rect: egui::Rect,
+    on: bool,
+    hovered: bool,
+    pressed: bool,
+) {
+    if on {
+        let fill = if pressed {
+            accent_press()
+        } else if hovered {
+            accent_hot()
+        } else {
+            accent()
+        };
+        p.rect_filled(box_rect, CornerRadius::same(5), fill);
+        // White check mark.
+        let s = box_rect.width();
+        let a = box_rect.min + egui::vec2(0.24 * s, 0.52 * s);
+        let b = box_rect.min + egui::vec2(0.43 * s, 0.72 * s);
+        let d = box_rect.min + egui::vec2(0.78 * s, 0.30 * s);
+        let stroke = Stroke::new(2.0, Color32::WHITE);
+        p.line_segment([a, b], stroke);
+        p.line_segment([b, d], stroke);
+    } else {
+        p.rect_filled(box_rect, CornerRadius::same(5), input_bg());
+        p.rect_stroke(
+            box_rect,
+            CornerRadius::same(5),
+            Stroke::new(1.0, if hovered { accent() } else { border() }),
+            egui::StrokeKind::Inside,
+        );
+    }
+}
+
 /// SageThumbs-style checkbox: rounded square, brand-blue fill + white check
 /// when on, input-well + hairline border when off. The whole row is clickable.
 pub(crate) fn blue_check(ui: &mut egui::Ui, on: &mut bool, label: &str) -> egui::Response {
-    let box_side = 18.0;
+    let box_side = CHECK_BOX_SIDE;
     let gap = 8.0;
     let text_galley = ui.painter().layout_no_wrap(
         label.to_string(),
@@ -25,33 +67,13 @@ pub(crate) fn blue_check(ui: &mut egui::Ui, on: &mut bool, label: &str) -> egui:
             egui::pos2(rect.min.x, rect.center().y - box_side / 2.0),
             egui::vec2(box_side, box_side),
         );
-        let hovered = resp.hovered();
-        if *on {
-            let fill = if resp.is_pointer_button_down_on() {
-                accent_press()
-            } else if hovered {
-                accent_hot()
-            } else {
-                accent()
-            };
-            p.rect_filled(box_rect, CornerRadius::same(5), fill);
-            // White check mark.
-            let s = box_side;
-            let a = box_rect.min + egui::vec2(0.24 * s, 0.52 * s);
-            let b = box_rect.min + egui::vec2(0.43 * s, 0.72 * s);
-            let d = box_rect.min + egui::vec2(0.78 * s, 0.30 * s);
-            let stroke = Stroke::new(2.0, Color32::WHITE);
-            p.line_segment([a, b], stroke);
-            p.line_segment([b, d], stroke);
-        } else {
-            p.rect_filled(box_rect, CornerRadius::same(5), input_bg());
-            p.rect_stroke(
-                box_rect,
-                CornerRadius::same(5),
-                Stroke::new(1.0, if hovered { accent() } else { border() }),
-                egui::StrokeKind::Inside,
-            );
-        }
+        paint_check_box(
+            p,
+            box_rect,
+            *on,
+            resp.hovered(),
+            resp.is_pointer_button_down_on(),
+        );
         p.galley(
             egui::pos2(
                 box_rect.max.x + gap,
@@ -62,6 +84,40 @@ pub(crate) fn blue_check(ui: &mut egui::Ui, on: &mut bool, label: &str) -> egui:
         );
     }
     resp
+}
+/// The bare box of [`blue_check`], no label: for a row that is its own label
+/// (the History list). Toggles `on` and marks the response changed on click.
+pub(crate) fn blue_check_box(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
+    let box_side = CHECK_BOX_SIDE;
+    let (rect, mut resp) = ui.allocate_exact_size(
+        egui::vec2(box_side, box_side.max(20.0)),
+        egui::Sense::click(),
+    );
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    if ui.is_rect_visible(rect) {
+        let box_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(box_side, box_side));
+        paint_check_box(
+            ui.painter(),
+            box_rect,
+            *on,
+            resp.hovered(),
+            resp.is_pointer_button_down_on(),
+        );
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+/// A compact button whose label is one icon glyph (or its short text
+/// fallback, see `copy_glyph`): tighter padding than a text button, and a
+/// minimum size so a row of them lines up whether or not the icon font loaded.
+pub(crate) fn icon_button(ui: &mut egui::Ui, label: RichText) -> egui::Response {
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding = egui::vec2(7.0, 3.0);
+        ui.add(egui::Button::new(label).min_size(egui::vec2(28.0, 22.0)))
+    })
+    .inner
 }
 /// A plain seconds text box bound to a `u64` **millisecond** config field, with
 /// a small "s" unit label beside it. The config stores durations in ms, but
@@ -488,6 +544,21 @@ pub(crate) fn stats_provider_chart(
                 );
             }
         });
+}
+/// The muted explanatory paragraph at the top of a page or card.
+pub(crate) fn blurb(ui: &mut egui::Ui, copy: &str) {
+    ui.label(RichText::new(copy).size(11.5).color(muted()));
+}
+/// Opens a sub-section inside a card: breathing room, a hairline, breathing
+/// room. Pair with [`subsection_title`] for the heading text.
+pub(crate) fn subsection_start(ui: &mut egui::Ui) {
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(6.0);
+}
+/// The muted heading of a sub-section inside a card ("Files", "AI cleanup").
+pub(crate) fn subsection_title(title: &str) -> RichText {
+    RichText::new(title).size(12.0).color(muted())
 }
 /// A section header: a small accent-blue icon glyph followed by the title.
 /// `icon` is a Segoe icon-font codepoint (see `apply_fonts`); it's skipped

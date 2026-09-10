@@ -17,7 +17,7 @@ use super::heuristics::{transcripts_equivalent, transport_failure_lost_speech};
 use super::provider::AudioFormat;
 use super::recv_task::SessionAccumulators;
 use super::{
-    audio_duration_ms, deliver_transcript, SentAudio, SessionUsage, EXHAUSTED_SIGNAL, TAIL_MIN,
+    audio_duration_ms, deliver_transcript, SentAudio, SessionAbort, SessionUsage, TAIL_MIN,
 };
 
 /// Everything the finalize phase (the fast-fail abort, or the normal
@@ -75,7 +75,7 @@ pub(super) async fn abort_for_early_key_failure(
         }
     }
     ctx.keys.mark_failed(&ctx.key, kind);
-    Err(anyhow!(EXHAUSTED_SIGNAL))
+    Err(SessionAbort::KeyRejected.into())
 }
 
 /// Flip the release flag so the send/recv tasks switch into their
@@ -274,7 +274,7 @@ pub(super) fn finish_session_outcome(
     crate::sound::play_stop(ctx.enable_sound);
     tracing::info!("session[{epoch}] ended");
     if key_failure.is_some() {
-        return Err(anyhow!(EXHAUSTED_SIGNAL));
+        return Err(SessionAbort::KeyRejected.into());
     }
     if let Some(message) = ctx.acc.provider_failure.lock().take() {
         // A transport that died without costing the user anything is a

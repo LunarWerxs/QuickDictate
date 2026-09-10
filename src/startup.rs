@@ -36,6 +36,20 @@ use crate::{
 /// process-wide name so it's stable across versions and install locations.
 const SINGLE_INSTANCE_MUTEX_NAME: &str = "QuickDictate.SingleInstance";
 
+/// The mutex name this process guards on. A dev instance -- one launched with
+/// `QUICKDICTATE_DEV_PORT` set, the way `scripts\ui_shot.ps1` does for a
+/// headless screenshot -- gets its own name, suffixed with that port, so it
+/// can run beside the user's live QuickDictate instead of merely poking that
+/// one awake and exiting. Never set the variable for a real launch.
+fn single_instance_mutex_name() -> String {
+    match std::env::var(crate::dev_trigger::ENV_PORT) {
+        Ok(port) if !port.trim().is_empty() => {
+            format!("{SINGLE_INSTANCE_MUTEX_NAME}.dev{}", port.trim())
+        }
+        _ => SINGLE_INSTANCE_MUTEX_NAME.to_string(),
+    }
+}
+
 /// How long a second launch retries `FindWindowW` for before giving up. Only
 /// matters if the first instance is still mid-boot (overlay window not yet
 /// created) when the second one is spawned.
@@ -64,7 +78,7 @@ fn wide_z(s: &str) -> Vec<u16> {
 /// us -- Windows closes it (and releases the mutex) automatically when the
 /// process exits, however it exits.
 pub(crate) fn single_instance_guard() -> bool {
-    let name = wide_z(SINGLE_INSTANCE_MUTEX_NAME);
+    let name = wide_z(&single_instance_mutex_name());
     // SAFETY: FFI call with a valid, nul-terminated wide string and no
     // security attributes (default security descriptor).
     let handle = match unsafe { CreateMutexW(None, true, PCWSTR(name.as_ptr())) } {

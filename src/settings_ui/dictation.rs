@@ -267,33 +267,6 @@ impl super::SettingsApp {
                     self.open_replacements_modal();
                 }
             });
-
-            ui.add_space(10.0);
-            ui.separator();
-            ui.add_space(8.0);
-            ui.label(
-                RichText::new("Custom vocabulary")
-                    .font(semibold(13.0))
-                    .color(text()),
-            );
-            ui.label(
-                RichText::new(
-                    "Words and phrases sent to the provider to bias recognition toward them: \
-                     names, jargon, product names it keeps mishearing. This is \
-                     different from text replacements above, which repair the text *after* \
-                     recognition. One term per line.",
-                )
-                .size(11.5)
-                .color(muted()),
-            );
-            ui.add_space(6.0);
-            ui.add(
-                egui::TextEdit::multiline(&mut self.vocabulary_text)
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(4)
-                    .margin(Margin::symmetric(6, CTRL_PAD))
-                    .hint_text("Supabase\nCloudflare\nQuickDictate"),
-            );
         });
     }
 }

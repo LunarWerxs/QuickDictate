@@ -31,7 +31,7 @@ use crossbeam_channel::Sender;
 use crate::hotkeys::HotkeyEvent;
 use crate::state::App;
 
-const ENV_PORT: &str = "QUICKDICTATE_DEV_PORT";
+pub(crate) const ENV_PORT: &str = "QUICKDICTATE_DEV_PORT";
 
 /// A parsed control-channel command, decoupled from dispatch (which needs the
 /// app handles / channels this module is wired to).

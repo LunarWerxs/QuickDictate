@@ -159,3 +159,21 @@ TypeScript its tests are checked against.
 Everything above covers the Rust gates CI enforces. There is no separate
 lint/format toolchain for docs or scripts in this repo; keep pull requests
 focused and consistent with the surrounding file's existing style.
+
+## Licensing of contributions
+
+QuickDictate is offered under the [PolyForm Noncommercial License 1.0.0](LICENSE). So
+that the project can keep being offered under that license, or a different one later,
+without tracking down every contributor:
+
+1. You confirm the contribution is your own work (or that you have the right to submit
+   it) and that it carries no terms that conflict with these.
+2. You grant LunarWerx Studios a perpetual, worldwide, non-exclusive, royalty-free,
+   irrevocable license to use, reproduce, modify, publish, distribute, sublicense, and
+   **relicense** your contribution, in whole or in part, under any license terms,
+   including a commercial license.
+3. To the fullest extent the law allows, you assign your copyright in the contribution to
+   LunarWerx Studios; where that assignment is not effective, the license in point 2
+   applies instead, with the same practical effect.
+4. Opening a pull request means you accept these terms. Your authorship stays visible in
+   the Git history either way.

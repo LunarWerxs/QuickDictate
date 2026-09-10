@@ -12,12 +12,12 @@ use anyhow::{anyhow, Result};
 use tokio::time::Instant;
 
 use crate::config::Config;
-use crate::keys::{FailKind, KeyPool};
+use crate::keys::KeyPool;
 use crate::state::{App, Status};
 
 use super::dispatch::make_provider_id;
 use super::provider::{AudioFormat, ProviderSession, ProviderSink, ProviderStream, SttSessionOpts};
-use super::{CONNECT_TIMEOUT, ERROR_PIP_VISIBLE, EXHAUSTED_SIGNAL};
+use super::{SessionAbort, CONNECT_TIMEOUT, ERROR_PIP_VISIBLE};
 
 /// Trim, drop blanks, and de-duplicate the user's biasing terms before they go
 /// on the wire. Case-insensitive de-dup keeping first-seen order, so a list
@@ -94,15 +94,18 @@ pub(super) fn audio_capture_unhealthy(app: &Arc<App>, epoch: u64) -> bool {
 /// Resolve config/per-app-profile overrides, acquire a key, and connect.
 /// `Ok(None)` means the connection succeeded but the press it belongs to is
 /// already superseded (a newer epoch started, or `stop` fired) -- the caller
-/// returns `Ok(())` without spawning anything. Every `Err` arm already
-/// rotates/marks the key exactly as the pre-extraction code did before
-/// returning `EXHAUSTED_SIGNAL` (or, for a no-key-required provider, the raw
-/// error).
+/// returns `Ok(())` without spawning anything. A key the provider refuses at
+/// connect is marked failed in the pool and reported as
+/// [`SessionAbort::KeyRejected`] so the retry shell moves to the next key
+/// `tried` does not yet name; a handshake that never answers is
+/// [`SessionAbort::ConnectTimedOut`], which ends the press without blaming
+/// any key. A no-key-required provider's connect error is returned raw.
 pub(super) async fn establish_connected_session(
     app: &Arc<App>,
     keys: Arc<KeyPool>,
     stop: &Arc<AtomicBool>,
     epoch: u64,
+    tried: &mut Vec<String>,
 ) -> Result<Option<ConnectedSession>> {
     let cfg = app.config.load_full();
     // Resolve Per-App Profile overrides ONCE, at session start. The profile
@@ -114,8 +117,12 @@ pub(super) async fn establish_connected_session(
     let effective = cfg.effective_settings(exe_at_start.as_deref());
     let resolved_provider = cfg.provider_for_exe(exe_at_start.as_deref());
     // A profile that names a DIFFERENT provider needs that provider's keys,
-    // so the session runs on its own pool. Everything else keeps using the
-    // shared pool the main loop maintains, byte-identically to before.
+    // so the session runs on that provider's pool -- the one `App` keeps per
+    // provider, so what this attempt learns about a key survives to the next
+    // attempt and the next press. (Building a fresh pool here, as this once
+    // did, forgot every rejection the moment it was recorded, and a dead key
+    // was tried again on every single attempt.) Everything else keeps using
+    // the shared pool the main loop maintains.
     let keys = match resolved_provider.as_deref() {
         Some(want) if want != keys.provider_id() => {
             tracing::info!(
@@ -123,7 +130,7 @@ pub(super) async fn establish_connected_session(
                 exe_at_start.as_deref().unwrap_or("<unknown>"),
                 keys.provider_id()
             );
-            crate::keys::KeyPool::for_provider(&cfg, want)
+            app.pool_for_provider(&cfg, want)
         }
         _ => keys,
     };
@@ -141,15 +148,14 @@ pub(super) async fn establish_connected_session(
     let suppress_phantom = provider.suppress_phantom_finalization();
 
     let key = if requires_api_key {
-        match keys.acquire() {
-            Some(k) => k,
-            None => {
-                tracing::info!("session[{epoch}] pool empty; waiting up to 1.5 s for refresh");
-                if !keys.wait_until_ready(Duration::from_millis(1500)).await {
-                    anyhow::bail!("no API key available");
-                }
-                keys.acquire().ok_or_else(|| anyhow!("no API key"))?
+        match keys.acquire_excluding(tried) {
+            Some(k) => {
+                tried.push(k.clone());
+                k
             }
+            // Nothing this press has not already tried, or nothing at all.
+            // The retry shell reads "no key acquired" off `tried` and stops.
+            None => return Err(SessionAbort::KeyRejected.into()),
         }
     } else {
         String::new()
@@ -200,21 +206,24 @@ pub(super) async fn establish_connected_session(
             tracing::warn!(
                 "session[{epoch}] {provider_id} connect failed with key ...{key_suffix}: {e}"
             );
-            return Err(anyhow!(EXHAUSTED_SIGNAL));
+            return Err(SessionAbort::KeyRejected.into());
         }
         Err(_) => {
-            if !requires_api_key {
-                return Err(anyhow!(
-                    "{provider_id} connect timed out after {CONNECT_TIMEOUT:?}"
-                ));
-            }
-            // Exceeded CONNECT_TIMEOUT: a stalled handshake, not a bad key.
-            // Treat it as transient and rotate rather than hang the press.
-            keys.mark_failed(&key, FailKind::Transient);
-            tracing::warn!(
-                    "session[{epoch}] {provider_id} connect timed out after {CONNECT_TIMEOUT:?} with key ...{key_suffix}"
-                );
-            return Err(anyhow!(EXHAUSTED_SIGNAL));
+            // Exceeded CONNECT_TIMEOUT: the provider is not answering. That
+            // is the network's fault, not the key's -- a refused credential
+            // is refused in milliseconds -- so the key keeps its standing
+            // (this used to bench a proven-good key for 30 s over one
+            // stalled handshake and lock the user out of dictation) and no
+            // other key is sent to wait out the same stall.
+            let message = if requires_api_key {
+                format!(
+                    "{provider_id} connect timed out after {CONNECT_TIMEOUT:?} with key ...{key_suffix}; not the key's fault, so it keeps its place"
+                )
+            } else {
+                format!("{provider_id} connect timed out after {CONNECT_TIMEOUT:?}")
+            };
+            tracing::warn!("session[{epoch}] {message}");
+            return Err(SessionAbort::ConnectTimedOut(message).into());
         }
     };
     tracing::info!(

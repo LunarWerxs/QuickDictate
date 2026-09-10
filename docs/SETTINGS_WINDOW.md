@@ -1,7 +1,7 @@
 # Settings window: developer notes
 
 Read this before changing the sizing or the Save button in
-[`src/settings_ui.rs`](../src/settings_ui.rs). The Settings window is an
+[`src/settings_ui/`](../src/settings_ui/). The Settings window is an
 egui/eframe app with a few non-obvious behaviors that make quick edits go
 sideways if you do not know about them. This file exists because working these
 out from scratch cost a long, painful session; the goal is that the next change
@@ -73,7 +73,7 @@ does) or move settings into another category. Do not grow the window to fit.
 
 To check a page you are editing, screenshot it directly:
 `pwsh -File scripts\ui_shot.ps1 -Tab dictation`. `-Tab` takes a prefix of the
-rail label (provider, dictation, application, history, settings).
+rail label (application, dictation, vocabulary, history, advanced).
 
 ## 3. The Save split button (`SPLIT_BTN_H`)
 
@@ -98,11 +98,14 @@ small because it holds a single glyph.
 Headless screenshot, no screen-control tooling needed:
 
 ```
-pwsh -File scripts\refresh_test_exe.ps1        # rebuild release + copy to the root test exe
-pwsh -File scripts\ui_shot.ps1 -Shot out.png   # open Settings, self-screenshot, kill the app
+cargo build --release                          # ui_shot runs target\release\quickdictate.exe
+pwsh -File scripts\ui_shot.ps1 -Shot out.png   # isolated copy: open Settings, self-screenshot, exit
 ```
 
-`ui_shot.ps1` captures the *physical* framebuffer, so at 0.9 zoom a
+`ui_shot.ps1` runs a *separate* copy of the exe from a scratch folder, with its
+own demo settings and its own single-instance mutex (`QUICKDICTATE_DEV_PORT`
+gives it one), so a QuickDictate you are running keeps running and is never the
+one being photographed. It captures the *physical* framebuffer, so at 0.9 zoom a
 600-egui-point-wide window produces a 540 px wide PNG. The PNG dimensions are a
 quick sanity check on the real window size.
 

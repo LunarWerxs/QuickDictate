@@ -138,6 +138,23 @@ pub(crate) fn delete_glyph() -> RichText {
         RichText::new("Remove")
     }
 }
+/// Label for a History row's copy-to-clipboard button. The text fallback
+/// keeps the action readable if the Windows icon font is unavailable.
+pub(crate) fn copy_glyph() -> RichText {
+    if icons_available() {
+        RichText::new("\u{E8C8}").font(icon_font(14.0)) // MDL2 "Copy"
+    } else {
+        RichText::new("Copy")
+    }
+}
+/// Label for a History row's paste-again button; same fallback rule.
+pub(crate) fn paste_glyph() -> RichText {
+    if icons_available() {
+        RichText::new("\u{E77F}").font(icon_font(14.0)) // MDL2 "Paste"
+    } else {
+        RichText::new("Paste")
+    }
+}
 /// SageThumbs-flavoured egui visuals: theme surfaces, hairline borders, the
 /// brand blue for selection/links, generous rounding.
 pub(crate) fn apply_style(ctx: &egui::Context) {

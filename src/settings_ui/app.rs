@@ -2,6 +2,7 @@
 //! history cache, and `SettingsApp` itself, plus the per-frame `eframe::App`
 //! loop that drives them.
 
+use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc};
 
@@ -10,8 +11,6 @@ use eframe::egui::{self, Margin};
 use crate::config::Config;
 use crate::state::{App, HistoryEntry};
 use crate::stats::StatsRange;
-
-// Split out of this file so each surface can be reviewed on its own; the
 
 use super::*;
 
@@ -114,7 +113,6 @@ pub(super) struct SyncUi {
 /// `app.history` and re-run `history_matches` over every entry from scratch.
 /// Rebuilt exactly when [`history_cache_stale`] says `version` or `filter`
 /// moved since the last build.
-#[derive(Default)]
 pub(super) struct HistoryCache {
     /// `TranscriptHistory::version()` as of the last rebuild.
     pub(super) version: u64,
@@ -129,6 +127,22 @@ pub(super) struct HistoryCache {
     /// matching `filter`, newest first — the original index is what "Copy" /
     /// "Paste again" need to look the entry back up in `app.history`.
     pub(super) rows: Vec<(usize, HistoryEntry)>,
+}
+
+impl Default for HistoryCache {
+    /// The state before the first rebuild. `history_empty` starts TRUE: a
+    /// history that is still empty when the window opens has version 0, the
+    /// same as the fresh cache, so no rebuild runs until something changes --
+    /// and a `false` here read "No matches." over an empty history instead of
+    /// "No dictations yet this session."
+    fn default() -> Self {
+        Self {
+            version: 0,
+            filter: String::new(),
+            history_empty: true,
+            rows: Vec::new(),
+        }
+    }
 }
 
 /// A "Save and restart" that saved locally and kicked off a best-effort sync
@@ -181,6 +195,11 @@ pub(super) struct SettingsApp {
     pub(super) history_filter: String,
     /// Cached, pre-filtered rows for `history_card`; see [`HistoryCache`].
     pub(super) history_cache: HistoryCache,
+    /// The History page's multi-select: the `HistoryEntry::id`s currently
+    /// ticked. Ids rather than positions, because every new dictation shifts
+    /// every position by one. Pruned to entries that still exist whenever the
+    /// cache rebuilds, and cleared on re-open.
+    pub(super) history_selected: HashSet<u64>,
     /// settings.json's mtime when "Edit settings.json…" was last opened, so a
     /// later Save can tell a hand-edit landed on disk in the meantime. `None`
     /// when no editor session is being tracked (the common case).
@@ -195,11 +214,6 @@ pub(super) struct SettingsApp {
     pub(super) shot_path: Option<String>,
     pub(super) frames: u32,
     pub(super) shot_requested: bool,
-    /// Last window inner height (logical pts) we requested via the auto-fit in
-    /// `ui`. The window is sized to its content each frame so it can never
-    /// scroll and is never taller than needed; this cache gates the resize so we
-    /// only issue a viewport command when the content height actually changes
-    /// (winit applies `InnerSize` a frame late, so resending every frame would
     /// Which page the nav rail is showing. Kept across a hide/reveal so
     /// reopening Settings lands where you left off.
     pub(super) tab: nav::Tab,
@@ -336,23 +350,25 @@ impl eframe::App for SettingsApp {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        // Exactly one page. Application carries the app-level
-                        // toggles plus the two things that are set once and
-                        // rarely revisited (which provider/keys to use, and
-                        // whether settings sync is on), so the rail stays
-                        // short. Per-app profiles live inside the Application
-                        // card; check-for-updates / log / settings.json are in
-                        // the ⋯ overflow menu below.
+                        // Exactly one page. Application is the everyday page:
+                        // which provider and keys to use, the behaviour
+                        // toggles a person actually revisits, and settings
+                        // sync. The switches that are set once and forgotten
+                        // (diagnostics, files, per-app profiles) sit on
+                        // Advanced so this one stays short; check-for-updates
+                        // / log / settings.json are in the ⋯ overflow menu.
                         match self.tab {
                             nav::Tab::Application => {
-                                self.application_card(ui);
-                                ui.add_space(10.0);
                                 self.provider_card(ui, &ctx, testing);
+                                ui.add_space(10.0);
+                                self.application_card(ui);
                                 ui.add_space(10.0);
                                 self.sync_card(ui, &ctx);
                             }
                             nav::Tab::Dictation => self.dictation_card(ui),
+                            nav::Tab::Vocabulary => self.vocabulary_card(ui),
                             nav::Tab::History => self.history_card(ui),
+                            nav::Tab::Advanced => self.advanced_card(ui),
                         }
                         ui.add_space(12.0);
                     });

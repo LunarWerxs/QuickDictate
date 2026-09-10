@@ -27,7 +27,7 @@ optional local model for fully offline transcription, <b>no QuickDictate subscri
   <a href="https://github.com/LunarWerxs/QuickDictate/releases/latest"><img src="https://img.shields.io/github/v/release/LunarWerxs/QuickDictate?label=release&color=2e7df6" alt="Latest release"></a>
   <a href="https://github.com/LunarWerxs/QuickDictate/releases/latest"><img src="https://img.shields.io/github/downloads/LunarWerxs/QuickDictate/total?color=2e7df6&label=downloads" alt="Downloads"></a>
   <img src="https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D6" alt="Windows 10/11 x64">
-  <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-PolyForm_Noncommercial-3ddc84" alt="PolyForm Noncommercial license"></a>
   <a href="https://github.com/LunarWerxs/QuickDictate/stargazers"><img src="https://img.shields.io/github/stars/LunarWerxs/QuickDictate?color=f6b02e" alt="Stars"></a>
   <a href="https://discord.gg/PsWpeNUzhk"><img src="https://img.shields.io/badge/Discord-join_the_community-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
 </p>
@@ -99,7 +99,7 @@ key or an internet connection. Microphone audio stays on your PC.
 > [!TIP]
 > **Keeping the exe on your Desktop?** By default QuickDictate writes its `logs\`
 > folder, usage stats, and update cache next to itself, which turns the Desktop
-> into a scratch directory. **Settings ▸ Application ▸ Files** moves them: click
+> into a scratch directory. **Settings ▸ Advanced ▸ Files** moves them: click
 > **Use AppData** for `%LOCALAPPDATA%\QuickDictate`, or **Browse…** for anywhere
 > you like. Existing files are moved across on the next start. (Or set `data_dir`
 > in `settings.json`; `%VARIABLES%` are expanded.)
@@ -133,7 +133,8 @@ Windows' own recognizer, with no choice of engine or provider.
 ## ❓ FAQ
 
 **Is QuickDictate free?**
-QuickDictate itself is free and MIT-licensed, with no subscription or account. You bring
+QuickDictate itself is free for personal and any other noncommercial use ([PolyForm
+Noncommercial](LICENSE), source available), with no subscription or account. You bring
 your own API key for one of six cloud speech-to-text providers (ElevenLabs, Deepgram,
 OpenAI, AssemblyAI, DashScope, or Google), which bill you directly per their own pricing,
 or you can skip the cloud entirely and use the free offline Local provider.
@@ -182,7 +183,11 @@ focused application.
 
 ## 📄 License
 
-MIT, see [LICENSE](LICENSE). Made with care by **[LunarWerx Studios](https://lunarwerx.com)**.
+[PolyForm Noncommercial 1.0.0](LICENSE) © LunarWerx Studios, starting with v0.9.0. The source
+is available and free for noncommercial use; commercial use needs a separate license from
+LunarWerx Studios (open an issue to arrange one). Releases through v0.8.0 were MIT, and that
+grant stays in effect for those copies. Made with care by
+**[LunarWerx Studios](https://lunarwerx.com)**.
 Also from LunarWerx Studios: [RepoYeti](https://repoyeti.com),
 [SageThumbs](https://sagethumbs.lunarwerx.com), and
 [DevWebUI](https://devwebui.lunarwerx.com).

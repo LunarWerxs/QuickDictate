@@ -61,7 +61,7 @@ BEGIN
       VALUE "FileDescription", "QuickDictate - bring-your-own-key dictation for Windows"
       VALUE "FileVersion", "{version}"
       VALUE "InternalName", "quickdictate"
-      VALUE "LegalCopyright", "(c) 2026 Lunarwerx. MIT License."
+      VALUE "LegalCopyright", "(c) 2026 Lunarwerx. PolyForm Noncommercial 1.0.0."
       VALUE "OriginalFilename", "quickdictate.exe"
       VALUE "ProductName", "QuickDictate"
       VALUE "ProductVersion", "{version}"
@@ -77,5 +77,11 @@ END
     );
     fs::write(&rc_path, rc_contents).expect("write app.rc");
 
-    embed_resource::compile(&rc_path, embed_resource::NONE);
+    // embed-resource 3 reports instead of panicking; a resource that failed
+    // to compile would ship an exe with no icon and no version block, which
+    // is exactly the "looks sketchy" this script exists to prevent, so a
+    // failure here stops the build.
+    embed_resource::compile(&rc_path, embed_resource::NONE)
+        .manifest_optional()
+        .expect("compile the icon and version resource");
 }

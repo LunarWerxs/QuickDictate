@@ -149,7 +149,8 @@ impl super::SettingsApp {
             // Save discards it exactly like any other unsaved draft edit.
             self.draft.error_reporting_enabled = true;
             self.error_report_preview = Some(self.build_error_report_text());
-            self.tab = nav::Tab::Application;
+            // The preview renders under "Error reporting" on the Advanced page.
+            self.tab = nav::Tab::Advanced;
             self.status.clear();
         }
         if open_report || dismissed {

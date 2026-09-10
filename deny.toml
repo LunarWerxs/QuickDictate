@@ -54,7 +54,9 @@ ignore = []
 
 # ----------------------------------------------------------------------------
 [licenses]
-# QuickDictate itself is MIT (see LICENSE). This list is about DEPENDENCIES, and
+# QuickDictate itself is PolyForm Noncommercial 1.0.0 (see LICENSE); it is
+# `publish = false`, so `private.ignore` below keeps it out of this scan. This
+# list is about DEPENDENCIES, and
 # is deliberately kept to exactly what the lockfile actually resolves to on the
 # Windows targets, so a new crate arriving under a surprising license fails the
 # build rather than sliding in under a permissive catch-all.

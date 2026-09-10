@@ -76,18 +76,19 @@ const SILENCE_RMS: i32 = 1500;
 /// it never fires at all -- it only matters for deliberately long tails.
 const TAIL_KEEPALIVE_AFTER: Duration = Duration::from_secs(5);
 
-/// Keys we try per "round" of attempts before pausing to let a refresh land.
-const MAX_KEY_ATTEMPTS: u32 = 3;
-
-/// After a full round of MAX_KEY_ATTEMPTS bad keys, pause this long before
-/// trying another round (only helps if a key on a short cooldown recovered).
-const POOL_REFRESH_WAIT: Duration = Duration::from_secs(4);
+/// The most keys one press will try before giving up. Each key is tried at
+/// most once per press (see `run_session_with_retries`), so with fewer keys
+/// than this the press simply runs out of keys first; the cap only bounds a
+/// pathological pool of many rejected keys.
+const MAX_KEYS_PER_PRESS: usize = 8;
 const ERROR_PIP_VISIBLE: Duration = Duration::from_secs(2);
 /// Hard cap on a single provider `connect()` during a real dictation session.
-/// probe_key already bounds its prewarm connect at 6 s; the live path had no
-/// timeout at all, so a stalled handshake (black-holed network, provider outage
-/// mid-handshake) could hang the user's hotkey press until the OS TCP timeout.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// A rejected credential answers in milliseconds; only a black-holed network
+/// or a provider outage mid-handshake takes this long, and the user's press
+/// must not hang until the OS TCP timeout finds that out. Same bound as the
+/// prewarm probe's connect, so there is one number for "the provider is not
+/// answering" rather than two.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// Hard cap on ONE `send_audio` call. Chunks are ~100 ms of audio, so a
 /// healthy socket completes this in single-digit milliseconds; anything near
@@ -96,12 +97,33 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// still talking rather than after they release.
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Hard cap on rounds (3 keys × 2 rounds = up to 6 attempts per press).
-const MAX_RETRY_ROUNDS: u32 = 2;
+/// Why an attempt could not be served, out of band of ordinary errors so the
+/// retry shell can tell "try the next key" from "stop now", and the error pip
+/// can name the cause. A real failure (mic, transport mid-session) is still a
+/// plain `anyhow` error and bubbles up untouched.
+#[derive(Debug, thiserror::Error)]
+pub(super) enum SessionAbort {
+    /// The provider rejected the key this attempt used (invalid, out of
+    /// credit, rate-limited, or a connect-stage error laid at the key's
+    /// door), or there was no untried key left to use. The pool has already
+    /// been told; the shell moves on to the next untried key, if any.
+    #[error("the provider did not accept an API key for this press")]
+    KeyRejected,
+    /// The handshake never completed inside [`CONNECT_TIMEOUT`]. That is the
+    /// network's (or the provider's) fault, never the key's — a bad key is
+    /// refused in milliseconds — so no key is benched, no other key is tried
+    /// against the same stalled endpoint, and the press fails now rather than
+    /// after every key has waited out the same timeout.
+    #[error("{0}")]
+    ConnectTimedOut(String),
+}
 
-/// Sentinel error asking the retry shell to pick a different key. Stays out of
-/// band of normal errors so a real failure (network, mic) still bubbles up.
-const EXHAUSTED_SIGNAL: &str = "__quickdictate_key_exhausted__";
+impl SessionAbort {
+    /// The abort reason behind `err`, if it is one.
+    fn of(err: &anyhow::Error) -> Option<&SessionAbort> {
+        err.downcast_ref::<SessionAbort>()
+    }
+}
 
 pub struct SttHandle {
     pub stop: Arc<AtomicBool>,
@@ -152,11 +174,14 @@ pub fn start_session(app: Arc<App>, keys: Arc<KeyPool>) -> SttHandle {
     }
 }
 
-/// Retry shell for one dictation session: a session may fail fast with
-/// EXHAUSTED_SIGNAL, in which case we rotate to the next of the user's keys.
-/// After a round of MAX_KEY_ATTEMPTS failures we pause briefly
-/// (POOL_REFRESH_WAIT) in case a short cooldown lapses, then try another
-/// round. Split out of `start_session`'s spawned block purely to keep its
+/// Retry shell for one dictation session. An attempt whose key the provider
+/// rejects ([`SessionAbort::KeyRejected`]) is followed by another attempt on
+/// the next key this press has NOT tried yet; `tried` is what makes that
+/// "not yet" true, so a press can never circle back to a key that just
+/// failed. The press ends when an attempt runs (or fails for a reason that is
+/// not the key's), when no untried key is left, or when the user lets go
+/// mid-rotation — in which case the key failure is still reported, not
+/// swallowed. Split out of `start_session`'s spawned block purely to keep its
 /// cognitive load down.
 async fn run_session_with_retries(
     app2: Arc<App>,
@@ -165,59 +190,55 @@ async fn run_session_with_retries(
     epoch: u64,
     session_usage: Arc<parking_lot::Mutex<SessionUsage>>,
 ) -> Result<()> {
-    let mut final_res: Result<()> = Ok(());
-    let mut attempts_in_round: u32 = 0;
-    let mut rounds_done: u32 = 0;
-    let mut total_attempts: u32 = 0;
+    let mut tried: Vec<String> = Vec::new();
     let user_aborted = || stop.load(Ordering::Acquire) || app2.current_session_epoch() != epoch;
     loop {
-        if user_aborted() {
-            break;
-        }
-        attempts_in_round += 1;
-        total_attempts += 1;
+        let before = tried.len();
         let attempt_res = run_session(
             app2.clone(),
             Arc::clone(&keys),
             Arc::clone(&stop),
             epoch,
             Arc::clone(&session_usage),
+            &mut tried,
         )
         .await;
-        let is_exhausted = matches!(&attempt_res, Err(e) if e.to_string() == EXHAUSTED_SIGNAL);
-        if !is_exhausted {
-            final_res = attempt_res;
-            break;
+        let rejected = matches!(
+            &attempt_res,
+            Err(e) if matches!(SessionAbort::of(e), Some(SessionAbort::KeyRejected))
+        );
+        if !rejected {
+            return attempt_res;
         }
-        if attempts_in_round < MAX_KEY_ATTEMPTS {
-            tracing::warn!(
-                "session[{epoch}] attempt {total_attempts} (round {round}, key {attempts_in_round}/{MAX_KEY_ATTEMPTS}) hit a bad key; rotating",
-                round = rounds_done + 1
-            );
-            continue;
-        }
-        rounds_done += 1;
-        if rounds_done >= MAX_RETRY_ROUNDS {
+        if tried.len() == before {
+            // The attempt never got a key: nothing untried is left. The
+            // pool's summary says why (every key rejected, or none configured).
             tracing::error!(
-                "session[{epoch}] {total_attempts} attempts across {MAX_RETRY_ROUNDS} rounds all failed; giving up"
+                "session[{epoch}] no untried API key left after {} attempt(s); giving up ({})",
+                tried.len(),
+                keys.summary()
             );
-            final_res = attempt_res;
-            break;
+            return attempt_res;
+        }
+        if tried.len() >= MAX_KEYS_PER_PRESS {
+            tracing::error!(
+                "session[{epoch}] {MAX_KEYS_PER_PRESS} keys rejected in one press; giving up ({})",
+                keys.summary()
+            );
+            return attempt_res;
+        }
+        if user_aborted() {
+            // Released (or pressed again) while we were still looking for a
+            // key that works. Don't start an attempt nobody is holding the
+            // button for, but do surface the rejection: a press that did
+            // nothing and said nothing is the failure mode this exists to end.
+            return attempt_res;
         }
         tracing::warn!(
-            "session[{epoch}] round {rounds_done}/{MAX_RETRY_ROUNDS} exhausted; waiting up to {POOL_REFRESH_WAIT:?} for pool refresh"
+            "session[{epoch}] key {} of this press was rejected; trying the next untried key",
+            tried.len()
         );
-        let refreshed = keys.schedule_refresh_and_wait(POOL_REFRESH_WAIT).await;
-        if user_aborted() {
-            break;
-        }
-        tracing::info!(
-            "session[{epoch}] refresh completed={refreshed}; starting round {round} of {MAX_RETRY_ROUNDS}",
-            round = rounds_done + 1
-        );
-        attempts_in_round = 0;
     }
-    final_res
 }
 
 /// Record usage, then report or clear the session's outcome. Split out of
@@ -236,13 +257,14 @@ async fn finish_session(
         crate::sync::schedule_stats_push(Arc::clone(&app2));
     }
     if let Err(e) = final_res {
-        let key_shaped = e.to_string() == EXHAUSTED_SIGNAL;
-        if key_shaped {
-            tracing::error!(
-                "session[{epoch}] tried {MAX_KEY_ATTEMPTS} keys, none worked -- check provider credit / pool health"
-            );
-        } else {
-            tracing::error!("session error: {e:#}");
+        let abort = SessionAbort::of(&e);
+        match abort {
+            Some(SessionAbort::KeyRejected) => tracing::error!(
+                "session[{epoch}] no API key worked for this press -- check provider credit / pool health ({})",
+                keys.summary()
+            ),
+            Some(SessionAbort::ConnectTimedOut(_)) => tracing::error!("session[{epoch}] {e}"),
+            None => tracing::error!("session error: {e:#}"),
         }
         if app2.current_session_epoch() == epoch {
             // Name the actual cause, but only when the failure was actually
@@ -251,10 +273,10 @@ async fn finish_session(
             // it for a NON-key failure misattributes: a mic or network error
             // on a machine whose spare keys sat at Quota would show "out of
             // credit" for a dictation that never touched those keys.
-            let kind = if key_shaped {
-                error_kind_for(&keys)
-            } else {
-                crate::state::ErrorKind::Generic
+            let kind = match abort {
+                Some(SessionAbort::KeyRejected) => error_kind_for(&keys),
+                Some(SessionAbort::ConnectTimedOut(_)) => crate::state::ErrorKind::Network,
+                None => crate::state::ErrorKind::Generic,
             };
             app2.raise_error(kind);
             let app_for_clear = Arc::clone(&app2);
@@ -362,12 +384,16 @@ fn audio_duration_ms(samples: u64, sample_rate: u32) -> u64 {
     samples.saturating_mul(1_000) / sample_rate as u64
 }
 
+/// One attempt at a session on one key. `tried` is the press's memory of the
+/// keys it has already used; the key this attempt acquires is appended so the
+/// retry shell never hands it out again for the same press.
 async fn run_session(
     app: Arc<App>,
     keys: Arc<KeyPool>,
     stop: Arc<AtomicBool>,
     epoch: u64,
     session_usage: Arc<parking_lot::Mutex<SessionUsage>>,
+    tried: &mut Vec<String>,
 ) -> Result<()> {
     tracing::info!("session[{epoch}] starting");
 
@@ -375,7 +401,7 @@ async fn run_session(
         return Ok(());
     }
 
-    let connected = match establish_connected_session(&app, keys, &stop, epoch).await? {
+    let connected = match establish_connected_session(&app, keys, &stop, epoch, tried).await? {
         Some(connected) => connected,
         None => return Ok(()),
     };
