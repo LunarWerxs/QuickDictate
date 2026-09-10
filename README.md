@@ -80,7 +80,7 @@ key or an internet connection. Microphone audio stays on your PC.
 | ⌨️ **Types into any window** | Whatever has focus, your editor, a chat box, a terminal, or a web form. |
 | ✋ **Hold or tap** | Hold a key while you talk, or tap to start and stop. Both are configurable. |
 | 💬 **Clear live feedback** | Five cloud providers stream words as you talk; batch and Local modes show when the final result is processing. |
-| 🪄 **Little touches that add up** | A custom vocabulary so your jargon is heard right the first time, a fix-list for words it mishears, per-app profiles, a searchable dictation history, and a *"scratch that"* voice command. |
+| 🪄 **Little touches that add up** | A custom vocabulary so your jargon is heard right the first time, a fix-list for words it mishears, per-app profiles, a searchable dictation history that survives restarts and updates, and a *"scratch that"* voice command. |
 | 🔒 **Your data stays yours** | Cloud audio goes only to the provider you pick; Local audio never leaves the PC. Optional settings sync is opt-in, and updates ask before installing. |
 
 ## 🚀 Quick start

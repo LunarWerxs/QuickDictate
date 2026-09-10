@@ -19,6 +19,16 @@ Cargo.toml: this list exists so none of them drift (SECURITY.md sat on
   Get-ChildItem -Recurse -Include *.md,*.toml -Exclude CHANGELOG.md | Select-String '<old version>'
   ```
 
+- [ ] The **website is a separate repo** (`..\site`, `QuickDictate/quickdictate.github.io`) and
+      names the version in three places in `index.html`: the JSON-LD `softwareVersion`, the hero
+      eyebrow, and the closing paragraph. `sed -i 's/<old>/<new>/g' index.html` covers all three.
+
+      ⚠️ **Do not touch `site\VERSION`.** That file is the *site's own* version (0.1.x), not the
+      app's, and a global find-and-replace across the site repo will happily rewrite it.
+
+      Push the site **after** the release workflow has published the assets, so the page never
+      advertises a version nobody can download yet.
+
 ## 3. Verify
 
 - [ ] `pwsh -File scripts\check.ps1 -Full`: the exact gates CI runs. Format,
@@ -42,6 +52,14 @@ Cargo.toml: this list exists so none of them drift (SECURITY.md sat on
 ## 4. Tag and publish
 
 - [ ] Commit, tag `vX.Y.Z`, and push the tag.
+- [ ] Confirm both updater endpoints report the new tag before telling anyone it shipped. The app
+      asks the first and only falls back to the second, so a stale first one means nobody is
+      offered the update:
+
+      ```powershell
+      curl.exe -s https://studio.connections.icu/v1/app/quickdictate/latest | ConvertFrom-Json | % tag_name
+      curl.exe -s https://api.github.com/repos/LunarWerxs/QuickDictate/releases/latest | ConvertFrom-Json | % tag_name
+      ```
 - [ ] The `Release` GitHub Actions workflow reruns formatting, Clippy, tests, and
       the locked release build from that exact tag. It then verifies the public
       executable's GUI subsystem, version metadata, embedded icon, and
