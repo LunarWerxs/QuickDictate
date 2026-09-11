@@ -51,6 +51,12 @@ impl SttProvider for GoogleProvider {
         "google"
     }
 
+    /// Batch: the whole recording is POSTed at commit, so there is nothing to
+    /// show while the user talks. The pip spins instead of holding "0".
+    fn streams_interim_text(&self) -> bool {
+        false
+    }
+
     fn required_audio_format(&self) -> AudioFormat {
         AudioFormat {
             sample_rate: 16_000,

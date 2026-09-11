@@ -9,6 +9,8 @@
 //! real end-to-end pipeline is covered by the live tests and `smoke_test.ps1`).
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
@@ -19,9 +21,13 @@ use super::provider::{
 
 /// A provider that replays a scripted event sequence. `send_audio`/`commit`/
 /// `close` are no-ops (recorded), so tests control exactly what the stream
-/// half yields.
+/// half yields. `connects` and `sent_chunks` count across every session the
+/// provider opened, so a test can see a reconnect and what was replayed.
+#[derive(Default)]
 pub struct MockProvider {
     pub script: Vec<SttEvent>,
+    pub connects: Arc<AtomicUsize>,
+    pub sent_chunks: Arc<AtomicUsize>,
 }
 
 #[async_trait]
@@ -41,8 +47,11 @@ impl SttProvider for MockProvider {
         _key: &str,
         _opts: &SttSessionOpts,
     ) -> Result<ProviderSession, ConnectError> {
+        self.connects.fetch_add(1, Ordering::AcqRel);
         Ok(ProviderSession {
-            sink: Box::new(MockSink { audio_chunks: 0 }),
+            sink: Box::new(MockSink {
+                audio_chunks: Arc::clone(&self.sent_chunks),
+            }),
             stream: Box::new(MockStream {
                 events: self.script.clone().into(),
             }),
@@ -51,13 +60,13 @@ impl SttProvider for MockProvider {
 }
 
 struct MockSink {
-    audio_chunks: usize,
+    audio_chunks: Arc<AtomicUsize>,
 }
 
 #[async_trait]
 impl ProviderSink for MockSink {
     async fn send_audio(&mut self, _pcm: &[i16]) -> Result<(), SendError> {
-        self.audio_chunks += 1;
+        self.audio_chunks.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
     async fn commit(&mut self) -> Result<(), SendError> {
@@ -128,6 +137,7 @@ mod tests {
                 SttEvent::Committed("the quick brown fox".into()),
                 SttEvent::Closed(None),
             ],
+            ..Default::default()
         };
         let (committed, last_partial, fail) = drive(&provider).await;
         assert_eq!(committed, "the quick brown fox");
@@ -144,6 +154,7 @@ mod tests {
                 SttEvent::KeyFailure(FailKind::Exhausted),
                 SttEvent::Closed(None),
             ],
+            ..Default::default()
         };
         let (committed, _partial, fail) = drive(&provider).await;
         assert_eq!(committed, "first second");

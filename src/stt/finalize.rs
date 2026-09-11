@@ -43,12 +43,15 @@ pub(super) struct SessionFinalizeCtx {
 
 /// Fast-fail: the provider already told us (via `SttEvent::KeyFailure`)
 /// that the key is dead before the session ever reached release. Skip the
-/// entire finalize and hand back to the retry shell to rotate keys.
+/// entire finalize and hand back to the retry shell to rotate keys. What
+/// this attempt had transcribed but not yet pasted goes into `carry` for
+/// the next attempt (or the press's end) to deliver.
 pub(super) async fn abort_for_early_key_failure(
     ctx: &SessionFinalizeCtx,
     kind: FailKind,
     send_task: tokio::task::JoinHandle<SentAudio>,
     recv_task: tokio::task::JoinHandle<()>,
+    carry: &mut Vec<String>,
 ) -> Result<()> {
     let epoch = ctx.epoch;
     tracing::warn!(
@@ -63,6 +66,12 @@ pub(super) async fn abort_for_early_key_failure(
     recv_task.abort();
     let _ = send_task.await;
     let _ = recv_task.await;
+    let stashed = stash_unpasted(&ctx.acc, carry);
+    if stashed > 0 {
+        tracing::info!(
+            "session[{epoch}] carrying {stashed} unpasted chunk(s) into the next attempt"
+        );
+    }
     if !ctx.delay_until_release {
         let words = ctx.acc.transcribed_words.load(Ordering::Acquire);
         if words > 0 {
@@ -76,6 +85,57 @@ pub(super) async fn abort_for_early_key_failure(
     }
     ctx.keys.mark_failed(&ctx.key, kind);
     Err(SessionAbort::KeyRejected.into())
+}
+
+/// Move everything an attempt transcribed but never pasted -- its held
+/// commits and a trailing partial that is not just the last commit again --
+/// onto `carry`. Returns how many chunks moved. Pure over the accumulators,
+/// so it is unit-tested without a session.
+pub(super) fn stash_unpasted(acc: &SessionAccumulators, carry: &mut Vec<String>) -> usize {
+    let mut held = std::mem::take(&mut *acc.chunks_buf.lock());
+    let partial = std::mem::take(&mut *acc.last_partial_buf.lock());
+    if !partial.is_empty() {
+        let last = acc.last_commit_text.lock();
+        if !transcripts_equivalent(&last, &partial) {
+            held.push(partial);
+        }
+    }
+    let moved = held.len();
+    carry.append(&mut held);
+    moved
+}
+
+/// Seed a fresh attempt with what earlier attempts of the same press carried
+/// over: in held mode the text joins the attempt's held commits, so it is
+/// pasted in order at release; in live mode it is pasted right away, exactly
+/// as the commits would have been had their attempt survived. Returns the
+/// number of words seeded, already added to the attempt's word count.
+pub(super) fn seed_from_carry(
+    app: &Arc<App>,
+    ctx: &SessionFinalizeCtx,
+    carry: &mut Vec<String>,
+) -> u64 {
+    if carry.is_empty() {
+        return 0;
+    }
+    let chunks = std::mem::take(carry);
+    let words: u64 = chunks
+        .iter()
+        .map(|c| c.split_whitespace().count() as u64)
+        .sum();
+    ctx.acc.transcribed_words.fetch_add(words, Ordering::AcqRel);
+    ctx.acc.committed_flag.store(true, Ordering::Release);
+    tracing::info!(
+        "session[{}] seeded with {} chunk(s) ({words} words) carried from an earlier attempt",
+        ctx.epoch,
+        chunks.len()
+    );
+    if ctx.delay_until_release {
+        ctx.acc.chunks_buf.lock().extend(chunks);
+    } else if !app.session_discarded(ctx.epoch) {
+        deliver_transcript(&app.transcript_tx, chunks.join(" "));
+    }
+    words
 }
 
 /// Flip the release flag so the send/recv tasks switch into their
@@ -103,7 +163,7 @@ pub(super) fn enter_release_phase(
     let release_flush: Vec<String> = std::mem::take(&mut *ctx.acc.chunks_buf.lock());
     if !release_flush.is_empty() {
         let joined = release_flush.join(" ");
-        if app.current_session_epoch() == epoch {
+        if !app.session_discarded(epoch) {
             tracing::info!(
                 "session[{epoch}] release flush: {} chunk(s), {} chars",
                 release_flush.len(),
@@ -112,7 +172,7 @@ pub(super) fn enter_release_phase(
             deliver_transcript(&app.transcript_tx, joined);
         } else {
             tracing::info!(
-                "session[{epoch}] skipping release flush because a newer action superseded it"
+                "session[{epoch}] skipping release flush because the user discarded this dictation"
             );
         }
     }
@@ -183,7 +243,7 @@ pub(super) fn promote_tail_transcript(app: &Arc<App>, ctx: &SessionFinalizeCtx) 
 
     if !held_chunks.is_empty() {
         let joined = held_chunks.join(" ");
-        if app.current_session_epoch() == epoch {
+        if !app.session_discarded(epoch) {
             tracing::info!(
                 "session[{epoch}] flushing {} held commit chunk(s), {} chars total",
                 held_chunks.len(),
@@ -192,7 +252,7 @@ pub(super) fn promote_tail_transcript(app: &Arc<App>, ctx: &SessionFinalizeCtx) 
             deliver_transcript(&app.transcript_tx, joined);
         } else {
             tracing::info!(
-                "session[{epoch}] skipping held commit flush because a newer action superseded it"
+                "session[{epoch}] skipping held commit flush because the user discarded this dictation"
             );
         }
     }
@@ -205,6 +265,13 @@ pub(super) fn promote_tail_transcript(app: &Arc<App>, ctx: &SessionFinalizeCtx) 
     // earlier sentence committed. `got_committed` still guards the
     // "no transcript at all" diagnostic in the caller, which is genuinely per
     // session.
+    //
+    // It is promoted even when the NEXT press has already started. This is
+    // the common shape of a stalled provider: the user sees only the first
+    // sentence land at release, presses again within a second to say the
+    // rest, and the trailing partial -- the very words that went missing --
+    // used to be dropped as "superseded". Only a dictation the user threw
+    // away on purpose (the replay long-press) is withheld.
     let had_partial = !last_partial.is_empty();
     let partial_was_dropped_phantom = dropped_phantom
         .as_deref()
@@ -223,7 +290,7 @@ pub(super) fn promote_tail_transcript(app: &Arc<App>, ctx: &SessionFinalizeCtx) 
         tracing::info!(
             "session[{epoch}] suppressing last partial because it repeats the last commit"
         );
-    } else if had_partial && app.current_session_epoch() == epoch {
+    } else if had_partial && !app.session_discarded(epoch) {
         ctx.acc.transcribed_words.fetch_add(
             last_partial.split_whitespace().count() as u64,
             Ordering::AcqRel,
@@ -239,7 +306,7 @@ pub(super) fn promote_tail_transcript(app: &Arc<App>, ctx: &SessionFinalizeCtx) 
         deliver_transcript(&app.transcript_tx, last_partial);
     } else if had_partial {
         tracing::info!(
-            "session[{epoch}] skipping last partial because a newer action superseded it"
+            "session[{epoch}] skipping last partial because the user discarded this dictation"
         );
     }
 

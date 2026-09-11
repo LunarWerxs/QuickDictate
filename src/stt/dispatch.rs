@@ -42,6 +42,16 @@ pub(super) fn make_provider_id(id: &str, cfg: &Config) -> Box<dyn SttProvider> {
     }
 }
 
+/// Whether the provider `cfg` selects streams interim transcripts while the
+/// user talks (see [`SttProvider::streams_interim_text`]). The pip asks this
+/// to choose between its live word count and the spinner; asking the provider
+/// is what keeps that choice from drifting as adapters are added, which a
+/// hardcoded `== "local"` in the UI had already done -- Google and OpenAI
+/// both sat on a frozen "0".
+pub fn provider_streams_interim_text(cfg: &Config) -> bool {
+    make_provider(cfg).streams_interim_text()
+}
+
 /// Startup key prewarm (§owner request, 2026-07-04): probe every key of the
 /// active provider in config order, mark dead/limited ones failed (so the
 /// session's `acquire` never wastes a press on them), and queue the first
@@ -151,5 +161,39 @@ async fn probe_key(
             let _ = sink.close().await;
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_provider(id: &str) -> Config {
+        Config {
+            stt_provider: id.into(),
+            ..Config::default()
+        }
+    }
+
+    /// The pip's choice between a live word count and the spinner, for every
+    /// provider the app can be set to. A new adapter that answers only at
+    /// commit has to be added here (and override the trait method) or its
+    /// users watch a "0" that never moves.
+    #[test]
+    fn only_the_commit_only_providers_hide_the_live_word_count() {
+        for id in ["elevenlabs", "deepgram", "assemblyai", "dashscope"] {
+            assert!(
+                provider_streams_interim_text(&with_provider(id)),
+                "{id} streams partials, so the pip should count words"
+            );
+        }
+        for id in ["google", "local", "openai"] {
+            assert!(
+                !provider_streams_interim_text(&with_provider(id)),
+                "{id} answers only after commit, so the pip should spin"
+            );
+        }
+        // An unknown id falls back to ElevenLabs, which does stream.
+        assert!(provider_streams_interim_text(&with_provider("nonsense")));
     }
 }

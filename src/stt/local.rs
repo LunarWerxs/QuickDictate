@@ -26,6 +26,12 @@ impl SttProvider for LocalProvider {
         "local"
     }
 
+    /// Batch: inference runs once on the finished recording, so the pip spins
+    /// rather than holding a word count of "0" throughout.
+    fn streams_interim_text(&self) -> bool {
+        false
+    }
+
     fn required_audio_format(&self) -> AudioFormat {
         AudioFormat {
             sample_rate: 16_000,

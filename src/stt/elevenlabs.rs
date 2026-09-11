@@ -63,6 +63,15 @@ impl SttProvider for ElevenLabsProvider {
         true
     }
 
+    /// Observed 2026-09-11: a session sends one VAD commit and then nothing
+    /// at all for the rest of the press -- no partial, no commit, no close,
+    /// not even an answer to the final manual commit -- while the socket
+    /// keeps accepting audio. A fresh connection on the same key answers
+    /// within ~200 ms and transcribes the replayed segment normally.
+    fn supports_stall_recovery(&self) -> bool {
+        true
+    }
+
     async fn connect(
         &self,
         key: &str,
@@ -314,19 +323,53 @@ fn map_frame(text: &str) -> Option<SttEvent> {
         "auth_error" | "invalid_api_key" | "unauthorized" => {
             Some(SttEvent::KeyFailure(FailKind::Invalid))
         }
-        "rate_limit_exceeded" | "too_many_requests" => {
+        // `rate_limited` is the name in ElevenLabs' own AsyncAPI spec; the
+        // other two are kept for whatever older builds observed.
+        "rate_limited" | "rate_limit_exceeded" | "too_many_requests" => {
             Some(SttEvent::KeyFailure(FailKind::RateLimit))
         }
-        t if t.contains("error") || is_account_exhausted(text) => {
-            let kind = if is_account_exhausted(text) {
-                FailKind::Exhausted
-            } else {
-                FailKind::Transient
-            };
-            Some(SttEvent::KeyFailure(kind))
+        // Advisory frames the spec documents. None of them ends the session
+        // or blames the key, but a session that went quiet after one is only
+        // diagnosable if the log shows it, so they are never dropped silently.
+        "warning"
+        | "commit_throttled"
+        | "insufficient_audio_activity"
+        | "queue_overflow"
+        | "resource_exhausted"
+        | "session_time_limit_exceeded" => {
+            tracing::warn!("elevenlabs: server sent {}", summarize_frame(text));
+            None
         }
-        _ => None,
+        // A billing-flavoured body under any type: the key is out of credit.
+        _ if is_account_exhausted(text) => Some(SttEvent::KeyFailure(FailKind::Exhausted)),
+        // Every other error-shaped frame (`error`, `transcriber_error`,
+        // `input_error`, `invalid_request`, ...) is the SERVER's problem, not
+        // the credential's. It used to be a transient key failure, which
+        // benched a working key and aborted the attempt -- dropping the
+        // sentences it was holding. As a provider failure the press keeps
+        // going: if the server then closes or goes quiet, the stall watchdog
+        // replaces the connection with the text intact, and the failure is
+        // only surfaced if the press ends having delivered nothing.
+        t if t.contains("error") || t == "invalid_request" || t == "chunk_size_exceeded" => Some(
+            SttEvent::ProviderFailure(format!("elevenlabs sent {}", summarize_frame(text))),
+        ),
+        "" => None,
+        _ => {
+            tracing::debug!("elevenlabs: ignoring frame {}", summarize_frame(text));
+            None
+        }
     }
+}
+
+/// A frame as it should appear in a log line: its type and a bounded slice of
+/// the body. Never carries audio (the server sends none) and never a key.
+fn summarize_frame(text: &str) -> String {
+    const MAX: usize = 240;
+    let mut out: String = text.chars().take(MAX).collect();
+    if text.chars().count() > MAX {
+        out.push('…');
+    }
+    out
 }
 
 /// Substring check on close-frame reasons / message bodies that indicate the
@@ -397,21 +440,63 @@ mod tests {
 
     #[test]
     fn generic_error_frame_classifies() {
-        // A billing-flavored error body → Exhausted; a plain error → Transient.
+        // A billing-flavored error body → Exhausted (the key's fault); any
+        // other error shape is the server's problem and never benches a key.
         assert!(matches!(
             map_frame(r#"{"message_type":"error","text":"insufficient_funds"}"#),
             Some(SttEvent::KeyFailure(FailKind::Exhausted))
         ));
-        assert!(matches!(
-            map_frame(r#"{"message_type":"internal_error"}"#),
-            Some(SttEvent::KeyFailure(FailKind::Transient))
-        ));
+        for frame in [
+            r#"{"message_type":"internal_error"}"#,
+            r#"{"message_type":"transcriber_error","error":"model crashed"}"#,
+            r#"{"message_type":"input_error","error":"bad chunk"}"#,
+            r#"{"message_type":"invalid_request"}"#,
+        ] {
+            assert!(
+                matches!(map_frame(frame), Some(SttEvent::ProviderFailure(m)) if m.contains("elevenlabs sent")),
+                "{frame} must be a provider failure"
+            );
+        }
     }
 
     #[test]
     fn non_json_and_unknown_are_ignored() {
         assert!(map_frame("not json at all").is_none());
         assert!(map_frame(r#"{"message_type":"heartbeat"}"#).is_none());
+    }
+
+    #[test]
+    fn spec_named_rate_limit_rotates_the_key() {
+        assert!(matches!(
+            map_frame(r#"{"message_type":"rate_limited","error":"slow down"}"#),
+            Some(SttEvent::KeyFailure(FailKind::RateLimit))
+        ));
+    }
+
+    #[test]
+    fn advisory_frames_are_logged_not_acted_on() {
+        // The session keeps running and the key keeps its standing.
+        for t in [
+            "warning",
+            "commit_throttled",
+            "insufficient_audio_activity",
+            "queue_overflow",
+            "resource_exhausted",
+            "session_time_limit_exceeded",
+        ] {
+            let frame = format!(r#"{{"message_type":"{t}","error":"x"}}"#);
+            assert!(map_frame(&frame).is_none(), "{t} must not become an event");
+        }
+    }
+
+    #[test]
+    fn frame_summary_is_bounded() {
+        let long = format!(
+            r#"{{"message_type":"warning","error":"{}"}}"#,
+            "a".repeat(1000)
+        );
+        assert!(summarize_frame(&long).chars().count() <= 241);
+        assert_eq!(summarize_frame("short"), "short");
     }
 
     fn test_opts(vocab: Vec<&str>) -> SttSessionOpts {

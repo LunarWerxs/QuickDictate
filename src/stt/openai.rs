@@ -49,6 +49,16 @@ impl SttProvider for OpenAiProvider {
         }
     }
 
+    /// Measured against the live API on 2026-09-11: with `turn_detection`
+    /// null (manual commit, what this adapter uses) OpenAI sends NO delta
+    /// while the user is speaking. The first one landed 0.9 s after commit
+    /// and the whole transcript streamed in over the next 100 ms. So the pip
+    /// spins here, like the batch providers, instead of showing a "0" that
+    /// never moves for the length of the dictation.
+    fn streams_interim_text(&self) -> bool {
+        false
+    }
+
     fn final_transcript_timeout(&self) -> std::time::Duration {
         // Realtime `.completed` has taken a little over two seconds in field
         // logs. The socket intentionally remains open after commit, so give
@@ -265,23 +275,36 @@ fn classify_event(text: &str) -> OaEvent {
             .transcript
             .map(OaEvent::Completed)
             .unwrap_or(OaEvent::Other),
-        "session.created" => OaEvent::Created,
-        "error" => {
-            let msg = m
-                .error
-                .map(|e| {
-                    format!(
-                        "{} {} {}",
-                        e.err_type.unwrap_or_default(),
-                        e.code.unwrap_or_default(),
-                        e.message.unwrap_or_default()
-                    )
-                })
-                .unwrap_or_default();
-            OaEvent::Failure(classify_by_substring(&msg))
+        // The transcription of a committed buffer failed. THIS is where a key
+        // with no credit left is reported (`insufficient_quota` /
+        // `credit_balance_exhausted`), not in a top-level `error` frame --
+        // measured against the live API on 2026-09-11. Ignoring it (as this
+        // did) left the press waiting out its whole timeout in silence: no
+        // words, no error pip, no rotation to the next key, and the dead key
+        // credited as alive. A second key that would have worked was never
+        // tried.
+        "conversation.item.input_audio_transcription.failed" | "error" => {
+            OaEvent::Failure(classify_by_substring(&error_text(m.error)))
         }
+        "session.created" => OaEvent::Created,
         _ => OaEvent::Other,
     }
+}
+
+/// Flatten an OpenAI `error` object into the one string
+/// [`classify_by_substring`] reads. Empty when the frame carried no error
+/// object, which classifies as `Transient` -- the right default for a
+/// failure the server would not explain.
+fn error_text(err: Option<OaError>) -> String {
+    err.map(|e| {
+        format!(
+            "{} {} {}",
+            e.err_type.unwrap_or_default(),
+            e.code.unwrap_or_default(),
+            e.message.unwrap_or_default()
+        )
+    })
+    .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -317,6 +340,21 @@ mod tests {
     fn error_maps_to_failure() {
         let e = r#"{"type":"error","error":{"type":"invalid_request_error","code":"invalid_api_key","message":"Incorrect API key"}}"#;
         assert_eq!(classify_event(e), OaEvent::Failure(FailKind::Invalid));
+    }
+
+    #[test]
+    fn an_out_of_credit_key_is_reported_through_the_transcription_failed_event() {
+        // Captured verbatim from the live API, 2026-09-11. Before this was
+        // handled the session simply went quiet and the key was never rotated.
+        let e = r#"{"type":"conversation.item.input_audio_transcription.failed","item_id":"item_x","content_index":0,"error":{"type":"insufficient_quota","code":"credit_balance_exhausted","message":"You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/."}}"#;
+        assert_eq!(classify_event(e), OaEvent::Failure(FailKind::Exhausted));
+    }
+
+    #[test]
+    fn a_transcription_failure_with_no_error_object_is_still_a_failure() {
+        let e =
+            r#"{"type":"conversation.item.input_audio_transcription.failed","item_id":"item_x"}"#;
+        assert_eq!(classify_event(e), OaEvent::Failure(FailKind::Transient));
     }
 
     fn test_opts(vocab: Vec<&str>) -> SttSessionOpts {

@@ -223,6 +223,11 @@ pub struct App {
     error_kind: AtomicU8,
     pub shutdown: AtomicBool,
     pub session_epoch: parking_lot::Mutex<u64>,
+    /// Epochs the user explicitly threw away (the long-press replay discards
+    /// the live dictation). A finished session delivers whatever it still
+    /// holds unless it is in here: a session merely SUPERSEDED by the next
+    /// press keeps its words. Small ring; `0` is never an epoch.
+    discarded_epochs: parking_lot::Mutex<[u64; 4]>,
     pub rt: TokioHandle,
     pub transcript_tx: crossbeam_channel::Sender<String>,
     pub transcript_rx: crossbeam_channel::Receiver<String>,
@@ -282,6 +287,7 @@ impl App {
             error_kind: AtomicU8::new(ErrorKind::Generic as u8),
             shutdown: AtomicBool::new(false),
             session_epoch: Mutex::new(0),
+            discarded_epochs: Mutex::new([0; 4]),
             rt,
             transcript_tx,
             transcript_rx,
@@ -463,9 +469,23 @@ impl App {
         *self.session_epoch.lock()
     }
 
+    /// Throw the live dictation away: nothing it has not pasted yet may land.
+    /// Bumps the epoch (so the session's own loops stop) AND records the
+    /// discarded epoch, because a bumped epoch alone also describes the
+    /// ordinary "next press started while the last one was still finalizing"
+    /// case, whose words must still be delivered.
     pub fn invalidate_current_session(&self) {
         let mut e = self.session_epoch.lock();
+        let mut ring = self.discarded_epochs.lock();
+        ring.rotate_right(1);
+        ring[0] = *e;
         *e = e.wrapping_add(1);
+    }
+
+    /// Whether `epoch` was explicitly discarded by the user (see
+    /// [`invalidate_current_session`](Self::invalidate_current_session)).
+    pub fn session_discarded(&self, epoch: u64) -> bool {
+        self.discarded_epochs.lock().contains(&epoch)
     }
 }
 

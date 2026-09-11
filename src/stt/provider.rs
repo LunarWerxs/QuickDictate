@@ -172,6 +172,33 @@ pub trait SttProvider: Send + Sync {
         false
     }
 
+    /// Whether the runner may recover a session whose server has gone quiet
+    /// mid-dictation: open a fresh connection on the same key, hand its
+    /// inbound half to the recv task, and replay the current segment's audio
+    /// into it (see `send_task::StallWatch`). Only right for a streaming
+    /// provider that answers speech with a partial within a second or two;
+    /// that cadence is what the watchdog measures against. A batch or local
+    /// provider answers only at commit, so it would read every long sentence
+    /// as a stall. Default false.
+    fn supports_stall_recovery(&self) -> bool {
+        false
+    }
+
+    /// Whether this provider sends interim transcripts WHILE the user is
+    /// still talking. The pip's live word count is built out of those, so a
+    /// provider that answers only after the audio is committed leaves it
+    /// sitting at "0" for the whole dictation, which reads as broken. The UI
+    /// draws its spinner instead for those (see `ui::loop_state`).
+    ///
+    /// Default `true`: every streaming adapter here does stream partials, and
+    /// that is what the pip showed before this existed. The batch ones
+    /// (Google, the local model) and OpenAI Realtime in manual-commit mode --
+    /// measured 2026-09-11: its first delta lands ~0.9 s AFTER commit, never
+    /// during speech -- override it.
+    fn streams_interim_text(&self) -> bool {
+        true
+    }
+
     /// Open a session for `key`. Returns a split sink+stream on success.
     async fn connect(
         &self,

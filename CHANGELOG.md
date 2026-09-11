@@ -6,6 +6,56 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-09-11
+
+### Fixed
+
+- **Dictation no longer "stops listening" partway through a sentence.** ElevenLabs was
+  caught, four times in one minute, sending one committed sentence and then nothing at all for
+  the rest of the press: no partials, no commit, not even an answer to the final flush, while
+  the socket kept accepting audio. The pip's word count froze and only the first sentence was
+  pasted. Now, if the provider says nothing for five seconds while speech is going out, the
+  session opens a replacement connection on the same key and replays everything since the last
+  committed sentence into it, so the words spoken into the dead connection are transcribed
+  after all. At most two replacements per press. ElevenLabs, Deepgram and AssemblyAI opt in,
+  each measured against its live API to answer speech within about a second. Google, the local
+  model and OpenAI answer only once the recording is committed, so the watchdog stays off for
+  them; DashScope waits until its keys work again. A server that closes or resets the socket
+  mid-press is replaced at once.
+
+- **The tail of a dictation is no longer thrown away when you press again quickly.** When the
+  provider had left the last few words uncommitted, releasing and pressing the hotkey again
+  within about a second discarded them as "superseded". Those were exactly the words that had
+  gone missing above. A finished press now delivers whatever it still holds; only a dictation
+  you discarded on purpose (the long-press replay) is withheld.
+
+- **A key dying mid-dictation no longer eats the sentences before it.** When the provider
+  rejected the key partway through a press (out of credit, rate-limited), the attempt was
+  abandoned and the next key tried, but the sentences already transcribed and waiting to be
+  pasted at release went with it. They are now carried into the next attempt (and pasted in
+  order at release), or pasted outright if no key is left. ElevenLabs' non-credential errors
+  (`transcriber_error`, `input_error`, a bare `error`) also stop being treated as a bad key:
+  they no longer bench a working key, and if the server then closes or goes quiet the
+  replacement connection above takes over with the text intact.
+
+- **ElevenLabs' advisory messages reach the log.** `warning`, `commit_throttled`,
+  `insufficient_audio_activity`, `queue_overflow`, `resource_exhausted` and
+  `session_time_limit_exceeded` used to be dropped unread, so a session that went quiet after
+  one was undiagnosable. They are logged now, `rate_limited` (the name in ElevenLabs' own
+  spec) rotates the key like the other rate-limit shapes, and any other unknown frame is
+  logged at debug level.
+
+- **An OpenAI key with no credit left hung the dictation instead of moving to your next
+  key.** OpenAI reports an exhausted balance in a message QuickDictate was ignoring, so the
+  press waited out its whole timeout in silence: nothing pasted, no error shown, the dead key
+  still counted as working, and a second key that would have transcribed the dictation never
+  tried. It is now read as "out of credit" and the next key takes over.
+
+- **The pip no longer shows a frozen "0" on Google and OpenAI.** Those providers send no text
+  until the recording is committed, so the live word count had nothing to count, but only the
+  local model got the rotating ring instead. Whether the pip counts or spins is now the
+  provider's own answer rather than a hardcoded name, so any future provider gets it right.
+
 ## [0.9.1] - 2026-09-10
 
 ### Fixed

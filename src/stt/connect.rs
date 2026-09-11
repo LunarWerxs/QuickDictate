@@ -16,8 +16,44 @@ use crate::keys::KeyPool;
 use crate::state::{App, Status};
 
 use super::dispatch::make_provider_id;
-use super::provider::{AudioFormat, ProviderSession, ProviderSink, ProviderStream, SttSessionOpts};
+use super::provider::{
+    AudioFormat, ProviderSession, ProviderSink, ProviderStream, SttProvider, SttSessionOpts,
+};
 use super::{SessionAbort, CONNECT_TIMEOUT, ERROR_PIP_VISIBLE};
+
+/// How a live session opens a REPLACEMENT connection when its server goes
+/// quiet: the same provider, the same key, the same options. Built only for
+/// providers that opt in via [`SttProvider::supports_stall_recovery`].
+pub(super) struct Reconnector {
+    provider: Arc<dyn SttProvider>,
+    key: String,
+    opts: SttSessionOpts,
+}
+
+impl Reconnector {
+    pub(super) fn new(provider: Arc<dyn SttProvider>, key: String, opts: SttSessionOpts) -> Self {
+        Self {
+            provider,
+            key,
+            opts,
+        }
+    }
+
+    /// Connect under the same bound as the original handshake. A failure is
+    /// reported as text: the caller stays on the connection it has.
+    pub(super) async fn connect(&self) -> Result<ProviderSession, String> {
+        match tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            self.provider.connect(&self.key, &self.opts),
+        )
+        .await
+        {
+            Ok(Ok(session)) => Ok(session),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err(format!("handshake timed out after {CONNECT_TIMEOUT:?}")),
+        }
+    }
+}
 
 /// Trim, drop blanks, and de-duplicate the user's biasing terms before they go
 /// on the wire. Case-insensitive de-dup keeping first-seen order, so a list
@@ -62,6 +98,8 @@ pub(super) struct ConnectedSession {
     pub(super) flusher: crate::audio::SessionFlusher,
     pub(super) sink: Box<dyn ProviderSink>,
     pub(super) stream: Box<dyn ProviderStream>,
+    /// `Some` when the provider supports mid-session stall recovery.
+    pub(super) recovery: Option<Reconnector>,
 }
 
 /// If the global capture stream has died (mic unplugged, driver error), this
@@ -134,10 +172,10 @@ pub(super) async fn establish_connected_session(
         }
         _ => keys,
     };
-    let provider = make_provider_id(
+    let provider: Arc<dyn SttProvider> = Arc::from(make_provider_id(
         resolved_provider.as_deref().unwrap_or(&cfg.stt_provider),
         &cfg,
-    );
+    ));
     let provider_id = provider.id();
     let requires_api_key = provider.requires_api_key();
     let finalize_timeout = provider.finalize_timeout();
@@ -235,6 +273,10 @@ pub(super) async fn establish_connected_session(
         return Ok(None);
     }
 
+    let recovery = provider
+        .supports_stall_recovery()
+        .then(|| Reconnector::new(Arc::clone(&provider), key.clone(), opts.clone()));
+
     Ok(Some(ConnectedSession {
         cfg,
         keys,
@@ -250,5 +292,6 @@ pub(super) async fn establish_connected_session(
         flusher,
         sink,
         stream,
+        recovery,
     }))
 }

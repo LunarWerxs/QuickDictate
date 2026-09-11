@@ -41,6 +41,14 @@ impl SttProvider for DeepgramProvider {
         "deepgram"
     }
 
+    /// Measured 2026-09-11 (`live_deepgram` at realtime pace): first partial
+    /// ~1.1 s after speech starts, then one every ~1.1 s, and partials keep
+    /// coming after each committed sentence. Comfortably inside the stall
+    /// watchdog's 5 s window, so a server that goes quiet is replaced.
+    fn supports_stall_recovery(&self) -> bool {
+        true
+    }
+
     fn required_audio_format(&self) -> AudioFormat {
         AudioFormat {
             sample_rate: 16_000,

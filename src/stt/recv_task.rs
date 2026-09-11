@@ -13,7 +13,7 @@ use crate::state::App;
 
 use super::deliver_transcript;
 use super::heuristics::{is_phantom_finalization, looks_like_short_answer, transcripts_equivalent};
-use super::provider::{ProviderStream, SttEvent};
+use super::provider::{ProviderStream, RecvError, SttEvent};
 
 /// The accumulators [`run_recv_task`] fills in and the finalize phase reads
 /// back through [`SessionFinalizeCtx`](super::finalize::SessionFinalizeCtx) once the send task's release phase
@@ -68,25 +68,108 @@ pub(super) struct RecvTaskState {
     pub(super) release_pending: Arc<AtomicBool>,
     pub(super) speech_shipped: Arc<AtomicU64>,
     pub(super) acc: SessionAccumulators,
+    /// Words an earlier attempt of this press already earned (carried held
+    /// text), so the pip's count starts there instead of at zero.
+    pub(super) seeded_words: u32,
+    /// Bumped on every partial and commit, for the send task's stall watchdog.
+    pub(super) server_activity: Arc<AtomicU64>,
+    /// Bumped on every KEPT commit, so the send task's replay buffer can
+    /// start over at each durable segment boundary.
+    pub(super) commits_seen: Arc<AtomicU64>,
+    /// Raised when the inbound half ends before release, so the send task
+    /// reconnects at once instead of waiting out the stall timer.
+    pub(super) stream_dead: Arc<AtomicBool>,
+    /// Replacement inbound halves from the send task's stall recovery. The
+    /// sender lives in the send task, so the channel closes when it is done
+    /// and no replacement can come any more.
+    pub(super) stream_swap: tokio::sync::mpsc::Receiver<Box<dyn ProviderStream>>,
+}
+
+/// What the recv loop's select settled on: a replacement stream (or the news
+/// that none can come), or the next event off the current one. Split out so
+/// the stream can be swapped after the select's borrows are released.
+enum Next {
+    Swap(Option<Box<dyn ProviderStream>>),
+    Event(Result<Option<SttEvent>, RecvError>),
 }
 
 /// The session's inbound-event task: normalize provider events into
 /// [`RecvTaskState::acc`]. Runs on its own `tokio::spawn` from
 /// [`run_session`](super::run_session), mirroring [`run_send_task`](super::send_task::run_send_task) on the outbound side.
+///
+/// If the stream ends before release while a replacement could still arrive
+/// (the send task's stall recovery), the task PARKS on the swap channel
+/// instead of finishing, and carries on with the replacement when it comes.
 pub(super) async fn run_recv_task(mut state: RecvTaskState) {
     let epoch = state.epoch;
     let provider_id = state.provider_id;
     let mut events: usize = 0;
-    let mut committed_words: u32 = 0;
+    let mut committed_words: u32 = state.seeded_words;
     // Snapshot of `speech_shipped` taken at the last *kept* commit. Compared
     // against the live count at each new commit to spot a phantom (equal =>
     // no speech shipped in between). Starts at 0, so the very first real
     // commit -- always backed by shipped speech -- is never mistaken for one.
     let mut last_commit_speech: u64 = 0;
+    // Whether a replacement stream can still arrive.
+    let mut swap_open = true;
+    // The current stream ended early and we are waiting for a replacement.
+    let mut parked = false;
     loop {
-        let ev = match state.stream.recv_event().await {
+        let next = tokio::select! {
+            biased;
+            swapped = state.stream_swap.recv(), if swap_open => Next::Swap(swapped),
+            r = state.stream.recv_event(), if !parked => Next::Event(r),
+            else => break,
+        };
+        let received = match next {
+            Next::Swap(Some(stream)) => {
+                state.stream = stream;
+                parked = false;
+                // Whatever the quiet connection last said about the open
+                // segment is superseded: the replacement transcribes the
+                // replayed audio afresh, so the pip falls back to the
+                // committed count until its partials arrive.
+                state.acc.last_partial_buf.lock().clear();
+                state
+                    .recv_app
+                    .word_count
+                    .store(committed_words, Ordering::Release);
+                if state.acc.provider_failure.lock().take().is_some() {
+                    tracing::info!(
+                        "session[{epoch}] clearing the transport failure: the press carries on over a replacement connection"
+                    );
+                }
+                tracing::info!(
+                    "session[{epoch}] {provider_id} listening on the replacement connection"
+                );
+                continue;
+            }
+            Next::Swap(None) => {
+                swap_open = false;
+                if parked {
+                    break;
+                }
+                continue;
+            }
+            Next::Event(r) => r,
+        };
+        // Whether an early end of this stream should be waited out rather
+        // than ending the task: only before release, and only while the send
+        // task can still produce a replacement.
+        let can_park = swap_open && !state.release_pending.load(Ordering::Acquire);
+        let ev = match received {
             Ok(Some(ev)) => ev,
-            Ok(None) => break,
+            Ok(None) => {
+                if can_park {
+                    tracing::warn!(
+                        "session[{epoch}] inbound half ended before release; waiting for a replacement connection"
+                    );
+                    state.stream_dead.store(true, Ordering::Release);
+                    parked = true;
+                    continue;
+                }
+                break;
+            }
             Err(e) => {
                 // A read error mid-utterance is NOT a clean end of stream.
                 // Recording it in `provider_failure` is what makes
@@ -101,11 +184,20 @@ pub(super) async fn run_recv_task(mut state: RecvTaskState) {
                 // ElevenLabs routinely resets the socket without a closing
                 // handshake once it has sent the final transcript, and
                 // erroring on that flashed the pip after a dictation the
-                // user watched succeed.
+                // user watched succeed. A successful replacement clears it.
                 tracing::warn!("session[{epoch}] recv error: {e}");
                 let mut slot = state.acc.provider_failure.lock();
                 if slot.is_none() {
                     *slot = Some(format!("transport failed mid-session: {e}"));
+                }
+                drop(slot);
+                if can_park {
+                    tracing::warn!(
+                        "session[{epoch}] transport failed before release; waiting for a replacement connection"
+                    );
+                    state.stream_dead.store(true, Ordering::Release);
+                    parked = true;
+                    continue;
                 }
                 break;
             }
@@ -116,6 +208,7 @@ pub(super) async fn run_recv_task(mut state: RecvTaskState) {
                 tracing::info!("session[{epoch}] {provider_id} session_started");
             }
             SttEvent::Partial(t) => {
+                state.server_activity.fetch_add(1, Ordering::AcqRel);
                 if state.log_transcripts {
                     tracing::debug!("session[{epoch}] partial: {t}");
                 } else {
@@ -129,6 +222,7 @@ pub(super) async fn run_recv_task(mut state: RecvTaskState) {
                 *state.acc.last_partial_buf.lock() = t;
             }
             SttEvent::Committed(final_text) => {
+                state.server_activity.fetch_add(1, Ordering::AcqRel);
                 handle_committed_event(
                     &mut state,
                     &mut committed_words,
@@ -153,6 +247,14 @@ pub(super) async fn run_recv_task(mut state: RecvTaskState) {
                     }
                     None => tracing::info!("session[{epoch}] transport closed by server"),
                 }
+                if can_park {
+                    tracing::warn!(
+                        "session[{epoch}] server closed the session before release; waiting for a replacement connection"
+                    );
+                    state.stream_dead.store(true, Ordering::Release);
+                    parked = true;
+                    continue;
+                }
                 break;
             }
         }
@@ -172,9 +274,11 @@ fn handle_committed_event(
     final_text: String,
 ) {
     let epoch = state.epoch;
-    // Drop the chunk entirely if a NEWER session has taken over.
-    if state.recv_app.current_session_epoch() != epoch {
-        tracing::debug!("session[{epoch}] dropping late commit (newer session active)");
+    // Drop the chunk entirely only if the user threw this dictation away. A
+    // commit that lands while the NEXT press is already live is still this
+    // press's words, and in held mode it is swept up at finalize.
+    if state.recv_app.session_discarded(epoch) {
+        tracing::debug!("session[{epoch}] dropping late commit (dictation discarded)");
         return;
     }
 
@@ -227,6 +331,7 @@ fn handle_committed_event(
     // partial would lose its promotion fallback.
     state.acc.committed_flag.store(true, Ordering::Release);
     *last_commit_speech = speech_now;
+    state.commits_seen.fetch_add(1, Ordering::AcqRel);
 
     // This commit supersedes every partial up to this point, so
     // clear the buffer. What lands in it AFTER this is speech

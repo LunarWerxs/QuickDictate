@@ -344,7 +344,12 @@ pub(super) fn compute_tick_snapshot(app: &App) -> TickSnapshot {
     let hotkey_pip_visible = cfg.mouse_follower_enabled && hotkey_blocked;
     let want_visible = active_visible || hotkey_pip_visible;
 
-    let show_spinner = cfg.stt_provider.eq_ignore_ascii_case("local")
+    // A provider that sends nothing until the audio is committed has no live
+    // word count to show, so the pip spins instead of displaying a "0" that
+    // never moves. Asked of the provider rather than hardcoded here: this
+    // read `== "local"`, which left Google and OpenAI users watching a frozen
+    // zero for the whole dictation.
+    let show_spinner = !crate::stt::provider_streams_interim_text(&cfg)
         && matches!(
             status,
             Status::Starting | Status::Listening | Status::Processing

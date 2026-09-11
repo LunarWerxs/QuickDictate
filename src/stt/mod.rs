@@ -43,12 +43,15 @@ use crate::state::{App, Status};
 use connect::{audio_capture_unhealthy, establish_connected_session, ConnectedSession};
 use finalize::{
     abort_for_early_key_failure, enter_release_phase, finish_session_outcome, join_recv_task,
-    join_send_task, promote_tail_transcript, SessionFinalizeCtx,
+    join_send_task, promote_tail_transcript, seed_from_carry, SessionFinalizeCtx,
 };
 use recv_task::{run_recv_task, RecvTaskState, SessionAccumulators};
-use send_task::{run_send_task, SendTaskState};
+use send_task::{run_send_task, SendTaskState, StallRecovery};
 
-pub use dispatch::{spawn_key_test, spawn_prewarm};
+#[cfg(test)]
+mod stall_tests;
+
+pub use dispatch::{provider_streams_interim_text, spawn_key_test, spawn_prewarm};
 
 const TAIL_MIN: Duration = Duration::from_millis(250);
 
@@ -89,6 +92,31 @@ const ERROR_PIP_VISIBLE: Duration = Duration::from_secs(2);
 /// prewarm probe's connect, so there is one number for "the provider is not
 /// answering" rather than two.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// The stall watchdog (send task, live phase). A streaming provider answers
+/// speech with a partial within a second or two. If this much wall time
+/// passes with speech-bearing audio going out and NOTHING coming back (no
+/// partial, no commit), the server side of the session is presumed dead:
+/// the session reconnects on the same key and replays the current segment
+/// (see [`send_task::StallWatch`]). ElevenLabs was caught doing exactly this
+/// on 2026-09-11: one VAD commit, then silence for the rest of the press
+/// while the socket kept accepting audio, and every word after the first
+/// sentence was lost. A fresh connection answered within 200 ms.
+const STALL_AFTER: Duration = Duration::from_secs(5);
+/// ...and at least this many speech-bearing chunks (100 ms each) must have
+/// gone out in that window, so a user who simply paused is never mistaken
+/// for a stalled server.
+const STALL_MIN_SPEECH_CHUNKS: u64 = 20;
+/// Reconnects per press. A third stall in one press means the provider is
+/// having a bad day; the press then ends through the normal path.
+const MAX_STALL_RECONNECTS: u32 = 2;
+/// How much of the current segment the replay buffer keeps (chunks of
+/// 100 ms): 40 s, well past ElevenLabs' own ~36 s auto-commit.
+const REPLAY_CAP_CHUNKS: usize = 400;
+/// Pace of the replay burst into the replacement connection: 20x realtime,
+/// so even a full buffer is back on the wire in 2 s -- inside the mic queue
+/// (`AUDIO_QUEUE_CAPACITY`), which keeps filling with live audio meanwhile.
+const REPLAY_CHUNK_PACE: Duration = Duration::from_millis(5);
 
 /// Hard cap on ONE `send_audio` call. Chunks are ~100 ms of audio, so a
 /// healthy socket completes this in single-digit milliseconds; anything near
@@ -191,8 +219,13 @@ async fn run_session_with_retries(
     session_usage: Arc<parking_lot::Mutex<SessionUsage>>,
 ) -> Result<()> {
     let mut tried: Vec<String> = Vec::new();
+    // Text an aborted attempt had transcribed but not yet pasted. The next
+    // attempt starts with it; whatever is still here when the press ends is
+    // pasted anyway, so a key dying mid-sentence never eats the sentences
+    // before it.
+    let mut carry: Vec<String> = Vec::new();
     let user_aborted = || stop.load(Ordering::Acquire) || app2.current_session_epoch() != epoch;
-    loop {
+    let res = loop {
         let before = tried.len();
         let attempt_res = run_session(
             app2.clone(),
@@ -201,6 +234,7 @@ async fn run_session_with_retries(
             epoch,
             Arc::clone(&session_usage),
             &mut tried,
+            &mut carry,
         )
         .await;
         let rejected = matches!(
@@ -208,7 +242,7 @@ async fn run_session_with_retries(
             Err(e) if matches!(SessionAbort::of(e), Some(SessionAbort::KeyRejected))
         );
         if !rejected {
-            return attempt_res;
+            break attempt_res;
         }
         if tried.len() == before {
             // The attempt never got a key: nothing untried is left. The
@@ -218,27 +252,63 @@ async fn run_session_with_retries(
                 tried.len(),
                 keys.summary()
             );
-            return attempt_res;
+            break attempt_res;
         }
         if tried.len() >= MAX_KEYS_PER_PRESS {
             tracing::error!(
                 "session[{epoch}] {MAX_KEYS_PER_PRESS} keys rejected in one press; giving up ({})",
                 keys.summary()
             );
-            return attempt_res;
+            break attempt_res;
         }
         if user_aborted() {
             // Released (or pressed again) while we were still looking for a
             // key that works. Don't start an attempt nobody is holding the
             // button for, but do surface the rejection: a press that did
             // nothing and said nothing is the failure mode this exists to end.
-            return attempt_res;
+            break attempt_res;
         }
         tracing::warn!(
             "session[{epoch}] key {} of this press was rejected; trying the next untried key",
             tried.len()
         );
+    };
+    flush_carry(&app2, &keys, epoch, carry, &session_usage);
+    res
+}
+
+/// The press is over and no attempt took the carried text: paste it now
+/// (unless the user discarded the dictation) and account its words, so the
+/// sentences transcribed before a key died are never simply gone.
+fn flush_carry(
+    app: &Arc<App>,
+    keys: &KeyPool,
+    epoch: u64,
+    carry: Vec<String>,
+    session_usage: &parking_lot::Mutex<SessionUsage>,
+) {
+    if carry.is_empty() {
+        return;
     }
+    if app.session_discarded(epoch) {
+        tracing::info!(
+            "session[{epoch}] dropping {} carried chunk(s): the user discarded this dictation",
+            carry.len()
+        );
+        return;
+    }
+    let words: u64 = carry
+        .iter()
+        .map(|c| c.split_whitespace().count() as u64)
+        .sum();
+    tracing::info!(
+        "session[{epoch}] pasting {} chunk(s) ({words} words) carried from an aborted attempt",
+        carry.len()
+    );
+    session_usage
+        .lock()
+        .add_fragment(&keys.provider_id(), words, 0);
+    deliver_transcript(&app.transcript_tx, carry.join(" "));
 }
 
 /// Record usage, then report or clear the session's outcome. Split out of
@@ -386,7 +456,9 @@ fn audio_duration_ms(samples: u64, sample_rate: u32) -> u64 {
 
 /// One attempt at a session on one key. `tried` is the press's memory of the
 /// keys it has already used; the key this attempt acquires is appended so the
-/// retry shell never hands it out again for the same press.
+/// retry shell never hands it out again for the same press. `carry` is the
+/// text earlier attempts of this press transcribed but never pasted: this
+/// attempt takes it over, and gives back its own if it aborts.
 async fn run_session(
     app: Arc<App>,
     keys: Arc<KeyPool>,
@@ -394,6 +466,7 @@ async fn run_session(
     epoch: u64,
     session_usage: Arc<parking_lot::Mutex<SessionUsage>>,
     tried: &mut Vec<String>,
+    carry: &mut Vec<String>,
 ) -> Result<()> {
     tracing::info!("session[{epoch}] starting");
 
@@ -420,6 +493,7 @@ async fn run_session(
         flusher,
         sink,
         stream,
+        recovery,
     } = connected;
 
     if app.promote_starting_to_listening() {
@@ -450,6 +524,19 @@ async fn run_session(
     // silence the live phase also ships) is what makes the equality meaningful.
     let speech_shipped = Arc::new(AtomicU64::new(0));
     let sent_progress = Arc::new(parking_lot::Mutex::new(SentAudio::default()));
+    // Stall recovery plumbing (see `send_task::StallWatch`). The send task
+    // holds the only sender, so the recv task learns that no replacement can
+    // come the moment the send task finishes. For providers without
+    // recovery the sender is dropped right here, to the same effect.
+    let server_activity = Arc::new(AtomicU64::new(0));
+    let commits_seen = Arc::new(AtomicU64::new(0));
+    let stream_dead = Arc::new(AtomicBool::new(false));
+    let (stream_tx, stream_swap) = tokio::sync::mpsc::channel(1);
+    let recovery = recovery.map(|reconnect| StallRecovery {
+        reconnect,
+        stream_tx,
+        epoch,
+    });
     let send_task: tokio::task::JoinHandle<SentAudio> =
         tokio::spawn(run_send_task(SendTaskState {
             samples_rx,
@@ -460,6 +547,10 @@ async fn run_session(
             sent_progress: Arc::clone(&sent_progress),
             tail_quiet,
             tail_max,
+            server_activity: Arc::clone(&server_activity),
+            commits_seen: Arc::clone(&commits_seen),
+            stream_dead: Arc::clone(&stream_dead),
+            recovery,
         }));
 
     let recv_app = Arc::clone(&app);
@@ -504,8 +595,10 @@ async fn run_session(
         session_usage,
     };
 
-    // Reset the live word counter at the start of every session.
-    app.word_count.store(0, Ordering::Release);
+    // Reset the live word counter at the start of every session, then let it
+    // reflect whatever an earlier attempt of this press already earned.
+    let carried_words = seed_from_carry(&app, &ctx, carry).min(u32::MAX as u64) as u32;
+    app.word_count.store(carried_words, Ordering::Release);
     // Drop any answer speculated for the PREVIOUS press. It is keyed by exact
     // text so it could not be misapplied anyway, but a new dictation should
     // not be racing against a stale in-flight request either.
@@ -523,6 +616,11 @@ async fn run_session(
         release_pending: Arc::clone(&release_pending),
         speech_shipped: Arc::clone(&speech_shipped),
         acc,
+        seeded_words: carried_words,
+        server_activity,
+        commits_seen,
+        stream_dead,
+        stream_swap,
     }));
 
     while !stop.load(Ordering::Acquire) {
@@ -541,7 +639,7 @@ async fn run_session(
     // entire finalize and hand back to the retry shell to rotate keys.
     let early_key_failure = *ctx.acc.key_fail_kind.lock();
     if let Some(kind) = early_key_failure {
-        return abort_for_early_key_failure(&ctx, kind, send_task, recv_task).await;
+        return abort_for_early_key_failure(&ctx, kind, send_task, recv_task, carry).await;
     }
 
     enter_release_phase(&app, &ctx, tail_quiet, tail_max, &release_pending);

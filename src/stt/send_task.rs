@@ -3,14 +3,21 @@
 //! Four phases in order: live, dynamic tail, drain, then commit + close. The
 //! tail and drain phases run every chunk past [`TailSilenceGate`], so trailing
 //! silence never reaches a model that would finalize it into a hallucination.
+//! The live phase also runs the stall watchdog ([`StallWatch`]): a server
+//! that stops answering while speech is going out is replaced mid-press.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::heuristics::rms_i16;
-use super::provider::ProviderSink;
-use super::{SentAudio, SEND_TIMEOUT, SILENCE_RMS, TAIL_KEEPALIVE_AFTER, TAIL_MIN};
+use super::connect::Reconnector;
+use super::heuristics::{rms_i16, stall_tripped};
+use super::provider::{ProviderSink, ProviderStream};
+use super::{
+    SentAudio, MAX_STALL_RECONNECTS, REPLAY_CAP_CHUNKS, REPLAY_CHUNK_PACE, SEND_TIMEOUT,
+    SILENCE_RMS, TAIL_KEEPALIVE_AFTER, TAIL_MIN,
+};
 
 /// Send one PCM chunk through the provider sink. Mirrors the original `ship()`:
 /// once a send errors the socket is dead, so we log only the first failure and
@@ -118,11 +125,169 @@ pub(super) struct SendTaskState {
     pub(super) sent_progress: Arc<parking_lot::Mutex<SentAudio>>,
     pub(super) tail_quiet: Duration,
     pub(super) tail_max: Duration,
+    /// Bumped by the recv task on every partial and commit. The stall
+    /// watchdog reads it: unchanged while speech goes out means the server
+    /// side of the session is gone.
+    pub(super) server_activity: Arc<AtomicU64>,
+    /// Bumped by the recv task on every KEPT commit. A change means the
+    /// replay buffer can start over: that segment is durable now.
+    pub(super) commits_seen: Arc<AtomicU64>,
+    /// Set by the recv task when the inbound half ended before release (the
+    /// server closed or reset the socket mid-press). The watchdog trips on
+    /// it at once rather than waiting out [`super::STALL_AFTER`].
+    pub(super) stream_dead: Arc<AtomicBool>,
+    /// How to recover from a stall, or `None` for providers that opt out
+    /// (see [`super::provider::SttProvider::supports_stall_recovery`]).
+    pub(super) recovery: Option<StallRecovery>,
+}
+
+/// Everything the send task needs to replace a stalled connection: the
+/// reconnector, and the channel that hands the replacement's inbound half to
+/// the recv task (which parks on it whenever its own stream dies early).
+pub(super) struct StallRecovery {
+    pub(super) reconnect: Reconnector,
+    pub(super) stream_tx: tokio::sync::mpsc::Sender<Box<dyn ProviderStream>>,
+    pub(super) epoch: u64,
+}
+
+/// The live phase's stall watchdog and replay buffer.
+///
+/// A streaming provider answers speech with partials every second or so.
+/// This tracks how long the server has said nothing while speech-bearing
+/// audio kept going out; past [`super::STALL_AFTER`] (with at least
+/// [`super::STALL_MIN_SPEECH_CHUNKS`] of speech in that window) the session
+/// is presumed dead on the server side, even though the socket still accepts
+/// bytes -- which is exactly how ElevenLabs was caught failing: one commit,
+/// then nothing for the rest of the press. Recovery opens a replacement
+/// connection on the same key and replays the current segment (everything
+/// shipped since the last kept commit) into it, so the words spoken into the
+/// dead connection are transcribed after all. The segment is what gets
+/// replayed, not just the last few seconds, because the stalled server's
+/// partial for it is discarded: the replacement transcribes it whole.
+pub(super) struct StallWatch {
+    activity_seen: u64,
+    commits_seen: u64,
+    quiet_since: tokio::time::Instant,
+    speech_since_activity: u64,
+    reconnects: u32,
+    segment: VecDeque<Vec<i16>>,
+}
+
+impl StallWatch {
+    fn new(state: &SendTaskState) -> Self {
+        Self {
+            activity_seen: state.server_activity.load(Ordering::Acquire),
+            commits_seen: state.commits_seen.load(Ordering::Acquire),
+            quiet_since: tokio::time::Instant::now(),
+            speech_since_activity: 0,
+            reconnects: 0,
+            segment: VecDeque::new(),
+        }
+    }
+
+    /// Note one shipped live chunk. Returns `true` when the watchdog trips.
+    fn observe(&mut self, state: &SendTaskState, chunk: Vec<i16>, is_speech: bool) -> bool {
+        let activity = state.server_activity.load(Ordering::Acquire);
+        if activity != self.activity_seen {
+            self.activity_seen = activity;
+            self.rearm();
+        }
+        let commits = state.commits_seen.load(Ordering::Acquire);
+        if commits != self.commits_seen {
+            self.commits_seen = commits;
+            self.segment.clear();
+        }
+        self.segment.push_back(chunk);
+        if self.segment.len() > REPLAY_CAP_CHUNKS {
+            self.segment.pop_front();
+        }
+        if is_speech {
+            self.speech_since_activity += 1;
+        }
+        if state.stream_dead.swap(false, Ordering::AcqRel) {
+            // The recv task watched the socket end mid-press. No need to
+            // wait for the timer to prove what is already known.
+            return self.reconnects < MAX_STALL_RECONNECTS;
+        }
+        stall_tripped(
+            self.quiet_since.elapsed(),
+            self.speech_since_activity,
+            self.reconnects,
+        )
+    }
+
+    /// Start the quiet timer over (server activity seen, or a recovery just
+    /// ran and must not immediately re-trip).
+    fn rearm(&mut self) {
+        self.quiet_since = tokio::time::Instant::now();
+        self.speech_since_activity = 0;
+    }
+}
+
+/// The watchdog tripped: open a replacement connection, hand its inbound half
+/// to the recv task, switch the sink, and replay the current segment. Any
+/// failure along the way leaves the session on the connection it has; the
+/// end-of-session path then reports whatever that connection managed.
+async fn recover_from_stall(state: &mut SendTaskState, watch: &mut StallWatch, ws_dead: &mut bool) {
+    let Some(recovery) = state.recovery.as_ref() else {
+        return;
+    };
+    let epoch = recovery.epoch;
+    watch.reconnects += 1;
+    tracing::warn!(
+        "session[{epoch}] provider went quiet: no transcript for {:.1} s while {} speech chunk(s) went out; opening a replacement connection ({} of {MAX_STALL_RECONNECTS})",
+        watch.quiet_since.elapsed().as_secs_f64(),
+        watch.speech_since_activity,
+        watch.reconnects
+    );
+    let replacement = match recovery.reconnect.connect().await {
+        Ok(session) => session,
+        Err(e) => {
+            tracing::warn!(
+                "session[{epoch}] replacement connection failed ({e}); staying on the quiet one"
+            );
+            watch.rearm();
+            return;
+        }
+    };
+    // Never block here: the recv task drains this one-slot channel the moment
+    // anything lands in it, so a full or closed channel means that task is
+    // stuck or gone, and a replacement it would never read is no use.
+    if recovery.stream_tx.try_send(replacement.stream).is_err() {
+        tracing::warn!(
+            "session[{epoch}] recv task did not take the replacement; staying on the quiet connection"
+        );
+        watch.rearm();
+        return;
+    }
+    state.sink = replacement.sink;
+    let replay: Vec<Vec<i16>> = watch.segment.iter().cloned().collect();
+    let samples: usize = replay.iter().map(Vec::len).sum();
+    tracing::info!(
+        "session[{epoch}] replacement connected; replaying the current segment ({} chunk(s), {samples} samples) into it",
+        replay.len()
+    );
+    // Replayed audio is not new audio: `sent` and `speech_shipped` already
+    // count it, and the recv task drops the stalled partial for it.
+    let mut dead = false;
+    for chunk in &replay {
+        if !ship(&mut state.sink, chunk, &mut dead).await {
+            break;
+        }
+        tokio::time::sleep(REPLAY_CHUNK_PACE).await;
+    }
+    if dead {
+        tracing::warn!("session[{epoch}] the replacement connection died during the replay");
+        *ws_dead = true;
+    }
+    watch.rearm();
 }
 
 /// Phase 1 of [`run_send_task`]: forward mic audio to the provider as fast as
-/// it arrives, until the hotkey is released or the socket dies.
+/// it arrives, until the hotkey is released or the socket dies. Runs the
+/// stall watchdog for providers that support recovery.
 async fn send_task_live_phase(state: &mut SendTaskState, sent: &mut SentAudio, ws_dead: &mut bool) {
+    let mut watch = state.recovery.is_some().then(|| StallWatch::new(state));
     loop {
         if state.release_pending.load(Ordering::Acquire) || *ws_dead {
             break;
@@ -145,6 +310,11 @@ async fn send_task_live_phase(state: &mut SendTaskState, sent: &mut SentAudio, w
                 *state.sent_progress.lock() = *sent;
                 if is_speech {
                     state.speech_shipped.fetch_add(1, Ordering::Release);
+                }
+                if let Some(watch) = watch.as_mut() {
+                    if watch.observe(state, chunk, is_speech) {
+                        recover_from_stall(state, watch, ws_dead).await;
+                    }
                 }
             }
             None => break,
@@ -186,7 +356,16 @@ async fn send_task_tail_phase(
             break;
         }
         let chunk_opt = tokio::select! {
-            v = state.samples_rx.recv() => v,
+            v = state.samples_rx.recv() => match v {
+                Some(chunk) => Some(chunk),
+                // The capture side is gone (device lost mid-tail). Nothing
+                // more can arrive, and a closed receiver answers instantly,
+                // so waiting out the tail here would be a hot spin.
+                None => {
+                    tracing::warn!("session tail: audio source closed; ending the tail early");
+                    break;
+                }
+            },
             _ = tokio::time::sleep(Duration::from_millis(20)) => None,
         };
         if let Some(chunk) = chunk_opt {

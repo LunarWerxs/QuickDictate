@@ -3,6 +3,10 @@
 //! Each is a total function of its arguments, so each has a unit test that
 //! needs no provider, no socket and no audio device.
 
+use std::time::Duration;
+
+use super::{MAX_STALL_RECONNECTS, STALL_AFTER, STALL_MIN_SPEECH_CHUNKS};
+
 /// True when a committed transcript is a hallucinated end-of-stream
 /// finalization rather than something the user actually said.
 ///
@@ -54,6 +58,22 @@ pub(super) fn is_phantom_finalization(
 /// alarms around. The count is still logged next to the chunk totals, because
 /// it is exactly what you want when diagnosing a press after the fact.
 #[inline]
+/// The stall watchdog's verdict for one live-phase tick: the server has said
+/// nothing (no partial, no commit) for `quiet_for` while `speech_chunks_since`
+/// speech-bearing chunks went out, and this press still has reconnects left.
+/// Both halves matter: silence from the server is normal while the USER is
+/// silent, and a provider that answers the first words of a sentence a couple
+/// of seconds late must not be reconnected out from under a working session.
+pub(super) fn stall_tripped(
+    quiet_for: Duration,
+    speech_chunks_since: u64,
+    reconnects_so_far: u32,
+) -> bool {
+    reconnects_so_far < MAX_STALL_RECONNECTS
+        && quiet_for >= STALL_AFTER
+        && speech_chunks_since >= STALL_MIN_SPEECH_CHUNKS
+}
+
 pub(super) fn transport_failure_lost_speech(words: u64, socket_died: bool) -> bool {
     words == 0 && socket_died
 }

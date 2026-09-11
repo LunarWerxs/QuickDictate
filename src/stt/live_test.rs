@@ -76,22 +76,39 @@ async fn probe(provider: &dyn SttProvider, key: &str, samples: Vec<i16>) -> anyh
         .await
         .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
 
-    // Send task: stream 100 ms chunks (1600 samples @ 16 kHz), paced a few×
-    // faster than realtime, then commit + close.
+    // Send task: stream 100 ms chunks (1600 samples @ 16 kHz) at the mic's
+    // real cadence, then commit + close. Realtime pacing (not the old 4x)
+    // because the timeline printed below is what decides whether a provider
+    // may opt into stall recovery: the watchdog trips on 5 s of server
+    // silence during speech, so a provider needs its first partial well
+    // inside that and a steady cadence after it.
+    let started = tokio::time::Instant::now();
+    let chunk_ms = 1600 * 1000 / fmt.sample_rate as u64;
+    // When the last chunk goes out. A commit that lands mid-stream (VAD
+    // providers commit each sentence) must not shorten the wait below this,
+    // or the second half of the fixture is never collected.
+    let audio_ends =
+        started + Duration::from_millis(samples.len() as u64 * 1000 / fmt.sample_rate as u64);
     let send = tokio::spawn(async move {
         let mut sink = sink;
         for chunk in samples.chunks(1600) {
             if sink.send_audio(chunk).await.is_err() {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            tokio::time::sleep(Duration::from_millis(chunk_ms)).await;
         }
+        eprintln!(
+            "  [{:6.2}s] >>> audio done; commit + close",
+            started.elapsed().as_secs_f64()
+        );
         let _ = sink.commit().await;
         let _ = sink.close().await;
     });
 
     let mut committed = String::new();
     let mut last_partial = String::new();
+    let mut first_partial_at: Option<Duration> = None;
+    let mut partials: usize = 0;
     let hard_deadline = tokio::time::Instant::now() + Duration::from_secs(25);
     // Once a final chunk lands we only linger briefly for more (multi-segment),
     // rather than waiting out the hard deadline — OpenAI keeps the socket open.
@@ -103,14 +120,31 @@ async fn probe(provider: &dyn SttProvider, key: &str, samples: Vec<i16>) -> anyh
         };
         match ev {
             Ok(Some(SttEvent::Committed(t))) => {
+                eprintln!(
+                    "  [{:6.2}s] committed ({} words)",
+                    started.elapsed().as_secs_f64(),
+                    t.split_whitespace().count()
+                );
                 if !committed.is_empty() {
                     committed.push(' ');
                 }
                 committed.push_str(&t);
-                deadline =
-                    (tokio::time::Instant::now() + Duration::from_millis(1500)).min(hard_deadline);
+                deadline = (tokio::time::Instant::now() + Duration::from_millis(1500))
+                    .max(audio_ends + Duration::from_millis(2500))
+                    .min(hard_deadline);
             }
-            Ok(Some(SttEvent::Partial(t))) => last_partial = t,
+            Ok(Some(SttEvent::Partial(t))) => {
+                partials += 1;
+                if first_partial_at.is_none() {
+                    first_partial_at = Some(started.elapsed());
+                }
+                eprintln!(
+                    "  [{:6.2}s] partial ({} words)",
+                    started.elapsed().as_secs_f64(),
+                    t.split_whitespace().count()
+                );
+                last_partial = t;
+            }
             Ok(Some(SttEvent::KeyFailure(k))) => {
                 return Err(anyhow::anyhow!("provider signaled key failure: {k:?}"))
             }
@@ -131,6 +165,13 @@ async fn probe(provider: &dyn SttProvider, key: &str, samples: Vec<i16>) -> anyh
         }
     }
     let _ = send.await;
+    eprintln!(
+        "  [{:6.2}s] stream ended: {partials} partial(s), first partial at {}",
+        started.elapsed().as_secs_f64(),
+        first_partial_at
+            .map(|d| format!("{:.2}s", d.as_secs_f64()))
+            .unwrap_or_else(|| "never".into())
+    );
     Ok(if committed.trim().is_empty() {
         last_partial
     } else {
