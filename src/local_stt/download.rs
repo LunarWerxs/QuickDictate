@@ -268,7 +268,7 @@ async fn download_single(
             "download was incomplete (expected {expected_bytes} bytes, got {downloaded})"
         ));
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>())
 }
 
 pub(super) fn range_segments(total: u64, workers: usize) -> Vec<(u64, u64)> {
@@ -524,7 +524,7 @@ fn hash_file(path: &Path, cancel: &AtomicBool) -> Result<String, String> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>())
 }
 
 /// `is_installed` trusts a matching length plus a marker derived only from

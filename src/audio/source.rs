@@ -82,8 +82,8 @@ impl AudioSource {
 
         tracing::info!(
             "AudioSource: '{}' @ {} Hz, {} ch, fmt {:?}",
-            device.name().unwrap_or_default(),
-            supported.sample_rate().0,
+            device.description().map(|desc| desc.name().to_string()).unwrap_or_default(),
+            supported.sample_rate(),
             supported.channels(),
             sample_format,
         );
@@ -96,7 +96,7 @@ impl AudioSource {
         let healthy = Arc::new(AtomicBool::new(true));
         let healthy_thread = Arc::clone(&healthy);
         let healthy_cb = Arc::clone(&healthy);
-        let device_rate = Arc::new(AtomicU32::new(supported.sample_rate().0));
+        let device_rate = Arc::new(AtomicU32::new(supported.sample_rate()));
         let device_rate_cb = Arc::clone(&device_rate);
         let channels = Arc::new(AtomicUsize::new(supported.channels() as usize));
         let channels_cb = Arc::clone(&channels);

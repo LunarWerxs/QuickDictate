@@ -114,7 +114,7 @@ impl ProviderSink for AssemblyAiSink {
     async fn send_audio(&mut self, pcm: &[i16]) -> Result<(), SendError> {
         let bytes = i16_slice_as_bytes(pcm).to_vec();
         self.sink
-            .send(Message::Binary(bytes))
+            .send(Message::Binary(bytes.into()))
             .await
             .map_err(|e| SendError(e.to_string()))
     }
@@ -132,7 +132,7 @@ impl ProviderSink for AssemblyAiSink {
         // transport-level WS ping: a harmless standard control frame that resets
         // connection idle timers. The recv side ignores the Pong reply.
         self.sink
-            .send(Message::Ping(Vec::new()))
+            .send(Message::Ping(Vec::new().into()))
             .await
             .map_err(|e| SendError(e.to_string()))
     }

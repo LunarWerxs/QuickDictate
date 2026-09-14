@@ -75,8 +75,8 @@ pub(super) fn resolve_input() -> Result<(cpal::Device, cpal::SupportedStreamConf
             .ok()
             .and_then(|mut devices| {
                 devices.find(|d| {
-                    d.name()
-                        .is_ok_and(|n| n.to_ascii_lowercase().contains(&needle))
+                    d.description()
+                        .is_ok_and(|desc| desc.name().to_ascii_lowercase().contains(&needle))
                 })
             })
             .or_else(|| {
@@ -104,7 +104,9 @@ pub(super) fn resolve_input() -> Result<(cpal::Device, cpal::SupportedStreamConf
 /// has changed underneath it (an RDP session connecting or disconnecting, a
 /// USB mic being plugged in, Windows promoting a new default).
 fn resolved_input_name() -> Option<String> {
-    resolve_input().ok().and_then(|(d, _)| d.name().ok())
+    resolve_input()
+        .ok()
+        .and_then(|(d, _)| d.description().ok().map(|desc| desc.name().to_string()))
 }
 
 /// Why `stream_until_failure` returned without an error.
@@ -150,12 +152,12 @@ pub(super) fn run_global_capture(
             // swap is not a degraded state and must not raise the error pip.
             Ok(StreamOutcome::DeviceChanged) => match resolve_input() {
                 Ok((d, s)) => {
-                    device_rate.store(s.sample_rate().0, Ordering::Release);
+                    device_rate.store(s.sample_rate(), Ordering::Release);
                     channels.store(s.channels() as usize, Ordering::Release);
                     tracing::info!(
                         "AudioSource: now on '{}' @ {} Hz, {} ch",
-                        d.name().unwrap_or_default(),
-                        s.sample_rate().0,
+                        d.description().map(|desc| desc.name().to_string()).unwrap_or_default(),
+                        s.sample_rate(),
                         s.channels(),
                     );
                     device = d;
@@ -194,12 +196,12 @@ pub(super) fn run_global_capture(
             }
             match resolve_input() {
                 Ok((d, s)) => {
-                    device_rate.store(s.sample_rate().0, Ordering::Release);
+                    device_rate.store(s.sample_rate(), Ordering::Release);
                     channels.store(s.channels() as usize, Ordering::Release);
                     tracing::info!(
                         "AudioSource: reopened '{}' @ {} Hz, {} ch",
-                        d.name().unwrap_or_default(),
-                        s.sample_rate().0,
+                        d.description().map(|desc| desc.name().to_string()).unwrap_or_default(),
+                        s.sample_rate(),
                         s.channels(),
                     );
                     device = d;
@@ -248,7 +250,7 @@ fn stream_until_failure(
             let channels = Arc::clone(channels);
             let mut scratch: Vec<i16> = Vec::new();
             device.build_input_stream(
-                &config,
+                config,
                 move |data: &[f32], _| {
                     scratch.clear();
                     scratch.reserve(data.len());
@@ -266,7 +268,7 @@ fn stream_until_failure(
             let device_rate = Arc::clone(device_rate);
             let channels = Arc::clone(channels);
             device.build_input_stream(
-                &config,
+                config,
                 move |data: &[i16], _| {
                     // WASAPI already gave us the exact representation the
                     // resamplers consume, so avoid copying every callback into
@@ -283,7 +285,7 @@ fn stream_until_failure(
             let channels = Arc::clone(channels);
             let mut scratch: Vec<i16> = Vec::new();
             device.build_input_stream(
-                &config,
+                config,
                 move |data: &[u16], _| {
                     scratch.clear();
                     scratch.reserve(data.len());
@@ -303,7 +305,7 @@ fn stream_until_failure(
     healthy.store(true, Ordering::Release);
     tracing::info!("AudioSource: streaming");
 
-    let open_name = device.name().unwrap_or_default();
+    let open_name = device.description().map(|desc| desc.name().to_string()).unwrap_or_default();
     watch_stream(stream, stop, healthy, &open_name)
 }
 

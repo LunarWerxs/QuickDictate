@@ -111,7 +111,7 @@ impl SttProvider for DashScopeProvider {
 
         // 1) send run-task
         let run_task = build_run_task(&task_id, model, opts);
-        ws.send(Message::Text(run_task))
+        ws.send(Message::Text(run_task.into()))
             .await
             .map_err(|e| ConnectError(format!("run-task send: {e}")))?;
 
@@ -208,7 +208,7 @@ impl ProviderSink for DashScopeSink {
     async fn send_audio(&mut self, pcm: &[i16]) -> Result<(), SendError> {
         let bytes = i16_slice_as_bytes(pcm).to_vec();
         self.sink
-            .send(Message::Binary(bytes))
+            .send(Message::Binary(bytes.into()))
             .await
             .map_err(|e| SendError(e.to_string()))
     }
@@ -220,7 +220,7 @@ impl ProviderSink for DashScopeSink {
         })
         .to_string();
         self.sink
-            .send(Message::Text(finish))
+            .send(Message::Text(finish.into()))
             .await
             .map_err(|e| SendError(e.to_string()))
     }
@@ -230,7 +230,7 @@ impl ProviderSink for DashScopeSink {
         // harmless standard control frame that resets idle timers. The recv side
         // ignores the Pong reply.
         self.sink
-            .send(Message::Ping(Vec::new()))
+            .send(Message::Ping(Vec::new().into()))
             .await
             .map_err(|e| SendError(e.to_string()))
     }

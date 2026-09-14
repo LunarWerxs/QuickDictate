@@ -87,7 +87,7 @@ impl SttProvider for OpenAiProvider {
         // Configure the transcription session (GA Realtime shape). Manual commit
         // (turn_detection = null) so we control end-of-utterance.
         let update = build_session_update(model, opts).to_string();
-        ws.send(Message::Text(update))
+        ws.send(Message::Text(update.into()))
             .await
             .map_err(|e| ConnectError(format!("session.update send: {e}")))?;
 
@@ -140,7 +140,7 @@ impl ProviderSink for OpenAiSink {
         let audio = base64::engine::general_purpose::STANDARD.encode(i16_slice_as_bytes(pcm));
         let msg = json!({ "type": "input_audio_buffer.append", "audio": audio }).to_string();
         self.sink
-            .send(Message::Text(msg))
+            .send(Message::Text(msg.into()))
             .await
             .map_err(|e| SendError(e.to_string()))
     }
@@ -159,7 +159,7 @@ impl ProviderSink for OpenAiSink {
         // ping keeps any connection idle timer from firing during a long silent
         // tail. The recv side ignores the Pong reply.
         self.sink
-            .send(Message::Ping(Vec::new()))
+            .send(Message::Ping(Vec::new().into()))
             .await
             .map_err(|e| SendError(e.to_string()))
     }

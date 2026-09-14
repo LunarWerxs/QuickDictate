@@ -285,7 +285,7 @@ fn model_hash_is_verified_once_then_cached_per_process() {
     let path = test_path("model-hash-cache");
     fs::write(&path, b"hello world").unwrap();
     let good_hash: &'static str =
-        Box::leak(format!("{:x}", Sha256::digest(b"hello world")).into_boxed_str());
+        Box::leak(Sha256::digest(b"hello world").iter().map(|b| format!("{b:02x}")).collect::<String>().into_boxed_str());
     let spec = ModelSpec {
         id: "test-model-hash-cache",
         label: "test",
@@ -325,7 +325,7 @@ fn model_hash_mismatch_is_reported_and_not_cached_as_passing() {
 
     // Not cached as a pass: fixing the file and re-checking succeeds.
     let good_hash: &'static str =
-        Box::leak(format!("{:x}", Sha256::digest(b"actual content")).into_boxed_str());
+        Box::leak(Sha256::digest(b"actual content").iter().map(|b| format!("{b:02x}")).collect::<String>().into_boxed_str());
     let fixed = ModelSpec {
         sha256: good_hash,
         ..spec
@@ -460,7 +460,7 @@ fn parallel_downloader_reassembles_http_ranges() {
 #[test]
 fn cancelling_download_stops_and_removes_partial_file() {
     let data = Arc::new(vec![0x5a; 4 * 1024 * 1024]);
-    let expected_sha256 = format!("{:x}", Sha256::digest(data.as_slice()));
+    let expected_sha256 = Sha256::digest(data.as_slice()).iter().map(|b| format!("{b:02x}")).collect::<String>();
     let (url, server) =
         spawn_download_server(Arc::clone(&data), 1, false, Duration::from_millis(2));
     let dest = test_path("cancel-download");

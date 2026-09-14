@@ -127,7 +127,7 @@ impl ProviderSink for DeepgramSink {
         // Raw little-endian PCM16 binary frame — no envelope.
         let bytes = i16_slice_as_bytes(pcm).to_vec();
         self.sink
-            .send(Message::Binary(bytes))
+            .send(Message::Binary(bytes.into()))
             .await
             .map_err(|e| SendError(e.to_string()))
     }

@@ -198,7 +198,7 @@ impl ProviderSink for ElevenLabsSink {
         self.buf.push_str(&self.sample_rate.to_string());
         self.buf.push('}');
         self.sink
-            .send(Message::Text(self.buf.clone()))
+            .send(Message::Text(self.buf.clone().into()))
             .await
             .map_err(|e| SendError(e.to_string()))
     }
@@ -212,7 +212,7 @@ impl ProviderSink for ElevenLabsSink {
         })
         .to_string();
         self.sink
-            .send(Message::Text(commit))
+            .send(Message::Text(commit.into()))
             .await
             .map_err(|e| SendError(e.to_string()))
     }
@@ -229,7 +229,7 @@ impl ProviderSink for ElevenLabsSink {
         })
         .to_string();
         self.sink
-            .send(Message::Text(ka))
+            .send(Message::Text(ka.into()))
             .await
             .map_err(|e| SendError(e.to_string()))
     }
