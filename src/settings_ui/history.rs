@@ -77,6 +77,22 @@ fn history_row(ui: &mut egui::Ui, entry: &HistoryEntry, is_selected: bool) -> Ro
     action
 }
 
+/// The line under the card title, which has to say whether the history the
+/// user is looking at outlives the session.
+fn history_blurb(persisted: bool) -> &'static str {
+    if persisted {
+        "Your last 50 dictations, kept on this PC so they survive a restart or \
+         an update (never synced or sent anywhere). Tick any number and copy \
+         them together, or use a row's buttons to copy just that one or paste \
+         it again into whatever's currently focused."
+    } else {
+        "Your recent dictations for this session only (history saving is off \
+         on the Advanced page). Tick any number and copy them together, or use \
+         a row's buttons to copy just that one or paste it again into \
+         whatever's currently focused."
+    }
+}
+
 impl super::SettingsApp {
     /// Recent-transcriptions browser: a bigger window onto the same list the
     /// tray's "Recent transcriptions" submenu shows (`app.history`, kept on
@@ -85,80 +101,15 @@ impl super::SettingsApp {
     /// after the card closure, matching the rest of this module's pattern
     /// for keeping `&mut self` calls unnested.
     pub(crate) fn history_card(&mut self, ui: &mut egui::Ui) {
-        let mut do_copy: Option<usize> = None;
-        let mut do_replay: Option<usize> = None;
-        let mut do_copy_selected = false;
         // The list takes every point of the page the toolbar leaves it: a
         // history is more useful the more of it is on screen, and the page
         // has nothing else to show.
         let page_height = ui.available_height();
-        // Reads the SAVED setting, not the draft: the blurb describes what
-        // the app is doing now, and an unsaved tick is not that yet.
-        let persisted = self.app.config.load().persist_history;
-        card(ui, |ui| {
-            blurb(
-                ui,
-                if persisted {
-                    "Your last 50 dictations, kept on this PC so they survive a restart or \
-                     an update (never synced or sent anywhere). Tick any number and copy \
-                     them together, or use a row's buttons to copy just that one or paste \
-                     it again into whatever's currently focused."
-                } else {
-                    "Your recent dictations for this session only (history saving is off \
-                     on the Advanced page). Tick any number and copy them together, or use \
-                     a row's buttons to copy just that one or paste it again into \
-                     whatever's currently focused."
-                },
-            );
-            ui.add_space(6.0);
-
-            self.rebuild_history_cache_if_stale();
-            do_copy_selected = self.history_toolbar(ui);
-
-            if self.history_cache.history_empty {
-                ui.label(
-                    RichText::new("No dictations yet.")
-                        .size(12.0)
-                        .color(muted()),
-                );
-                return;
-            }
-            if self.history_cache.rows.is_empty() {
-                ui.label(RichText::new("No matches.").size(12.0).color(muted()));
-                return;
-            }
-
-            let list_h = (page_height - HISTORY_CHROME_H).max(HISTORY_LIST_MIN_H);
-            let rows = &self.history_cache.rows;
-            let selected = &mut self.history_selected;
-            egui::ScrollArea::vertical()
-                .id_salt("history_rows")
-                .max_height(list_h)
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    for (idx, entry) in rows {
-                        let action = history_row(ui, entry, selected.contains(&entry.id));
-                        if action.toggle && !selected.remove(&entry.id) {
-                            selected.insert(entry.id);
-                        }
-                        if action.copy {
-                            do_copy = Some(*idx);
-                        }
-                        if action.replay {
-                            do_replay = Some(*idx);
-                        }
-                    }
-                });
-        });
+        let (copy_selected, do_copy, do_replay) = self.history_card_body(ui, page_height);
         if let Some(idx) = do_copy {
-            if let Some(entry) = self.app.history.lock().get(idx) {
-                match crate::output::copy_to_clipboard(&entry.text) {
-                    Ok(()) => self.status = "Copied to clipboard.".into(),
-                    Err(e) => self.status = format!("Copy failed: {e}"),
-                }
-            }
+            self.copy_history_entry(idx);
         }
-        if do_copy_selected {
+        if copy_selected {
             self.copy_selected_history();
         }
         if let Some(idx) = do_replay {
@@ -167,6 +118,91 @@ impl super::SettingsApp {
             // the replay channel and let the output loop (see `output.rs`)
             // do the actual paste.
             let _ = self.app.replay_tx.try_send(Some(idx));
+        }
+    }
+
+    /// The card itself: blurb, toolbar, then the list (or why there is none).
+    /// Returns whether "Copy selected" was clicked and the row indices whose
+    /// copy / paste-again icons were.
+    fn history_card_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        page_height: f32,
+    ) -> (bool, Option<usize>, Option<usize>) {
+        // Reads the SAVED setting, not the draft: the blurb describes what
+        // the app is doing now, and an unsaved tick is not that yet.
+        let persisted = self.app.config.load().persist_history;
+        let mut copy_selected = false;
+        let mut do_copy: Option<usize> = None;
+        let mut do_replay: Option<usize> = None;
+        card(ui, |ui| {
+            blurb(ui, history_blurb(persisted));
+            ui.add_space(6.0);
+
+            self.rebuild_history_cache_if_stale();
+            copy_selected = self.history_toolbar(ui);
+
+            let Some(notice) = self.history_notice() else {
+                (do_copy, do_replay) = self.history_rows(ui, page_height);
+                return;
+            };
+            ui.label(RichText::new(notice).size(12.0).color(muted()));
+        });
+        (copy_selected, do_copy, do_replay)
+    }
+
+    /// The scroll area of rows. Returns the copy / paste-again requests the
+    /// rows raised this frame. Only called when the list has something to
+    /// show (see [`Self::history_notice`]).
+    fn history_rows(
+        &mut self,
+        ui: &mut egui::Ui,
+        page_height: f32,
+    ) -> (Option<usize>, Option<usize>) {
+        let list_h = (page_height - HISTORY_CHROME_H).max(HISTORY_LIST_MIN_H);
+        let rows = &self.history_cache.rows;
+        let selected = &mut self.history_selected;
+        let mut do_copy: Option<usize> = None;
+        let mut do_replay: Option<usize> = None;
+        egui::ScrollArea::vertical()
+            .id_salt("history_rows")
+            .max_height(list_h)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for (idx, entry) in rows {
+                    let action = history_row(ui, entry, selected.contains(&entry.id));
+                    if action.toggle && !selected.remove(&entry.id) {
+                        selected.insert(entry.id);
+                    }
+                    if action.copy {
+                        do_copy = Some(*idx);
+                    }
+                    if action.replay {
+                        do_replay = Some(*idx);
+                    }
+                }
+            });
+        (do_copy, do_replay)
+    }
+
+    /// What to show in place of the list, if anything: nothing matching the
+    /// filter, or nothing recorded at all.
+    fn history_notice(&self) -> Option<&'static str> {
+        if self.history_cache.history_empty {
+            return Some("No dictations yet.");
+        }
+        self.history_cache.rows.is_empty().then_some("No matches.")
+    }
+
+    /// Copy one dictation, picked by its row's icon button.
+    fn copy_history_entry(&mut self, idx: usize) {
+        let text = self.app.history.lock().get(idx).map(|e| e.text.clone());
+        let Some(text) = text else {
+            return;
+        };
+        match crate::output::copy_to_clipboard(&text) {
+            Ok(()) => self.status = "Copied to clipboard.".into(),
+            Err(e) => self.status = format!("Copy failed: {e}"),
         }
     }
 

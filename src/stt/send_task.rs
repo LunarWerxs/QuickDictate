@@ -335,91 +335,180 @@ async fn send_task_tail_phase(
     sent: &mut SentAudio,
     ws_dead: &mut bool,
 ) -> TailSilenceGate {
-    let mut gate = TailSilenceGate::default();
-    let tail_start = tokio::time::Instant::now();
-    let mut last_speech = tail_start;
-    // Last time a real audio frame (or a keepalive) actually went out. While
-    // we're trimming a long silent stretch nothing ships, so this drives the
-    // keepalive that stops an idle server from closing the session mid-tail.
-    let mut last_send = tail_start;
-    let mut tail_chunks: usize = 0;
-    let mut peak_rms: i32 = 0;
+    let mut run = TailRun::new();
     while !*ws_dead {
-        let elapsed = tail_start.elapsed();
-        if elapsed >= state.tail_max {
-            tracing::info!(
-                "session tail: hit tail_max ({:.0} ms) after {:.0} ms (peak_rms={peak_rms}, {} silent chunk(s) trimmed)",
-                state.tail_max.as_secs_f64() * 1000.0,
-                elapsed.as_secs_f64() * 1000.0,
-                gate.held(),
-            );
+        let elapsed = run.elapsed();
+        if run.hit_max(state, elapsed) {
             break;
         }
-        let chunk_opt = tokio::select! {
-            v = state.samples_rx.recv() => match v {
-                Some(chunk) => Some(chunk),
-                // The capture side is gone (device lost mid-tail). Nothing
-                // more can arrive, and a closed receiver answers instantly,
-                // so waiting out the tail here would be a hot spin.
-                None => {
-                    tracing::warn!("session tail: audio source closed; ending the tail early");
-                    break;
-                }
-            },
-            _ = tokio::time::sleep(Duration::from_millis(20)) => None,
+        let chunk = match next_tail_chunk(state).await {
+            TailChunk::Audio(chunk) => Some(chunk),
+            TailChunk::Idle => None,
+            TailChunk::SourceClosed => break,
         };
-        if let Some(chunk) = chunk_opt {
-            let rms = rms_i16(&chunk);
-            if rms > peak_rms {
-                peak_rms = rms;
-            }
-            let is_speech = rms >= SILENCE_RMS;
-            if is_speech {
-                last_speech = tokio::time::Instant::now();
-            }
-            // Ship speech now (flushing any held pause first); buffer silence.
-            let outgoing = gate.offer(chunk, is_speech);
-            let n = ship_all(&mut state.sink, &outgoing, ws_dead).await;
-            sent.record_prefix(&outgoing, n);
-            *state.sent_progress.lock() = *sent;
-            tail_chunks += n;
-            if n > 0 {
-                last_send = tokio::time::Instant::now();
-                // A speech-bearing tail chunk went out: a genuinely-spoken
-                // trailing word. Count it so its commit isn't mistaken for a
-                // phantom (this is what preserves a real trailing "Yes.").
-                if is_speech {
-                    state.speech_shipped.fetch_add(1, Ordering::Release);
-                }
-            }
-            if *ws_dead {
-                break;
-            }
+        if let Some(chunk) = chunk {
+            run.ship_chunk(state, sent, ws_dead, chunk).await;
         }
-        // Long quiet tail: no audio has gone out for a while (we're trimming
-        // silence). Send a content-free keepalive so the server keeps the
-        // session open. Never fires on a normal-length tail.
-        if last_send.elapsed() >= TAIL_KEEPALIVE_AFTER {
-            if let Err(e) = state.sink.keepalive().await {
-                tracing::debug!("session tail: keepalive failed (socket likely dead): {e}");
-                *ws_dead = true;
-                break;
-            }
-            last_send = tokio::time::Instant::now();
-            tracing::debug!("session tail: sent keepalive during long silent tail");
+        // Only shipping can kill the socket here (the loop guard already
+        // vouched for it on a tick that carried no audio), and a dead socket
+        // must not go on to send a keepalive.
+        if *ws_dead {
+            break;
         }
-        if elapsed >= TAIL_MIN && last_speech.elapsed() >= state.tail_quiet {
-            tracing::info!(
-                "session tail: ended after {:.0} ms ({} tail chunk(s) shipped, {} silent chunk(s) trimmed, peak_rms={peak_rms}, quiet ={:.0} ms)",
-                elapsed.as_secs_f64() * 1000.0,
-                tail_chunks,
-                gate.held(),
-                last_speech.elapsed().as_secs_f64() * 1000.0
-            );
+        if !run.keepalive_if_due(state).await {
+            *ws_dead = true;
+            break;
+        }
+        if run.quiet_enough(state, elapsed) {
             break;
         }
     }
-    gate
+    run.gate
+}
+
+/// One chunk handed over by the tail's select: audio, a wake-up with nothing
+/// to do, or the news that the capture side is gone.
+enum TailChunk {
+    Audio(Vec<i16>),
+    Idle,
+    SourceClosed,
+}
+
+/// Wait for the next captured chunk during the tail, or the poll tick that
+/// lets the tail's clocks be re-checked.
+async fn next_tail_chunk(state: &mut SendTaskState) -> TailChunk {
+    tokio::select! {
+        v = state.samples_rx.recv() => match v {
+            Some(chunk) => TailChunk::Audio(chunk),
+            // The capture side is gone (device lost mid-tail). Nothing
+            // more can arrive, and a closed receiver answers instantly,
+            // so waiting out the tail here would be a hot spin.
+            None => {
+                tracing::warn!("session tail: audio source closed; ending the tail early");
+                TailChunk::SourceClosed
+            }
+        },
+        _ = tokio::time::sleep(Duration::from_millis(20)) => TailChunk::Idle,
+    }
+}
+
+/// The tail's running state: the silence gate, the endpointing clocks, and
+/// the counters the end-of-tail log lines report.
+struct TailRun {
+    gate: TailSilenceGate,
+    start: tokio::time::Instant,
+    last_speech: tokio::time::Instant,
+    /// Last time a real audio frame (or a keepalive) actually went out. While
+    /// we're trimming a long silent stretch nothing ships, so this drives the
+    /// keepalive that stops an idle server from closing the session mid-tail.
+    last_send: tokio::time::Instant,
+    chunks: usize,
+    peak_rms: i32,
+}
+
+impl TailRun {
+    fn new() -> Self {
+        let now = tokio::time::Instant::now();
+        Self {
+            gate: TailSilenceGate::default(),
+            start: now,
+            last_speech: now,
+            last_send: now,
+            chunks: 0,
+            peak_rms: 0,
+        }
+    }
+
+    /// How long the tail has been running.
+    fn elapsed(&self) -> Duration {
+        self.start.elapsed()
+    }
+
+    /// Fold one captured chunk in: track its loudness and endpointing, then
+    /// ship whatever the gate lets through (flushing any held pause first).
+    async fn ship_chunk(
+        &mut self,
+        state: &mut SendTaskState,
+        sent: &mut SentAudio,
+        ws_dead: &mut bool,
+        chunk: Vec<i16>,
+    ) {
+        let rms = rms_i16(&chunk);
+        if rms > self.peak_rms {
+            self.peak_rms = rms;
+        }
+        let is_speech = rms >= SILENCE_RMS;
+        if is_speech {
+            self.last_speech = tokio::time::Instant::now();
+        }
+        // Ship speech now (flushing any held pause first); buffer silence.
+        let outgoing = self.gate.offer(chunk, is_speech);
+        let n = ship_all(&mut state.sink, &outgoing, ws_dead).await;
+        sent.record_prefix(&outgoing, n);
+        *state.sent_progress.lock() = *sent;
+        self.chunks += n;
+        if n == 0 {
+            return;
+        }
+        self.last_send = tokio::time::Instant::now();
+        // A speech-bearing tail chunk went out: a genuinely-spoken
+        // trailing word. Count it so its commit isn't mistaken for a
+        // phantom (this is what preserves a real trailing "Yes.").
+        if is_speech {
+            state.speech_shipped.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    /// Long quiet tail: no audio has gone out for a while (we're trimming
+    /// silence). Send a content-free keepalive so the server keeps the
+    /// session open -- never fires on a normal-length tail. Returns `false`
+    /// when the keepalive failed, i.e. the socket is likely dead.
+    async fn keepalive_if_due(&mut self, state: &mut SendTaskState) -> bool {
+        if self.last_send.elapsed() < TAIL_KEEPALIVE_AFTER {
+            return true;
+        }
+        if let Err(e) = state.sink.keepalive().await {
+            tracing::debug!("session tail: keepalive failed (socket likely dead): {e}");
+            return false;
+        }
+        self.last_send = tokio::time::Instant::now();
+        tracing::debug!("session tail: sent keepalive during long silent tail");
+        true
+    }
+
+    /// Whether the tail has run into its hard ceiling. Logs the line the
+    /// ceiling is reported with.
+    fn hit_max(&self, state: &SendTaskState, elapsed: Duration) -> bool {
+        if elapsed < state.tail_max {
+            return false;
+        }
+        tracing::info!(
+            "session tail: hit tail_max ({:.0} ms) after {:.0} ms (peak_rms={}, {} silent chunk(s) trimmed)",
+            state.tail_max.as_secs_f64() * 1000.0,
+            elapsed.as_secs_f64() * 1000.0,
+            self.peak_rms,
+            self.gate.held(),
+        );
+        true
+    }
+
+    /// Whether enough quiet has passed since the last speech (and the tail
+    /// has run at least [`TAIL_MIN`]) to end it. Logs the line the end is
+    /// reported with.
+    fn quiet_enough(&self, state: &SendTaskState, elapsed: Duration) -> bool {
+        if elapsed < TAIL_MIN || self.last_speech.elapsed() < state.tail_quiet {
+            return false;
+        }
+        tracing::info!(
+            "session tail: ended after {:.0} ms ({} tail chunk(s) shipped, {} silent chunk(s) trimmed, peak_rms={}, quiet ={:.0} ms)",
+            elapsed.as_secs_f64() * 1000.0,
+            self.chunks,
+            self.gate.held(),
+            self.peak_rms,
+            self.last_speech.elapsed().as_secs_f64() * 1000.0
+        );
+        true
+    }
 }
 
 /// Phase 3 of [`run_send_task`]: flush the session's resampler tail, then

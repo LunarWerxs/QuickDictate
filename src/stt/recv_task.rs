@@ -93,6 +93,209 @@ enum Next {
     Event(Result<Option<SttEvent>, RecvError>),
 }
 
+/// One read off the provider stream, sorted into what the loop does with it.
+enum StreamRead {
+    /// An event arrived.
+    Event(SttEvent),
+    /// The stream is down before release: park until a replacement arrives.
+    Park,
+    /// Nothing more will come off the current stream: finish the task.
+    End,
+}
+
+/// What handling one inbound step asks the recv loop to do.
+enum RecvStep {
+    /// Keep reading.
+    Keep,
+    /// Park this task until a replacement connection arrives.
+    Park,
+    /// Finish the task.
+    End,
+}
+
+/// Wait for the next read off the current stream, transparently taking over
+/// any replacement the send task hands across first. `None` means the loop is
+/// done: the swap channel closed while parked (nothing left to wait for), or
+/// it closed and no stream is parked on it.
+///
+/// `swap_open` and `parked` are the loop's own flags, updated here because
+/// adopting a replacement and losing the swap channel both change them.
+async fn next_recv_read(
+    state: &mut RecvTaskState,
+    swap_open: &mut bool,
+    parked: &mut bool,
+    committed_words: u32,
+) -> Option<Result<Option<SttEvent>, RecvError>> {
+    loop {
+        let next = tokio::select! {
+            biased;
+            swapped = state.stream_swap.recv(), if *swap_open => Next::Swap(swapped),
+            r = state.stream.recv_event(), if !*parked => Next::Event(r),
+            else => return None,
+        };
+        match next {
+            Next::Swap(Some(stream)) => {
+                adopt_replacement(state, stream, committed_words);
+                *parked = false;
+            }
+            Next::Swap(None) => {
+                *swap_open = false;
+                if *parked {
+                    return None;
+                }
+            }
+            Next::Event(r) => return Some(r),
+        }
+    }
+}
+
+/// Take over a replacement inbound half from the send task's stall recovery.
+/// Whatever the quiet connection last said about the open segment is
+/// superseded: the replacement transcribes the replayed audio afresh, so the
+/// pip falls back to the committed count until its partials arrive.
+fn adopt_replacement(
+    state: &mut RecvTaskState,
+    stream: Box<dyn ProviderStream>,
+    committed_words: u32,
+) {
+    let epoch = state.epoch;
+    let provider_id = state.provider_id;
+    state.stream = stream;
+    state.acc.last_partial_buf.lock().clear();
+    state
+        .recv_app
+        .word_count
+        .store(committed_words, Ordering::Release);
+    if state.acc.provider_failure.lock().take().is_some() {
+        tracing::info!(
+            "session[{epoch}] clearing the transport failure: the press carries on over a replacement connection"
+        );
+    }
+    tracing::info!("session[{epoch}] {provider_id} listening on the replacement connection");
+}
+
+/// The current stream is down before release: say so, mark it dead so the
+/// send task's stall watchdog reconnects at once instead of waiting out its
+/// timer, and let the loop park for the replacement.
+fn park_for_replacement(state: &mut RecvTaskState, message: &str) {
+    tracing::warn!("session[{}] {message}", state.epoch);
+    state.stream_dead.store(true, Ordering::Release);
+}
+
+/// Sort one read off the provider stream. A clean end or a read error is only
+/// worth parking on before release, and only while the send task can still
+/// produce a replacement; otherwise the task finishes.
+fn classify_stream_read(
+    state: &mut RecvTaskState,
+    received: Result<Option<SttEvent>, RecvError>,
+    can_park: bool,
+) -> StreamRead {
+    let epoch = state.epoch;
+    match received {
+        Ok(Some(ev)) => StreamRead::Event(ev),
+        Ok(None) => {
+            if !can_park {
+                return StreamRead::End;
+            }
+            park_for_replacement(
+                state,
+                "inbound half ended before release; waiting for a replacement connection",
+            );
+            StreamRead::Park
+        }
+        Err(e) => {
+            // A read error mid-utterance is NOT a clean end of stream.
+            // Recording it in `provider_failure` is what makes
+            // run_session return Err, so the retry shell can rotate or
+            // the pip can show an error. Without this a dropped socket
+            // was indistinguishable from the provider finishing
+            // normally: no retry, no error, and any uncommitted speech
+            // silently gone while the app reported success.
+            //
+            // Recorded unconditionally here, but only SURFACED at the
+            // end of run_session when the session delivered no words.
+            // ElevenLabs routinely resets the socket without a closing
+            // handshake once it has sent the final transcript, and
+            // erroring on that flashed the pip after a dictation the
+            // user watched succeed. A successful replacement clears it.
+            tracing::warn!("session[{epoch}] recv error: {e}");
+            let mut slot = state.acc.provider_failure.lock();
+            if slot.is_none() {
+                *slot = Some(format!("transport failed mid-session: {e}"));
+            }
+            drop(slot);
+            if !can_park {
+                return StreamRead::End;
+            }
+            park_for_replacement(
+                state,
+                "transport failed before release; waiting for a replacement connection",
+            );
+            StreamRead::Park
+        }
+    }
+}
+
+/// Handle one provider event off the stream.
+fn handle_recv_event(
+    state: &mut RecvTaskState,
+    ev: SttEvent,
+    can_park: bool,
+    committed_words: &mut u32,
+    last_commit_speech: &mut u64,
+) -> RecvStep {
+    let epoch = state.epoch;
+    let provider_id = state.provider_id;
+    match ev {
+        SttEvent::SessionStarted => {
+            tracing::info!("session[{epoch}] {provider_id} session_started");
+        }
+        SttEvent::Partial(t) => {
+            state.server_activity.fetch_add(1, Ordering::AcqRel);
+            if state.log_transcripts {
+                tracing::debug!("session[{epoch}] partial: {t}");
+            } else {
+                tracing::debug!("session[{epoch}] partial: {} char(s)", t.chars().count());
+            }
+            let partial_words = t.split_whitespace().count() as u32;
+            state
+                .recv_app
+                .word_count
+                .store(*committed_words + partial_words, Ordering::Release);
+            *state.acc.last_partial_buf.lock() = t;
+        }
+        SttEvent::Committed(final_text) => {
+            state.server_activity.fetch_add(1, Ordering::AcqRel);
+            handle_committed_event(state, committed_words, last_commit_speech, final_text);
+        }
+        SttEvent::KeyFailure(kind) => {
+            tracing::warn!("session[{epoch}] provider signaled key failure ({kind:?})");
+            *state.acc.key_fail_kind.lock() = Some(kind);
+            // Don't break: the outer wait loop observes key_fail_kind and
+            // tears the session down / rotates keys.
+        }
+        SttEvent::ProviderFailure(message) => {
+            tracing::error!("session[{epoch}] {provider_id} failed: {message}");
+            *state.acc.provider_failure.lock() = Some(message);
+        }
+        SttEvent::Closed(reason) => {
+            match reason {
+                Some(r) => tracing::warn!("session[{epoch}] transport closed by server ({r})"),
+                None => tracing::info!("session[{epoch}] transport closed by server"),
+            }
+            if !can_park {
+                return RecvStep::End;
+            }
+            park_for_replacement(
+                state,
+                "server closed the session before release; waiting for a replacement connection",
+            );
+            return RecvStep::Park;
+        }
+    }
+    RecvStep::Keep
+}
+
 /// The session's inbound-event task: normalize provider events into
 /// [`RecvTaskState::acc`]. Runs on its own `tokio::spawn` from
 /// [`run_session`](super::run_session), mirroring [`run_send_task`](super::send_task::run_send_task) on the outbound side.
@@ -102,7 +305,6 @@ enum Next {
 /// instead of finishing, and carries on with the replacement when it comes.
 pub(super) async fn run_recv_task(mut state: RecvTaskState) {
     let epoch = state.epoch;
-    let provider_id = state.provider_id;
     let mut events: usize = 0;
     let mut committed_words: u32 = state.seeded_words;
     // Snapshot of `speech_shipped` taken at the last *kept* commit. Compared
@@ -115,148 +317,33 @@ pub(super) async fn run_recv_task(mut state: RecvTaskState) {
     // The current stream ended early and we are waiting for a replacement.
     let mut parked = false;
     loop {
-        let next = tokio::select! {
-            biased;
-            swapped = state.stream_swap.recv(), if swap_open => Next::Swap(swapped),
-            r = state.stream.recv_event(), if !parked => Next::Event(r),
-            else => break,
-        };
-        let received = match next {
-            Next::Swap(Some(stream)) => {
-                state.stream = stream;
-                parked = false;
-                // Whatever the quiet connection last said about the open
-                // segment is superseded: the replacement transcribes the
-                // replayed audio afresh, so the pip falls back to the
-                // committed count until its partials arrive.
-                state.acc.last_partial_buf.lock().clear();
-                state
-                    .recv_app
-                    .word_count
-                    .store(committed_words, Ordering::Release);
-                if state.acc.provider_failure.lock().take().is_some() {
-                    tracing::info!(
-                        "session[{epoch}] clearing the transport failure: the press carries on over a replacement connection"
-                    );
-                }
-                tracing::info!(
-                    "session[{epoch}] {provider_id} listening on the replacement connection"
-                );
-                continue;
-            }
-            Next::Swap(None) => {
-                swap_open = false;
-                if parked {
-                    break;
-                }
-                continue;
-            }
-            Next::Event(r) => r,
+        let Some(received) =
+            next_recv_read(&mut state, &mut swap_open, &mut parked, committed_words).await
+        else {
+            break;
         };
         // Whether an early end of this stream should be waited out rather
         // than ending the task: only before release, and only while the send
         // task can still produce a replacement.
         let can_park = swap_open && !state.release_pending.load(Ordering::Acquire);
-        let ev = match received {
-            Ok(Some(ev)) => ev,
-            Ok(None) => {
-                if can_park {
-                    tracing::warn!(
-                        "session[{epoch}] inbound half ended before release; waiting for a replacement connection"
-                    );
-                    state.stream_dead.store(true, Ordering::Release);
-                    parked = true;
-                    continue;
-                }
-                break;
-            }
-            Err(e) => {
-                // A read error mid-utterance is NOT a clean end of stream.
-                // Recording it in `provider_failure` is what makes
-                // run_session return Err, so the retry shell can rotate or
-                // the pip can show an error. Without this a dropped socket
-                // was indistinguishable from the provider finishing
-                // normally: no retry, no error, and any uncommitted speech
-                // silently gone while the app reported success.
-                //
-                // Recorded unconditionally here, but only SURFACED at the
-                // end of run_session when the session delivered no words.
-                // ElevenLabs routinely resets the socket without a closing
-                // handshake once it has sent the final transcript, and
-                // erroring on that flashed the pip after a dictation the
-                // user watched succeed. A successful replacement clears it.
-                tracing::warn!("session[{epoch}] recv error: {e}");
-                let mut slot = state.acc.provider_failure.lock();
-                if slot.is_none() {
-                    *slot = Some(format!("transport failed mid-session: {e}"));
-                }
-                drop(slot);
-                if can_park {
-                    tracing::warn!(
-                        "session[{epoch}] transport failed before release; waiting for a replacement connection"
-                    );
-                    state.stream_dead.store(true, Ordering::Release);
-                    parked = true;
-                    continue;
-                }
-                break;
-            }
-        };
-        events += 1;
-        match ev {
-            SttEvent::SessionStarted => {
-                tracing::info!("session[{epoch}] {provider_id} session_started");
-            }
-            SttEvent::Partial(t) => {
-                state.server_activity.fetch_add(1, Ordering::AcqRel);
-                if state.log_transcripts {
-                    tracing::debug!("session[{epoch}] partial: {t}");
-                } else {
-                    tracing::debug!("session[{epoch}] partial: {} char(s)", t.chars().count());
-                }
-                let partial_words = t.split_whitespace().count() as u32;
-                state
-                    .recv_app
-                    .word_count
-                    .store(committed_words + partial_words, Ordering::Release);
-                *state.acc.last_partial_buf.lock() = t;
-            }
-            SttEvent::Committed(final_text) => {
-                state.server_activity.fetch_add(1, Ordering::AcqRel);
-                handle_committed_event(
+        let step = match classify_stream_read(&mut state, received, can_park) {
+            StreamRead::Event(ev) => {
+                events += 1;
+                handle_recv_event(
                     &mut state,
+                    ev,
+                    can_park,
                     &mut committed_words,
                     &mut last_commit_speech,
-                    final_text,
-                );
+                )
             }
-            SttEvent::KeyFailure(kind) => {
-                tracing::warn!("session[{epoch}] provider signaled key failure ({kind:?})");
-                *state.acc.key_fail_kind.lock() = Some(kind);
-                // Don't break: the outer wait loop observes key_fail_kind and
-                // tears the session down / rotates keys.
-            }
-            SttEvent::ProviderFailure(message) => {
-                tracing::error!("session[{epoch}] {provider_id} failed: {message}");
-                *state.acc.provider_failure.lock() = Some(message);
-            }
-            SttEvent::Closed(reason) => {
-                match reason {
-                    Some(r) => {
-                        tracing::warn!("session[{epoch}] transport closed by server ({r})")
-                    }
-                    None => tracing::info!("session[{epoch}] transport closed by server"),
-                }
-                if can_park {
-                    tracing::warn!(
-                        "session[{epoch}] server closed the session before release; waiting for a replacement connection"
-                    );
-                    state.stream_dead.store(true, Ordering::Release);
-                    parked = true;
-                    continue;
-                }
-                break;
-            }
+            StreamRead::Park => RecvStep::Park,
+            StreamRead::End => RecvStep::End,
+        };
+        match step {
+            RecvStep::Keep => {}
+            RecvStep::Park => parked = true,
+            RecvStep::End => break,
         }
     }
     tracing::info!("session[{epoch}] recv_task ended (events={events})");
