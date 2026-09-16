@@ -24,4 +24,4 @@ Describe any manual testing (which provider(s), which settings, what you spoke/t
 - [ ] `cargo fmt` is clean
 - [ ] `cargo clippy -- -D warnings` is clean
 - [ ] `cargo test` passes
-- [ ] No secrets committed (no API keys, no personal `settings.json` — only `settings.example.json` should be tracked)
+- [ ] No secrets committed (no API keys, no personal `settings.json` - only `settings.example.json` should be tracked)

@@ -20,4 +20,4 @@ Any workarounds you're using today, or other approaches you considered.
 
 ### Additional context
 
-Anything else that helps — screenshots, provider docs, related issues, etc.
+Anything else that helps - screenshots, provider docs, related issues, etc.
