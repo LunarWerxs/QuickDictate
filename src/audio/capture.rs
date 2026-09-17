@@ -156,7 +156,9 @@ pub(super) fn run_global_capture(
                     channels.store(s.channels() as usize, Ordering::Release);
                     tracing::info!(
                         "AudioSource: now on '{}' @ {} Hz, {} ch",
-                        d.description().map(|desc| desc.name().to_string()).unwrap_or_default(),
+                        d.description()
+                            .map(|desc| desc.name().to_string())
+                            .unwrap_or_default(),
                         s.sample_rate(),
                         s.channels(),
                     );
@@ -200,7 +202,9 @@ pub(super) fn run_global_capture(
                     channels.store(s.channels() as usize, Ordering::Release);
                     tracing::info!(
                         "AudioSource: reopened '{}' @ {} Hz, {} ch",
-                        d.description().map(|desc| desc.name().to_string()).unwrap_or_default(),
+                        d.description()
+                            .map(|desc| desc.name().to_string())
+                            .unwrap_or_default(),
                         s.sample_rate(),
                         s.channels(),
                     );
@@ -305,7 +309,10 @@ fn stream_until_failure(
     healthy.store(true, Ordering::Release);
     tracing::info!("AudioSource: streaming");
 
-    let open_name = device.description().map(|desc| desc.name().to_string()).unwrap_or_default();
+    let open_name = device
+        .description()
+        .map(|desc| desc.name().to_string())
+        .unwrap_or_default();
     watch_stream(stream, stop, healthy, &open_name)
 }
 

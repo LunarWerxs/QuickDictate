@@ -82,7 +82,10 @@ impl AudioSource {
 
         tracing::info!(
             "AudioSource: '{}' @ {} Hz, {} ch, fmt {:?}",
-            device.description().map(|desc| desc.name().to_string()).unwrap_or_default(),
+            device
+                .description()
+                .map(|desc| desc.name().to_string())
+                .unwrap_or_default(),
             supported.sample_rate(),
             supported.channels(),
             sample_format,
