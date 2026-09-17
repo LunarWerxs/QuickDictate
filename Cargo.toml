@@ -148,4 +148,6 @@ windows = { version = "0.58", features = [
 ] }
 tray-icon = "0.25.0"
 # HKCU Run-key management for the run_at_startup setting.
-windows-registry = "0.100.0"
+# 0.100 requires rustc 1.95, above the 1.93 floor this crate declares (rust-version, ci.yml and
+# scripts/check.ps1 all name it); 0.6.1 is the newest release under it. Bump when the floor moves.
+windows-registry = "0.6.1"
