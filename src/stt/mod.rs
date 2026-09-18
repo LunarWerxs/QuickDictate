@@ -358,7 +358,11 @@ async fn finish_session(
             });
         }
     } else if app2.current_session_epoch() == epoch {
-        app2.clear_status_if(Status::Processing, Status::Idle);
+        // Whichever post-release state this press left the pip in (see
+        // `session_loop::status_after_release`), the transcript is in now.
+        if !app2.clear_status_if(Status::Processing, Status::Idle) {
+            app2.clear_status_if(Status::Finalizing, Status::Idle);
+        }
     }
 }
 

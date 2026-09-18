@@ -88,6 +88,14 @@ impl SttProvider for DashScopeProvider {
         }
     }
 
+    /// Measured 2026-09-18 against the live API (`live_dashscope`): first
+    /// partial at 0.73 s, then one every ~0.5 s through the utterance, the
+    /// fastest cadence of any provider here and far inside the watchdog's 5 s
+    /// window. Unmeasurable until then: every key the app had was in arrears.
+    fn supports_stall_recovery(&self) -> bool {
+        true
+    }
+
     async fn connect(
         &self,
         key: &str,

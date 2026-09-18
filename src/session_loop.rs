@@ -28,9 +28,17 @@ fn refresh_key_pool(app: &Arc<App>, keys: &mut Arc<KeyPool>) {
     }
 }
 
-fn status_after_release(provider: &str) -> Status {
-    if provider.eq_ignore_ascii_case("local") {
+/// What the pip shows between release and the transcript landing. The local
+/// model gets `Processing`, which also queues the next press (it cannot run two
+/// sessions at once). Any other provider that says nothing until commit
+/// (Google POSTs the recording then, OpenAI answers ~0.9 s after it) gets
+/// `Finalizing`: the same spinner, no queue. A streaming provider has already
+/// shown its words, so its pip goes as soon as you let go.
+fn status_after_release(cfg: &crate::config::Config) -> Status {
+    if cfg.stt_provider.eq_ignore_ascii_case("local") {
         Status::Processing
+    } else if !stt::provider_streams_interim_text(cfg) {
+        Status::Finalizing
     } else {
         Status::Idle
     }
@@ -117,7 +125,7 @@ fn handle_hotkey_event(
     match evt {
         HotkeyEvent::TogglePressed => {
             if has_live {
-                app.set_status(status_after_release(&app.config.load().stt_provider));
+                app.set_status(status_after_release(&app.config.load()));
                 if let Some(h) = active.take() {
                     tracing::info!("Stopping session (toggle off)");
                     h.stop();
@@ -161,7 +169,7 @@ fn handle_hotkey_event(
         }
         HotkeyEvent::HoldReleased => {
             if has_live {
-                app.set_status(status_after_release(&app.config.load().stt_provider));
+                app.set_status(status_after_release(&app.config.load()));
                 if let Some(h) = active.take() {
                     tracing::info!("Stopping session (hold release)");
                     h.stop();
@@ -229,9 +237,19 @@ mod tests {
 
     #[test]
     fn local_release_stays_visible_while_batch_inference_finishes() {
-        assert_eq!(status_after_release("local"), Status::Processing);
-        assert_eq!(status_after_release("LOCAL"), Status::Processing);
-        assert_eq!(status_after_release("elevenlabs"), Status::Idle);
+        let with = |id: &str| crate::config::Config {
+            stt_provider: id.into(),
+            ..crate::config::Config::default()
+        };
+        assert_eq!(status_after_release(&with("local")), Status::Processing);
+        assert_eq!(status_after_release(&with("LOCAL")), Status::Processing);
+        // Commit-only cloud providers keep the pip up while the transcript is
+        // on its way, without queueing the next press behind it.
+        assert_eq!(status_after_release(&with("google")), Status::Finalizing);
+        assert_eq!(status_after_release(&with("openai")), Status::Finalizing);
+        for streaming in ["elevenlabs", "deepgram", "assemblyai", "dashscope"] {
+            assert_eq!(status_after_release(&with(streaming)), Status::Idle);
+        }
     }
 
     #[test]

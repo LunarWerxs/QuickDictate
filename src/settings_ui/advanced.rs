@@ -17,83 +17,78 @@ fn profile_editor_row(
     p: &mut crate::config::Profile,
     vocab_buf: &mut String,
 ) {
-    egui::Frame::new()
-        .fill(input_bg())
-        .stroke(Stroke::new(1.0, border()))
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin::same(8))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(&p.name).font(semibold(13.0)).color(text()));
-                ui.label(RichText::new(p.match_.join(", ")).size(11.5).color(muted()));
-            });
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label("Language").on_hover_text(
-                    "Recognition language for this app. Leave blank to use the \
+    super::widgets::well(Margin::same(8)).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(&p.name).font(semibold(13.0)).color(text()));
+            ui.label(RichText::new(p.match_.join(", ")).size(11.5).color(muted()));
+        });
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label("Language").on_hover_text(
+                "Recognition language for this app. Leave blank to use the \
                      global language.",
-                );
-                let mut lang_buf = p.language.clone().unwrap_or_default();
-                if ui
-                    .add(
-                        styled_input(&mut lang_buf)
-                            .hint_text("Use global")
-                            .desired_width(90.0),
-                    )
-                    .changed()
-                {
-                    p.language = (!lang_buf.trim().is_empty()).then_some(lang_buf);
-                }
-                ui.add_space(8.0);
-                ui.label("Provider");
-                egui::ComboBox::from_id_salt(("profile_provider", idx))
-                    .width(150.0)
-                    .selected_text(
-                        p.stt_provider
-                            .as_deref()
-                            .map(provider_label)
-                            .unwrap_or("Use global"),
-                    )
-                    .show_ui(ui, |ui| {
-                        if ui
-                            .selectable_label(p.stt_provider.is_none(), "Use global")
-                            .clicked()
-                        {
-                            p.stt_provider = None;
-                        }
-                        for (id, label) in providers() {
-                            let selected = p.stt_provider.as_deref() == Some(id);
-                            if ui.selectable_label(selected, label).clicked() {
-                                p.stt_provider = Some(id.to_string());
-                            }
-                        }
-                    });
-            });
-            ui.add_space(4.0);
-            let mut override_vocab = p.custom_vocabulary.is_some();
-            if blue_check(ui, &mut override_vocab, "Override vocabulary for this app")
-                .on_hover_text(
-                    "Unchecked: use the global custom vocabulary (Vocabulary page). Checked \
-                     with an empty list: no vocabulary biasing at all in this app.",
+            );
+            let mut lang_buf = p.language.clone().unwrap_or_default();
+            if ui
+                .add(
+                    styled_input(&mut lang_buf)
+                        .hint_text("Use global")
+                        .desired_width(90.0),
                 )
                 .changed()
             {
-                p.custom_vocabulary = if override_vocab {
-                    Some(parse_vocabulary(vocab_buf))
-                } else {
-                    None
-                };
+                p.language = (!lang_buf.trim().is_empty()).then_some(lang_buf);
             }
-            if p.custom_vocabulary.is_some() {
-                ui.add(
-                    egui::TextEdit::multiline(vocab_buf)
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(2)
-                        .margin(Margin::symmetric(6, CTRL_PAD))
-                        .hint_text("One term per line"),
-                );
-            }
+            ui.add_space(8.0);
+            ui.label("Provider");
+            egui::ComboBox::from_id_salt(("profile_provider", idx))
+                .width(150.0)
+                .selected_text(
+                    p.stt_provider
+                        .as_deref()
+                        .map(provider_label)
+                        .unwrap_or("Use global"),
+                )
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(p.stt_provider.is_none(), "Use global")
+                        .clicked()
+                    {
+                        p.stt_provider = None;
+                    }
+                    for (id, label) in providers() {
+                        let selected = p.stt_provider.as_deref() == Some(id);
+                        if ui.selectable_label(selected, label).clicked() {
+                            p.stt_provider = Some(id.to_string());
+                        }
+                    }
+                });
         });
+        ui.add_space(4.0);
+        let mut override_vocab = p.custom_vocabulary.is_some();
+        if blue_check(ui, &mut override_vocab, "Override vocabulary for this app")
+            .on_hover_text(
+                "Unchecked: use the global custom vocabulary (Vocabulary page). Checked \
+                     with an empty list: no vocabulary biasing at all in this app.",
+            )
+            .changed()
+        {
+            p.custom_vocabulary = if override_vocab {
+                Some(parse_vocabulary(vocab_buf))
+            } else {
+                None
+            };
+        }
+        if p.custom_vocabulary.is_some() {
+            ui.add(
+                egui::TextEdit::multiline(vocab_buf)
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(2)
+                    .margin(Margin::symmetric(6, CTRL_PAD))
+                    .hint_text("One term per line"),
+            );
+        }
+    });
 }
 
 impl super::SettingsApp {

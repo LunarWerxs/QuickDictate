@@ -332,6 +332,16 @@ pub(crate) fn text_replacements_button(ui: &mut egui::Ui, count: usize) -> egui:
     resp
 }
 /// Card section: surface fill, hairline border, rounded, padded.
+/// The inset "well" the stat tiles, the charts, the key list and each profile
+/// row sit in: the input background inside a hairline border, radius 8. One
+/// definition, so the panels that share the look cannot drift apart.
+pub(crate) fn well(margin: Margin) -> egui::Frame {
+    egui::Frame::new()
+        .fill(input_bg())
+        .stroke(Stroke::new(1.0, border()))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(margin)
+}
 pub(crate) fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     egui::Frame::new()
         .fill(surface())
@@ -369,17 +379,12 @@ pub(crate) fn format_audio_time(audio_ms: u64) -> String {
     }
 }
 pub(crate) fn stat_tile(ui: &mut egui::Ui, label: &str, value: String, detail: &str) {
-    egui::Frame::new()
-        .fill(input_bg())
-        .stroke(Stroke::new(1.0, border()))
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin::same(11))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(RichText::new(label).size(11.5).color(muted()));
-            ui.label(RichText::new(value).font(semibold(22.0)).color(text()));
-            ui.label(RichText::new(detail).size(10.5).color(muted()));
-        });
+    well(Margin::same(11)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(RichText::new(label).size(11.5).color(muted()));
+        ui.label(RichText::new(value).font(semibold(22.0)).color(text()));
+        ui.label(RichText::new(detail).size(10.5).color(muted()));
+    });
 }
 pub(crate) fn stats_range_selector(ui: &mut egui::Ui, selected: &mut StatsRange) {
     ui.horizontal(|ui| {
@@ -406,67 +411,61 @@ pub(crate) fn stats_range_selector(ui: &mut egui::Ui, selected: &mut StatsRange)
     });
 }
 pub(crate) fn stats_chart(ui: &mut egui::Ui, points: &[u64], caption: &str) {
-    egui::Frame::new()
-        .fill(input_bg())
-        .stroke(Stroke::new(1.0, border()))
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin::symmetric(11, 9))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("ACTIVITY")
-                        .font(semibold(10.5))
-                        .color(muted()),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new(caption).size(10.5).color(muted()));
-                });
-            });
-            ui.add_space(4.0);
-            let chart_width = ui.available_width();
-            let (rect, _) =
-                ui.allocate_exact_size(egui::vec2(chart_width, 54.0), egui::Sense::hover());
-            let painter = ui.painter();
-            let max = points.iter().copied().max().unwrap_or(0);
-            let count = points.len().max(1) as f32;
-            let gap = if points.len() > 24 { 2.0 } else { 3.0 };
-            let bar_width = ((rect.width() - gap * (count - 1.0)) / count).max(1.0);
-            let baseline = rect.bottom();
-            painter.line_segment(
-                [
-                    egui::pos2(rect.left(), baseline),
-                    egui::pos2(rect.right(), baseline),
-                ],
-                Stroke::new(1.0, border()),
+    well(Margin::symmetric(11, 9)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("ACTIVITY")
+                    .font(semibold(10.5))
+                    .color(muted()),
             );
-            for (index, value) in points.iter().enumerate() {
-                let fraction = if max == 0 {
-                    0.0
-                } else {
-                    *value as f32 / max as f32
-                };
-                let height = if *value == 0 {
-                    2.0
-                } else {
-                    (fraction * (rect.height() - 4.0)).max(5.0)
-                };
-                let left = rect.left() + index as f32 * (bar_width + gap);
-                let bar = egui::Rect::from_min_max(
-                    egui::pos2(left, baseline - height),
-                    egui::pos2((left + bar_width).min(rect.right()), baseline),
-                );
-                painter.rect_filled(
-                    bar,
-                    CornerRadius::same(2),
-                    if *value == 0 {
-                        border().gamma_multiply(0.65)
-                    } else {
-                        accent().gamma_multiply(0.88)
-                    },
-                );
-            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(RichText::new(caption).size(10.5).color(muted()));
+            });
         });
+        ui.add_space(4.0);
+        let chart_width = ui.available_width();
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(chart_width, 54.0), egui::Sense::hover());
+        let painter = ui.painter();
+        let max = points.iter().copied().max().unwrap_or(0);
+        let count = points.len().max(1) as f32;
+        let gap = if points.len() > 24 { 2.0 } else { 3.0 };
+        let bar_width = ((rect.width() - gap * (count - 1.0)) / count).max(1.0);
+        let baseline = rect.bottom();
+        painter.line_segment(
+            [
+                egui::pos2(rect.left(), baseline),
+                egui::pos2(rect.right(), baseline),
+            ],
+            Stroke::new(1.0, border()),
+        );
+        for (index, value) in points.iter().enumerate() {
+            let fraction = if max == 0 {
+                0.0
+            } else {
+                *value as f32 / max as f32
+            };
+            let height = if *value == 0 {
+                2.0
+            } else {
+                (fraction * (rect.height() - 4.0)).max(5.0)
+            };
+            let left = rect.left() + index as f32 * (bar_width + gap);
+            let bar = egui::Rect::from_min_max(
+                egui::pos2(left, baseline - height),
+                egui::pos2((left + bar_width).min(rect.right()), baseline),
+            );
+            painter.rect_filled(
+                bar,
+                CornerRadius::same(2),
+                if *value == 0 {
+                    border().gamma_multiply(0.65)
+                } else {
+                    accent().gamma_multiply(0.88)
+                },
+            );
+        }
+    });
 }
 pub(crate) fn stats_provider_chart(
     ui: &mut egui::Ui,
@@ -483,67 +482,62 @@ pub(crate) fn stats_provider_chart(
         bars.push(("All".into(), total_dictations));
     }
 
-    egui::Frame::new()
-        .fill(input_bg())
-        .stroke(Stroke::new(1.0, border()))
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin::symmetric(11, 9))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("MIX").font(semibold(10.5)).color(muted()));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        RichText::new("All-time dictations by provider")
-                            .size(10.5)
-                            .color(muted()),
-                    );
-                });
+    well(Margin::symmetric(11, 9)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("MIX").font(semibold(10.5)).color(muted()));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    RichText::new("All-time dictations by provider")
+                        .size(10.5)
+                        .color(muted()),
+                );
             });
-            ui.add_space(4.0);
-            let (rect, _) = ui
-                .allocate_exact_size(egui::vec2(ui.available_width(), 62.0), egui::Sense::hover());
-            let painter = ui.painter();
-            let baseline = rect.bottom() - 15.0;
-            painter.line_segment(
-                [
-                    egui::pos2(rect.left(), baseline),
-                    egui::pos2(rect.right(), baseline),
-                ],
-                Stroke::new(1.0, border()),
-            );
-            let max = bars.iter().map(|(_, value)| *value).max().unwrap_or(0);
-            let slot_width = rect.width() / bars.len().max(1) as f32;
-            let bar_width = (slot_width * 0.38).clamp(18.0, 42.0);
-            for (index, (label, value)) in bars.iter().enumerate() {
-                let center = rect.left() + slot_width * (index as f32 + 0.5);
-                let fraction = if max == 0 {
-                    0.0
-                } else {
-                    *value as f32 / max as f32
-                };
-                let height = (fraction * 38.0).max(4.0);
-                let bar = egui::Rect::from_min_max(
-                    egui::pos2(center - bar_width / 2.0, baseline - height),
-                    egui::pos2(center + bar_width / 2.0, baseline),
-                );
-                painter.rect_filled(bar, CornerRadius::same(3), accent().gamma_multiply(0.88));
-                painter.text(
-                    egui::pos2(center, bar.top() - 2.0),
-                    egui::Align2::CENTER_BOTTOM,
-                    grouped_number(*value),
-                    semibold(9.0),
-                    text(),
-                );
-                painter.text(
-                    egui::pos2(center, baseline + 3.0),
-                    egui::Align2::CENTER_TOP,
-                    label,
-                    semibold(8.5),
-                    muted(),
-                );
-            }
         });
+        ui.add_space(4.0);
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 62.0), egui::Sense::hover());
+        let painter = ui.painter();
+        let baseline = rect.bottom() - 15.0;
+        painter.line_segment(
+            [
+                egui::pos2(rect.left(), baseline),
+                egui::pos2(rect.right(), baseline),
+            ],
+            Stroke::new(1.0, border()),
+        );
+        let max = bars.iter().map(|(_, value)| *value).max().unwrap_or(0);
+        let slot_width = rect.width() / bars.len().max(1) as f32;
+        let bar_width = (slot_width * 0.38).clamp(18.0, 42.0);
+        for (index, (label, value)) in bars.iter().enumerate() {
+            let center = rect.left() + slot_width * (index as f32 + 0.5);
+            let fraction = if max == 0 {
+                0.0
+            } else {
+                *value as f32 / max as f32
+            };
+            let height = (fraction * 38.0).max(4.0);
+            let bar = egui::Rect::from_min_max(
+                egui::pos2(center - bar_width / 2.0, baseline - height),
+                egui::pos2(center + bar_width / 2.0, baseline),
+            );
+            painter.rect_filled(bar, CornerRadius::same(3), accent().gamma_multiply(0.88));
+            painter.text(
+                egui::pos2(center, bar.top() - 2.0),
+                egui::Align2::CENTER_BOTTOM,
+                grouped_number(*value),
+                semibold(9.0),
+                text(),
+            );
+            painter.text(
+                egui::pos2(center, baseline + 3.0),
+                egui::Align2::CENTER_TOP,
+                label,
+                semibold(8.5),
+                muted(),
+            );
+        }
+    });
 }
 /// The muted explanatory paragraph at the top of a page or card.
 pub(crate) fn blurb(ui: &mut egui::Ui, copy: &str) {

@@ -177,7 +177,7 @@ impl Overlay {
             Status::Idle => return, // window will be hidden; nothing to draw
             Status::Starting => (0xFA, 0xB0, 0x05), // amber
             Status::Listening => (0x22, 0xC5, 0x5E), // green
-            Status::Processing => (0x4A, 0x90, 0xF5), // blue
+            Status::Processing | Status::Finalizing => (0x4A, 0x90, 0xF5), // blue
             Status::Error => (0xEF, 0x44, 0x44), // red
         };
         let cx = (self.size as f32 - 1.0) / 2.0;

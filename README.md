@@ -184,8 +184,10 @@ focused application.
 ## 📄 License
 
 [PolyForm Noncommercial 1.0.0](LICENSE) © LunarWerx Studios, starting with v0.9.0. The source
-is available and free for noncommercial use; commercial use needs a separate license from
-LunarWerx Studios (open an issue to arrange one). Releases through v0.8.0 were MIT, and that
+is available and free for noncommercial use; commercial use needs a license from LunarWerx
+Studios, one per installation: [US$19.99 once](https://checkout.connections.icu/licence/a0aab7bb-ba43-4d7f-8772-3c93659bad68) (perpetual) or
+[US$1.99 a month](https://checkout.connections.icu/licence/41b7e7f1-67b8-40ba-9d49-7ced20358da7) (cancel any time at
+[checkout.connections.icu/manage](https://checkout.connections.icu/manage)); for anything else, open an issue. Releases through v0.8.0 were MIT, and that
 grant stays in effect for those copies. Made with care by
 **[LunarWerx Studios](https://lunarwerx.com)**.
 Also from LunarWerx Studios: [RepoYeti](https://repoyeti.com),

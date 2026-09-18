@@ -6,7 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-18
+
 ### Added
+
+- **A commercial licence you can simply buy.** QuickDictate stays free for personal and other
+  noncommercial use. Commercial use is now US$19.99 once (a perpetual licence covering every
+  release) or US$1.99 a month, per installation, through Connections' hosted checkout, instead
+  of "open an issue to arrange one". Links and terms are in `LICENSE`, the README, the guide and
+  the site's pricing page. There is nothing to activate in the app; the emailed key is the proof
+  of licence.
+
+- **DashScope recovers a connection that goes quiet mid-recording**, like ElevenLabs, Deepgram
+  and AssemblyAI already did. Measured against the live API before switching it on: the first
+  words arrive in 0.73 s and an update every half second after that, the fastest of any
+  provider here.
+
+- **Google and OpenAI keep the pip up until your words land.** They say nothing until the
+  recording is sent, so the pip used to vanish the moment you let go and the text appeared a
+  second or two later with nothing on screen in between. The pip now stays, with its spinner,
+  until the transcript arrives, and unlike the local model a new press still starts at once
+  instead of waiting its turn.
 
 - **Keys are checked for the ElevenLabs "terms not accepted" problem before you ever dictate on
   them.** A key whose account never accepted the Scribe terms connects and works for exactly ten

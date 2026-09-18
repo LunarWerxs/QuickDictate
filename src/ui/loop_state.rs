@@ -352,7 +352,7 @@ pub(super) fn compute_tick_snapshot(app: &App) -> TickSnapshot {
     let show_spinner = !crate::stt::provider_streams_interim_text(&cfg)
         && matches!(
             status,
-            Status::Starting | Status::Listening | Status::Processing
+            Status::Starting | Status::Listening | Status::Processing | Status::Finalizing
         );
 
     TickSnapshot {

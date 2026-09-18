@@ -257,4 +257,4 @@ Bug reports and pull requests are welcome, there are issue templates under [.git
 
 ## License
 
-[PolyForm Noncommercial 1.0.0](../LICENSE), starting with v0.9.0: free for noncommercial use, with commercial use by separate license from LunarWerx Studios. Releases through v0.8.0 were MIT, and that grant stays in effect for those copies. Made by [LunarWerx Studios](https://lunarwerx.com).
+[PolyForm Noncommercial 1.0.0](../LICENSE), starting with v0.9.0: free for noncommercial use; commercial use needs a license from LunarWerx Studios, one per installation: [US$19.99 once](https://checkout.connections.icu/licence/a0aab7bb-ba43-4d7f-8772-3c93659bad68) (perpetual) or [US$1.99 a month](https://checkout.connections.icu/licence/41b7e7f1-67b8-40ba-9d49-7ced20358da7), cancelable any time at [checkout.connections.icu/manage](https://checkout.connections.icu/manage). Releases through v0.8.0 were MIT, and that grant stays in effect for those copies. Made by [LunarWerx Studios](https://lunarwerx.com).

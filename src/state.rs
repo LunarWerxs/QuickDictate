@@ -145,7 +145,15 @@ pub enum Status {
     Error = 3,
     /// Recording has stopped and a batch/local provider is producing the final
     /// transcript. Pip remains visible with a spinner so this never looks hung.
+    /// Also SERIALISES presses: the next hotkey is queued until this ends,
+    /// because local inference cannot overlap a second session.
     Processing = 4,
+    /// Recording has stopped and a commit-only CLOUD provider (Google, OpenAI)
+    /// is still producing the transcript, a second or two after release. The
+    /// pip stays up with its spinner exactly as for [`Status::Processing`], but
+    /// a new press starts at once: those providers overlap sessions fine, and a
+    /// lockout after every dictation would cost more than the pip gains.
+    Finalizing = 5,
 }
 
 impl Status {
@@ -155,6 +163,7 @@ impl Status {
             2 => Status::Listening,
             3 => Status::Error,
             4 => Status::Processing,
+            5 => Status::Finalizing,
             _ => Status::Idle,
         }
     }

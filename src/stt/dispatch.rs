@@ -427,6 +427,24 @@ mod tests {
         assert!(matches!(verdict, AccountVerdict::Inconclusive(_)));
     }
 
+    /// Which providers the stall watchdog may reconnect, each measured against
+    /// its live API: a partial within a couple of seconds and a steady cadence.
+    #[test]
+    fn stall_recovery_is_on_exactly_for_the_measured_streaming_providers() {
+        for id in ["elevenlabs", "deepgram", "assemblyai", "dashscope"] {
+            assert!(
+                make_provider(&with_provider(id)).supports_stall_recovery(),
+                "{id} streams partials fast enough to be watched"
+            );
+        }
+        for id in ["google", "local", "openai"] {
+            assert!(
+                !make_provider(&with_provider(id)).supports_stall_recovery(),
+                "{id} says nothing until commit; every sentence would look like a stall"
+            );
+        }
+    }
+
     #[test]
     fn only_elevenlabs_needs_an_account_check() {
         for id in [

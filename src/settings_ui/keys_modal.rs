@@ -90,68 +90,63 @@ fn render_key_bulk_editor(ui: &mut egui::Ui, state: &mut KeysModalState, out: &m
         return;
     }
     ui.add_space(10.0);
-    egui::Frame::new()
-        .fill(input_bg())
-        .stroke(Stroke::new(1.0, border()))
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin::same(10))
-        .show(ui, |ui| {
-            ui.label(
-                RichText::new("One API key per line")
-                    .font(semibold(13.0))
-                    .color(text()),
-            );
-            ui.label(
-                RichText::new("Blank lines and keys already in the list are skipped.")
-                    .size(11.5)
-                    .color(muted()),
-            );
-            ui.add_space(6.0);
-            ui.add(
-                egui::TextEdit::multiline(&mut state.bulk_text)
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(8)
-                    .margin(Margin::symmetric(6, CTRL_PAD))
-                    .font(egui::TextStyle::Monospace)
-                    .hint_text("sk_example_key_1\nsk_example_key_2\nsk_example_key_3"),
-            );
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui.button("Cancel").clicked() {
-                    state.bulk = false;
-                    state.bulk_text.clear();
-                    state.bulk_note.clear();
-                }
-                if accent_button(ui, "Save").clicked() {
-                    match merge_key_lines(&mut state.rows, &state.bulk_text) {
-                        Ok(summary) => {
-                            state.bulk_error = false;
-                            state.bulk_note = format!(
-                                "{} added \u{00b7} {} duplicate{} skipped",
-                                summary.added,
-                                summary.duplicates,
-                                if summary.duplicates == 1 { "" } else { "s" }
-                            );
-                            state.bulk_text.clear();
-                            state.bulk = false;
-                            out.action = ModalAction::CommitAndSave;
-                        }
-                        Err(lines) => {
-                            state.bulk_error = true;
-                            state.bulk_note = format!(
-                                "Nothing imported \u{2014} whitespace/control characters on line{} {}.",
-                                if lines.len() == 1 { "" } else { "s" },
-                                lines
-                                    .iter()
-                                    .map(usize::to_string)
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            );
-                        }
+    super::widgets::well(Margin::same(10)).show(ui, |ui| {
+        ui.label(
+            RichText::new("One API key per line")
+                .font(semibold(13.0))
+                .color(text()),
+        );
+        ui.label(
+            RichText::new("Blank lines and keys already in the list are skipped.")
+                .size(11.5)
+                .color(muted()),
+        );
+        ui.add_space(6.0);
+        ui.add(
+            egui::TextEdit::multiline(&mut state.bulk_text)
+                .desired_width(f32::INFINITY)
+                .desired_rows(8)
+                .margin(Margin::symmetric(6, CTRL_PAD))
+                .font(egui::TextStyle::Monospace)
+                .hint_text("sk_example_key_1\nsk_example_key_2\nsk_example_key_3"),
+        );
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui.button("Cancel").clicked() {
+                state.bulk = false;
+                state.bulk_text.clear();
+                state.bulk_note.clear();
+            }
+            if accent_button(ui, "Save").clicked() {
+                match merge_key_lines(&mut state.rows, &state.bulk_text) {
+                    Ok(summary) => {
+                        state.bulk_error = false;
+                        state.bulk_note = format!(
+                            "{} added \u{00b7} {} duplicate{} skipped",
+                            summary.added,
+                            summary.duplicates,
+                            if summary.duplicates == 1 { "" } else { "s" }
+                        );
+                        state.bulk_text.clear();
+                        state.bulk = false;
+                        out.action = ModalAction::CommitAndSave;
+                    }
+                    Err(lines) => {
+                        state.bulk_error = true;
+                        state.bulk_note = format!(
+                            "Nothing imported \u{2014} whitespace/control characters on line{} {}.",
+                            if lines.len() == 1 { "" } else { "s" },
+                            lines
+                                .iter()
+                                .map(usize::to_string)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
                     }
                 }
-            });
+            }
         });
+    });
 }
 
 /// The trailing Test all / Done / Cancel row, hidden while the bulk editor
