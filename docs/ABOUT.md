@@ -38,7 +38,7 @@ edit the dossier, not this block. Everything ABOVE the marker is yours.
 - **Live at:** https://quickdictate.github.io/
 - **Written in:** Rust (146 files), PowerShell (11 files), Python (1 files)
 - **Built with:** Serde, Tokio, cpal, egui, image, libloading, reqwest, tracing, windows-rs
-- **Package:** `quickdictate` 0.10.0
+- **Package:** `quickdictate` 1.0.0
 - **Entry points:** `cargo_bins`
 - **CI:** `ci.yml`, `release.yml`
 - **Domain:** dictation, speech-to-text, voice-typing, hotkeys, system-tray, text-injection

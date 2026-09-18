@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **The version line moves to 1.x.** The package now declares 1.0.0 (was 0.10.0), so the next release is 1.0.0 rather than another 0.x (owner directive, 2026-09-18: no public project stays on a zero major).
+
 ## [0.10.0] - 2026-09-18
 
 ### Added
