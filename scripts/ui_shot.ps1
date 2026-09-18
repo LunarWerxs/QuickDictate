@@ -2,7 +2,10 @@
 #
 # Runs an ISOLATED copy of the exe from a scratch folder: its own
 # settings.json (hotkeys off, no key probing, no update check, one demo key so
-# the provider card looks configured), its own data folder, and its own
+# the provider card looks configured), its own data folder (named through
+# QUICKDICTATE_DATA_DIR, the one way a copy stays out of the folder the real
+# install recorded: with only a settings.json beside it, the copy swept that
+# folder into the scratch one, which the next run then deletes), and its own
 # single-instance mutex (QUICKDICTATE_DEV_PORT gives it one, see
 # `single_instance_mutex_name` in src/startup.rs). Nothing it does touches a
 # QuickDictate you are running: it never stops another process, and only its
@@ -87,6 +90,7 @@ if (-not $RealSettings) {
 }
 $cfg | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $scratch 'settings.json') -Encoding utf8
 
+$env:QUICKDICTATE_DATA_DIR = $scratch
 $env:QUICKDICTATE_DEV_PORT = "$DevPort"
 $env:QUICKDICTATE_UI_SHOT = $Shot
 $env:QUICKDICTATE_UI_OPEN = $Open
@@ -94,7 +98,7 @@ $env:QUICKDICTATE_UI_TAB = $Tab
 $procArgs = @{ FilePath = $scratchExe; PassThru = $true; WorkingDirectory = $scratch }
 if ($Provider) { $procArgs.ArgumentList = @('--provider', $Provider) }
 $proc = Start-Process @procArgs
-foreach ($name in 'QUICKDICTATE_DEV_PORT', 'QUICKDICTATE_UI_SHOT', 'QUICKDICTATE_UI_OPEN', 'QUICKDICTATE_UI_TAB') {
+foreach ($name in 'QUICKDICTATE_DATA_DIR', 'QUICKDICTATE_DEV_PORT', 'QUICKDICTATE_UI_SHOT', 'QUICKDICTATE_UI_OPEN', 'QUICKDICTATE_UI_TAB') {
     Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
 }
 

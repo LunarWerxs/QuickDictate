@@ -34,18 +34,30 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $exeName     = if ($UseDebugBuild) { 'target\debug\quickdictate.exe' } else { 'target\release\quickdictate.exe' }
 $exePath     = Join-Path $projectRoot $exeName
-$logPath     = Join-Path (Split-Path $exePath) 'quickdictate.log'
 
 if (-not (Test-Path $exePath)) {
     throw "exe not found at $exePath - run 'cargo build [--release]' first"
 }
+
+# The run gets its own data folder, named through QUICKDICTATE_DATA_DIR, with a
+# copy of the project settings.json the exe would otherwise have walked up to.
+# Without it the run swept the folder the real install recorded (log, stats,
+# history) into the working tree and re-pointed the install at it; and the log
+# it waited on (next to the exe) has not been written since the data folder
+# became a setting, so the test could not pass.
+$sandbox = Join-Path ([IO.Path]::GetTempPath()) "quickdictate-smoke-$DevPort"
+if (Test-Path $sandbox) { Remove-Item $sandbox -Recurse -Force }
+New-Item -ItemType Directory -Path $sandbox | Out-Null
+$projectSettings = Join-Path $projectRoot 'settings.json'
+if (-not (Test-Path $projectSettings)) { throw "settings not found: $projectSettings" }
+Copy-Item -LiteralPath $projectSettings -Destination (Join-Path $sandbox 'settings.json')
+$logPath = Join-Path $sandbox 'logs\quickdictate.log'
 
 Write-Host "[smoke] killing any existing quickdictate.exe..."
 Get-Process -Name 'quickdictate' -ErrorAction SilentlyContinue | ForEach-Object {
     Stop-Process -Id $_.Id -Force
 }
 Start-Sleep -Milliseconds 300
-if (Test-Path $logPath) { Remove-Item $logPath -Force }
 
 function Send-Cmd([string]$cmd) {
     $udp = New-Object System.Net.Sockets.UdpClient
@@ -70,10 +82,12 @@ function Wait-LogContains([string]$needle, [int]$timeoutMs = 8000) {
 }
 
 Write-Host "[smoke] launching $exePath (DEV_PORT=$DevPort)"
+$env:QUICKDICTATE_DATA_DIR = $sandbox
 $env:QUICKDICTATE_DEV_PORT = "$DevPort"
 # Force file logging on for the smoke run regardless of settings.json.
 $env:QUICKDICTATE_LOG       = 'info,quickdictate=debug'
 $proc = Start-Process -FilePath $exePath -PassThru -WorkingDirectory $projectRoot
+$env:QUICKDICTATE_DATA_DIR = $null
 $env:QUICKDICTATE_DEV_PORT = $null
 $env:QUICKDICTATE_LOG       = $null
 
