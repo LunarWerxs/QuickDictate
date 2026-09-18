@@ -271,10 +271,11 @@ impl ProviderStream for ElevenLabsStream {
                 Ok(Message::Close(c)) => {
                     self.closed = true;
                     let reason = c.as_ref().map(|f| f.reason.to_string()).unwrap_or_default();
-                    // A billing/quota close reason means the key is exhausted;
-                    // surface that as a KeyFailure (the runner then rotates).
-                    if is_account_exhausted(&reason) {
-                        return Ok(Some(SttEvent::KeyFailure(FailKind::Exhausted)));
+                    // A close reason that blames the key's account (out of
+                    // credit, terms never accepted) is a KeyFailure, so the
+                    // runner rotates to the next key and carries the text.
+                    if let Some(kind) = close_key_failure(&reason) {
+                        return Ok(Some(SttEvent::KeyFailure(kind)));
                     }
                     return Ok(Some(SttEvent::Closed(
                         (!reason.is_empty()).then_some(reason),
@@ -321,6 +322,10 @@ fn map_frame(text: &str) -> Option<SttEvent> {
         }
         "quota_exceeded" => Some(SttEvent::KeyFailure(FailKind::Exhausted)),
         "auth_error" | "invalid_api_key" | "unauthorized" => {
+            Some(SttEvent::KeyFailure(FailKind::Invalid))
+        }
+        "unaccepted_terms" => {
+            warn_unaccepted_terms();
             Some(SttEvent::KeyFailure(FailKind::Invalid))
         }
         // `rate_limited` is the name in ElevenLabs' own AsyncAPI spec; the
@@ -370,6 +375,34 @@ fn summarize_frame(text: &str) -> String {
         out.push('…');
     }
     out
+}
+
+/// What a close-frame reason says about the key, if anything.
+///
+/// `unaccepted_terms` is the account behind the key never having accepted the
+/// Scribe terms in the ElevenLabs dashboard. The server lets such a session
+/// run for about ten seconds and then closes it with that reason, on every
+/// press, so it has to bench the key: left as a plain close it kept the key at
+/// the head of the pool, and every press longer than ten seconds lost the rest
+/// of what was said (2026-09-18, a new key added at #1).
+fn close_key_failure(reason: &str) -> Option<FailKind> {
+    if is_account_exhausted(reason) {
+        return Some(FailKind::Exhausted);
+    }
+    if reason.to_ascii_lowercase().contains("unaccepted_terms") {
+        warn_unaccepted_terms();
+        return Some(FailKind::Invalid);
+    }
+    None
+}
+
+/// The one log line that tells the owner what to do about `unaccepted_terms`.
+/// The key's number comes from the runner's own "key #N of M" lines around it.
+fn warn_unaccepted_terms() {
+    tracing::warn!(
+        "elevenlabs: this key's account has not accepted the Scribe terms (unaccepted_terms); \
+         the key is benched until someone signs in to that ElevenLabs account and accepts them"
+    );
 }
 
 /// Substring check on close-frame reasons / message bodies that indicate the
@@ -463,6 +496,27 @@ mod tests {
     fn non_json_and_unknown_are_ignored() {
         assert!(map_frame("not json at all").is_none());
         assert!(map_frame(r#"{"message_type":"heartbeat"}"#).is_none());
+    }
+
+    #[test]
+    fn unaccepted_terms_benches_the_key_as_a_frame_or_a_close_reason() {
+        // The 2026-09-18 failure arrived as the close reason; the spec also
+        // names it as an error frame. Either way the key has to rotate out.
+        assert!(matches!(
+            map_frame(r#"{"message_type":"unaccepted_terms","error":"accept the terms"}"#),
+            Some(SttEvent::KeyFailure(FailKind::Invalid))
+        ));
+        assert_eq!(
+            close_key_failure("unaccepted_terms"),
+            Some(FailKind::Invalid)
+        );
+        assert_eq!(
+            close_key_failure("quota_exceeded"),
+            Some(FailKind::Exhausted)
+        );
+        // A reasonless close or a throttle says nothing about the key.
+        assert_eq!(close_key_failure(""), None);
+        assert_eq!(close_key_failure("commit_throttled"), None);
     }
 
     #[test]

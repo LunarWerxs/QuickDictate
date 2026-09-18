@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Long dictations no longer stop dead at about ten seconds on a key whose ElevenLabs account
+  has not accepted the Scribe terms.** ElevenLabs lets such a session run for about ten seconds
+  and then closes it with `unaccepted_terms`. QuickDictate treated that as an ordinary close,
+  kept the key at the head of the pool, and every press longer than ten seconds lost everything
+  said after that point while the pip still showed Listening. The key is now benched like a
+  rejected one, the press moves to the next key with the text it already had, and the log says
+  which account needs its terms accepted.
+
+- **A server that closes the connection mid-press is now actually replaced.** 0.9.2 promised
+  this, but the first audio send after the close failed and the sender stopped right there,
+  before the replacement logic ever looked, so the rest of the press went nowhere. The refused
+  audio now opens the replacement itself and is replayed into it with the rest of the segment.
+
 ## [0.9.2] - 2026-09-11
 
 ### Fixed

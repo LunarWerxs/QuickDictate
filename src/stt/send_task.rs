@@ -185,8 +185,9 @@ impl StallWatch {
         }
     }
 
-    /// Note one shipped live chunk. Returns `true` when the watchdog trips.
-    fn observe(&mut self, state: &SendTaskState, chunk: Vec<i16>, is_speech: bool) -> bool {
+    /// Catch up with the recv task: server activity re-arms the quiet timer,
+    /// and a kept commit means the replay segment can start over.
+    fn sync(&mut self, state: &SendTaskState) {
         let activity = state.server_activity.load(Ordering::Acquire);
         if activity != self.activity_seen {
             self.activity_seen = activity;
@@ -197,10 +198,20 @@ impl StallWatch {
             self.commits_seen = commits;
             self.segment.clear();
         }
+    }
+
+    /// Add a chunk to the replay segment, bounded by [`REPLAY_CAP_CHUNKS`].
+    fn remember(&mut self, chunk: Vec<i16>) {
         self.segment.push_back(chunk);
         if self.segment.len() > REPLAY_CAP_CHUNKS {
             self.segment.pop_front();
         }
+    }
+
+    /// Note one shipped live chunk. Returns `true` when the watchdog trips.
+    fn observe(&mut self, state: &SendTaskState, chunk: Vec<i16>, is_speech: bool) -> bool {
+        self.sync(state);
+        self.remember(chunk);
         if is_speech {
             self.speech_since_activity += 1;
         }
@@ -228,16 +239,19 @@ impl StallWatch {
 /// to the recv task, switch the sink, and replay the current segment. Any
 /// failure along the way leaves the session on the connection it has; the
 /// end-of-session path then reports whatever that connection managed.
-async fn recover_from_stall(state: &mut SendTaskState, watch: &mut StallWatch, ws_dead: &mut bool) {
+async fn recover_from_stall(
+    state: &mut SendTaskState,
+    watch: &mut StallWatch,
+    ws_dead: &mut bool,
+    cause: &str,
+) {
     let Some(recovery) = state.recovery.as_ref() else {
         return;
     };
     let epoch = recovery.epoch;
     watch.reconnects += 1;
     tracing::warn!(
-        "session[{epoch}] provider went quiet: no transcript for {:.1} s while {} speech chunk(s) went out; opening a replacement connection ({} of {MAX_STALL_RECONNECTS})",
-        watch.quiet_since.elapsed().as_secs_f64(),
-        watch.speech_since_activity,
+        "session[{epoch}] {cause}; opening a replacement connection ({} of {MAX_STALL_RECONNECTS})",
         watch.reconnects
     );
     let replacement = match recovery.reconnect.connect().await {
@@ -261,6 +275,8 @@ async fn recover_from_stall(state: &mut SendTaskState, watch: &mut StallWatch, w
         return;
     }
     state.sink = replacement.sink;
+    // A send that failed on the old socket set this; the new one is alive.
+    *ws_dead = false;
     let replay: Vec<Vec<i16>> = watch.segment.iter().cloned().collect();
     let samples: usize = replay.iter().map(Vec::len).sum();
     tracing::info!(
@@ -283,6 +299,38 @@ async fn recover_from_stall(state: &mut SendTaskState, watch: &mut StallWatch, w
     watch.rearm();
 }
 
+/// A live send failed: the server closed or reset the socket mid-press, and
+/// every later send on it would fail too. This, not the recv task's
+/// `stream_dead` flag, is where a closed connection shows up first: the next
+/// chunk goes out within 100 ms of the close and fails, and before this the
+/// live phase simply stopped there, so the rest of the press went nowhere
+/// while the pip still said Listening (2026-09-18, ElevenLabs closing every
+/// press at ten seconds). `chunk` is the one the dead socket refused; it joins
+/// the replay. Returns whether the press carries on over a replacement.
+async fn recover_dead_socket(
+    state: &mut SendTaskState,
+    watch: Option<&mut StallWatch>,
+    chunk: &[i16],
+    ws_dead: &mut bool,
+) -> bool {
+    let Some(watch) = watch else {
+        return false;
+    };
+    if watch.reconnects >= MAX_STALL_RECONNECTS {
+        return false;
+    }
+    watch.sync(state);
+    watch.remember(chunk.to_vec());
+    recover_from_stall(
+        state,
+        watch,
+        ws_dead,
+        "the server closed the connection mid-press",
+    )
+    .await;
+    !*ws_dead
+}
+
 /// Phase 1 of [`run_send_task`]: forward mic audio to the provider as fast as
 /// it arrives, until the hotkey is released or the socket dies. Runs the
 /// stall watchdog for providers that support recovery.
@@ -296,28 +344,40 @@ async fn send_task_live_phase(state: &mut SendTaskState, sent: &mut SentAudio, w
             v = state.samples_rx.recv() => v,
             _ = tokio::time::sleep(Duration::from_millis(30)) => continue,
         };
-        match chunk_opt {
-            Some(chunk) => {
-                // Classify before shipping so the phantom-finalization guard
-                // (recv task) can tell a commit backed by real speech from one
-                // conjured out of the trailing silence the live phase also
-                // forwards. Only speech advances `speech_shipped`.
-                let is_speech = rms_i16(&chunk) >= SILENCE_RMS;
-                if !ship(&mut state.sink, &chunk, ws_dead).await {
-                    break;
-                }
-                sent.record_chunk(&chunk);
-                *state.sent_progress.lock() = *sent;
-                if is_speech {
-                    state.speech_shipped.fetch_add(1, Ordering::Release);
-                }
-                if let Some(watch) = watch.as_mut() {
-                    if watch.observe(state, chunk, is_speech) {
-                        recover_from_stall(state, watch, ws_dead).await;
-                    }
-                }
+        let Some(chunk) = chunk_opt else {
+            break;
+        };
+        // Classify before shipping so the phantom-finalization guard (recv
+        // task) can tell a commit backed by real speech from one conjured out
+        // of the trailing silence the live phase also forwards. Only speech
+        // advances `speech_shipped`.
+        let is_speech = rms_i16(&chunk) >= SILENCE_RMS;
+        // A chunk the dead socket refused went out in the replacement's
+        // replay, so it counts as sent but is not observed a second time.
+        let replayed = if ship(&mut state.sink, &chunk, ws_dead).await {
+            false
+        } else if recover_dead_socket(state, watch.as_mut(), &chunk, ws_dead).await {
+            true
+        } else {
+            break;
+        };
+        sent.record_chunk(&chunk);
+        *state.sent_progress.lock() = *sent;
+        if is_speech {
+            state.speech_shipped.fetch_add(1, Ordering::Release);
+        }
+        if replayed {
+            continue;
+        }
+        if let Some(watch) = watch.as_mut() {
+            if watch.observe(state, chunk, is_speech) {
+                let cause = format!(
+                    "provider went quiet: no transcript for {:.1} s while {} speech chunk(s) went out",
+                    watch.quiet_since.elapsed().as_secs_f64(),
+                    watch.speech_since_activity
+                );
+                recover_from_stall(state, watch, ws_dead, &cause).await;
             }
-            None => break,
         }
     }
 }

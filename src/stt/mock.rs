@@ -28,6 +28,10 @@ pub struct MockProvider {
     pub script: Vec<SttEvent>,
     pub connects: Arc<AtomicUsize>,
     pub sent_chunks: Arc<AtomicUsize>,
+    /// When set, the FIRST session's sink refuses every send after accepting
+    /// this many chunks, the way a socket the server closed mid-press does.
+    /// Later sessions (replacements) accept everything.
+    pub first_socket_dies_after: Option<usize>,
 }
 
 #[async_trait]
@@ -47,10 +51,11 @@ impl SttProvider for MockProvider {
         _key: &str,
         _opts: &SttSessionOpts,
     ) -> Result<ProviderSession, ConnectError> {
-        self.connects.fetch_add(1, Ordering::AcqRel);
+        let first = self.connects.fetch_add(1, Ordering::AcqRel) == 0;
         Ok(ProviderSession {
             sink: Box::new(MockSink {
                 audio_chunks: Arc::clone(&self.sent_chunks),
+                accepts: self.first_socket_dies_after.filter(|_| first),
             }),
             stream: Box::new(MockStream {
                 events: self.script.clone().into(),
@@ -61,11 +66,19 @@ impl SttProvider for MockProvider {
 
 struct MockSink {
     audio_chunks: Arc<AtomicUsize>,
+    /// Sends left before this socket "closes"; `None` never closes.
+    accepts: Option<usize>,
 }
 
 #[async_trait]
 impl ProviderSink for MockSink {
     async fn send_audio(&mut self, _pcm: &[i16]) -> Result<(), SendError> {
+        if let Some(left) = self.accepts.as_mut() {
+            if *left == 0 {
+                return Err(SendError("mock: the server closed this socket".into()));
+            }
+            *left -= 1;
+        }
         self.audio_chunks.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }

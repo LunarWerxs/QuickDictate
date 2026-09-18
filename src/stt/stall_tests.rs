@@ -49,7 +49,11 @@ struct Harness {
 
 /// A send task on a mock provider whose stream never says anything.
 async fn spawn_send_task(with_recovery: bool) -> Harness {
-    let provider = Arc::new(MockProvider::default());
+    spawn_send_task_on(with_recovery, MockProvider::default()).await
+}
+
+async fn spawn_send_task_on(with_recovery: bool, provider: MockProvider) -> Harness {
+    let provider = Arc::new(provider);
     let ProviderSession { sink, stream: _ } = provider.connect("k", &opts()).await.unwrap();
     let (samples_tx, samples_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(64);
     let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(1);
@@ -165,6 +169,62 @@ async fn a_dead_inbound_half_reconnects_at_once() {
     );
     assert!(h.stream_rx.try_recv().is_ok());
     finish(h).await;
+}
+
+/// The 2026-09-18 failure: ElevenLabs closed the socket ten seconds into a
+/// press, the next send failed, and the live phase stopped right there, so
+/// nothing more of the press was ever sent. A send refused by a closed socket
+/// must open the replacement itself; the recv task's flag comes too late.
+#[tokio::test(start_paused = true)]
+async fn a_socket_the_server_closed_is_replaced_not_abandoned() {
+    let mut h = spawn_send_task_on(
+        true,
+        MockProvider {
+            first_socket_dies_after: Some(20),
+            ..Default::default()
+        },
+    )
+    .await;
+    speak(&h, 40).await;
+
+    assert_eq!(
+        h.provider.connects.load(Ordering::Acquire),
+        2,
+        "one replacement for the closed socket"
+    );
+    assert!(
+        h.stream_rx.try_recv().is_ok(),
+        "the replacement's inbound half must reach the recv task"
+    );
+    // 20 on the first socket, then the 21-chunk segment (the refused chunk
+    // included) replayed, then the 19 spoken after it.
+    assert_eq!(h.provider.sent_chunks.load(Ordering::Acquire), 20 + 21 + 19);
+
+    let sent = finish(h).await;
+    assert_eq!(sent.chunks, 40, "every chunk of the press went out once");
+    assert!(!sent.socket_died);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_closed_socket_without_recovery_still_ends_the_live_phase() {
+    let h = spawn_send_task_on(
+        false,
+        MockProvider {
+            first_socket_dies_after: Some(20),
+            ..Default::default()
+        },
+    )
+    .await;
+    // 20 accepted, the 21st refused; after that the task has let go of the
+    // mic, so speaking on would only fail the harness's own send.
+    speak(&h, 21).await;
+    assert_eq!(h.provider.connects.load(Ordering::Acquire), 1);
+    let sent = finish(h).await;
+    assert_eq!(sent.chunks, 20);
+    assert!(
+        sent.socket_died,
+        "the end-of-session gate must hear about it"
+    );
 }
 
 #[tokio::test(start_paused = true)]

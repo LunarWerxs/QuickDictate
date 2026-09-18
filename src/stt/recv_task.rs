@@ -161,6 +161,9 @@ fn adopt_replacement(
     let epoch = state.epoch;
     let provider_id = state.provider_id;
     state.stream = stream;
+    // The flag described the stream just replaced. Left up, the watchdog would
+    // read it on the next chunk and tear down the healthy replacement too.
+    state.stream_dead.store(false, Ordering::Release);
     state.acc.last_partial_buf.lock().clear();
     state
         .recv_app
