@@ -6,7 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Keys are checked for the ElevenLabs "terms not accepted" problem before you ever dictate on
+  them.** A key whose account never accepted the Scribe terms connects and works for exactly ten
+  seconds of audio, so the usual key probe passes it. Now, at startup and in Test keys, each
+  ElevenLabs key that has not been checked before streams twelve seconds of faint noise (sent
+  ten times faster than real time, about four seconds in all), and a key the server cuts off is
+  benched and logged before any press can land on it. A key that passes is remembered in
+  `quickdictate-key-checks.json` (a one-way fingerprint, never the key) and never re-checked, so
+  the check costs each key twelve seconds of quota once. A key that fails is checked again at
+  the next launch, so accepting the terms brings it back on its own.
+
 ### Fixed
+
+- **A second copy started with `QUICKDICTATE_DATA_DIR` no longer raids the main install's data
+  folder.** The variable is meant for tests and portable installs, but a run under it still
+  swept the folder the regular install had recorded and moved its log, stats, update cache and
+  history into its own, and re-pointed the marker so the regular install would follow. A copy
+  run that way with history turned off then deleted the moved history outright. Such a run now
+  leaves the regular install's folder and marker alone.
 
 - **Long dictations no longer stop dead at about ten seconds on a key whose ElevenLabs account
   has not accepted the Scribe terms.** ElevenLabs lets such a session run for about ten seconds

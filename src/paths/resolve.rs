@@ -13,10 +13,7 @@ use super::*;
 pub(super) fn resolve(configured: &str, default_dir: &Path) -> (PathBuf, Vec<String>) {
     let mut diags = Vec::new();
 
-    if let Some(raw) = std::env::var(DATA_DIR_ENV)
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-    {
+    if let Some(raw) = env_raw() {
         match expand(&raw) {
             Some(dir) => return (dir, diags),
             None => diags.push(format!(
@@ -39,6 +36,49 @@ pub(super) fn resolve(configured: &str, default_dir: &Path) -> (PathBuf, Vec<Str
     (default_dir.to_path_buf(), diags)
 }
 
+/// `QUICKDICTATE_DATA_DIR` as set, if it is set to anything.
+fn env_raw() -> Option<String> {
+    std::env::var(DATA_DIR_ENV)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+}
+
+/// The folder `QUICKDICTATE_DATA_DIR` names, when it names a usable one (the
+/// same test [`resolve`] applies before letting it win).
+pub(super) fn env_dir() -> Option<PathBuf> {
+    env_raw().and_then(|raw| expand(&raw))
+}
+
+/// Every place [`init`] sweeps for files to move into the data folder, in
+/// order and without repeats:
+///   * `previous`, the folder recorded on the LAST run -- the only one that
+///     survives a second relocation (default -> A -> B strands everything in
+///     A without it), and the reason the marker file exists at all. `None`
+///     for a run under `QUICKDICTATE_DATA_DIR`: on 2026-09-18 an isolated test
+///     copy swept the owner's recorded folder and took the log, stats and
+///     update cache out from under the running app, then (running with
+///     history off) deleted the saved history;
+///   * the exe folder, where a shipped install put everything;
+///   * the settings folder, which a dev run resolves elsewhere.
+///
+/// The last two are the same path for a normal install, hence the dedup.
+pub(super) fn migration_sources(
+    previous: Option<PathBuf>,
+    exe: PathBuf,
+    default_dir: &Path,
+) -> Vec<PathBuf> {
+    let mut sources: Vec<PathBuf> = Vec::new();
+    for source in [previous, Some(exe), Some(default_dir.to_path_buf())]
+        .into_iter()
+        .flatten()
+    {
+        if !sources.contains(&source) {
+            sources.push(source);
+        }
+    }
+    sources
+}
+
 /// Resolve the data folder, create it, migrate anything left in the old one,
 /// and lock the answer in for the rest of the process.
 ///
@@ -55,6 +95,7 @@ pub(super) fn resolve(configured: &str, default_dir: &Path) -> (PathBuf, Vec<Str
 /// tracing once the logger is up; this runs before logging exists.
 pub(crate) fn init(configured: &str, default_dir: &Path) -> Vec<String> {
     let _ = DEFAULT_DIR.set(default_dir.to_path_buf());
+    let from_env = env_dir().is_some();
     let (dir, mut diags) = resolve(configured, default_dir);
 
     // A configured folder we cannot create is a dead end: fall back rather than
@@ -85,31 +126,18 @@ pub(crate) fn init(configured: &str, default_dir: &Path) -> Vec<String> {
         }
     };
 
-    // Sweep every place the files could be sitting:
-    //   * the folder recorded on the LAST run -- the only one that survives a
-    //     second relocation (default -> A -> B strands everything in A without
-    //     it), and the reason the marker file exists at all;
-    //   * the exe folder, where a shipped install put everything;
-    //   * the settings folder, which a dev run resolves elsewhere.
-    // The last two are the same path for a normal install, hence the dedup.
-    let mut sources: Vec<PathBuf> = Vec::new();
-    for source in [
-        previous_dir(),
-        Some(exe_dir()),
-        Some(default_dir.to_path_buf()),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if !sources.contains(&source) {
-            sources.push(source);
-        }
-    }
-    for source in &sources {
+    // A folder named by the environment is a test, CI or scripted portable run
+    // standing BESIDE the regular install, not a move of it: the recorded
+    // folder is the regular install's, and neither sweeping nor re-recording
+    // it is this run's business.
+    let previous = if from_env { None } else { previous_dir() };
+    for source in &migration_sources(previous, exe_dir(), default_dir) {
         diags.extend(migrate_into(source, &dir));
     }
 
-    diags.extend(record_active_dir(&dir));
+    if !from_env {
+        diags.extend(record_active_dir(&dir));
+    }
 
     // `set` only fails if something already initialized it, which would mean a
     // second `init` call. Keep the first answer: re-pointing the data folder

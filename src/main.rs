@@ -30,6 +30,7 @@ mod fuzz;
 mod history_store;
 mod hotkeys;
 mod icon;
+mod key_checks;
 mod keys;
 mod local_stt;
 mod logging;

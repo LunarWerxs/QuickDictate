@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::Config;
+use crate::key_checks;
 use crate::keys::{FailKind, KeyPool};
 use crate::state::App;
 
@@ -80,20 +81,191 @@ pub fn spawn_prewarm(app: Arc<App>, keys: Arc<KeyPool>) {
             return;
         }
         tracing::info!("prewarm: probing {} {provider_id} key(s)", list.len());
+        let mut alive = Vec::new();
         for key in list {
             let verdict = probe_key(provider.as_ref(), &key, &opts).await;
             match verdict {
-                Ok(()) => keys.mark_alive_probe(&key),
+                Ok(()) => {
+                    keys.mark_alive_probe(&key);
+                    alive.push(key);
+                }
                 Err(kind) => keys.mark_failed(&key, kind),
             }
         }
+        check_new_accounts(provider.as_ref(), &keys, &alive, &opts).await;
         tracing::info!("prewarm: done — {}", keys.summary());
     });
 }
 
+/// Prewarm half of the account check: run it on every key the connect probe
+/// just passed that has never passed it before, all at once, and bench the
+/// ones whose account the provider rejects. A key found this way is marked
+/// failed exactly as if a press had been cut off by it, so it is never handed
+/// to a press, where it would have cost everything said after ten seconds.
+async fn check_new_accounts(
+    provider: &dyn SttProvider,
+    keys: &KeyPool,
+    alive: &[String],
+    opts: &SttSessionOpts,
+) {
+    let Some(audio) = provider.account_check_audio() else {
+        return;
+    };
+    let provider_id = provider.id();
+    let due: Vec<&String> = alive
+        .iter()
+        .filter(|key| !key_checks::has_passed(provider_id, key))
+        .collect();
+    if due.is_empty() {
+        return;
+    }
+    tracing::info!(
+        "prewarm: account check on {} {provider_id} key(s) not checked before",
+        due.len()
+    );
+    let verdicts = futures_util::future::join_all(
+        due.iter()
+            .map(|key| check_account(provider, key, opts, audio)),
+    )
+    .await;
+    for (key, verdict) in due.into_iter().zip(verdicts) {
+        let label = keys.label(key);
+        match verdict {
+            AccountVerdict::Passed => {
+                key_checks::record_pass(provider_id, key);
+                tracing::info!("key {label} passed the account check");
+            }
+            AccountVerdict::Failed(kind) => {
+                tracing::warn!(
+                    "key {label} failed the account check ({kind:?}); benched so no press uses it"
+                );
+                keys.mark_failed(key, kind);
+            }
+            AccountVerdict::Inconclusive(why) => {
+                tracing::info!(
+                    "key {label}: account check inconclusive ({why}); next launch tries again"
+                );
+            }
+        }
+    }
+}
+
+/// What [`check_account`] concluded about a key's account.
+#[derive(Debug, PartialEq)]
+pub(super) enum AccountVerdict {
+    /// The provider took the whole stream without a word against the key.
+    Passed,
+    /// The provider rejected the key (for ElevenLabs: `unaccepted_terms`).
+    Failed(FailKind),
+    /// Nothing either way: a network hiccup or a close that blamed nothing.
+    Inconclusive(&'static str),
+}
+
+/// Chunks of [`account_chunk`] go out this far apart: 100 ms of audio every
+/// 10 ms, ten times real time. ElevenLabs counts audio, not wall-clock time,
+/// so a rejected account is closed about a second in rather than ten.
+const ACCOUNT_CHECK_PACE: Duration = Duration::from_millis(10);
+
+/// How long to keep listening once the last chunk is out. The rejection
+/// trails the tenth second of audio by well under a second (measured).
+const ACCOUNT_CHECK_LISTEN: Duration = Duration::from_secs(3);
+
+/// 100 ms of faint noise, about -40 dBFS: the shape the check was measured
+/// with against ElevenLabs (good keys answered it with nothing at all).
+fn account_chunk(sample_rate: u32) -> Vec<i16> {
+    (0..sample_rate / 10)
+        .map(|i| ((i * 7919) % 601) as i16 - 300)
+        .collect()
+}
+
+/// Stream `audio` worth of [`account_chunk`]s into one session and listen for
+/// the provider rejecting the key's account on the way. See
+/// [`SttProvider::account_check_audio`] for which providers need this, and
+/// `key_checks` for why a pass is remembered.
+pub(super) async fn check_account(
+    provider: &dyn SttProvider,
+    key: &str,
+    opts: &SttSessionOpts,
+    audio: Duration,
+) -> AccountVerdict {
+    let connect = tokio::time::timeout(Duration::from_secs(6), provider.connect(key, opts));
+    let ProviderSession {
+        mut sink,
+        mut stream,
+    } = match connect.await {
+        Err(_) => return AccountVerdict::Inconclusive("connect timed out"),
+        Ok(Err(e)) => {
+            return match provider.classify_connect_error(&e) {
+                FailKind::Transient => AccountVerdict::Inconclusive("connect failed"),
+                kind => AccountVerdict::Failed(kind),
+            }
+        }
+        Ok(Ok(session)) => session,
+    };
+    let chunk = account_chunk(opts.sample_rate);
+    let chunks = audio.as_millis() / 100;
+    // `Some(outcome)` if the stream settled it first; `None` if the whole
+    // stream went out and the listening window passed without a word.
+    let heard = tokio::select! {
+        heard = async {
+            loop {
+                match stream.recv_event().await {
+                    Ok(Some(SttEvent::KeyFailure(kind))) => return Some(kind),
+                    Ok(Some(_)) => continue,
+                    Ok(None) | Err(_) => return None,
+                }
+            }
+        } => Some(heard),
+        () = async {
+            for _ in 0..chunks {
+                // A refused send means the server closed the socket; the
+                // stream arm reports why.
+                if sink.send_audio(&chunk).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(ACCOUNT_CHECK_PACE).await;
+            }
+            tokio::time::sleep(ACCOUNT_CHECK_LISTEN).await;
+        } => None,
+    };
+    let _ = sink.close().await;
+    match heard {
+        None => AccountVerdict::Passed,
+        Some(Some(FailKind::Transient)) | Some(None) => {
+            AccountVerdict::Inconclusive("the connection ended without a verdict")
+        }
+        Some(Some(kind)) => AccountVerdict::Failed(kind),
+    }
+}
+
+/// "Test keys" half of the account check: true unless the provider rejects
+/// the key's account. A key that passed before is not checked again, and an
+/// inconclusive check does not fail a key the connect probe just passed.
+async fn passes_account_check(
+    provider: &dyn SttProvider,
+    key: &str,
+    opts: &SttSessionOpts,
+) -> bool {
+    let Some(audio) = provider.account_check_audio() else {
+        return true;
+    };
+    if key_checks::has_passed(provider.id(), key) {
+        return true;
+    }
+    match check_account(provider, key, opts, audio).await {
+        AccountVerdict::Passed => {
+            key_checks::record_pass(provider.id(), key);
+            true
+        }
+        AccountVerdict::Failed(_) => false,
+        AccountVerdict::Inconclusive(_) => true,
+    }
+}
+
 /// Settings-window "Test keys": probe `keys_to_test` against `cfg`'s selected
 /// provider, all keys **in parallel**, invoking `on_result(key, ok)` as each
-/// verdict lands. Purely diagnostic — does not touch the live KeyPool.
+/// verdict lands. Purely diagnostic — does not touch the live KeyPool (a
+/// passed account check is remembered in `key_checks`, nothing else).
 pub fn spawn_key_test(
     app: &App,
     cfg: Config,
@@ -114,7 +286,8 @@ pub fn spawn_key_test(
                 model: cfg.stt_model.clone(),
                 custom_vocabulary: Vec::new(),
             };
-            let ok = probe_key(provider.as_ref(), &key, &opts).await.is_ok();
+            let ok = probe_key(provider.as_ref(), &key, &opts).await.is_ok()
+                && passes_account_check(provider.as_ref(), &key, &opts).await;
             on_result(key, ok);
         });
     }
@@ -195,5 +368,86 @@ mod tests {
         }
         // An unknown id falls back to ElevenLabs, which does stream.
         assert!(provider_streams_interim_text(&with_provider("nonsense")));
+    }
+
+    fn check_opts() -> SttSessionOpts {
+        SttSessionOpts {
+            language: "en".into(),
+            sample_rate: 16_000,
+            model: None,
+            custom_vocabulary: Vec::new(),
+        }
+    }
+
+    const TWELVE_SECONDS: Duration = Duration::from_secs(12);
+
+    #[tokio::test(start_paused = true)]
+    async fn an_account_that_takes_the_whole_stream_passes() {
+        use std::sync::atomic::Ordering;
+        let provider = super::super::mock::MockProvider {
+            hold_open: true,
+            ..Default::default()
+        };
+        let verdict = check_account(&provider, "k", &check_opts(), TWELVE_SECONDS).await;
+        assert_eq!(verdict, AccountVerdict::Passed);
+        assert_eq!(
+            provider.sent_chunks.load(Ordering::Acquire),
+            120,
+            "twelve seconds of audio in 100 ms chunks"
+        );
+    }
+
+    /// The 2026-09-18 keys: ElevenLabs closed the session with
+    /// `unaccepted_terms`, which the adapter reports as an Invalid key.
+    #[tokio::test(start_paused = true)]
+    async fn an_account_the_provider_rejects_fails() {
+        let provider = super::super::mock::MockProvider {
+            script: vec![
+                SttEvent::SessionStarted,
+                SttEvent::KeyFailure(FailKind::Invalid),
+            ],
+            ..Default::default()
+        };
+        let verdict = check_account(&provider, "k", &check_opts(), TWELVE_SECONDS).await;
+        assert_eq!(verdict, AccountVerdict::Failed(FailKind::Invalid));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_that_just_ends_proves_nothing() {
+        let provider = super::super::mock::MockProvider::default();
+        let verdict = check_account(&provider, "k", &check_opts(), TWELVE_SECONDS).await;
+        assert!(matches!(verdict, AccountVerdict::Inconclusive(_)));
+        // A transient complaint blames the network, not the account.
+        let provider = super::super::mock::MockProvider {
+            script: vec![SttEvent::KeyFailure(FailKind::Transient)],
+            hold_open: true,
+            ..Default::default()
+        };
+        let verdict = check_account(&provider, "k", &check_opts(), TWELVE_SECONDS).await;
+        assert!(matches!(verdict, AccountVerdict::Inconclusive(_)));
+    }
+
+    #[test]
+    fn only_elevenlabs_needs_an_account_check() {
+        for id in [
+            "deepgram",
+            "assemblyai",
+            "dashscope",
+            "google",
+            "local",
+            "openai",
+        ] {
+            assert!(
+                make_provider(&with_provider(id))
+                    .account_check_audio()
+                    .is_none(),
+                "{id} would spend quota on a check it does not need"
+            );
+        }
+        let audio = make_provider(&with_provider("elevenlabs")).account_check_audio();
+        assert!(
+            audio.is_some_and(|a| a > Duration::from_secs(11)),
+            "ElevenLabs rejects at about ten seconds of audio"
+        );
     }
 }

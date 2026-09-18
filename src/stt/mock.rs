@@ -32,6 +32,9 @@ pub struct MockProvider {
     /// this many chunks, the way a socket the server closed mid-press does.
     /// Later sessions (replacements) accept everything.
     pub first_socket_dies_after: Option<usize>,
+    /// Once the script runs out, keep the stream open and silent (a healthy
+    /// server with nothing to say) instead of ending it.
+    pub hold_open: bool,
 }
 
 #[async_trait]
@@ -59,6 +62,7 @@ impl SttProvider for MockProvider {
             }),
             stream: Box::new(MockStream {
                 events: self.script.clone().into(),
+                hold_open: self.hold_open,
             }),
         })
     }
@@ -92,12 +96,16 @@ impl ProviderSink for MockSink {
 
 struct MockStream {
     events: VecDeque<SttEvent>,
+    hold_open: bool,
 }
 
 #[async_trait]
 impl ProviderStream for MockStream {
     async fn recv_event(&mut self) -> Result<Option<SttEvent>, RecvError> {
-        Ok(self.events.pop_front())
+        match self.events.pop_front() {
+            None if self.hold_open => std::future::pending().await,
+            next => Ok(next),
+        }
     }
 }
 

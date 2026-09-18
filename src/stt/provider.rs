@@ -184,6 +184,16 @@ pub trait SttProvider: Send + Sync {
         false
     }
 
+    /// How much audio a key must stream before this provider has passed
+    /// judgment on the key's ACCOUNT, or `None` (the default) when the
+    /// connect probe already says everything. For a provider that accepts a
+    /// connection and only rejects the account later; the startup prewarm and
+    /// "Test keys" stream this much once per key (see
+    /// `dispatch::check_account`, `key_checks`).
+    fn account_check_audio(&self) -> Option<Duration> {
+        None
+    }
+
     /// Whether this provider sends interim transcripts WHILE the user is
     /// still talking. The pip's live word count is built out of those, so a
     /// provider that answers only after the audio is committed leaves it

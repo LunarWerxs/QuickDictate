@@ -312,3 +312,55 @@ async fn live_openai() {
 async fn live_google() {
     run_live("google", Box::new(super::google::GoogleProvider)).await;
 }
+
+/// Which ElevenLabs keys fail the account check (`dispatch::check_account`),
+/// i.e. whose account never accepted the Scribe terms. Keys come from
+/// `QD_ACCOUNT_CHECK_KEYS` (comma-separated) or else `ELEVENLABS_KEYS` in
+/// `my.keys.env`; prints each key's position and verdict, never the key.
+/// Streams twelve seconds of each key's quota.
+#[tokio::test]
+#[ignore = "live network + real key"]
+async fn live_elevenlabs_account_check() {
+    let keys: Vec<String> = match std::env::var("QD_ACCOUNT_CHECK_KEYS") {
+        Ok(list) => list
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        Err(_) => keys_for("elevenlabs"),
+    };
+    if keys.is_empty() {
+        eprintln!("skip: no ElevenLabs keys");
+        return;
+    }
+    let provider = super::elevenlabs::ElevenLabsProvider;
+    let audio = provider
+        .account_check_audio()
+        .expect("ElevenLabs needs an account check");
+    let opts = SttSessionOpts {
+        language: "en".into(),
+        sample_rate: 16_000,
+        model: None,
+        custom_vocabulary: Vec::new(),
+    };
+    let started = std::time::Instant::now();
+    let verdicts = futures_util::future::join_all(
+        keys.iter()
+            .map(|key| super::dispatch::check_account(&provider, key, &opts, audio)),
+    )
+    .await;
+    for (i, verdict) in verdicts.iter().enumerate() {
+        println!("key #{} of {}: {verdict:?}", i + 1, keys.len());
+    }
+    println!(
+        "checked {} key(s) in {:.1} s",
+        keys.len(),
+        started.elapsed().as_secs_f64()
+    );
+    assert!(
+        verdicts
+            .iter()
+            .all(|v| !matches!(v, super::dispatch::AccountVerdict::Inconclusive(_))),
+        "every key should get a verdict"
+    );
+}

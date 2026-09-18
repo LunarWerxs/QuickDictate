@@ -72,6 +72,15 @@ impl SttProvider for ElevenLabsProvider {
         true
     }
 
+    /// An account that never accepted the Scribe terms connects and streams
+    /// normally, then is closed with `unaccepted_terms` once about ten seconds
+    /// of AUDIO have gone in, whether that audio took ten seconds or one
+    /// (measured 2026-09-18: 10.3-10.5 s of audio, at real time and at 10x).
+    /// Twelve clears that with room; good keys took thirteen without a word.
+    fn account_check_audio(&self) -> Option<Duration> {
+        Some(Duration::from_secs(12))
+    }
+
     async fn connect(
         &self,
         key: &str,

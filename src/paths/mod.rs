@@ -12,8 +12,9 @@
 //!
 //! Resolution order (first match wins):
 //!   1. the `QUICKDICTATE_DATA_DIR` environment variable -- an escape hatch for
-//!      tests, CI, and anyone scripting a portable install, and the only way to
-//!      relocate the folder without a readable settings.json;
+//!      tests, CI, and anyone scripting a portable install. Such a run stands
+//!      beside the regular install: it never sweeps the folder the regular
+//!      install recorded and never records its own (see `resolve::init`);
 //!   2. `data_dir` in settings.json, with `%VARS%` expanded;
 //!   3. the folder holding settings.json -- the historical behaviour. For a
 //!      shipped exe that folder IS the exe folder, so an existing install that
@@ -74,13 +75,14 @@ const ACTIVE_DIR_MARKER: &str = "active-data-dir.txt";
 /// behind in the old folder when the user relocates.
 ///
 /// `logs` is a directory and is handled as one; the rest are plain files.
-pub(crate) const RELOCATABLE: [&str; 6] = [
+pub(crate) const RELOCATABLE: [&str; 7] = [
     "logs",
     "quickdictate-stats.json",
     "quickdictate-connections.dat",
     "quickdictate-update.txt",
     "quickdictate-dev-port.txt",
     crate::history_store::HISTORY_FILE,
+    crate::key_checks::KEY_CHECKS_FILE,
 ];
 
 static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();

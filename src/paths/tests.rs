@@ -1,6 +1,6 @@
 //! Tests for folder resolution, the writability check, and migration.
 
-use super::resolve::resolve;
+use super::resolve::{env_dir, migration_sources, resolve};
 use super::*;
 
 /// `expand` and `resolve` read process-wide environment state, so the tests
@@ -353,4 +353,33 @@ fn every_relocatable_entry_is_named_once() {
     let before = seen.len();
     seen.dedup();
     assert_eq!(before, seen.len(), "a data file is listed twice");
+}
+
+/// The 2026-09-18 incident: an isolated copy run under QUICKDICTATE_DATA_DIR
+/// swept the regular install's recorded folder and took its files. `init`
+/// passes no recorded folder for such a run, so only its own folders remain.
+#[test]
+fn a_run_under_the_environment_never_sweeps_the_recorded_folder() {
+    let recorded = PathBuf::from(r"C:\Users\me\AppData\Local\QuickDictate");
+    let exe = PathBuf::from(r"C:\scratch");
+    let settings = Path::new(r"C:\scratch");
+    assert_eq!(
+        migration_sources(Some(recorded.clone()), exe.clone(), settings),
+        vec![recorded, exe.clone()],
+        "a normal run sweeps the recorded folder first, then its own (deduped)"
+    );
+    assert_eq!(migration_sources(None, exe.clone(), settings), vec![exe]);
+}
+
+#[test]
+fn only_a_usable_environment_folder_counts_as_an_environment_run() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var(DATA_DIR_ENV, r"C:\from-env");
+    assert_eq!(env_dir(), Some(PathBuf::from(r"C:\from-env")));
+    std::env::set_var(DATA_DIR_ENV, r"relative\path");
+    assert_eq!(env_dir(), None, "resolve ignores it, so init must too");
+    std::env::set_var(DATA_DIR_ENV, "  ");
+    assert_eq!(env_dir(), None);
+    std::env::remove_var(DATA_DIR_ENV);
+    assert_eq!(env_dir(), None);
 }
