@@ -241,7 +241,11 @@ fn stream_until_failure(
     // build_input_stream consumes the closure.
     let make_err_fn = || {
         let healthy = Arc::clone(healthy);
-        move |e| {
+        move |e: cpal::Error| {
+            if stream_survives(e.kind()) {
+                tracing::warn!("audio: {e} (the stream keeps running)");
+                return;
+            }
             tracing::error!("audio stream error: {e}");
             healthy.store(false, Ordering::Release);
         }
@@ -314,6 +318,19 @@ fn stream_until_failure(
         .map(|desc| desc.name().to_string())
         .unwrap_or_default();
     watch_stream(stream, stop, healthy, &open_name)
+}
+
+/// Stream errors that report something the stream already lived through,
+/// rather than a stream that stopped delivering. cpal 0.18 began reporting
+/// WASAPI's data-discontinuity flag as `Xrun` (0.15 dropped it silently), and
+/// treated as a failure it tore the microphone down and reopened it: a
+/// two-second hole in whatever was being said, several times an hour under
+/// load (2026-09-18, the first build shipped with cpal 0.18).
+pub(super) fn stream_survives(kind: cpal::ErrorKind) -> bool {
+    matches!(
+        kind,
+        cpal::ErrorKind::Xrun | cpal::ErrorKind::RealtimeDenied
+    )
 }
 
 /// Idle until shutdown or failure, watching the error callback and (every

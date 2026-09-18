@@ -162,3 +162,21 @@ fn the_microphone_preference_round_trips_and_trims() {
     set_preferred_input("");
     assert_eq!(PREFERRED_INPUT.load().as_str(), "");
 }
+
+/// cpal 0.18 reports a WASAPI data discontinuity as `Xrun`; the stream keeps
+/// delivering, so it must never trigger the tear-down-and-reopen path. A
+/// stream that really stopped still must.
+#[test]
+fn a_glitch_keeps_the_stream_and_a_dead_device_does_not() {
+    use super::capture::stream_survives;
+    assert!(stream_survives(cpal::ErrorKind::Xrun));
+    assert!(stream_survives(cpal::ErrorKind::RealtimeDenied));
+    for fatal in [
+        cpal::ErrorKind::DeviceNotAvailable,
+        cpal::ErrorKind::StreamInvalidated,
+        cpal::ErrorKind::BackendError,
+        cpal::ErrorKind::Other,
+    ] {
+        assert!(!stream_survives(fatal), "{fatal:?} must rebuild the stream");
+    }
+}

@@ -20,6 +20,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A tiny microphone glitch no longer punches a two-second hole in a dictation.** cpal 0.18 (the
+  audio library, updated 2026-09-17) began reporting Windows' "some samples were dropped" flag as
+  a stream error, which 0.15 had ignored. QuickDictate treated every stream error as a dead
+  microphone, so it closed the mic and reopened it, losing about two seconds of speech each time,
+  several times an hour whenever the machine was busy. Such a glitch is now logged and the
+  recording carries on; a microphone that really stops is still reopened.
+
 - **A second copy started with `QUICKDICTATE_DATA_DIR` no longer raids the main install's data
   folder.** The variable is meant for tests and portable installs, but a run under it still
   swept the folder the regular install had recorded and moved its log, stats, update cache and
