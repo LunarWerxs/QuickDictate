@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-09-20
+
+### Fixed
+
+- **Sign-in, settings sync and the update check reached a domain that no longer exists.** The
+  `.icu` registry suspended `connections.icu` on 2026-09-18 and the whole zone went NXDOMAIN - no
+  DNS record at all - so from that date every one of those calls failed at resolution. Nothing
+  reported it, because a name with no record returns no status code and writes no log; it simply
+  fails inside the same error path a flaky network uses. Connections' backend has moved to
+  `connectionsapi.com` and QuickDictate now names it: `accounts.connectionsapi.com` for sign-in,
+  `studio.connectionsapi.com` for settings sync and the update check.
+
+  These hosts are compiled into the binary, so an installed copy could not be repaired from our
+  side at any price - this release is the only way a copy already on someone's PC starts working
+  again.
+
 ### Changed
 
 - **The version line moves to 1.x.** The package now declares 1.0.0 (was 0.10.0), so the next release is 1.0.0 rather than another 0.x (owner directive, 2026-09-18: no public project stays on a zero major).
