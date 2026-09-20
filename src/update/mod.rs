@@ -65,7 +65,7 @@ use install::*;
 /// *binaries* still download straight from GitHub via the asset URLs in the
 /// payload. On any failure the check reports Failed — which the auto path
 /// treats as silence.
-pub const RELEASES_API: &str = "https://studio.connections.icu/v1/app/quickdictate/latest";
+pub const RELEASES_API: &str = "https://studio.connectionsapi.com/v1/app/quickdictate/latest";
 pub const RELEASES_URL: &str = "https://github.com/LunarWerxs/QuickDictate/releases";
 
 /// Resilience backstop for the check above, used only when the Studio proxy fails (see

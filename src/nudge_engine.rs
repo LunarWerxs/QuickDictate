@@ -182,7 +182,7 @@ impl Config {
             repeat_ms: Some(DAY_MS),
             snooze_after: 3,
             discover: false,
-            link_base: "https://connections.icu/link".to_string(),
+            link_base: "https://getconnections.icu/link".to_string(),
         }
     }
 }
@@ -905,7 +905,7 @@ mod tests {
         config.app_version = Some("2.1.0".into());
         let url = build_link(&config, "settings-changed", Campaign::SignIn, 1);
         assert!(
-            url.starts_with("https://connections.icu/link/testapp?"),
+            url.starts_with("https://getconnections.icu/link/testapp?"),
             "{url}"
         );
         for part in [

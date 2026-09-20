@@ -2,8 +2,8 @@
 //!
 //! Implements LunarWerx's portable Connections settings-sync protocol for a
 //! native Windows app: loopback-redirect OAuth (Authorization Code + PKCE,
-//! public client, no secret) against `accounts.connections.icu`, and raw-HTTP
-//! calls to the live per-user settings store at `studio.connections.icu/v1/app-data`.
+//! public client, no secret) against `accounts.connectionsapi.com`, and raw-HTTP
+//! calls to the live per-user settings store at `studio.connectionsapi.com/v1/app-data`.
 //!
 //! Design choices, all matched to how the rest of QuickDictate is built:
 //!   * **Blocking `reqwest` on worker threads** (same pattern as `update.rs`) —
@@ -55,14 +55,14 @@ use store::{clear_store_cache, CachedRemoteDoc};
 
 /// QuickDictate's OAuth `client_id` — **also its store `appId`**. Public value
 /// (a PKCE public client ships no secret), registered once by the owner:
-/// `POST https://studio.connections.icu/v1/oauth-apps` with `openid profile
+/// `POST https://studio.connectionsapi.com/v1/oauth-apps` with `openid profile
 /// email` scopes and bare-host loopback redirect URIs. Safe to commit.
 pub const CLIENT_ID: &str = "6448e5f7a13816eb3cbfc7e406570bdf";
 
-const AUTH_URL: &str = "https://accounts.connections.icu/oauth/authorize";
-const TOKEN_URL: &str = "https://accounts.connections.icu/oauth/token";
-const USERINFO_URL: &str = "https://accounts.connections.icu/oauth/userinfo";
-const STORE_BASE: &str = "https://studio.connections.icu/v1/app-data";
+const AUTH_URL: &str = "https://accounts.connectionsapi.com/oauth/authorize";
+const TOKEN_URL: &str = "https://accounts.connectionsapi.com/oauth/token";
+const USERINFO_URL: &str = "https://accounts.connectionsapi.com/oauth/userinfo";
+const STORE_BASE: &str = "https://studio.connectionsapi.com/v1/app-data";
 const SCOPES: &str = "openid profile email photo";
 const REDIRECT_PATH: &str = "/oauth/callback";
 const CREDS_FILE: &str = "quickdictate-connections.dat";

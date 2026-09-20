@@ -5,7 +5,7 @@
 //! keeps them strictly local (see `stats::usage::UsageStats`, the existing
 //! Settings-window charts). This lets LunarWerx see aggregate feature
 //! adoption fleet-wide without a new pipeline: it reuses the same
-//! `studio.connections.icu/v1/app/quickdictate/*` endpoint family and
+//! `studio.connectionsapi.com/v1/app/quickdictate/*` endpoint family and
 //! anonymous `install_id` the update checker already established as a
 //! precedent (`update::RELEASES_API`, `update::init_install_id`). Off by
 //! default; a distinct, new capability from the already-shipped local usage
@@ -40,7 +40,7 @@ mod tests;
 /// OAuth-app registration); until it exists server-side, [`send_now`] simply
 /// fails closed and the next daily attempt carries the same lifetime totals
 /// forward, so no data is lost by the endpoint not existing yet.
-pub const USAGE_REPORT_API: &str = "https://studio.connections.icu/v1/app/quickdictate/usage";
+pub const USAGE_REPORT_API: &str = "https://studio.connectionsapi.com/v1/app/quickdictate/usage";
 
 const USER_AGENT: &str = concat!("QuickDictate/", env!("CARGO_PKG_VERSION"));
 const CACHE_FILE: &str = "quickdictate-usage-report.txt";

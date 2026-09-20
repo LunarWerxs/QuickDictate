@@ -1,4 +1,4 @@
-//! OAuth against accounts.connections.icu.
+//! OAuth against accounts.connectionsapi.com.
 //!
 //! Authorization Code + PKCE as a public client: CNG for the verifier and
 //! state, the system browser for consent, a one-shot loopback listener for the
