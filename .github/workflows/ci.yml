@@ -58,6 +58,18 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
+      # Tests run BEFORE the fat-LTO release build (2026-09-22): the build is the slowest step in
+      # this job, and a failing test used to be reported only after paying for it.
+      # Unit tests only. The live provider tests are #[ignore] — they need real
+      # API keys + network and are run locally, never in CI.
+      #
+      # This also runs the mutation-fuzz suite (`src/fuzz.rs`), which is wired
+      # in as ordinary tests rather than a named job precisely so it cannot be
+      # skipped: every parser that reads a network response gets thousands of
+      # mutated and truncated inputs on every push, for about a second.
+      - name: Test
+        run: cargo test --locked
+
       - name: Build release
         run: cargo build --release --locked
 
@@ -69,16 +81,6 @@ jobs:
           ./scripts/check_release_binary.ps1 `
             -ExePath target/release/quickdictate.exe `
             -ExpectedVersion $version
-
-      # Unit tests only. The live provider tests are #[ignore] — they need real
-      # API keys + network and are run locally, never in CI.
-      #
-      # This also runs the mutation-fuzz suite (`src/fuzz.rs`), which is wired
-      # in as ordinary tests rather than a named job precisely so it cannot be
-      # skipped: every parser that reads a network response gets thousands of
-      # mutated and truncated inputs on every push, for about a second.
-      - name: Test
-        run: cargo test --locked
 
   deny:
     name: cargo-deny (advisories · licenses · sources)
