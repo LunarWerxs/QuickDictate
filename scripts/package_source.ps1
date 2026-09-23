@@ -24,7 +24,7 @@ try {
 
     # Copy only what's needed.  Robocopy is fastest and handles excludes natively;
     # /MIR mirrors, /XD excludes directories, /XF excludes files.
-    $excludeDirs  = @('target', '.git', '.saydeploy', '.vscode', '.idea', 'node_modules')
+    $excludeDirs  = @('target', '.git', '.vscode', '.idea', 'node_modules')
     $excludeFiles = @(
         'settings.json',   # a dev's real API keys live here — never ship it
         'quickdictate.log',

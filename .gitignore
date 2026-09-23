@@ -6,7 +6,6 @@
 /mutants.out.old/
 
 # Local runtime/tooling output.
-/.saydeploy/
 /.vscode/
 /.idea/
 # Generated symbol digest (rebuilt in under a second, never reviewed).
