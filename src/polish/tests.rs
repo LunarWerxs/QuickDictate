@@ -172,18 +172,37 @@ fn dead_endpoint(deadline_ms: u64) -> PolishSettings {
 
 const LONG_ENOUGH: &str = "this transcript is comfortably past the minimum length";
 
+/// The fastest of `rounds` timings of `work`, so one stall on a loaded
+/// machine cannot decide a ratio built from it.
+fn best_of(rounds: usize, mut work: impl FnMut()) -> Duration {
+    (0..rounds)
+        .map(|_| {
+            let started = Instant::now();
+            work();
+            started.elapsed()
+        })
+        .min()
+        .unwrap_or(Duration::MAX)
+}
+
 #[tokio::test]
 async fn a_dead_endpoint_costs_the_deadline_and_nothing_more() {
-    let p = Polisher::new(tokio::runtime::Handle::current());
-    let settings = dead_endpoint(200);
-    let started = Instant::now();
-    assert!(p.resolve(&settings, LONG_ENOUGH).is_none());
     // The bound that matters: a broken cleanup pass can never cost more
-    // than the budget the user set for it.
+    // than the budget the user set for it. Measured as a RATIO, never a
+    // budget: `resolve` against a bare wait of the same deadline timed beside
+    // it, best of five rounds on both sides, so the machine's load cancels
+    // out. On this single-threaded test runtime the spawned pass cannot run
+    // while `resolve` blocks, so every round is a deadline expiring.
+    let p = Polisher::new(tokio::runtime::Handle::current());
+    let settings = dead_endpoint(50);
+    let resolving = best_of(5, || assert!(p.resolve(&settings, LONG_ENOUGH).is_none()));
+    let deadline_alone = best_of(5, || {
+        let (_tx, rx) = std::sync::mpsc::sync_channel::<String>(1);
+        let _ = rx.recv_timeout(settings.deadline);
+    });
     assert!(
-        started.elapsed() < Duration::from_millis(1_500),
-        "resolve blocked for {:?}",
-        started.elapsed()
+        resolving < deadline_alone * 2,
+        "resolve blocked for {resolving:?} against a {deadline_alone:?} deadline"
     );
 }
 
@@ -251,10 +270,16 @@ fn keys_are_rotated_so_several_projects_share_the_load() {
 
 #[tokio::test]
 async fn text_too_short_to_polish_never_waits_at_all() {
+    // Counted, not timed: the only wait in `resolve` is on a pass it started
+    // or joined, so a call that leaves no pass in flight and no waiter behind
+    // never waited, however long a busy machine took to run it.
     let p = Polisher::new(tokio::runtime::Handle::current());
-    let started = Instant::now();
     assert!(p.resolve(&dead_endpoint(3_000), "too short").is_none());
-    assert!(started.elapsed() < Duration::from_millis(100));
+    let st = p.state.lock();
+    assert!(
+        st.inflight.is_none() && st.waiters.is_empty(),
+        "a text too short to polish started or joined a pass"
+    );
 }
 
 #[tokio::test]
@@ -281,13 +306,17 @@ async fn a_speculated_answer_is_returned_without_waiting() {
     let p = Polisher::new(tokio::runtime::Handle::current());
     let polished = format!("{LONG_ENOUGH}, tidied");
     p.state.lock().ready = Some((LONG_ENOUGH.to_string(), polished.clone()));
-    let started = Instant::now();
     assert_eq!(
         p.resolve(&dead_endpoint(3_000), LONG_ENOUGH),
         Some(polished)
     );
-    // The whole point of speculating: the hit costs nothing.
-    assert!(started.elapsed() < Duration::from_millis(50));
+    // The whole point of speculating: the hit costs nothing. Counted, not
+    // timed: no pass was started or joined, so nothing was waited for.
+    let st = p.state.lock();
+    assert!(
+        st.inflight.is_none() && st.waiters.is_empty(),
+        "a speculated answer started or joined a pass"
+    );
 }
 
 #[tokio::test]
