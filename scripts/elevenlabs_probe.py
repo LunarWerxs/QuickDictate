@@ -101,7 +101,7 @@ def build(wav_dir: Path, pause: float, noise_rms: int, skip_c: bool):
     return parts, marks
 
 
-async def main() -> None:
+def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", required=True, help="folder holding segA/segB/segC.wav")
     ap.add_argument("--pause", type=float, default=12.0)
@@ -111,97 +111,133 @@ async def main() -> None:
     ap.add_argument("--skip-c", action="store_true")
     ap.add_argument("--lang", default="en")
     ap.add_argument("--linger", type=float, default=8.0)
-    args = ap.parse_args()
+    return ap.parse_args()
 
+
+class Clock:
+    """Seconds since the probe connected, as the `+  1.23s` prefix every line carries."""
+
+    def __init__(self) -> None:
+        self.t0 = time.perf_counter()
+
+    def elapsed(self) -> float:
+        return time.perf_counter() - self.t0
+
+    def stamp(self) -> str:
+        return f"+{self.elapsed():6.2f}s"
+
+
+def audio_msg(chunk: list[int], commit: bool = False) -> str:
+    b = struct.pack(f"<{len(chunk)}h", *chunk)
+    msg = {
+        "message_type": "input_audio_chunk",
+        "audio_base_64": base64.b64encode(b).decode(),
+        "sample_rate": RATE,
+    }
+    if commit:
+        msg["commit"] = True
+    return json.dumps(msg)
+
+
+class NudgeWatch:
+    """The --nudge rule: one manual commit after 2.5 s of client-side silence that
+    follows uncommitted speech, re-armed by the next speech chunk."""
+
+    def __init__(self) -> None:
+        self.speech_since_commit = 0
+        self.silent_run = 0.0
+        self.nudged = False
+        self.commits_sent = 0
+
+    def observe(self, chunk: list[int]) -> None:
+        if rms(chunk) >= SILENCE_RMS:
+            self.speech_since_commit += 1
+            self.silent_run = 0.0
+            self.nudged = False
+        else:
+            self.silent_run += len(chunk) / RATE
+
+    def due(self) -> bool:
+        return not self.nudged and self.speech_since_commit > 0 and self.silent_run >= 2.5
+
+    def sent(self) -> None:
+        self.commits_sent += 1
+        self.nudged = True
+        self.speech_since_commit = 0
+
+
+async def send_audio(ws, samples: list[int], nudge: bool, clock: Clock) -> None:
+    watch = NudgeWatch()
+    for i in range(0, len(samples), CHUNK):
+        chunk = samples[i : i + CHUNK]
+        await ws.send(audio_msg(chunk))
+        watch.observe(chunk)
+        if nudge and watch.due():
+            await ws.send(audio_msg([], commit=True))
+            watch.sent()
+            print(f"{clock.stamp()} >>> client NUDGE commit #{watch.commits_sent} sent (2.5 s client silence)")
+        await asyncio.sleep(0.1)
+    print(f"{clock.stamp()} >>> audio done; sending final manual commit")
+    await ws.send(audio_msg([], commit=True))
+    await asyncio.sleep(0.3)  # PRE_CLOSE_DELAY in src/stt/elevenlabs.rs
+    print(f"{clock.stamp()} >>> sending WS close")
+    await ws.close()
+
+
+def describe_frame(d: dict) -> str:
+    """One server frame as the probe prints it."""
+    mt = d.get("message_type")
+    text = d.get("text") or d.get("committed_transcript") or ""
+    if mt == "partial_transcript":
+        return f"partial ({len(text.split())} words): {text[-70:]!r}"
+    if mt and mt.startswith("committed_transcript"):
+        return f"*** COMMITTED: {text!r}"
+    if mt == "session_started":
+        cfg = {k: v for k, v in d.items() if k != "message_type"}
+        return f"session_started {json.dumps(cfg)[:400]}"
+    return f"OTHER: {json.dumps(d)[:400]}"
+
+
+async def receive_frames(ws, clock: Clock, events: list[tuple[float, str | None]]) -> None:
+    try:
+        async for raw in ws:
+            try:
+                d = json.loads(raw)
+            except Exception:
+                print(f"{clock.stamp()} <<< non-JSON frame: {str(raw)[:120]!r}")
+                continue
+            events.append((clock.elapsed(), d.get("message_type")))
+            print(f"{clock.stamp()} <<< {describe_frame(d)}")
+    except websockets.ConnectionClosed as e:
+        print(f"{clock.stamp()} <<< connection closed by peer: code={e.code} reason={e.reason!r}")
+
+
+async def main() -> None:
+    args = parse_args()
     key = read_key(args.key)
     samples, marks = build(Path(args.dir), args.pause, args.noise, args.skip_c)
     print(f"audio: {len(samples) / RATE:.1f} s total; timeline:")
     for t, label in marks:
         print(f"  +{t:6.2f}s  {label}")
 
-    t0 = time.perf_counter()
-
-    def now() -> str:
-        return f"+{time.perf_counter() - t0:6.2f}s"
-
+    clock = Clock()
     url = URL.format(lang=args.lang)
     async with websockets.connect(
         url, additional_headers={"xi-api-key": key}, max_size=None
     ) as ws:
-        print(f"{now()} connected")
+        print(f"{clock.stamp()} connected")
         events: list[tuple[float, str | None]] = []
-
-        def audio_msg(chunk: list[int], commit: bool = False) -> str:
-            b = struct.pack(f"<{len(chunk)}h", *chunk)
-            msg = {
-                "message_type": "input_audio_chunk",
-                "audio_base_64": base64.b64encode(b).decode(),
-                "sample_rate": RATE,
-            }
-            if commit:
-                msg["commit"] = True
-            return json.dumps(msg)
-
-        async def sender():
-            speech_since_commit = 0
-            silent_run = 0.0
-            nudged = False
-            commits_sent = 0
-            for i in range(0, len(samples), CHUNK):
-                chunk = samples[i : i + CHUNK]
-                await ws.send(audio_msg(chunk))
-                if rms(chunk) >= SILENCE_RMS:
-                    speech_since_commit += 1
-                    silent_run = 0.0
-                    nudged = False
-                else:
-                    silent_run += len(chunk) / RATE
-                if args.nudge and not nudged and speech_since_commit > 0 and silent_run >= 2.5:
-                    await ws.send(audio_msg([], commit=True))
-                    commits_sent += 1
-                    nudged = True
-                    speech_since_commit = 0
-                    print(f"{now()} >>> client NUDGE commit #{commits_sent} sent (2.5 s client silence)")
-                await asyncio.sleep(0.1)
-            print(f"{now()} >>> audio done; sending final manual commit")
-            await ws.send(audio_msg([], commit=True))
-            await asyncio.sleep(0.3)  # PRE_CLOSE_DELAY in src/stt/elevenlabs.rs
-            print(f"{now()} >>> sending WS close")
-            await ws.close()
-
-        async def receiver():
-            try:
-                async for raw in ws:
-                    try:
-                        d = json.loads(raw)
-                    except Exception:
-                        print(f"{now()} <<< non-JSON frame: {str(raw)[:120]!r}")
-                        continue
-                    mt = d.get("message_type")
-                    text = d.get("text") or d.get("committed_transcript") or ""
-                    events.append((time.perf_counter() - t0, mt))
-                    if mt == "partial_transcript":
-                        print(f"{now()} <<< partial ({len(text.split())} words): {text[-70:]!r}")
-                    elif mt and mt.startswith("committed_transcript"):
-                        print(f"{now()} <<< *** COMMITTED: {text!r}")
-                    elif mt == "session_started":
-                        cfg = {k: v for k, v in d.items() if k != "message_type"}
-                        print(f"{now()} <<< session_started {json.dumps(cfg)[:400]}")
-                    else:
-                        print(f"{now()} <<< OTHER: {json.dumps(d)[:400]}")
-            except websockets.ConnectionClosed as e:
-                print(f"{now()} <<< connection closed by peer: code={e.code} reason={e.reason!r}")
-
-        recv = asyncio.create_task(receiver())
-        await sender()
+        recv = asyncio.create_task(receive_frames(ws, clock, events))
+        await send_audio(ws, samples, args.nudge, clock)
         try:
             await asyncio.wait_for(recv, timeout=args.linger)
         except asyncio.TimeoutError:
-            print(f"{now()} receiver still open after {args.linger} s linger; giving up")
+            print(f"{clock.stamp()} receiver still open after {args.linger} s linger; giving up")
             recv.cancel()
         commits = sum(1 for _, m in events if m and m.startswith("committed"))
         partials = sum(1 for _, m in events if m == "partial_transcript")
-        print(f"{now()} done. commits received: {commits}, partials: {partials}")
+        print(f"{clock.stamp()} done. commits received: {commits}, partials: {partials}")
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
