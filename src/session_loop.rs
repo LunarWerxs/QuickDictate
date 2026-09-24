@@ -67,6 +67,56 @@ fn handle_processing_hotkey(pending: &mut Option<PendingStart>, event: HotkeyEve
     true
 }
 
+/// Decide whether `evt` only updates the queue or must be applied to the
+/// session now: true means it was absorbed into the queue.
+///
+/// The queue lives only while local processing runs. An event met in any
+/// other status first drops whatever is still queued: processing ended
+/// without the loop seeing Idle (usually in Error, which never consumes the
+/// queue), and this fresh press or release supersedes it. Kept, it would
+/// start a session nobody asked for the next time status reached Idle, and a
+/// queued hold would start after its key was already up.
+fn absorb_into_queue(status: Status, pending: &mut Option<PendingStart>, evt: HotkeyEvent) -> bool {
+    if status != Status::Processing {
+        if let Some(stale) = pending.take() {
+            tracing::info!("dropped queued {stale:?} start: processing ended in {status:?}");
+        }
+        return false;
+    }
+    let prior_pending = *pending;
+    if !handle_processing_hotkey(pending, evt) {
+        return false;
+    }
+    log_processing_hotkey_queue(evt, prior_pending);
+    true
+}
+
+/// Start a new session and make it the tracked one. Any prior handle is a
+/// completed session (callers check `has_live` first); it is dropped without
+/// touching its shared state, and its background task finishes on its own.
+fn begin_session(
+    app: &Arc<App>,
+    keys: &mut Arc<KeyPool>,
+    active: &mut Option<SttHandle>,
+    what: std::fmt::Arguments<'_>,
+) {
+    let _ = active.take();
+    refresh_key_pool(app, keys);
+    tracing::info!("{what}");
+    app.set_status(Status::Starting);
+    *active = Some(stt::start_session(Arc::clone(app), Arc::clone(keys)));
+}
+
+/// Stop the live session: show the provider's post-release status first,
+/// then signal the session to finish.
+fn end_session(app: &Arc<App>, active: &mut Option<SttHandle>, why: &str) {
+    app.set_status(status_after_release(&app.config.load()));
+    if let Some(h) = active.take() {
+        tracing::info!("Stopping session ({why})");
+        h.stop();
+    }
+}
+
 fn start_queued_session_if_idle(
     app: &Arc<App>,
     keys: &mut Arc<KeyPool>,
@@ -79,11 +129,12 @@ fn start_queued_session_if_idle(
     let Some(kind) = pending.take() else {
         return;
     };
-    let _ = active.take();
-    refresh_key_pool(app, keys);
-    tracing::info!("Starting queued {kind:?} session after local processing");
-    app.set_status(Status::Starting);
-    *active = Some(stt::start_session(Arc::clone(app), Arc::clone(keys)));
+    begin_session(
+        app,
+        keys,
+        active,
+        format_args!("Starting queued {kind:?} session after local processing"),
+    );
 }
 
 /// Log the outcome of `handle_processing_hotkey` queuing a hotkey while local
@@ -118,67 +169,51 @@ fn handle_hotkey_event(
     app: &Arc<App>,
     keys: &mut Arc<KeyPool>,
     active: &mut Option<SttHandle>,
-    pending_start: &mut Option<PendingStart>,
     evt: HotkeyEvent,
     has_live: bool,
 ) {
     match evt {
-        HotkeyEvent::TogglePressed => {
-            if has_live {
-                app.set_status(status_after_release(&app.config.load()));
-                if let Some(h) = active.take() {
-                    tracing::info!("Stopping session (toggle off)");
-                    h.stop();
-                }
-            } else {
-                // Drop any prior completed handle without touching its
-                // shared state; the background task will finish on its own.
-                let _ = active.take();
-                refresh_key_pool(app, keys);
-                tracing::info!("Starting session (toggle on)");
-                app.set_status(Status::Starting);
-                *active = Some(stt::start_session(Arc::clone(app), Arc::clone(keys)));
-            }
-        }
-        HotkeyEvent::ToggleLongPressed => {
-            *pending_start = None;
-            if let Some(h) = active.take() {
-                tracing::info!("Discarding active session for saved-transcription replay");
-                app.invalidate_current_session();
-                h.stop();
-            }
-            app.word_count.store(0, Ordering::Release);
-            app.set_status(Status::Idle);
-            // try_send, never send: this runs on the win32 message-pump
-            // thread. A blocking send on a full queue would freeze the
-            // tray, the hotkeys, and every window this process owns until
-            // the paste worker drained. Dropping one replay request is a
-            // far better outcome than a frozen app.
-            if let Err(e) = app.replay_tx.try_send(None) {
-                tracing::warn!("saved-transcription replay request dropped: {e}");
-            }
-        }
-        HotkeyEvent::HoldPressed => {
-            if !has_live {
-                let _ = active.take();
-                refresh_key_pool(app, keys);
-                tracing::info!("Starting session (hold press)");
-                app.set_status(Status::Starting);
-                *active = Some(stt::start_session(Arc::clone(app), Arc::clone(keys)));
-            }
-        }
+        HotkeyEvent::TogglePressed if has_live => end_session(app, active, "toggle off"),
+        HotkeyEvent::TogglePressed => begin_session(
+            app,
+            keys,
+            active,
+            format_args!("Starting session (toggle on)"),
+        ),
+        HotkeyEvent::ToggleLongPressed => start_replay(app, active),
+        HotkeyEvent::HoldPressed if !has_live => begin_session(
+            app,
+            keys,
+            active,
+            format_args!("Starting session (hold press)"),
+        ),
+        HotkeyEvent::HoldPressed => {}
+        HotkeyEvent::HoldReleased if has_live => end_session(app, active, "hold release"),
         HotkeyEvent::HoldReleased => {
-            if has_live {
-                app.set_status(status_after_release(&app.config.load()));
-                if let Some(h) = active.take() {
-                    tracing::info!("Stopping session (hold release)");
-                    h.stop();
-                }
-            } else {
-                let _ = active.take();
-                app.set_status(Status::Idle);
-            }
+            let _ = active.take();
+            app.set_status(Status::Idle);
         }
+    }
+}
+
+/// The long press: discard any live session and ask the paste worker to
+/// replay the saved transcription. The queue was already cleared on the way
+/// here (by `handle_processing_hotkey` or `absorb_into_queue`).
+fn start_replay(app: &Arc<App>, active: &mut Option<SttHandle>) {
+    if let Some(h) = active.take() {
+        tracing::info!("Discarding active session for saved-transcription replay");
+        app.invalidate_current_session();
+        h.stop();
+    }
+    app.word_count.store(0, Ordering::Release);
+    app.set_status(Status::Idle);
+    // try_send, never send: this runs on the win32 message-pump
+    // thread. A blocking send on a full queue would freeze the
+    // tray, the hotkeys, and every window this process owns until
+    // the paste worker drained. Dropping one replay request is a
+    // far better outcome than a frozen app.
+    if let Err(e) = app.replay_tx.try_send(None) {
+        tracing::warn!("saved-transcription replay request dropped: {e}");
     }
 }
 
@@ -208,13 +243,10 @@ pub(crate) fn run_event_loop(
         // the already-queued session before interpreting a newly arrived event,
         // otherwise `pending_start` could survive into a later session.
         start_queued_session_if_idle(app, keys, &mut active, &mut pending_start);
-        tracing::info!("hotkey event: {evt:?} (status={:?})", app.status());
-        if app.status() == Status::Processing {
-            let prior_pending = pending_start;
-            if handle_processing_hotkey(&mut pending_start, evt) {
-                log_processing_hotkey_queue(evt, prior_pending);
-                continue;
-            }
+        let status = app.status();
+        tracing::info!("hotkey event: {evt:?} (status={status:?})");
+        if absorb_into_queue(status, &mut pending_start, evt) {
+            continue;
         }
         // Main owns the visible status. Streaming sessions may keep finalizing
         // while a newer one starts. Local batch inference is deliberately
@@ -225,7 +257,7 @@ pub(crate) fn run_event_loop(
         // flag is set means the session terminated on its own (clean or
         // errored); we treat it as "no live session" for hotkey purposes.
         let has_live = active.as_ref().map(|h| !h.is_done()).unwrap_or(false);
-        handle_hotkey_event(app, keys, &mut active, &mut pending_start, evt, has_live);
+        handle_hotkey_event(app, keys, &mut active, evt, has_live);
     }
 
     active
@@ -280,6 +312,48 @@ mod tests {
 
         pending = Some(PendingStart::Toggle);
         assert!(!handle_processing_hotkey(
+            &mut pending,
+            HotkeyEvent::ToggleLongPressed
+        ));
+        assert_eq!(pending, None);
+    }
+
+    /// Regression: a press queued during local processing outlived processing
+    /// that ended in Error, then started a session nobody asked for the next
+    /// time status reached Idle -- a queued hold after its key was already up.
+    #[test]
+    fn an_event_outside_processing_drops_the_stale_queue() {
+        for queued in [PendingStart::Hold, PendingStart::Toggle] {
+            for status in [Status::Error, Status::Idle, Status::Finalizing] {
+                for evt in [HotkeyEvent::HoldReleased, HotkeyEvent::TogglePressed] {
+                    let mut pending = Some(queued);
+                    assert!(!absorb_into_queue(status, &mut pending, evt));
+                    assert_eq!(pending, None, "{queued:?} survived {evt:?} in {status:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn processing_still_absorbs_presses_into_the_queue() {
+        let mut pending = None;
+        assert!(absorb_into_queue(
+            Status::Processing,
+            &mut pending,
+            HotkeyEvent::HoldPressed
+        ));
+        assert_eq!(pending, Some(PendingStart::Hold));
+        assert!(absorb_into_queue(
+            Status::Processing,
+            &mut pending,
+            HotkeyEvent::HoldReleased
+        ));
+        assert_eq!(pending, None);
+        pending = Some(PendingStart::Toggle);
+        // The long press is the one event processing does not absorb: it
+        // clears the queue and goes on to the replay.
+        assert!(!absorb_into_queue(
+            Status::Processing,
             &mut pending,
             HotkeyEvent::ToggleLongPressed
         ));

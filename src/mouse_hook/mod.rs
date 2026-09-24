@@ -207,20 +207,24 @@ pub fn configure(
     })));
 }
 
-/// Install the hook if it isn't already installed. Returns whether a hook is
+/// Install the hook, replacing any earlier one. Returns whether a hook is
 /// live afterwards.
 ///
 /// **Must be called from the thread that pumps the message loop** — Windows
 /// dispatches a low-level hook's callback onto the installing thread, so a
 /// hook installed from a thread that never pumps simply never fires.
 ///
-/// Idempotent, and called both at startup and from the hotkey loop's periodic
-/// re-arm, because Windows silently removes a low-level hook that overruns
-/// `LowLevelHooksTimeout`.
+/// Called both at startup and from the hotkey loop's periodic re-arm, because
+/// Windows silently removes a low-level hook that overruns
+/// `LowLevelHooksTimeout`. A stored handle proves nothing: Windows never says
+/// it removed the hook, so trusting the handle left mouse hotkeys dead until
+/// restart. Every call therefore installs a fresh hook, then unhooks the old
+/// handle (an error there just means Windows already did). New first, old
+/// second: both run on this thread, which dispatches no hook callback
+/// between the two calls, so no button event lands in a gap with no hook.
+/// Per-button state lives in the statics, so a press claimed by the old hook
+/// still pairs with its release under the new one.
 pub fn ensure_installed() -> bool {
-    if HOOK.load(Ordering::Acquire) != 0 {
-        return true;
-    }
     let module = unsafe { windows::Win32::System::LibraryLoader::GetModuleHandleW(None) };
     let hmod = match module {
         Ok(m) => windows::Win32::Foundation::HINSTANCE(m.0),
@@ -231,8 +235,12 @@ pub fn ensure_installed() -> bool {
     };
     match unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), hmod, 0) } {
         Ok(h) => {
-            HOOK.store(h.0 as isize, Ordering::Release);
-            tracing::info!("mouse hotkey hook installed");
+            let old = HOOK.swap(h.0 as isize, Ordering::AcqRel);
+            if old == 0 {
+                tracing::info!("mouse hotkey hook installed");
+            } else {
+                let _ = unsafe { UnhookWindowsHookEx(HHOOK(old as *mut core::ffi::c_void)) };
+            }
             true
         }
         Err(e) => {

@@ -28,24 +28,9 @@ pub(super) fn feed_sessions(
     channels: &AtomicUsize,
     data: &[i16],
 ) {
-    // Normal path takes only a shared lock. A write lock is needed solely when
-    // a session disappeared without its normal flusher cleanup.
-    let mut list = sessions.read();
-    if list.is_empty() {
+    let Some(list) = live_sessions(sessions) else {
         return;
-    }
-
-    if list.iter().any(|entry| entry.tx.is_closed()) {
-        drop(list);
-        {
-            let mut writable = sessions.write();
-            writable.retain(|entry| !entry.tx.is_closed());
-        }
-        list = sessions.read();
-        if list.is_empty() {
-            return;
-        }
-    }
+    };
 
     // Two cheap atomic loads per callback, not per session and not per
     // sample. Every session below compares its own built-for values against
@@ -60,74 +45,111 @@ pub(super) fn feed_sessions(
         // chunk boundary.
         let chunks = {
             let mut inner = entry.inner.lock();
+            match_device_format(&mut inner, current_rate, current_channels);
             let SessionResampler {
                 resampler,
                 pending,
-                target_rate,
-                built_rate,
-                built_channels,
                 spare_chunks,
+                ..
             } = &mut *inner;
-
-            if *built_rate != current_rate || *built_channels != current_channels {
-                tracing::warn!(
-                    "audio: device format changed ({} Hz, {} ch -> {} Hz, {} ch); \
-                     rebuilding session resampler",
-                    built_rate,
-                    built_channels,
-                    current_rate,
-                    current_channels
-                );
-                let step = current_rate as f64 / *target_rate as f64;
-                *resampler = LinearResampler::new(step, current_channels);
-                *built_rate = current_rate;
-                *built_channels = current_channels;
-                // `pending` is left alone: it holds already-resampled output
-                // waiting to be chunked, which is still correct: only the
-                // resampler's own interpolation state (fed samples, half-frame
-                // carry) was tied to the old format, and `LinearResampler::new`
-                // resets exactly that.
-            }
-
             resampler.feed_and_emit(data, pending);
-
-            let mut chunks = Vec::new();
-            while pending.len() >= CHUNK_SAMPLES {
-                // Reuse a buffer from the session's free list when one is
-                // available instead of allocating fresh audio storage on
-                // every chunk boundary; a new buffer is allocated only when
-                // the pool is empty.
-                let mut chunk = spare_chunks
-                    .pop()
-                    .unwrap_or_else(|| Vec::with_capacity(CHUNK_SAMPLES));
-                chunk.clear();
-                chunk.extend_from_slice(&pending[..CHUNK_SAMPLES]);
-                // drain() shifts the remainder down in place, reusing
-                // `pending`'s existing allocation. split_off() would allocate
-                // a brand new Vec for the tail on every chunk boundary, which
-                // is an allocation inside the real-time capture callback.
-                pending.drain(..CHUNK_SAMPLES);
-                chunks.push(chunk);
-            }
-            chunks
+            drain_complete_chunks(pending, spare_chunks)
         };
-        for chunk in chunks {
-            match entry.tx.try_send(chunk) {
-                Ok(()) => {
-                    if entry.queue_full_reported.swap(false, Ordering::Relaxed) {
-                        tracing::info!("audio: session queue recovered");
-                    }
+        send_chunks(entry, chunks);
+    }
+}
+
+/// The session list under a shared lock, or `None` when nobody is listening.
+/// Normal path takes only a shared lock. A write lock is needed solely when
+/// a session disappeared without its normal flusher cleanup.
+fn live_sessions(
+    sessions: &parking_lot::RwLock<Vec<SessionEntry>>,
+) -> Option<parking_lot::RwLockReadGuard<'_, Vec<SessionEntry>>> {
+    let list = sessions.read();
+    if list.is_empty() {
+        return None;
+    }
+    if !list.iter().any(|entry| entry.tx.is_closed()) {
+        return Some(list);
+    }
+    drop(list);
+    sessions.write().retain(|entry| !entry.tx.is_closed());
+    let list = sessions.read();
+    (!list.is_empty()).then_some(list)
+}
+
+/// Rebuild the session's resampler in place when a device reopen (unplug,
+/// mic swap, sleep resume) changed the format it was built for.
+fn match_device_format(inner: &mut SessionResampler, current_rate: u32, current_channels: usize) {
+    if inner.built_rate == current_rate && inner.built_channels == current_channels {
+        return;
+    }
+    tracing::warn!(
+        "audio: device format changed ({} Hz, {} ch -> {} Hz, {} ch); \
+         rebuilding session resampler",
+        inner.built_rate,
+        inner.built_channels,
+        current_rate,
+        current_channels
+    );
+    let step = current_rate as f64 / inner.target_rate as f64;
+    inner.resampler = LinearResampler::new(step, current_channels);
+    inner.built_rate = current_rate;
+    inner.built_channels = current_channels;
+    // `pending` is left alone: it holds already-resampled output
+    // waiting to be chunked, which is still correct: only the
+    // resampler's own interpolation state (fed samples, half-frame
+    // carry) was tied to the old format, and `LinearResampler::new`
+    // resets exactly that.
+}
+
+/// Move every complete `CHUNK_SAMPLES` chunk out of `pending`, leaving the
+/// incomplete tail for the next callback.
+fn drain_complete_chunks(
+    pending: &mut Vec<i16>,
+    spare_chunks: &mut Vec<Vec<i16>>,
+) -> Vec<Vec<i16>> {
+    let mut chunks = Vec::new();
+    while pending.len() >= CHUNK_SAMPLES {
+        // Reuse a buffer from the session's free list when one is
+        // available instead of allocating fresh audio storage on
+        // every chunk boundary; a new buffer is allocated only when
+        // the pool is empty.
+        let mut chunk = spare_chunks
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(CHUNK_SAMPLES));
+        chunk.clear();
+        chunk.extend_from_slice(&pending[..CHUNK_SAMPLES]);
+        // drain() shifts the remainder down in place, reusing
+        // `pending`'s existing allocation. split_off() would allocate
+        // a brand new Vec for the tail on every chunk boundary, which
+        // is an allocation inside the real-time capture callback.
+        pending.drain(..CHUNK_SAMPLES);
+        chunks.push(chunk);
+    }
+    chunks
+}
+
+/// Queue the chunks for the session's send task without ever blocking the
+/// capture callback: a full queue drops the chunk (and recycles its buffer),
+/// a closed one drops the rest.
+fn send_chunks(entry: &SessionEntry, chunks: Vec<Vec<i16>>) {
+    for chunk in chunks {
+        match entry.tx.try_send(chunk) {
+            Ok(()) => {
+                if entry.queue_full_reported.swap(false, Ordering::Relaxed) {
+                    tracing::info!("audio: session queue recovered");
                 }
-                Err(mpsc::error::TrySendError::Full(returned)) => {
-                    if !entry.queue_full_reported.swap(true, Ordering::Relaxed) {
-                        tracing::warn!(
-                            "audio: session queue full; dropping audio to keep latency bounded"
-                        );
-                    }
-                    return_spare_chunk(entry, returned);
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => break,
             }
+            Err(mpsc::error::TrySendError::Full(returned)) => {
+                if !entry.queue_full_reported.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        "audio: session queue full; dropping audio to keep latency bounded"
+                    );
+                }
+                return_spare_chunk(entry, returned);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => break,
         }
     }
 }

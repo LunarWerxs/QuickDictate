@@ -110,6 +110,68 @@ fn feed_sessions_drain_chunking_preserves_exact_sample_order() {
 }
 
 #[test]
+fn feed_sessions_prunes_a_session_whose_receiver_is_gone() {
+    let (live_tx, mut live_rx) = mpsc::channel(4);
+    let (dead_tx, dead_rx) = mpsc::channel(4);
+    drop(dead_rx);
+    let sessions = parking_lot::RwLock::new(vec![test_entry(1, dead_tx), test_entry(2, live_tx)]);
+    let (device_rate, channels) = native_format();
+
+    feed_sessions(&sessions, &device_rate, &channels, &[5_i16; CHUNK_SAMPLES]);
+
+    let remaining: Vec<u64> = sessions.read().iter().map(|entry| entry.id).collect();
+    assert_eq!(remaining, vec![2]);
+    assert_eq!(
+        live_rx.try_recv().expect("live session fed").len(),
+        CHUNK_SAMPLES
+    );
+}
+
+#[test]
+fn resampler_interpolates_and_holds_across_buffers() {
+    // Step 0.5 doubles the rate: halfway points are interpolated inside a
+    // buffer, and the last frame is held (not blended with a frame that has
+    // not arrived yet) until the next buffer continues the position.
+    let mut r = LinearResampler::new(0.5, 1);
+    let mut out = Vec::new();
+    r.feed_and_emit(&[0, 100], &mut out);
+    r.feed_and_emit(&[200], &mut out);
+    assert_eq!(out, vec![0, 50, 100, 100, 200, 200]);
+}
+
+#[test]
+fn resampler_mixes_interleaved_channels_to_mono() {
+    let mut r = LinearResampler::new(1.0, 2);
+    let mut out = Vec::new();
+    r.feed_and_emit(&[100, 300, -100, -300, 7], &mut out);
+    // The odd trailing sample is not a whole frame and is ignored.
+    assert_eq!(out, vec![200, -200]);
+    assert_eq!(r.last_frame_mono, Some(-200));
+}
+
+#[test]
+fn sample_conversions_hit_the_i16_range_ends() {
+    assert_eq!(f32_to_i16(0.0), 0);
+    assert_eq!(f32_to_i16(1.0), i16::MAX);
+    assert_eq!(f32_to_i16(-1.0), -i16::MAX);
+    assert_eq!(f32_to_i16(4.0), i16::MAX);
+    assert_eq!(f32_to_i16(-4.0), i16::MIN);
+    assert_eq!(u16_to_i16(0), i16::MIN);
+    assert_eq!(u16_to_i16(32_768), 0);
+    assert_eq!(u16_to_i16(u16::MAX), i16::MAX);
+}
+
+#[test]
+fn a_stopped_capture_thread_does_not_sit_out_the_retry_delay() {
+    let started = std::time::Instant::now();
+    assert!(!sleep_unless_stopped(
+        &AtomicBool::new(true),
+        std::time::Duration::from_secs(60)
+    ));
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+}
+
+#[test]
 fn session_flusher_targets_and_unregisters_by_stable_id() {
     let (tx1, mut rx1) = mpsc::channel(4);
     let (tx2, mut rx2) = mpsc::channel(4);

@@ -18,14 +18,7 @@ pub fn parse_combo(combo: &str) -> Result<(u32, u32)> {
         if part.is_empty() {
             continue;
         }
-        let m = match part.as_str() {
-            "ctrl" | "control" => Some(MOD_CONTROL.0),
-            "alt" | "menu" => Some(MOD_ALT.0),
-            "shift" => Some(MOD_SHIFT.0),
-            "win" | "windows" | "super" => Some(MOD_WIN.0),
-            _ => None,
-        };
-        if let Some(bits) = m {
+        if let Some(bits) = modifier_bits(&part) {
             modifiers |= bits;
             continue;
         }
@@ -49,6 +42,18 @@ pub fn parse_combo(combo: &str) -> Result<(u32, u32)> {
         bail!("no main key in '{combo}'");
     }
     Ok((modifiers | MOD_NOREPEAT.0, vk))
+}
+
+/// The `RegisterHotKey` modifier flag a combo part names, or `None` when the
+/// part is a key rather than a modifier.
+fn modifier_bits(part: &str) -> Option<u32> {
+    match part {
+        "ctrl" | "control" => Some(MOD_CONTROL.0),
+        "alt" | "menu" => Some(MOD_ALT.0),
+        "shift" => Some(MOD_SHIFT.0),
+        "win" | "windows" | "super" => Some(MOD_WIN.0),
+        _ => None,
+    }
 }
 
 /// Mouse buttons we deliberately refuse to bind, mapped to a human label for
@@ -112,34 +117,19 @@ fn vk_for_alnum(name: &str) -> Option<u32> {
     None
 }
 
+/// Virtual-key code of F1, the first of the 24 consecutive function-key codes.
+const VK_F1: u32 = 0x70;
+
+// F1-F24. Windows numbers them consecutively from VK_F1, so the code is
+// computed rather than tabled. Only the canonical spelling counts: "f01" and
+// "f+1" parse as numbers but were never key names, so they stay unknown.
 fn vk_for_function_key(name: &str) -> Option<u32> {
-    Some(match name {
-        "f1" => 0x70,
-        "f2" => 0x71,
-        "f3" => 0x72,
-        "f4" => 0x73,
-        "f5" => 0x74,
-        "f6" => 0x75,
-        "f7" => 0x76,
-        "f8" => 0x77,
-        "f9" => 0x78,
-        "f10" => 0x79,
-        "f11" => 0x7A,
-        "f12" => 0x7B,
-        "f13" => 0x7C,
-        "f14" => 0x7D,
-        "f15" => 0x7E,
-        "f16" => 0x7F,
-        "f17" => 0x80,
-        "f18" => 0x81,
-        "f19" => 0x82,
-        "f20" => 0x83,
-        "f21" => 0x84,
-        "f22" => 0x85,
-        "f23" => 0x86,
-        "f24" => 0x87,
-        _ => return None,
-    })
+    let digits = name.strip_prefix('f')?;
+    if digits.starts_with('0') || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: u32 = digits.parse().ok()?;
+    (1..=24).contains(&n).then(|| VK_F1 + n - 1)
 }
 
 fn vk_for_editing_key(name: &str) -> Option<u32> {

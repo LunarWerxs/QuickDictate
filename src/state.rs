@@ -361,8 +361,10 @@ impl App {
             crate::history_store::remove();
             return;
         }
-        let snapshot = self.history.lock().snapshot();
-        if let Err(e) = crate::history_store::save(&snapshot) {
+        // The snapshot is taken inside `save`, under its file lock: taken out
+        // here, a save that snapshotted first could still write last and put
+        // an older list back on disk.
+        if let Err(e) = crate::history_store::save(|| self.history.lock().snapshot()) {
             tracing::warn!("history: {e}");
         }
     }
