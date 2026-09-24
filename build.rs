@@ -38,11 +38,16 @@ fn main() {
     // heuristics, and a populated version resource measurably reduces those
     // false positives (same rationale as SageThumbs 2K's installer).
     let version = env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION");
-    let mut parts = version.split('.');
+    // FILEVERSION/PRODUCTVERSION take four numbers and nothing else, so they
+    // get the numeric core from Cargo's own split; the full string (a test
+    // build's "1.2.0-fade" included) goes in the text fields below. Splitting
+    // CARGO_PKG_VERSION on '.' instead handed rc.exe "0-fade" and failed the
+    // build for any pre-release version.
+    let num = |key: &str| env::var(key).unwrap_or_else(|_| "0".into());
     let (maj, min, pat) = (
-        parts.next().unwrap_or("0"),
-        parts.next().unwrap_or("0"),
-        parts.next().unwrap_or("0"),
+        num("CARGO_PKG_VERSION_MAJOR"),
+        num("CARGO_PKG_VERSION_MINOR"),
+        num("CARGO_PKG_VERSION_PATCH"),
     );
     let rc_contents = format!(
         r#"1 ICON "{ico}"

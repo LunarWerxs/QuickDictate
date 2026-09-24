@@ -2886,7 +2886,7 @@ dependencies = [
 
 [[package]]
 name = "quickdictate"
-version = "1.1.0"
+version = "1.2.0-fade"
 dependencies = [
  "anyhow",
  "arc-swap",

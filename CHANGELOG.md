@@ -22,6 +22,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   it is quieted again, so its quiet volume is never mistaken for its normal one.
 - **Every duck is written down before any volume moves**, so even a crash in the middle of a fade
   leaves a list the next launch can repair.
+- **A pre-release version no longer breaks the build.** The exe's Windows version resource split
+  the version string on dots and handed the resource compiler `0-fade`; it now takes the numeric
+  parts Cargo already provides, and the full string still shows in the file's properties.
 
 ## [1.1.0] - 2026-09-24
 
