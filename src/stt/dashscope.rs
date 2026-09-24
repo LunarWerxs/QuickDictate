@@ -15,15 +15,14 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use super::provider::{
-    i16_slice_as_bytes, AudioFormat, ConnectError, ProviderSession, ProviderSink, ProviderStream,
-    RecvError, SendError, SttEvent, SttProvider, SttSessionOpts,
+    classify_by_substring, server_error_event, AudioFormat, ConnectError, ProviderSession,
+    ProviderSink, ProviderStream, RecvError, SendError, SttEvent, SttProvider, SttSessionOpts,
 };
+use super::ws::{self, WsConn, WsReader, WsSink};
+use crate::keys::FailKind;
 
 // Host is chosen by the `dashscope_intl` config flag: mainland-China (default)
 // vs. the `-intl` host for International accounts. A key from the wrong region
@@ -37,12 +36,9 @@ const MODEL_ID: &str = "paraformer-realtime-v2";
 /// silent proxy) would park the session forever waiting for `task-started`.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(6);
 
-type WsSink = futures_util::stream::SplitSink<
-    WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
-    Message,
->;
-type WsStream =
-    futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>;
+/// How a handshake `task-failed` starts its [`ConnectError`], followed by
+/// `error_code error_message`. `classify_connect_error` keys on it.
+const TASK_FAILED: &str = "task-failed: ";
 
 /// DashScope wants a 32-char task_id, reused across run-task/finish-task.
 fn gen_task_id() -> String {
@@ -96,6 +92,17 @@ impl SttProvider for DashScopeProvider {
         true
     }
 
+    /// A handshake `task-failed` is classified by its error code, exactly as
+    /// the same event is mid-stream (see [`classify_error_code`]). Every
+    /// other connect failure (the upgrade's HTTP status, a timeout) keeps the
+    /// substring default.
+    fn classify_connect_error(&self, err: &ConnectError) -> FailKind {
+        match err.0.strip_prefix(TASK_FAILED) {
+            Some(detail) => classify_error_code(detail.split(' ').next().unwrap_or("")),
+            None => classify_by_substring(&err.0),
+        }
+    }
+
     async fn connect(
         &self,
         key: &str,
@@ -104,44 +111,18 @@ impl SttProvider for DashScopeProvider {
         let model = opts.model.as_deref().unwrap_or(MODEL_ID);
         let task_id = gen_task_id();
 
-        let mut request = self
-            .ws_url()
-            .into_client_request()
-            .map_err(|e| ConnectError(format!("ws request: {e}")))?;
-        request.headers_mut().insert(
-            "Authorization",
-            HeaderValue::from_str(&format!("bearer {key}"))
-                .map_err(|e| ConnectError(format!("bad key header: {e}")))?,
-        );
-        let (mut ws, _resp) = tokio_tungstenite::connect_async(request)
-            .await
-            .map_err(|e| ConnectError(format!("ws connect failed: {e}")))?;
+        let mut conn =
+            ws::connect(self.ws_url(), "Authorization", &format!("bearer {key}")).await?;
 
         // 1) send run-task
         let run_task = build_run_task(&task_id, model, opts);
-        ws.send(Message::Text(run_task.into()))
+        conn.send(Message::Text(run_task.into()))
             .await
             .map_err(|e| ConnectError(format!("run-task send: {e}")))?;
 
         // 2) await task-started (or task-failed) before letting audio flow,
         //    bounded so a silent-but-open connection can't hang the session.
-        let handshake = async {
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(t))) => match header_event(&t).as_deref() {
-                        Some("task-started") => return Ok(()),
-                        Some("task-failed") => {
-                            return Err(ConnectError(format!("task-failed: {t}")))
-                        }
-                        _ => continue,
-                    },
-                    Some(Ok(_)) => continue,
-                    Some(Err(e)) => return Err(ConnectError(format!("handshake recv: {e}"))),
-                    None => return Err(ConnectError("closed before task-started".into())),
-                }
-            }
-        };
-        match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await {
+        match tokio::time::timeout(HANDSHAKE_TIMEOUT, await_task_started(&mut conn)).await {
             Ok(r) => r?,
             Err(_) => {
                 return Err(ConnectError(format!(
@@ -150,14 +131,65 @@ impl SttProvider for DashScopeProvider {
             }
         }
 
-        let (sink, stream) = ws.split();
+        let (sink, stream) = conn.split();
         Ok(ProviderSession {
             sink: Box::new(DashScopeSink { sink, task_id }),
             stream: Box::new(DashScopeStream {
-                stream,
-                closed: false,
+                ws: WsReader::new(stream),
             }),
         })
+    }
+}
+
+/// Read until the server answers `run-task`: `Ok` on `task-started`, the
+/// failure on `task-failed`, skipping anything else it sends first.
+async fn await_task_started(conn: &mut WsConn) -> Result<(), ConnectError> {
+    loop {
+        match conn.next().await {
+            Some(Ok(Message::Text(t))) => {
+                let Some(header) = parse_header(&t) else {
+                    continue;
+                };
+                match header.event.as_deref() {
+                    Some("task-started") => return Ok(()),
+                    Some("task-failed") => return Err(task_failed_error(&header)),
+                    _ => continue,
+                }
+            }
+            Some(Ok(_)) => continue,
+            Some(Err(e)) => return Err(ConnectError(format!("handshake recv: {e}"))),
+            None => return Err(ConnectError("closed before task-started".into())),
+        }
+    }
+}
+
+/// The [`ConnectError`] for a handshake `task-failed`: its code and message
+/// only, never the whole frame. The frame echoes our random 32-hex `task_id`,
+/// and a "401", "403" or "429" inside that id used to bench a good key as
+/// Invalid or RateLimit over a transient server error.
+fn task_failed_error(header: &DsHeader) -> ConnectError {
+    ConnectError(format!(
+        "{TASK_FAILED}{} {}",
+        header.error_code.as_deref().unwrap_or_default(),
+        header.error_message.as_deref().unwrap_or_default()
+    ))
+}
+
+/// What a `task-failed` error code says about the key, read from the code
+/// alone, never the prose. `InvalidParameter` (a model or language hint the
+/// server rejects) contains "invalid" and `Throttling.RateQuota` contains
+/// "quota", so the old substring read benched good keys as Dead or out of
+/// credit over a setting or a throttle. Anything not named here is the
+/// request's or the server's problem ([`FailKind::Transient`]).
+fn classify_error_code(code: &str) -> FailKind {
+    match code {
+        "InvalidApiKey" => FailKind::Invalid,
+        "Arrearage" => FailKind::Exhausted,
+        c if c.starts_with("Throttling") => FailKind::RateLimit,
+        // A spent allowance that is not a per-minute throttle, such as
+        // `AllocationQuota.FreeTierOnly`.
+        c if c.contains("Quota") => FailKind::Exhausted,
+        _ => FailKind::Transient,
     }
 }
 
@@ -214,11 +246,7 @@ struct DashScopeSink {
 #[async_trait]
 impl ProviderSink for DashScopeSink {
     async fn send_audio(&mut self, pcm: &[i16]) -> Result<(), SendError> {
-        let bytes = i16_slice_as_bytes(pcm).to_vec();
-        self.sink
-            .send(Message::Binary(bytes.into()))
-            .await
-            .map_err(|e| SendError(e.to_string()))
+        ws::send_pcm(&mut self.sink, pcm).await
     }
 
     async fn commit(&mut self) -> Result<(), SendError> {
@@ -227,20 +255,12 @@ impl ProviderSink for DashScopeSink {
             "payload": { "input": {} }
         })
         .to_string();
-        self.sink
-            .send(Message::Text(finish.into()))
-            .await
-            .map_err(|e| SendError(e.to_string()))
+        ws::send_text(&mut self.sink, finish).await
     }
 
     async fn keepalive(&mut self) -> Result<(), SendError> {
-        // No documented no-audio keepalive, so use a transport-level WS ping: a
-        // harmless standard control frame that resets idle timers. The recv side
-        // ignores the Pong reply.
-        self.sink
-            .send(Message::Ping(Vec::new().into()))
-            .await
-            .map_err(|e| SendError(e.to_string()))
+        // No documented no-audio keepalive, so use a transport-level WS ping.
+        ws::ping(&mut self.sink).await
     }
 
     async fn close(&mut self) -> Result<(), SendError> {
@@ -250,49 +270,19 @@ impl ProviderSink for DashScopeSink {
 }
 
 struct DashScopeStream {
-    stream: WsStream,
-    closed: bool,
+    ws: WsReader,
 }
 
 #[async_trait]
 impl ProviderStream for DashScopeStream {
     async fn recv_event(&mut self) -> Result<Option<SttEvent>, RecvError> {
-        if self.closed {
-            return Ok(None);
-        }
-        loop {
-            let msg = match self.stream.next().await {
-                Some(m) => m,
-                None => {
-                    self.closed = true;
-                    return Ok(None);
-                }
-            };
-            let text = match msg {
-                Ok(Message::Text(t)) => t.to_string(),
-                Ok(Message::Close(c)) => {
-                    self.closed = true;
-                    let reason = c.as_ref().map(|f| f.reason.to_string()).unwrap_or_default();
-                    return Ok(Some(SttEvent::Closed(
-                        (!reason.is_empty()).then_some(reason),
-                    )));
-                }
-                Ok(_) => continue,
-                Err(e) => return Err(RecvError(e.to_string())),
-            };
-            if let Some(ev) = map_frame(&text) {
-                return Ok(Some(ev));
-            }
-        }
+        self.ws.recv(map_frame).await
     }
 }
 
-/// Extract `header.event` from a DashScope frame (used during the handshake).
-fn header_event(text: &str) -> Option<String> {
-    serde_json::from_str::<DsMessage>(text)
-        .ok()
-        .and_then(|m| m.header)
-        .and_then(|h| h.event)
+/// The `header` of a DashScope frame (used during the handshake).
+fn parse_header(text: &str) -> Option<DsHeader> {
+    serde_json::from_str::<DsMessage>(text).ok()?.header
 }
 
 #[derive(Deserialize)]
@@ -343,16 +333,13 @@ fn map_frame(text: &str) -> Option<SttEvent> {
             }
         }
         "task-finished" => Some(SttEvent::Closed(None)),
-        "task-failed" => {
-            let msg = format!(
-                "{} {}",
-                header.error_code.unwrap_or_default(),
-                header.error_message.unwrap_or_default()
-            );
-            Some(SttEvent::KeyFailure(
-                super::provider::classify_by_substring(&msg),
-            ))
-        }
+        // The same code-only read as a handshake failure, so the two paths
+        // cannot drift; only a verdict on the key rotates it.
+        "task-failed" => Some(server_error_event(
+            "dashscope",
+            classify_error_code(header.error_code.as_deref().unwrap_or_default()),
+            text,
+        )),
         _ => None,
     }
 }
@@ -391,14 +378,66 @@ mod tests {
         ));
     }
 
+    fn task_failed(code: &str) -> String {
+        format!(
+            r#"{{"header":{{"task_id":"401aa403bb429cc00123456789abcdef","event":"task-failed","error_code":"{code}","error_message":"something went wrong"}}}}"#
+        )
+    }
+
     #[test]
     fn task_failed_is_key_failure() {
         assert!(matches!(
             map_frame(
                 r#"{"header":{"event":"task-failed","error_code":"InvalidApiKey","error_message":"unauthorized"}}"#
             ),
-            Some(SttEvent::KeyFailure(_))
+            Some(SttEvent::KeyFailure(FailKind::Invalid))
         ));
+        assert!(matches!(
+            map_frame(&task_failed("Arrearage")),
+            Some(SttEvent::KeyFailure(FailKind::Exhausted))
+        ));
+        assert!(matches!(
+            map_frame(&task_failed("Throttling.RateQuota")),
+            Some(SttEvent::KeyFailure(FailKind::RateLimit))
+        ));
+    }
+
+    #[test]
+    fn a_task_failure_that_is_not_the_keys_fault_keeps_the_press_alive() {
+        // InvalidParameter used to read as Invalid off the word "invalid",
+        // and anything unrecognised as a key failure that ended the press.
+        for code in ["InternalError", "InvalidParameter"] {
+            assert!(
+                matches!(
+                    map_frame(&task_failed(code)),
+                    Some(SttEvent::ProviderFailure(m)) if m.starts_with("dashscope sent")
+                ),
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_handshake_failure_is_classified_by_its_code_not_the_echoed_task_id() {
+        // The task_id holds "401", "403" and "429"; before, the whole frame
+        // went to the substring classifier and a transient InternalError
+        // benched the key as Invalid.
+        let provider = DashScopeProvider { intl: false };
+        let classify = |code: &str| {
+            let header = parse_header(&task_failed(code)).unwrap();
+            provider.classify_connect_error(&task_failed_error(&header))
+        };
+        assert_eq!(classify("InternalError"), FailKind::Transient);
+        assert_eq!(classify("InvalidParameter"), FailKind::Transient);
+        assert_eq!(classify("InvalidApiKey"), FailKind::Invalid);
+        assert_eq!(classify("Arrearage"), FailKind::Exhausted);
+        // Failures before the handshake still read the upgrade's status.
+        assert_eq!(
+            provider.classify_connect_error(&ConnectError(
+                "ws connect failed: HTTP error: 401 Unauthorized".into()
+            )),
+            FailKind::Invalid
+        );
     }
 
     #[test]

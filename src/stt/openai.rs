@@ -14,25 +14,17 @@ use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use super::provider::{
-    classify_by_substring, i16_slice_as_bytes, AudioFormat, ConnectError, ProviderSession,
+    i16_slice_as_bytes, server_error_event, AudioFormat, ConnectError, ProviderSession,
     ProviderSink, ProviderStream, RecvError, SendError, SttEvent, SttProvider, SttSessionOpts,
 };
+use super::ws::{self, Frame, WsReader, WsSink};
+use crate::keys::FailKind;
 
 const WS_URL: &str = "wss://api.openai.com/v1/realtime?intent=transcription";
 const DEFAULT_MODEL: &str = "gpt-4o-transcribe";
-
-type WsSink = futures_util::stream::SplitSink<
-    WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
-    Message,
->;
-type WsStream =
-    futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>;
 
 pub struct OpenAiProvider;
 
@@ -72,31 +64,20 @@ impl SttProvider for OpenAiProvider {
         opts: &SttSessionOpts,
     ) -> Result<ProviderSession, ConnectError> {
         let model = opts.model.as_deref().unwrap_or(DEFAULT_MODEL);
-        let mut request = WS_URL
-            .into_client_request()
-            .map_err(|e| ConnectError(format!("ws request: {e}")))?;
-        request.headers_mut().insert(
-            "Authorization",
-            HeaderValue::from_str(&format!("Bearer {key}"))
-                .map_err(|e| ConnectError(format!("bad key header: {e}")))?,
-        );
-        let (mut ws, _resp) = tokio_tungstenite::connect_async(request)
-            .await
-            .map_err(|e| ConnectError(format!("ws connect failed: {e}")))?;
+        let mut conn = ws::connect(WS_URL, "Authorization", &format!("Bearer {key}")).await?;
 
         // Configure the transcription session (GA Realtime shape). Manual commit
         // (turn_detection = null) so we control end-of-utterance.
         let update = build_session_update(model, opts).to_string();
-        ws.send(Message::Text(update.into()))
+        conn.send(Message::Text(update.into()))
             .await
             .map_err(|e| ConnectError(format!("session.update send: {e}")))?;
 
-        let (sink, stream) = ws.split();
+        let (sink, stream) = conn.split();
         Ok(ProviderSession {
             sink: Box::new(OpenAiSink { sink }),
             stream: Box::new(OpenAiStream {
-                stream,
-                closed: false,
+                ws: WsReader::new(stream),
                 accum: String::new(),
             }),
         })
@@ -139,29 +120,18 @@ impl ProviderSink for OpenAiSink {
     async fn send_audio(&mut self, pcm: &[i16]) -> Result<(), SendError> {
         let audio = base64::engine::general_purpose::STANDARD.encode(i16_slice_as_bytes(pcm));
         let msg = json!({ "type": "input_audio_buffer.append", "audio": audio }).to_string();
-        self.sink
-            .send(Message::Text(msg.into()))
-            .await
-            .map_err(|e| SendError(e.to_string()))
+        ws::send_text(&mut self.sink, msg).await
     }
 
     async fn commit(&mut self) -> Result<(), SendError> {
-        self.sink
-            .send(Message::Text(
-                "{\"type\":\"input_audio_buffer.commit\"}".into(),
-            ))
-            .await
-            .map_err(|e| SendError(e.to_string()))
+        ws::send_text(&mut self.sink, "{\"type\":\"input_audio_buffer.commit\"}").await
     }
 
     async fn keepalive(&mut self) -> Result<(), SendError> {
         // The realtime socket has no short audio-idle close, but a transport WS
         // ping keeps any connection idle timer from firing during a long silent
-        // tail. The recv side ignores the Pong reply.
-        self.sink
-            .send(Message::Ping(Vec::new().into()))
-            .await
-            .map_err(|e| SendError(e.to_string()))
+        // tail.
+        ws::ping(&mut self.sink).await
     }
 
     async fn close(&mut self) -> Result<(), SendError> {
@@ -174,8 +144,7 @@ impl ProviderSink for OpenAiSink {
 }
 
 struct OpenAiStream {
-    stream: WsStream,
-    closed: bool,
+    ws: WsReader,
     /// Delta events are incremental; we accumulate them into the live partial.
     accum: String,
 }
@@ -183,54 +152,42 @@ struct OpenAiStream {
 #[async_trait]
 impl ProviderStream for OpenAiStream {
     async fn recv_event(&mut self) -> Result<Option<SttEvent>, RecvError> {
-        if self.closed {
-            return Ok(None);
-        }
-        loop {
-            let msg = match self.stream.next().await {
-                Some(m) => m,
-                None => {
-                    self.closed = true;
-                    return Ok(None);
-                }
+        while let Some(frame) = self.ws.next_frame().await? {
+            let text = match frame {
+                Frame::Text(text) => text,
+                Frame::Close(reason) => return Ok(Some(ws::closed_event(reason))),
             };
-            let text = match msg {
-                Ok(Message::Text(t)) => t.to_string(),
-                Ok(Message::Close(c)) => {
-                    self.closed = true;
-                    let reason = c.as_ref().map(|f| f.reason.to_string()).unwrap_or_default();
-                    return Ok(Some(SttEvent::Closed(
-                        (!reason.is_empty()).then_some(reason),
-                    )));
-                }
-                Ok(_) => continue,
-                Err(e) => return Err(RecvError(e.to_string())),
-            };
-            match classify_event(&text) {
-                OaEvent::Delta(d) => {
-                    self.accum.push_str(&d);
-                    let trimmed = self.accum.trim();
-                    if !trimmed.is_empty() {
-                        return Ok(Some(SttEvent::Partial(trimmed.to_string())));
-                    }
-                }
-                OaEvent::Completed(t) => {
-                    self.accum.clear();
-                    // One QuickDictate socket carries one utterance. Mark the
-                    // inbound half drained so the generic receiver exits after
-                    // delivering this final instead of waiting for a WS close
-                    // that OpenAI does not send here.
-                    self.closed = true;
-                    let t = t.trim();
-                    if !t.is_empty() {
-                        return Ok(Some(SttEvent::Committed(t.to_string())));
-                    }
-                    return Ok(None);
-                }
-                OaEvent::Created => return Ok(Some(SttEvent::SessionStarted)),
-                OaEvent::Failure(k) => return Ok(Some(SttEvent::KeyFailure(k))),
-                OaEvent::Other => continue,
+            if let Some(answer) = self.apply(classify_event(&text), &text) {
+                return Ok(answer);
             }
+        }
+        Ok(None)
+    }
+}
+
+impl OpenAiStream {
+    /// Fold one classified frame into the stream's state. `Some(answer)` is
+    /// what this `recv_event` call returns; `None` means keep reading.
+    fn apply(&mut self, event: OaEvent, frame: &str) -> Option<Option<SttEvent>> {
+        match event {
+            OaEvent::Delta(d) => {
+                self.accum.push_str(&d);
+                let trimmed = self.accum.trim();
+                (!trimmed.is_empty()).then(|| Some(SttEvent::Partial(trimmed.to_string())))
+            }
+            OaEvent::Completed(t) => {
+                self.accum.clear();
+                // One QuickDictate socket carries one utterance. Mark the
+                // inbound half drained so the generic receiver exits after
+                // delivering this final instead of waiting for a WS close
+                // that OpenAI does not send here.
+                self.ws.finish();
+                let t = t.trim();
+                Some((!t.is_empty()).then(|| SttEvent::Committed(t.to_string())))
+            }
+            OaEvent::Created => Some(Some(SttEvent::SessionStarted)),
+            OaEvent::Failure(kind) => Some(Some(server_error_event("openai", kind, frame))),
+            OaEvent::Other => None,
         }
     }
 }
@@ -240,7 +197,7 @@ enum OaEvent {
     Delta(String),
     Completed(String),
     Created,
-    Failure(crate::keys::FailKind),
+    Failure(FailKind),
     Other,
 }
 
@@ -258,7 +215,6 @@ struct OaError {
     #[serde(rename = "type")]
     err_type: Option<String>,
     code: Option<String>,
-    message: Option<String>,
 }
 
 /// Pure event classifier (fixture-tested). Stateless; delta accumulation is
@@ -284,33 +240,46 @@ fn classify_event(text: &str) -> OaEvent {
         // credited as alive. A second key that would have worked was never
         // tried.
         "conversation.item.input_audio_transcription.failed" | "error" => {
-            OaEvent::Failure(classify_by_substring(&error_text(m.error)))
+            OaEvent::Failure(classify_error(m.error.as_ref()))
         }
         "session.created" => OaEvent::Created,
         _ => OaEvent::Other,
     }
 }
 
-/// Flatten an OpenAI `error` object into the one string
-/// [`classify_by_substring`] reads. Empty when the frame carried no error
-/// object, which classifies as `Transient` -- the right default for a
-/// failure the server would not explain.
-fn error_text(err: Option<OaError>) -> String {
-    err.map(|e| {
-        format!(
-            "{} {} {}",
-            e.err_type.unwrap_or_default(),
-            e.code.unwrap_or_default(),
-            e.message.unwrap_or_default()
-        )
-    })
-    .unwrap_or_default()
+/// What an OpenAI error says about the key, read from its `code` and then its
+/// `type`, never its prose. The generic client-error type is literally
+/// `invalid_request_error`, so the old substring read ("invalid") marked
+/// every key Dead over a request OpenAI merely rejected: an unknown model, an
+/// unsupported language, a commit of under 100 ms of audio. Anything not named
+/// here, or a failure with no error object at all, is the request's or the
+/// server's problem: `Transient`, which surfaces as a provider failure.
+fn classify_error(err: Option<&OaError>) -> FailKind {
+    let Some(err) = err else {
+        return FailKind::Transient;
+    };
+    [err.code.as_deref(), err.err_type.as_deref()]
+        .into_iter()
+        .flatten()
+        .find_map(key_fail_kind)
+        .unwrap_or(FailKind::Transient)
+}
+
+/// The error codes and types that are a verdict on the key itself.
+fn key_fail_kind(code: &str) -> Option<FailKind> {
+    match code {
+        "invalid_api_key" | "account_deactivated" => Some(FailKind::Invalid),
+        "insufficient_quota" | "credit_balance_exhausted" | "billing_hard_limit_reached" => {
+            Some(FailKind::Exhausted)
+        }
+        "rate_limit_exceeded" => Some(FailKind::RateLimit),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keys::FailKind;
 
     #[test]
     fn delta_and_completed() {
@@ -355,6 +324,25 @@ mod tests {
         let e =
             r#"{"type":"conversation.item.input_audio_transcription.failed","item_id":"item_x"}"#;
         assert_eq!(classify_event(e), OaEvent::Failure(FailKind::Transient));
+    }
+
+    #[test]
+    fn a_rejected_request_is_not_a_dead_key() {
+        // The generic client-error type contains "invalid"; only the code
+        // may condemn the key. A model OpenAI does not have, and a commit
+        // with under 100 ms of audio:
+        for e in [
+            r#"{"type":"error","error":{"type":"invalid_request_error","code":"invalid_value","message":"Invalid value: 'gpt-nope'."}}"#,
+            r#"{"type":"error","error":{"type":"invalid_request_error","code":"input_audio_buffer_commit_empty","message":"buffer too small"}}"#,
+        ] {
+            assert_eq!(
+                classify_event(e),
+                OaEvent::Failure(FailKind::Transient),
+                "{e}"
+            );
+        }
+        let rate = r#"{"type":"error","error":{"type":"requests","code":"rate_limit_exceeded","message":"Rate limit reached"}}"#;
+        assert_eq!(classify_event(rate), OaEvent::Failure(FailKind::RateLimit));
     }
 
     fn test_opts(vocab: Vec<&str>) -> SttSessionOpts {

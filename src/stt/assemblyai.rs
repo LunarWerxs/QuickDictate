@@ -7,28 +7,18 @@
 //! with `{"type":"Terminate"}`, after which the server flushes and closes.
 
 use async_trait::async_trait;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use serde::Deserialize;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use super::provider::{
-    i16_slice_as_bytes, AudioFormat, ConnectError, ProviderSession, ProviderSink, ProviderStream,
-    RecvError, SendError, SttEvent, SttProvider, SttSessionOpts,
+    classify_by_substring, server_error_event, AudioFormat, ConnectError, ProviderSession,
+    ProviderSink, ProviderStream, RecvError, SendError, SttEvent, SttProvider, SttSessionOpts,
 };
+use super::ws::{self, WsReader, WsSink};
 
 const WS_URL: &str = "wss://streaming.assemblyai.com/v3/ws";
 /// v3 streaming hard-errors above 100 keyterms per session.
 const MAX_KEYTERMS: usize = 100;
-
-type WsSink = futures_util::stream::SplitSink<
-    WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
-    Message,
->;
-type WsStream =
-    futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>;
 
 pub struct AssemblyAiProvider;
 
@@ -58,24 +48,12 @@ impl SttProvider for AssemblyAiProvider {
         opts: &SttSessionOpts,
     ) -> Result<ProviderSession, ConnectError> {
         // v3 streaming is English-only and takes no language param.
-        let url = build_url(opts);
-        let mut request = url
-            .as_str()
-            .into_client_request()
-            .map_err(|e| ConnectError(format!("ws request: {e}")))?;
-        request.headers_mut().insert(
-            "Authorization",
-            HeaderValue::from_str(key).map_err(|e| ConnectError(format!("bad key header: {e}")))?,
-        );
-        let (ws, _resp) = tokio_tungstenite::connect_async(request)
-            .await
-            .map_err(|e| ConnectError(format!("ws connect failed: {e}")))?;
-        let (sink, stream) = ws.split();
+        let conn = ws::connect(&build_url(opts), "Authorization", key).await?;
+        let (sink, stream) = conn.split();
         Ok(ProviderSession {
             sink: Box::new(AssemblyAiSink { sink }),
             stream: Box::new(AssemblyAiStream {
-                stream,
-                closed: false,
+                ws: WsReader::new(stream),
             }),
         })
     }
@@ -112,29 +90,18 @@ struct AssemblyAiSink {
 #[async_trait]
 impl ProviderSink for AssemblyAiSink {
     async fn send_audio(&mut self, pcm: &[i16]) -> Result<(), SendError> {
-        let bytes = i16_slice_as_bytes(pcm).to_vec();
-        self.sink
-            .send(Message::Binary(bytes.into()))
-            .await
-            .map_err(|e| SendError(e.to_string()))
+        ws::send_pcm(&mut self.sink, pcm).await
     }
 
     async fn commit(&mut self) -> Result<(), SendError> {
         // Terminate flushes the final turn(s) and closes the socket server-side.
-        self.sink
-            .send(Message::Text("{\"type\":\"Terminate\"}".into()))
-            .await
-            .map_err(|e| SendError(e.to_string()))
+        ws::send_text(&mut self.sink, "{\"type\":\"Terminate\"}").await
     }
 
     async fn keepalive(&mut self) -> Result<(), SendError> {
         // No documented no-audio keepalive for the streaming API, so use a
-        // transport-level WS ping: a harmless standard control frame that resets
-        // connection idle timers. The recv side ignores the Pong reply.
-        self.sink
-            .send(Message::Ping(Vec::new().into()))
-            .await
-            .map_err(|e| SendError(e.to_string()))
+        // transport-level WS ping.
+        ws::ping(&mut self.sink).await
     }
 
     async fn close(&mut self) -> Result<(), SendError> {
@@ -144,40 +111,13 @@ impl ProviderSink for AssemblyAiSink {
 }
 
 struct AssemblyAiStream {
-    stream: WsStream,
-    closed: bool,
+    ws: WsReader,
 }
 
 #[async_trait]
 impl ProviderStream for AssemblyAiStream {
     async fn recv_event(&mut self) -> Result<Option<SttEvent>, RecvError> {
-        if self.closed {
-            return Ok(None);
-        }
-        loop {
-            let msg = match self.stream.next().await {
-                Some(m) => m,
-                None => {
-                    self.closed = true;
-                    return Ok(None);
-                }
-            };
-            let text = match msg {
-                Ok(Message::Text(t)) => t.to_string(),
-                Ok(Message::Close(c)) => {
-                    self.closed = true;
-                    let reason = c.as_ref().map(|f| f.reason.to_string()).unwrap_or_default();
-                    return Ok(Some(SttEvent::Closed(
-                        (!reason.is_empty()).then_some(reason),
-                    )));
-                }
-                Ok(_) => continue,
-                Err(e) => return Err(RecvError(e.to_string())),
-            };
-            if let Some(ev) = map_frame(&text) {
-                return Ok(Some(ev));
-            }
-        }
+        self.ws.recv(map_frame).await
     }
 }
 
@@ -208,8 +148,12 @@ fn map_frame(text: &str) -> Option<SttEvent> {
         }
         // Termination is the server ack of our Terminate; nothing to emit.
         "Termination" => None,
-        "Error" => Some(SttEvent::KeyFailure(
-            super::provider::classify_by_substring(text),
+        // Only a verdict on the key rotates it; anything else is the
+        // server's problem and must not end the press.
+        "Error" => Some(server_error_event(
+            "assemblyai",
+            classify_by_substring(text),
+            text,
         )),
         _ => None,
     }
@@ -244,6 +188,18 @@ mod tests {
         assert!(map_frame(r#"{"type":"Turn","transcript":"","end_of_turn":true}"#).is_none());
         assert!(map_frame(r#"{"type":"Termination","audio_duration_seconds":6}"#).is_none());
         assert!(map_frame("not json").is_none());
+    }
+
+    #[test]
+    fn a_server_error_keeps_the_press_alive_but_a_key_error_rotates() {
+        assert!(matches!(
+            map_frame(r#"{"type":"Error","error":"internal server error"}"#),
+            Some(SttEvent::ProviderFailure(m)) if m.starts_with("assemblyai sent")
+        ));
+        assert!(matches!(
+            map_frame(r#"{"type":"Error","error":"401 unauthorized"}"#),
+            Some(SttEvent::KeyFailure(crate::keys::FailKind::Invalid))
+        ));
     }
 
     fn test_opts(vocab: Vec<&str>) -> SttSessionOpts {

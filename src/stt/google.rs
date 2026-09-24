@@ -155,12 +155,26 @@ impl GoogleWorker {
             .await
             .map_err(|e| classify_by_substring(&e.to_string()))?;
         if !status.is_success() {
-            return Err(classify_by_substring(&format!(
-                "HTTP {} {text}",
-                status.as_u16()
-            )));
+            return Err(classify_http_failure(i64::from(status.as_u16()), &text));
         }
         parse_transcript(&text)
+    }
+
+    /// One segment's outcome for `run`: the event to hold until Finish (if
+    /// any), and whether the key is dead so later segments are skipped.
+    async fn segment_outcome(&self, pcm: &[i16]) -> (Option<SttEvent>, bool) {
+        match self.recognize_with_retry(pcm).await {
+            Ok(Some(text)) => (Some(SttEvent::Committed(text)), false),
+            Ok(None) => (None, false),
+            Err(kind) => {
+                // A bad key or exhausted quota poisons every later segment
+                // too, so stop draining and bench the key. A transient blip
+                // or rate-limit on one segment must not do either -- surface
+                // it and keep going.
+                let (event, stop) = segment_failure_event(kind);
+                (Some(event), stop)
+            }
+        }
     }
 
     /// `recognize`, retried up to `MAX_RETRIES` extra times with exponential
@@ -188,19 +202,9 @@ impl GoogleWorker {
                     if failed {
                         continue;
                     }
-                    match self.recognize_with_retry(&pcm).await {
-                        Ok(Some(text)) => pending_events.push(SttEvent::Committed(text)),
-                        Ok(None) => {}
-                        Err(kind) => {
-                            // A bad key or exhausted quota poisons every later
-                            // segment too, so stop draining and bench the key.
-                            // A transient blip or rate-limit on one segment
-                            // must not do either -- surface it and keep going.
-                            let (event, stop) = segment_failure_event(kind);
-                            pending_events.push(event);
-                            failed = stop;
-                        }
-                    }
+                    let (event, stop) = self.segment_outcome(&pcm).await;
+                    pending_events.extend(event);
+                    failed = stop;
                 }
                 GoogleCommand::Finish(done) => {
                     for event in pending_events {
@@ -406,17 +410,35 @@ struct GError {
     status: Option<String>,
 }
 
+/// What a failed `speech:recognize` says about the key, from its HTTP status
+/// and body. Google answers a malformed request (a language or model it does
+/// not know) with 400 `INVALID_ARGUMENT`, and the "invalid" in that marked a
+/// good key Dead for six hours over a setting. But Google ALSO reports a bad
+/// key as a 400 ("API key not valid", reason `API_KEY_INVALID`), so a 400
+/// condemns the key only when it names the key; any other 400 is
+/// `Transient`, which surfaces as a provider failure. Every other status
+/// keeps the substring read (403 key, 429 quota).
+fn classify_http_failure(status: i64, body: &str) -> FailKind {
+    let names_the_key = body.to_ascii_lowercase().contains("api key") || body.contains("API_KEY");
+    if status == 400 && !names_the_key {
+        return FailKind::Transient;
+    }
+    classify_by_substring(&format!("HTTP {status} {body}"))
+}
+
 /// Pure body parser (fixture-tested): concatenated transcript, `None` if empty,
 /// or a `FailKind` if the body carried an API error object.
 fn parse_transcript(body: &str) -> Result<Option<String>, FailKind> {
     let parsed: GResp = serde_json::from_str(body).map_err(|_| FailKind::Transient)?;
     if let Some(err) = parsed.error {
-        return Err(classify_by_substring(&format!(
-            "{} {} {}",
+        return Err(classify_http_failure(
             err.code.unwrap_or(0),
-            err.status.unwrap_or_default(),
-            err.message.unwrap_or_default()
-        )));
+            &format!(
+                "{} {}",
+                err.status.unwrap_or_default(),
+                err.message.unwrap_or_default()
+            ),
+        ));
     }
     let transcript = parsed
         .results
@@ -463,6 +485,25 @@ mod tests {
         let quota =
             r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"Quota exceeded"}}"#;
         assert!(matches!(parse_transcript(quota), Err(FailKind::Exhausted)));
+    }
+
+    #[test]
+    fn a_bad_request_is_not_a_dead_key_but_a_bad_key_still_is() {
+        let bad_language = r#"{"error":{"code":400,"message":"Invalid recognition 'config': bad language code.","status":"INVALID_ARGUMENT"}}"#;
+        assert_eq!(
+            classify_http_failure(400, bad_language),
+            FailKind::Transient
+        );
+        assert!(matches!(
+            parse_transcript(bad_language),
+            Err(FailKind::Transient)
+        ));
+        let bad_key = r#"{"error":{"code":400,"message":"API key not valid. Please pass a valid API key.","status":"INVALID_ARGUMENT","details":[{"reason":"API_KEY_INVALID"}]}}"#;
+        assert_eq!(classify_http_failure(400, bad_key), FailKind::Invalid);
+        assert_eq!(
+            classify_http_failure(429, r#"{"error":{"status":"RESOURCE_EXHAUSTED"}}"#),
+            FailKind::RateLimit
+        );
     }
 
     #[test]
