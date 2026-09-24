@@ -490,3 +490,59 @@ fn avatar_decoding_refuses_garbage_and_oversized_canvases() {
     assert!(decode_avatar(b"not an image").is_none());
     assert!(decode_avatar(&png(MAX_AVATAR_DIMENSION + 1, 1)).is_none());
 }
+
+// ---- Deleting through a merge-patch push ----------------------------------
+
+#[test]
+fn a_replacement_removed_here_is_deleted_in_the_cloud_not_kept() {
+    use serde_json::json;
+    let remote = json!({
+        "text_replacements": { "Github": "GitHub", "super bass": "Supabase" },
+        "mode": "toggle",
+        "usage_stats": { "devices": { "other-pc": { "words": 5 } } },
+    });
+    // This machine removed "super bass" and pushes its full snapshot.
+    let mut local = json!({
+        "text_replacements": { "Github": "GitHub" },
+        "mode": "hold",
+        "usage_stats": { "devices": { "this-pc": { "words": 1 } } },
+    });
+    super::schema::with_deletions(&mut local, &remote);
+    assert_eq!(
+        local["text_replacements"]["super bass"],
+        serde_json::Value::Null
+    );
+    assert_eq!(local["text_replacements"]["Github"], json!("GitHub"));
+    assert_eq!(local["mode"], json!("hold"));
+    // The stats object is merged elsewhere, never nulled out here.
+    assert!(local["usage_stats"]["devices"].get("other-pc").is_none());
+}
+
+#[test]
+fn a_stats_only_push_never_deletes_preferences_it_did_not_carry() {
+    use serde_json::json;
+    let remote = json!({
+        "text_replacements": { "Github": "GitHub" },
+        "mode": "toggle",
+    });
+    let mut local = json!({ "usage_stats": {} });
+    super::schema::with_deletions(&mut local, &remote);
+    assert_eq!(local, json!({ "usage_stats": {} }));
+}
+
+#[test]
+fn every_push_answer_maps_to_one_step() {
+    use super::store::{push_step, PushStep};
+    use serde_json::json;
+    assert_eq!(
+        push_step(200, &json!({ "version": 9 }), 3),
+        PushStep::Saved(9)
+    );
+    // A 2xx that names no version still moves the base on by one.
+    assert_eq!(push_step(201, &json!({}), 3), PushStep::Saved(4));
+    assert_eq!(push_step(409, &json!({}), 3), PushStep::Conflict);
+    assert_eq!(push_step(429, &json!({}), 3), PushStep::RateLimited);
+    assert_eq!(push_step(413, &json!({}), 3), PushStep::TooLarge);
+    assert_eq!(push_step(500, &json!({}), 3), PushStep::Failed);
+    assert_eq!(push_step(401, &json!({}), 3), PushStep::Failed);
+}

@@ -178,6 +178,43 @@ pub(super) fn stats_to_synced(stats: &UsageStats) -> Value {
     Value::Object(out)
 }
 
+/// Make a push delete what this machine removed. The store merges pushes as
+/// RFC 7386 JSON Merge Patch, deep: a key a nested object leaves out is KEPT
+/// on the server, and only an explicit `null` deletes it. So without this, a
+/// text replacement removed here stayed in the cloud and came back on the next
+/// pull. For every object-valued key `local` carries (text_replacements
+/// today), each key `remote` holds under it that `local` no longer does gets a
+/// `null`, recursively. Top-level keys `local` omits are left alone on
+/// purpose: a stats-only push omits every preference, and must not wipe them.
+/// The stats object is exempt too; `merge_stats` already unions it.
+pub(super) fn with_deletions(local: &mut Value, remote: &Value) {
+    let (Some(local), Some(remote)) = (local.as_object_mut(), remote.as_object()) else {
+        return;
+    };
+    for (key, value) in local.iter_mut() {
+        if key == STATS_KEY {
+            continue;
+        }
+        if let Some(theirs) = remote.get(key) {
+            null_out_removed(value, theirs);
+        }
+    }
+}
+
+fn null_out_removed(ours: &mut Value, theirs: &Value) {
+    let (Some(ours), Some(theirs)) = (ours.as_object_mut(), theirs.as_object()) else {
+        return;
+    };
+    for (key, their_value) in theirs {
+        match ours.get_mut(key) {
+            Some(our_value) => null_out_removed(our_value, their_value),
+            None => {
+                ours.insert(key.clone(), Value::Null);
+            }
+        }
+    }
+}
+
 pub fn synced_stats(remote: &Value) -> Option<&Value> {
     remote.as_object()?.get(STATS_KEY)
 }

@@ -220,6 +220,7 @@ pub fn push_now(mut local_snapshot: Value) -> Result<u64> {
     persist_rotated(&creds, &tokens);
     let remote = store_pull(&tokens.access_token)?;
     merge_stats(&mut local_snapshot, &remote.settings);
+    schema::with_deletions(&mut local_snapshot, &remote.settings);
     store_push(&tokens.access_token, &local_snapshot, remote.version)
 }
 
