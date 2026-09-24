@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-09-24
+
+A maintenance release with no change to how the app behaves.
+
+### Changed
+
+- **Model downloads run on the same code, reorganized.** The parallel and single-stream download
+  steps for local models shared one long list of arguments across seven functions; they now share
+  one download description instead. Downloads, resume after a failed range, cancellation and the
+  SHA-256 check behave exactly as before.
+- The last Architect warnings are resolved: four groups of look-alike tests became table-driven
+  tests (every case is still checked), and the five remaining look-alike code blocks each carry a
+  note saying why they are left as they are.
+
 ## [1.2.1] - 2026-09-24
 
 ### Fixed
