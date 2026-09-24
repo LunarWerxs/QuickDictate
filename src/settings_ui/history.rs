@@ -42,39 +42,41 @@ fn history_row(ui: &mut egui::Ui, entry: &HistoryEntry, is_selected: bool) -> Ro
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 let mut on = is_selected;
-                if blue_check_box(ui, &mut on).changed() {
-                    action.toggle = true;
-                }
-                let preview = truncate_preview(&entry.text.replace('\n', " "), PREVIEW_CHARS);
-                // The row is its own label: clicking the text ticks it, the
-                // same as the box.
-                if ui
-                    .add(
-                        egui::Label::new(RichText::new(preview).color(text()))
-                            .sense(egui::Sense::click()),
-                    )
-                    .on_hover_text(entry.text.clone())
-                    .clicked()
-                {
-                    action.toggle = true;
-                }
+                let box_clicked = blue_check_box(ui, &mut on).changed();
+                let text_clicked = history_row_label(ui, entry);
+                action.toggle = box_clicked || text_clicked;
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if icon_button(ui, paste_glyph())
-                        .on_hover_text("Paste again into whatever is focused")
-                        .clicked()
-                    {
-                        action.replay = true;
-                    }
-                    if icon_button(ui, copy_glyph())
-                        .on_hover_text("Copy to the clipboard")
-                        .clicked()
-                    {
-                        action.copy = true;
-                    }
+                    history_row_buttons(ui, &mut action);
                 });
             });
         });
     action
+}
+
+/// A row's one-line preview, with the full text on hover. The row is its own
+/// label: clicking the text ticks it, the same as the box. Returns whether it
+/// was clicked.
+fn history_row_label(ui: &mut egui::Ui, entry: &HistoryEntry) -> bool {
+    let preview = truncate_preview(&entry.text.replace('\n', " "), PREVIEW_CHARS);
+    ui.add(egui::Label::new(RichText::new(preview).color(text())).sense(egui::Sense::click()))
+        .on_hover_text(entry.text.clone())
+        .clicked()
+}
+
+/// A row's paste-again and copy icons, right-aligned (paste outermost).
+fn history_row_buttons(ui: &mut egui::Ui, action: &mut RowAction) {
+    if icon_button(ui, paste_glyph())
+        .on_hover_text("Paste again into whatever is focused")
+        .clicked()
+    {
+        action.replay = true;
+    }
+    if icon_button(ui, copy_glyph())
+        .on_hover_text("Copy to the clipboard")
+        .clicked()
+    {
+        action.copy = true;
+    }
 }
 
 /// The line under the card title, which has to say whether the history the

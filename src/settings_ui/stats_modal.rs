@@ -1,7 +1,7 @@
 //! The usage-stats modal: the tiles, the per-provider breakdown, the chart
 //! caption, and the reset-everything confirm inside it.
 
-use super::modals::{ModalAction, ModalOutcome};
+use super::modals::{modal_footer_rule, ModalAction, ModalOutcome};
 use super::*;
 
 /// "No dictations yet" placeholder, shown for a range that's had none.
@@ -157,33 +157,24 @@ fn render_stats_reset_confirm_box(
     out: &mut ModalOutcome,
 ) {
     ui.add_space(12.0);
-    egui::Frame::new()
-        .fill(bad().gamma_multiply(0.09))
-        .stroke(Stroke::new(1.0, bad().gamma_multiply(0.45)))
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin::symmetric(10, 8))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("Reset all stats? This also resets synced devices.")
-                        .size(11.5)
-                        .color(text()),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .button(RichText::new("Reset").font(semibold(11.5)).color(bad()))
-                        .clicked()
-                    {
-                        out.reset_stats = true;
-                        *stats_reset_confirm = false;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        *stats_reset_confirm = false;
-                    }
-                });
+    danger_box(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Reset all stats? This also resets synced devices.")
+                    .size(11.5)
+                    .color(text()),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if danger_button(ui, "Reset").clicked() {
+                    out.reset_stats = true;
+                    *stats_reset_confirm = false;
+                }
+                if ui.button("Cancel").clicked() {
+                    *stats_reset_confirm = false;
+                }
             });
         });
+    });
 }
 
 /// The trailing "Reset stats \u{2014} privacy note \u{2014} Done" row.
@@ -192,19 +183,9 @@ fn render_stats_footer_row(
     stats_reset_confirm: &mut bool,
     out: &mut ModalOutcome,
 ) {
-    ui.add_space(12.0);
-    ui.separator();
-    ui.add_space(6.0);
+    modal_footer_rule(ui);
     ui.horizontal(|ui| {
-        if !*stats_reset_confirm
-            && ui
-                .button(
-                    RichText::new("Reset stats")
-                        .font(semibold(11.5))
-                        .color(bad()),
-                )
-                .clicked()
-        {
+        if !*stats_reset_confirm && danger_button(ui, "Reset stats").clicked() {
             *stats_reset_confirm = true;
         }
         ui.label(

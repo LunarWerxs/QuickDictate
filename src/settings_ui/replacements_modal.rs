@@ -1,7 +1,7 @@
 //! The text-replacements modal: the table, its bulk text editor, and the
 //! toggle that converts between them.
 
-use super::modals::{ModalAction, ModalOutcome};
+use super::modals::{done_cancel_buttons, modal_footer_rule, ModalAction, ModalOutcome};
 use super::*;
 
 /// The header row: the hint label plus the table/text-editor toggle button,
@@ -96,19 +96,8 @@ fn render_replacements_table(ui: &mut egui::Ui, state: &mut ReplacementsModalSta
 
 /// The trailing Done / Cancel row.
 fn render_replacements_actions_row(ui: &mut egui::Ui, out: &mut ModalOutcome) {
-    ui.add_space(12.0);
-    ui.separator();
-    ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if accent_button(ui, "Done").clicked() {
-                out.action = ModalAction::Commit;
-            }
-            if ui.button("Cancel").clicked() {
-                out.action = ModalAction::Cancel;
-            }
-        });
-    });
+    modal_footer_rule(ui);
+    ui.horizontal(|ui| done_cancel_buttons(ui, out));
 }
 
 /// The text-replacements modal: the table/text-editor toggle, the row

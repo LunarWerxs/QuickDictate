@@ -15,13 +15,36 @@ fn local_model_status_controls(
     spec: &crate::local_stt::ModelSpec,
     snapshot: &crate::local_stt::InstallSnapshot,
 ) {
-    use crate::local_stt::InstallPhase;
-    match &snapshot.phase {
-        InstallPhase::Installed | InstallPhase::NotInstalled | InstallPhase::Failed(_) => {
-            render_model_action_button(status, ui, spec, &snapshot.phase);
-        }
-        _ => render_model_progress_controls(status, ui, spec, snapshot),
+    if install_idle(&snapshot.phase) {
+        render_model_action_button(status, ui, spec, &snapshot.phase);
+    } else {
+        render_model_progress_controls(status, ui, spec, snapshot);
     }
+}
+
+/// Whether a model row is waiting for a click (Install / Delete) rather than
+/// busy showing progress. "Failed" counts as idle so the user can retry.
+fn install_idle(phase: &crate::local_stt::InstallPhase) -> bool {
+    use crate::local_stt::InstallPhase;
+    matches!(
+        phase,
+        InstallPhase::Installed | InstallPhase::NotInstalled | InstallPhase::Failed(_)
+    )
+}
+
+/// Surface a model action's error in the status line; success needs no note,
+/// since the row's own progress shows it.
+fn report_model_error(status: &mut String, result: Result<(), String>) {
+    if let Err(e) = result {
+        *status = e;
+    }
+}
+
+/// How many tested keys passed and how many failed, for the chip row under
+/// the provider card.
+fn verdict_counts(verdicts: &[(String, bool)]) -> (usize, usize) {
+    let ok = verdicts.iter().filter(|(_, ok)| *ok).count();
+    (ok, verdicts.len() - ok)
 }
 
 /// The idle half of [`local_model_status_controls`]: a single clickable
@@ -41,15 +64,50 @@ fn render_model_action_button(
             )
             .clicked()
         {
-            if let Err(e) = crate::local_stt::start_remove(spec.id) {
-                *status = e;
-            }
+            report_model_error(status, crate::local_stt::start_remove(spec.id));
         }
     } else if accent_button(ui, "Install").clicked() {
-        if let Err(e) = crate::local_stt::start_install(spec.id) {
-            *status = e;
-        }
+        report_model_error(status, crate::local_stt::start_install(spec.id));
     }
+}
+
+/// Whether a busy phase can still be cancelled: anything before the model is
+/// in place. Cancelling and removing are already on their way out.
+fn install_cancellable(phase: &crate::local_stt::InstallPhase) -> bool {
+    use crate::local_stt::InstallPhase;
+    matches!(
+        phase,
+        InstallPhase::DownloadingRuntime
+            | InstallPhase::DownloadingModel
+            | InstallPhase::InstallingRuntime
+            | InstallPhase::VerifyingDownload
+    )
+}
+
+/// The progress text beside a busy model row's spinner: a percentage while
+/// downloading, a word for the phases with nothing to count. `None` for the
+/// idle phases, which show a button instead.
+fn install_progress_label(snapshot: &crate::local_stt::InstallSnapshot) -> Option<String> {
+    use crate::local_stt::InstallPhase;
+    let label = match &snapshot.phase {
+        InstallPhase::DownloadingRuntime | InstallPhase::DownloadingModel => {
+            // A total of 0 (size not known yet) reads as 0%, not a panic.
+            let pct = snapshot
+                .downloaded
+                .saturating_mul(100)
+                .checked_div(snapshot.total)
+                .unwrap_or(0);
+            return Some(format!("{pct}%"));
+        }
+        InstallPhase::VerifyingDownload => "verifying\u{2026}",
+        InstallPhase::InstallingRuntime => "installing runtime\u{2026}",
+        InstallPhase::Cancelling => "cancelling\u{2026}",
+        InstallPhase::Removing => "removing\u{2026}",
+        InstallPhase::Installed | InstallPhase::NotInstalled | InstallPhase::Failed(_) => {
+            return None;
+        }
+    };
+    Some(label.to_string())
 }
 
 /// The busy half of [`local_model_status_controls`]: a spinner plus whatever
@@ -60,47 +118,11 @@ fn render_model_progress_controls(
     spec: &crate::local_stt::ModelSpec,
     snapshot: &crate::local_stt::InstallSnapshot,
 ) {
-    use crate::local_stt::InstallPhase;
-    match &snapshot.phase {
-        InstallPhase::DownloadingRuntime | InstallPhase::DownloadingModel => {
-            if ui.button("Cancel").clicked() {
-                if let Err(e) = crate::local_stt::cancel_install(spec.id) {
-                    *status = e;
-                }
-            }
-            let pct = snapshot
-                .downloaded
-                .saturating_mul(100)
-                .checked_div(snapshot.total)
-                .unwrap_or(0);
-            ui.label(RichText::new(format!("{pct}%")).size(12.0).color(muted()));
-        }
-        InstallPhase::InstallingRuntime | InstallPhase::VerifyingDownload => {
-            if ui.button("Cancel").clicked() {
-                if let Err(e) = crate::local_stt::cancel_install(spec.id) {
-                    *status = e;
-                }
-            }
-            let label = if matches!(snapshot.phase, InstallPhase::VerifyingDownload) {
-                "verifying\u{2026}"
-            } else {
-                "installing runtime\u{2026}"
-            };
-            ui.label(RichText::new(label).size(12.0).color(muted()));
-        }
-        InstallPhase::Cancelling => {
-            ui.label(
-                RichText::new("cancelling\u{2026}")
-                    .size(12.0)
-                    .color(muted()),
-            );
-        }
-        InstallPhase::Removing => {
-            ui.label(RichText::new("removing\u{2026}").size(12.0).color(muted()));
-        }
-        InstallPhase::Installed | InstallPhase::NotInstalled | InstallPhase::Failed(_) => {
-            // Handled by `render_model_action_button`; unreachable here.
-        }
+    if install_cancellable(&snapshot.phase) && ui.button("Cancel").clicked() {
+        report_model_error(status, crate::local_stt::cancel_install(spec.id));
+    }
+    if let Some(label) = install_progress_label(snapshot) {
+        ui.label(RichText::new(label).size(12.0).color(muted()));
     }
     ui.add(egui::Spinner::new().size(14.0));
 }
@@ -169,22 +191,27 @@ impl super::SettingsApp {
                      API keys with Manage keys.",
                 );
             if self.draft.stt_provider != "local" {
-                if accent_button(ui, "Manage keys\u{2026}")
-                    .on_hover_text("Add, remove, or paste API keys for the selected provider.")
-                    .clicked()
-                {
-                    self.open_keys_modal(KEYS_TARGET_PROVIDER);
-                }
-                if ui
-                    .add_enabled(!testing, egui::Button::new("Test all keys"))
-                    .on_hover_text("Check every saved key for this provider against its live API.")
-                    .clicked()
-                {
-                    let keys = self.active_keys();
-                    self.start_key_test(ctx, keys);
-                }
+                self.provider_key_buttons(ui, ctx, testing);
             }
         });
+    }
+
+    /// "Manage keys…" and "Test all keys" for the selected cloud provider.
+    fn provider_key_buttons(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, testing: bool) {
+        if accent_button(ui, "Manage keys\u{2026}")
+            .on_hover_text("Add, remove, or paste API keys for the selected provider.")
+            .clicked()
+        {
+            self.open_keys_modal(KEYS_TARGET_PROVIDER);
+        }
+        if ui
+            .add_enabled(!testing, egui::Button::new("Test all keys"))
+            .on_hover_text("Check every saved key for this provider against its live API.")
+            .clicked()
+        {
+            let keys = self.active_keys();
+            self.start_key_test(ctx, keys);
+        }
     }
 
     /// The Local-provider block: the offline explainer, the active-model
@@ -202,6 +229,20 @@ impl super::SettingsApp {
             .color(muted()),
         );
         ui.add_space(7.0);
+        self.active_model_picker(ui);
+        ui.add_space(7.0);
+        for spec in crate::local_stt::MODELS {
+            let snapshot = crate::local_stt::install_snapshot(spec.id);
+            if snapshot.busy() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            self.local_model_row(ui, &spec, &snapshot);
+            ui.add_space(4.0);
+        }
+    }
+
+    /// The "Active model" dropdown over every local model.
+    fn active_model_picker(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label("Active model");
             egui::ComboBox::from_id_salt("local_model")
@@ -222,43 +263,45 @@ impl super::SettingsApp {
                     }
                 });
         });
-        ui.add_space(7.0);
-        for spec in crate::local_stt::MODELS {
-            let snapshot = crate::local_stt::install_snapshot(spec.id);
-            if snapshot.busy() {
-                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+
+    /// One local model: selected chip or "Use", its name and detail, its
+    /// install controls on the right, and the failure reason under it if the
+    /// last install failed.
+    fn local_model_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        spec: &crate::local_stt::ModelSpec,
+        snapshot: &crate::local_stt::InstallSnapshot,
+    ) {
+        ui.horizontal(|ui| {
+            let selected = self.draft.local_model == spec.id;
+            if selected {
+                chip(ui, "selected", accent());
+            } else if ui.small_button("Use").clicked() {
+                self.draft.local_model = spec.id.to_string();
             }
-            ui.horizontal(|ui| {
-                let selected = self.draft.local_model == spec.id;
-                if selected {
-                    chip(ui, "selected", accent());
-                } else if ui.small_button("Use").clicked() {
-                    self.draft.local_model = spec.id.to_string();
-                }
-                ui.vertical(|ui| {
-                    ui.label(RichText::new(spec.label).color(text()));
-                    ui.label(RichText::new(spec.detail).size(11.5).color(muted()));
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    local_model_status_controls(&mut self.status, ui, &spec, &snapshot);
-                });
+            ui.vertical(|ui| {
+                ui.label(RichText::new(spec.label).color(text()));
+                ui.label(RichText::new(spec.detail).size(11.5).color(muted()));
             });
-            if let crate::local_stt::InstallPhase::Failed(message) = &snapshot.phase {
-                ui.label(
-                    RichText::new(format!("Install problem: {message}"))
-                        .size(11.5)
-                        .color(bad()),
-                );
-            }
-            ui.add_space(4.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                local_model_status_controls(&mut self.status, ui, spec, snapshot);
+            });
+        });
+        if let crate::local_stt::InstallPhase::Failed(message) = &snapshot.phase {
+            ui.label(
+                RichText::new(format!("Install problem: {message}"))
+                    .size(11.5)
+                    .color(bad()),
+            );
         }
     }
 
     /// The trailing "N working / N failing / testing…" chip row, shown once
     /// there's something to report.
     fn key_test_status_row(&self, ui: &mut egui::Ui, testing: bool) {
-        let ok_count = self.verdicts.iter().filter(|(_, ok)| *ok).count();
-        let fail_count = self.verdicts.iter().filter(|(_, ok)| !*ok).count();
+        let (ok_count, fail_count) = verdict_counts(&self.verdicts);
         if ok_count == 0 && fail_count == 0 && !testing {
             return;
         }
@@ -275,5 +318,91 @@ impl super::SettingsApp {
                 ui.label(RichText::new("testing\u{2026}").color(muted()));
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::local_stt::{InstallPhase, InstallSnapshot};
+
+    fn snapshot(phase: InstallPhase, downloaded: u64, total: u64) -> InstallSnapshot {
+        InstallSnapshot {
+            phase,
+            downloaded,
+            total,
+        }
+    }
+
+    #[test]
+    fn idle_phases_offer_a_button_and_busy_ones_do_not() {
+        assert!(install_idle(&InstallPhase::NotInstalled));
+        assert!(install_idle(&InstallPhase::Installed));
+        // A failed install must stay clickable, or there is no way to retry.
+        assert!(install_idle(&InstallPhase::Failed("disk full".into())));
+        assert!(!install_idle(&InstallPhase::DownloadingModel));
+        assert!(!install_idle(&InstallPhase::Removing));
+    }
+
+    #[test]
+    fn only_phases_before_the_model_lands_can_be_cancelled() {
+        for phase in [
+            InstallPhase::DownloadingRuntime,
+            InstallPhase::InstallingRuntime,
+            InstallPhase::DownloadingModel,
+            InstallPhase::VerifyingDownload,
+        ] {
+            assert!(install_cancellable(&phase), "{phase:?}");
+        }
+        for phase in [
+            InstallPhase::Cancelling,
+            InstallPhase::Removing,
+            InstallPhase::Installed,
+            InstallPhase::NotInstalled,
+        ] {
+            assert!(!install_cancellable(&phase), "{phase:?}");
+        }
+    }
+
+    #[test]
+    fn download_progress_is_a_percentage_and_survives_an_unknown_total() {
+        let label = |d, t| install_progress_label(&snapshot(InstallPhase::DownloadingModel, d, t));
+        assert_eq!(label(50, 200).as_deref(), Some("25%"));
+        assert_eq!(label(200, 200).as_deref(), Some("100%"));
+        // Size not reported yet: 0%, not a division by zero.
+        assert_eq!(label(1234, 0).as_deref(), Some("0%"));
+    }
+
+    #[test]
+    fn phases_without_a_count_get_a_word_and_idle_ones_get_nothing() {
+        let label = |phase| install_progress_label(&snapshot(phase, 0, 0));
+        assert_eq!(
+            label(InstallPhase::VerifyingDownload).as_deref(),
+            Some("verifying\u{2026}")
+        );
+        assert_eq!(
+            label(InstallPhase::InstallingRuntime).as_deref(),
+            Some("installing runtime\u{2026}")
+        );
+        assert_eq!(
+            label(InstallPhase::Cancelling).as_deref(),
+            Some("cancelling\u{2026}")
+        );
+        assert_eq!(
+            label(InstallPhase::Removing).as_deref(),
+            Some("removing\u{2026}")
+        );
+        assert_eq!(label(InstallPhase::Installed), None);
+    }
+
+    #[test]
+    fn verdict_counts_split_passes_from_failures() {
+        assert_eq!(verdict_counts(&[]), (0, 0));
+        let verdicts = [
+            ("a".to_string(), true),
+            ("b".to_string(), false),
+            ("c".to_string(), true),
+        ];
+        assert_eq!(verdict_counts(&verdicts), (2, 1));
     }
 }

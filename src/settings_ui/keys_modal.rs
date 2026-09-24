@@ -1,7 +1,7 @@
 //! The API-key manager modal: the row list, the add row, the bulk paste
 //! editor, and the actions that commit them.
 
-use super::modals::{ModalAction, ModalOutcome};
+use super::modals::{done_cancel_buttons, modal_footer_rule, ModalAction, ModalOutcome};
 use super::*;
 
 /// The scrollable key list: one row per saved key, its mask, its test
@@ -59,21 +59,7 @@ fn render_key_add_row(ui: &mut egui::Ui, state: &mut KeysModalState) {
         let submitted = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         let add = ui.button("Add").clicked() || submitted;
         if add && !state.add_text.trim().is_empty() {
-            match merge_key_lines(&mut state.rows, &state.add_text) {
-                Ok(summary) => {
-                    state.bulk_error = false;
-                    state.bulk_note = if summary.added == 0 {
-                        "That key is already in the list.".into()
-                    } else {
-                        "Key added.".into()
-                    };
-                    state.add_text.clear();
-                }
-                Err(_) => {
-                    state.bulk_error = true;
-                    state.bulk_note = "A key cannot contain spaces or control characters.".into();
-                }
-            }
+            add_single_key(state);
         }
         if ui.button("Bulk add").clicked() {
             state.bulk = !state.bulk;
@@ -81,6 +67,81 @@ fn render_key_add_row(ui: &mut egui::Ui, state: &mut KeysModalState) {
             state.bulk_error = false;
         }
     });
+}
+
+/// Merge the add row's one pasted key into the list, noting the result under
+/// it; the field is cleared only when the key was accepted.
+fn add_single_key(state: &mut KeysModalState) {
+    match merge_key_lines(&mut state.rows, &state.add_text) {
+        Ok(summary) => {
+            state.bulk_error = false;
+            state.bulk_note = single_key_note(&summary).into();
+            state.add_text.clear();
+        }
+        Err(_) => {
+            state.bulk_error = true;
+            state.bulk_note = "A key cannot contain spaces or control characters.".into();
+        }
+    }
+}
+
+/// The note under the add row once one key has been merged.
+fn single_key_note(summary: &KeyMergeSummary) -> &'static str {
+    if summary.added == 0 {
+        "That key is already in the list."
+    } else {
+        "Key added."
+    }
+}
+
+/// The note once a bulk paste has been merged. Counts only, never a key.
+fn bulk_import_note(summary: &KeyMergeSummary) -> String {
+    format!(
+        "{} added \u{00b7} {} duplicate{} skipped",
+        summary.added,
+        summary.duplicates,
+        if summary.duplicates == 1 { "" } else { "s" }
+    )
+}
+
+/// The note when a bulk paste was refused. It names the offending line
+/// numbers, never their contents, so a malformed secret is not echoed back.
+fn bulk_rejected_note(lines: &[usize]) -> String {
+    format!(
+        "Nothing imported \u{2014} whitespace/control characters on line{} {}.",
+        if lines.len() == 1 { "" } else { "s" },
+        lines
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// Leave the bulk editor without importing anything: its Cancel button, and
+/// Escape or the backdrop while it is open.
+fn close_bulk_editor(state: &mut KeysModalState) {
+    state.bulk = false;
+    state.bulk_text.clear();
+    state.bulk_note.clear();
+}
+
+/// The bulk editor's Save: merge every pasted line and, if all of them were
+/// valid, close the editor and save at once. Nothing is merged otherwise.
+fn save_bulk_keys(state: &mut KeysModalState, out: &mut ModalOutcome) {
+    match merge_key_lines(&mut state.rows, &state.bulk_text) {
+        Ok(summary) => {
+            state.bulk_error = false;
+            state.bulk_note = bulk_import_note(&summary);
+            state.bulk_text.clear();
+            state.bulk = false;
+            out.action = ModalAction::CommitAndSave;
+        }
+        Err(lines) => {
+            state.bulk_error = true;
+            state.bulk_note = bulk_rejected_note(&lines);
+        }
+    }
 }
 
 /// The "paste many keys at once" text-editor frame, shown while
@@ -113,37 +174,10 @@ fn render_key_bulk_editor(ui: &mut egui::Ui, state: &mut KeysModalState, out: &m
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             if ui.button("Cancel").clicked() {
-                state.bulk = false;
-                state.bulk_text.clear();
-                state.bulk_note.clear();
+                close_bulk_editor(state);
             }
             if accent_button(ui, "Save").clicked() {
-                match merge_key_lines(&mut state.rows, &state.bulk_text) {
-                    Ok(summary) => {
-                        state.bulk_error = false;
-                        state.bulk_note = format!(
-                            "{} added \u{00b7} {} duplicate{} skipped",
-                            summary.added,
-                            summary.duplicates,
-                            if summary.duplicates == 1 { "" } else { "s" }
-                        );
-                        state.bulk_text.clear();
-                        state.bulk = false;
-                        out.action = ModalAction::CommitAndSave;
-                    }
-                    Err(lines) => {
-                        state.bulk_error = true;
-                        state.bulk_note = format!(
-                            "Nothing imported \u{2014} whitespace/control characters on line{} {}.",
-                            if lines.len() == 1 { "" } else { "s" },
-                            lines
-                                .iter()
-                                .map(usize::to_string)
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        );
-                    }
-                }
+                save_bulk_keys(state, out);
             }
         });
     });
@@ -155,21 +189,12 @@ fn render_key_actions_row(ui: &mut egui::Ui, state: &KeysModalState, out: &mut M
     if state.bulk {
         return;
     }
-    ui.add_space(12.0);
-    ui.separator();
-    ui.add_space(6.0);
+    modal_footer_rule(ui);
     ui.horizontal(|ui| {
         if accent_button(ui, "Test all").clicked() {
             out.test_request = Some(state.rows.iter().map(|r| r.value.clone()).collect());
         }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if accent_button(ui, "Done").clicked() {
-                out.action = ModalAction::Commit;
-            }
-            if ui.button("Cancel").clicked() {
-                out.action = ModalAction::Cancel;
-            }
-        });
+        done_cancel_buttons(ui, out);
     });
 }
 
@@ -206,11 +231,59 @@ pub(super) fn render_keys_modal(
     });
     if backdrop || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         if state.bulk {
-            state.bulk = false;
-            state.bulk_text.clear();
-            state.bulk_note.clear();
+            close_bulk_editor(state);
         } else {
             out.action = ModalAction::Cancel;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_key_note_tells_a_duplicate_from_a_new_key() {
+        let added = KeyMergeSummary {
+            added: 1,
+            duplicates: 0,
+        };
+        let duplicate = KeyMergeSummary {
+            added: 0,
+            duplicates: 1,
+        };
+        assert_eq!(single_key_note(&added), "Key added.");
+        assert_eq!(
+            single_key_note(&duplicate),
+            "That key is already in the list."
+        );
+    }
+
+    #[test]
+    fn bulk_notes_pluralize_and_list_only_line_numbers() {
+        let one = KeyMergeSummary {
+            added: 2,
+            duplicates: 1,
+        };
+        assert_eq!(
+            bulk_import_note(&one),
+            "2 added \u{00b7} 1 duplicate skipped"
+        );
+        let many = KeyMergeSummary {
+            added: 0,
+            duplicates: 3,
+        };
+        assert_eq!(
+            bulk_import_note(&many),
+            "0 added \u{00b7} 3 duplicates skipped"
+        );
+        assert_eq!(
+            bulk_rejected_note(&[4]),
+            "Nothing imported \u{2014} whitespace/control characters on line 4."
+        );
+        assert_eq!(
+            bulk_rejected_note(&[2, 5]),
+            "Nothing imported \u{2014} whitespace/control characters on lines 2, 5."
+        );
     }
 }
