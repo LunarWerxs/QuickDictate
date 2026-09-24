@@ -35,6 +35,8 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
+use crate::nudge::now_ms;
+
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// Days installed before the first ask. Longer than the sign-in nudge's week: someone asked to
@@ -194,13 +196,6 @@ fn issue_url(app_version: &str) -> String {
 
 // ===== persistence and the app-facing surface =====
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 /// One process-wide state, loaded on first touch. See `nudge.rs`'s identical `STATE` for why a
 /// plain `Mutex` is the right tool here: a few field writes and a small file write, at most a
 /// handful of times per run, never held across anything that blocks on the network.
@@ -232,41 +227,19 @@ fn parse_or_fresh(raw: &str, now: u64) -> FeedbackState {
 }
 
 fn load() -> FeedbackState {
-    let path = crate::paths::data_file(STATE_FILE);
-    let Ok(raw) = std::fs::read_to_string(&path) else {
-        return FeedbackState::fresh(now_ms());
-    };
-    parse_or_fresh(&raw, now_ms())
+    crate::nudge::load_state_file(STATE_FILE, parse_or_fresh, FeedbackState::fresh)
 }
 
+/// Best-effort, same rules as `nudge`'s own state file: a read-only data folder costs the user
+/// nothing worse than being asked again another day, and this must never be able to take down a
+/// dictation hotkey.
 fn persist(state: &FeedbackState) {
-    let path = crate::paths::data_file(STATE_FILE);
-    let Ok(json) = serde_json::to_string_pretty(state) else {
-        return;
-    };
-    if let Err(e) = std::fs::write(&path, json) {
-        // Best-effort by design, same reasoning as `nudge::persist`: a read-only data folder
-        // costs the user nothing worse than being asked again another day, and this must never
-        // be able to take down a dictation hotkey.
-        tracing::debug!(
-            "feedback survey: could not save state to {}: {e}",
-            path.display()
-        );
-    }
+    crate::nudge::save_state_file(STATE_FILE, state, "feedback survey");
 }
 
 /// Run `f` against the live state, persisting whatever it changed.
 fn with_state<T>(f: impl FnOnce(&mut FeedbackState) -> T) -> T {
-    let mut guard = match STATE.lock() {
-        Ok(guard) => guard,
-        // A poisoned lock means another thread panicked mid-update. This state is a prompt
-        // schedule, not user data: recovering the value is the right call, matching `nudge.rs`.
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    let state = guard.get_or_insert_with(load);
-    let out = f(state);
-    persist(state);
-    out
+    crate::nudge::with_persisted_state(&STATE, load, persist, f)
 }
 
 /// Count this launch. Call once, early, alongside `nudge::start_session`.

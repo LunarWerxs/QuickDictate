@@ -45,6 +45,7 @@ pub(super) unsafe fn build_about(hwnd: HWND) {
     let logo_px = s(hwnd, 72).max(1) as u32;
     if let Some(hbmp) = rgba_to_hbitmap(logo_px, logo_px, &qd_logo_rgba(logo_px)) {
         set_static_bitmap(logo, hbmp);
+        keep_static_bitmap(st, logo, hbmp);
     }
 
     // Product title — big + bold — then the muted subtitle.
@@ -136,11 +137,19 @@ pub(super) unsafe fn build_about(hwnd: HWND) {
     let (lw_pw, lw_ph) = (s(hwnd, lw_w).max(1) as u32, s(hwnd, lw_h).max(1) as u32);
     if let Some(hbmp) = lw_logo_hbitmap(lw_pw, lw_ph) {
         set_static_bitmap(lw, hbmp);
+        keep_static_bitmap(st, lw, hbmp);
     }
 
     if !st.is_null() {
         (*st).ver_pill = ver_pill.0 as isize;
         (*st).status_pill = status_pill.0 as isize;
         (*st).lw_logo = lw.0 as isize;
+    }
+}
+
+/// Remember a bitmap handed to a static, for `WM_DESTROY` to free.
+unsafe fn keep_static_bitmap(st: *mut About, ctl: HWND, hbmp: HBITMAP) {
+    if !st.is_null() {
+        (*st).static_bitmaps.push((ctl.0 as isize, hbmp));
     }
 }

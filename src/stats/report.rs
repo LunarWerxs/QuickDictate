@@ -29,7 +29,7 @@ use serde_json::{json, Map, Value};
 
 use crate::state::App;
 
-use super::UsageStats;
+use super::{PeriodStats, UsageStats};
 
 #[cfg(test)]
 mod tests;
@@ -87,9 +87,19 @@ fn write_cache() {
 /// `install_id` is the one identifier included -- the same crypto-random,
 /// machine-only id already sent with update checks, never derived from
 /// hostname, MAC, username, or account.
+///
+/// The counts are this install's own device row, not `UsageStats`' top-level
+/// totals: those are rebuilt across every device, and Connections sync merges
+/// the user's other machines in, so each synced PC would report the whole
+/// account under its own `install_id` and count it once per machine.
 pub(super) fn anonymized_payload(install_id: &str, stats: &UsageStats) -> Value {
+    let never_dictated = PeriodStats::default();
+    let totals = stats
+        .devices
+        .get(&stats.local_device_id)
+        .map_or(&never_dictated, |device| &device.totals);
     let mut providers = Map::new();
-    for (name, p) in &stats.providers {
+    for (name, p) in &totals.providers {
         providers.insert(
             name.clone(),
             json!({
@@ -102,11 +112,11 @@ pub(super) fn anonymized_payload(install_id: &str, stats: &UsageStats) -> Value 
     json!({
         "install_id": install_id,
         "app_version": env!("CARGO_PKG_VERSION"),
-        "total_words": stats.total_words,
-        "total_audio_ms": stats.total_audio_ms,
-        "total_dictations": stats.total_dictations,
-        "longest_dictation_words": stats.longest_dictation_words,
-        "longest_dictation_audio_ms": stats.longest_dictation_audio_ms,
+        "total_words": totals.words,
+        "total_audio_ms": totals.audio_ms,
+        "total_dictations": totals.dictations,
+        "longest_dictation_words": totals.longest_dictation_words,
+        "longest_dictation_audio_ms": totals.longest_dictation_audio_ms,
         "providers": Value::Object(providers),
     })
 }

@@ -210,6 +210,17 @@ pub(super) unsafe fn set_static_bitmap(ctl: HWND, hbmp: HBITMAP) {
     }
 }
 
+/// Undo [`set_static_bitmap`] for good: detach the image from `ctl` and
+/// delete it. For an alpha bitmap comctl32 v6 holds a copy rather than
+/// `original`, and the detach hands that copy back, so both are deleted.
+pub(super) unsafe fn release_static_bitmap(ctl: HWND, original: HBITMAP) {
+    let held = SendMessageW(ctl, super::STM_SETIMAGE, WPARAM(0), LPARAM(0));
+    if held.0 != 0 && held.0 != original.0 as isize {
+        let _ = DeleteObject(HGDIOBJ(held.0 as *mut c_void));
+    }
+    let _ = DeleteObject(original);
+}
+
 /// Straight-RGBA (top row first) → premultiplied 32-bpp DIB-section HBITMAP
 /// (SageThumbs' `create_premultiplied_dib`).
 pub(super) unsafe fn rgba_to_hbitmap(w: u32, h: u32, rgba: &[u8]) -> Option<HBITMAP> {
