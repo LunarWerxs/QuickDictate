@@ -241,9 +241,12 @@ mod tests {
         // through a real context so the fallback is proven, not just present.
         let ctx = egui::Context::default();
         ctx.set_fonts(font_definitions(None, None, None));
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             ui.label(RichText::new("Settings").font(semibold(15.0)));
         });
+        // No renderer here to upload the font atlas to; epaint 0.36 asserts
+        // that a frame's texture updates are consumed, so say so explicitly.
+        output.textures_delta.clear();
     }
 
     #[test]
