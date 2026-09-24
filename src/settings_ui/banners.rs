@@ -382,8 +382,10 @@ mod tests {
 
     #[test]
     fn onboarding_never_nags_the_keyless_local_provider() {
-        let mut draft = Config::default();
-        draft.stt_provider = "local".into();
+        let mut draft = Config {
+            stt_provider: "local".into(),
+            ..Config::default()
+        };
         assert!(!needs_onboarding(&draft));
         draft.stt_provider = "Local".into();
         assert!(!needs_onboarding(&draft));

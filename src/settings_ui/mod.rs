@@ -196,9 +196,18 @@ pub fn show_settings(app: Arc<App>) {
     }
 
     OPEN.store(true, Ordering::Release);
-    std::thread::Builder::new()
+    /// Clears `OPEN` however the settings thread ends, a panic included, so
+    /// nothing goes on believing a window is up that never will be again.
+    struct ClosedOnExit;
+    impl Drop for ClosedOnExit {
+        fn drop(&mut self) {
+            OPEN.store(false, Ordering::Release);
+        }
+    }
+    let spawned = std::thread::Builder::new()
         .name("qd-settings".into())
         .spawn(move || {
+            let _closed = ClosedOnExit;
             let options = eframe::NativeOptions {
                 viewport: egui::ViewportBuilder::default()
                     // A fixed, comfortable size. This used to open tall and then
@@ -240,10 +249,15 @@ pub fn show_settings(app: Arc<App>) {
                 tracing::error!("settings window: {e}");
             }
             // The loop returns only on real shutdown (or an error). winit won't
-            // let us build another, so `LAUNCHED` intentionally stays set.
-            OPEN.store(false, Ordering::Release);
-        })
-        .ok();
+            // let us build another, so `LAUNCHED` intentionally stays set;
+            // `_closed` clears `OPEN` on the way out.
+        });
+    if let Err(e) = spawned {
+        // No event loop was ever built, so the next click may try again.
+        OPEN.store(false, Ordering::Release);
+        LAUNCHED.store(false, Ordering::Release);
+        tracing::error!("settings window: could not start its thread ({e})");
+    }
 }
 
 impl SettingsApp {

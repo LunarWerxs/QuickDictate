@@ -304,16 +304,8 @@ impl super::SettingsApp {
                     *keys_of(&mut self.draft, &id) = deduped_key_values(&state.rows);
                 }
                 Some(Modal::Replacements(state)) => {
-                    // If the user left it in text-editor mode, parse that.
-                    let final_rows = if state.bulk {
-                        text_to_replacements(&state.bulk_text)
-                    } else {
-                        state.rows
-                    };
-                    self.draft.text_replacements = final_rows
-                        .into_iter()
-                        .filter(|(f, _)| !f.trim().is_empty())
-                        .collect();
+                    // The same commit a window close folds in (`commit_open_editor`).
+                    self.draft.text_replacements = state.into_committed();
                 }
                 Some(Modal::Stats)
                 | Some(Modal::DefaultReset)
