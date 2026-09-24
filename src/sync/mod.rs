@@ -22,6 +22,7 @@
 //! it is never persisted. Only the refresh token (+ a display email/name) is
 //! stored, DPAPI-sealed, next to the exe as `quickdictate-connections.dat`.
 
+mod baseline;
 mod creds;
 mod guard;
 mod oauth;
@@ -47,6 +48,7 @@ pub use oauth::{fetch_avatar, refresh, sign_in, Tokens};
 pub use schema::{apply_synced_to_config, snapshot_to_synced, synced_stats};
 pub use store::{store_delete, store_pull, store_push};
 
+pub(crate) use baseline::BASELINE_FILE;
 use oauth::fetch_userinfo;
 use schema::{merge_stats, stats_to_synced};
 use store::{clear_store_cache, CachedRemoteDoc};
@@ -133,6 +135,8 @@ pub fn connect_and_reconcile(local_snapshot: Value) -> Result<Connected> {
     let doc = store_pull(&tokens.access_token)?;
     if doc.version == 0 {
         store_push(&tokens.access_token, &local_snapshot, 0)?;
+        // The cloud is now exactly this machine's settings.
+        baseline::set(&local_snapshot);
         Ok(Connected {
             name: tokens.name,
             email: tokens.email,
@@ -145,6 +149,8 @@ pub fn connect_and_reconcile(local_snapshot: Value) -> Result<Connected> {
         if merge_stats(&mut merged, &local_snapshot) {
             store_push(&tokens.access_token, &merged, doc.version)?;
         }
+        // First contact: the whole cloud copy is applied, so it is all seen.
+        baseline::set(&merged);
         Ok(Connected {
             name: tokens.name,
             email: tokens.email,
@@ -169,11 +175,22 @@ pub fn resume_and_pull(local_snapshot: Value) -> Result<Connected> {
     if doc.version > 0 && merge_stats(&mut merged, &local_snapshot) {
         store_push(&tokens.access_token, &merged, doc.version)?;
     }
+    // Apply only what changed in the cloud since this machine last looked, so
+    // a change saved here that has not reached the cloud yet (offline, a
+    // failed push) is not reverted by the older cloud copy; with no baseline
+    // yet, the whole copy, as before.
+    let to_apply = (doc.version > 0).then(|| match baseline::get() {
+        Some(base) => schema::remote_changes(&merged, &base),
+        None => merged.clone(),
+    });
+    if doc.version > 0 {
+        baseline::set(&merged);
+    }
     Ok(Connected {
         name: creds.name,
         email: creds.email,
         avatar,
-        remote: (doc.version > 0).then_some(merged),
+        remote: to_apply,
         seeded: false,
     })
 }
@@ -220,8 +237,23 @@ pub fn push_now(mut local_snapshot: Value) -> Result<u64> {
     persist_rotated(&creds, &tokens);
     let remote = store_pull(&tokens.access_token)?;
     merge_stats(&mut local_snapshot, &remote.settings);
-    schema::with_deletions(&mut local_snapshot, &remote.settings);
-    store_push(&tokens.access_token, &local_snapshot, remote.version)
+    // Three-way: send only what this machine changed since it last saw the
+    // cloud, so a setting another PC changed meanwhile is not overwritten
+    // with this PC's stale copy. Before any pull (no baseline yet), the whole
+    // snapshot, with explicit deletions for what was removed here.
+    let patch = match baseline::get() {
+        Some(base) => schema::changes_since(&local_snapshot, &base),
+        None => {
+            schema::with_deletions(&mut local_snapshot, &remote.settings);
+            local_snapshot
+        }
+    };
+    if patch.as_object().is_some_and(|keys| keys.is_empty()) {
+        return Ok(remote.version); // nothing changed here: no write, no new version
+    }
+    let version = store_push(&tokens.access_token, &patch, remote.version)?;
+    baseline::record_push(&patch);
+    Ok(version)
 }
 
 /// Coalesce successful dictations into a quiet background stats push whenever
@@ -261,6 +293,7 @@ pub fn disconnect() {
     }
     clear_creds();
     clear_store_cache();
+    baseline::clear();
 }
 
 /// Best-effort final flush used by the process shutdown path. The worker is

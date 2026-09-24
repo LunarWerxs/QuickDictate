@@ -546,3 +546,68 @@ fn every_push_answer_maps_to_one_step() {
     assert_eq!(push_step(500, &json!({}), 3), PushStep::Failed);
     assert_eq!(push_step(401, &json!({}), 3), PushStep::Failed);
 }
+
+// ---- Three-way merge against the copy this machine last saw -----------------
+
+#[test]
+fn a_save_pushes_only_what_this_pc_changed_since_it_last_saw_the_cloud() {
+    use super::schema::changes_since;
+    use serde_json::json;
+    let base = json!({
+        "mode": "toggle",
+        "toggle_hotkey": "f14",
+        "text_replacements": { "Github": "GitHub", "super bass": "Supabase" },
+    });
+    // This PC changed the mode, removed one replacement and added another; it
+    // never touched the hotkey (which another PC may have changed since).
+    let local = json!({
+        "mode": "hold",
+        "toggle_hotkey": "f14",
+        "text_replacements": { "Github": "GitHub", "Chat GPT": "ChatGPT" },
+        "usage_stats": { "devices": {} },
+    });
+    let patch = changes_since(&local, &base);
+    assert_eq!(
+        patch,
+        json!({
+            "mode": "hold",
+            "text_replacements": { "super bass": null, "Chat GPT": "ChatGPT" },
+            "usage_stats": { "devices": {} },
+        })
+    );
+    // Nothing changed at all: only the stats go.
+    let same = json!({ "mode": "toggle", "toggle_hotkey": "f14" });
+    assert_eq!(changes_since(&same, &base), json!({}));
+}
+
+#[test]
+fn applying_the_patch_to_the_base_gives_back_what_this_pc_has() {
+    use super::schema::{changes_since, merge_patch};
+    use serde_json::json;
+    let base = json!({
+        "a": 1, "keep": "x",
+        "nested": { "gone": 1, "same": 2, "changed": 3, "deep": { "z": 1 } },
+        "list": [1, 2],
+    });
+    let local = json!({
+        "a": 2, "keep": "x",
+        "nested": { "same": 2, "changed": 4, "new": 5, "deep": { "z": 1, "y": 2 } },
+        "list": [2],
+    });
+    let mut rebuilt = base.clone();
+    merge_patch(&mut rebuilt, &changes_since(&local, &base));
+    assert_eq!(rebuilt, local);
+}
+
+#[test]
+fn a_pull_applies_only_what_changed_in_the_cloud_since_this_pc_last_looked() {
+    use super::schema::remote_changes;
+    use serde_json::json;
+    let base = json!({ "mode": "toggle", "language": "en-US" });
+    // Another PC changed the language; this PC's unpushed mode change must survive.
+    let remote = json!({ "mode": "toggle", "language": "de-DE" });
+    assert_eq!(
+        remote_changes(&remote, &base),
+        json!({ "language": "de-DE" })
+    );
+}

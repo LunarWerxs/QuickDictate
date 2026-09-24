@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Settings sync no longer lets one PC overwrite another's newer settings.** A Save pushed every
+  synced setting, so a PC that had not pulled recently wrote its stale copy over a change made on
+  your other PC. Sync is now a three-way merge against the cloud copy this PC last saw (kept in
+  `quickdictate-sync-baseline.json`): a Save sends only what changed here, and a pull applies only
+  what changed in the cloud, so a change saved here while offline is not reverted either.
+- **A text replacement you delete stays deleted.** The cloud merges pushes key by key and only an
+  explicit delete removes a key, so a removed replacement used to come back on the next pull.
+
 ## [1.2.0] - 2026-09-24
 
 A whole-codebase review (eight reviewers, every serious finding put to a skeptic) found 51

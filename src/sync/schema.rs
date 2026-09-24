@@ -215,6 +215,91 @@ fn null_out_removed(ours: &mut Value, theirs: &Value) {
     }
 }
 
+/// What `local` changed since `base` (the document as this machine last saw
+/// it), as a merge patch: only keys whose value moved, nested objects diffed
+/// key by key with `null` for what was removed. Pushing this instead of the
+/// whole snapshot is a three-way merge: a setting another PC changed that
+/// this one did not touch is left as the other PC set it, instead of being
+/// overwritten with this PC's stale copy. Top-level keys `local` omits are not
+/// compared (a stats-only push carries no preferences), and the stats object
+/// always goes, already unioned by `merge_stats`.
+pub(super) fn changes_since(local: &Value, base: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    if let Some(local) = local.as_object() {
+        for (key, value) in local {
+            let change = if key == STATS_KEY {
+                Some(value.clone())
+            } else {
+                diff_value(value, base.get(key))
+            };
+            if let Some(change) = change {
+                out.insert(key.clone(), change);
+            }
+        }
+    }
+    Value::Object(out)
+}
+
+/// One value's part of [`changes_since`]: `None` if unchanged since `base`;
+/// for two objects, a nested patch naming only what changed; otherwise the
+/// value whole.
+fn diff_value(ours: &Value, base: Option<&Value>) -> Option<Value> {
+    match (ours, base) {
+        (_, Some(base)) if ours == base => None,
+        (Value::Object(ours), Some(Value::Object(base))) => {
+            let mut patch = serde_json::Map::new();
+            for (key, value) in ours {
+                if let Some(change) = diff_value(value, base.get(key)) {
+                    patch.insert(key.clone(), change);
+                }
+            }
+            for key in base.keys().filter(|key| !ours.contains_key(*key)) {
+                patch.insert(key.clone(), Value::Null);
+            }
+            (!patch.is_empty()).then_some(Value::Object(patch))
+        }
+        _ => Some(ours.clone()),
+    }
+}
+
+/// Apply `patch` to `target` the way the store does (RFC 7386): objects merge
+/// key by key, `null` deletes, anything else replaces. Keeps this machine's
+/// picture of the cloud copy in step after a push without pulling it again.
+pub(super) fn merge_patch(target: &mut Value, patch: &Value) {
+    let Value::Object(patch) = patch else {
+        *target = patch.clone();
+        return;
+    };
+    if !target.is_object() {
+        *target = Value::Object(serde_json::Map::new());
+    }
+    if let Value::Object(target) = target {
+        for (key, value) in patch {
+            if value.is_null() {
+                target.remove(key);
+            } else {
+                merge_patch(target.entry(key.clone()).or_insert(Value::Null), value);
+            }
+        }
+    }
+}
+
+/// The part of `remote` to apply here: every key whose value changed since
+/// `base`, whole (the Settings overlay replaces a key's value outright). A
+/// key the cloud still holds as this machine last saw it is left out, so a
+/// local change that has not reached the cloud yet is not reverted by it.
+pub(super) fn remote_changes(remote: &Value, base: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    if let Some(remote) = remote.as_object() {
+        for (key, value) in remote {
+            if base.get(key) != Some(value) {
+                out.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    Value::Object(out)
+}
+
 pub fn synced_stats(remote: &Value) -> Option<&Value> {
     remote.as_object()?.get(STATS_KEY)
 }

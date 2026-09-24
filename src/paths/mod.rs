@@ -75,7 +75,7 @@ const ACTIVE_DIR_MARKER: &str = "active-data-dir.txt";
 /// behind in the old folder when the user relocates.
 ///
 /// `logs` is a directory and is handled as one; the rest are plain files.
-pub(crate) const RELOCATABLE: [&str; 8] = [
+pub(crate) const RELOCATABLE: [&str; 9] = [
     "logs",
     "quickdictate-stats.json",
     "quickdictate-connections.dat",
@@ -86,6 +86,9 @@ pub(crate) const RELOCATABLE: [&str; 8] = [
     // Left behind, it would strand the record of apps a crash left quiet in
     // a folder the next launch no longer reads, and they would stay quiet.
     crate::duck::LEFTOVERS_FILE,
+    // Left behind, the next pull would lose track of what this PC has seen
+    // and could revert a change it had not pushed yet.
+    crate::sync::BASELINE_FILE,
 ];
 
 static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
