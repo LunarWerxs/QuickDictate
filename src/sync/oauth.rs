@@ -158,16 +158,7 @@ pub fn sign_in() -> Result<Tokens> {
     let port = listener.local_addr()?.port();
     let redirect_uri = format!("http://127.0.0.1:{port}{REDIRECT_PATH}");
 
-    let mut url = url::Url::parse(AUTH_URL).context("parse authorize url")?;
-    url.query_pairs_mut()
-        .append_pair("response_type", "code")
-        .append_pair("client_id", CLIENT_ID)
-        .append_pair("redirect_uri", &redirect_uri)
-        .append_pair("scope", SCOPES)
-        .append_pair("code_challenge", &pkce.challenge)
-        .append_pair("code_challenge_method", "S256")
-        .append_pair("state", &state);
-
+    let url = authorize_url(&redirect_uri, &pkce.challenge, &state)?;
     open_browser(url.as_str());
     tracing::info!("connections: opened browser for sign-in on loopback :{port}");
 
@@ -176,29 +167,16 @@ pub fn sign_in() -> Result<Tokens> {
         bail!("state mismatch (possible CSRF) — sign-in aborted");
     }
 
-    let resp = client()?
-        .post(TOKEN_URL)
-        .form(&[
+    let (body, access_token) = post_token_grant(
+        &[
             ("grant_type", "authorization_code"),
             ("code", code.as_str()),
             ("redirect_uri", redirect_uri.as_str()),
             ("client_id", CLIENT_ID),
             ("code_verifier", pkce.verifier.as_str()),
-        ])
-        .send()
-        .context("token exchange request")?;
-    let status = resp.status();
-    let body: Value = resp.json().context("token response was not JSON")?;
-    if !status.is_success() {
-        bail!("token exchange failed (HTTP {status}): {body}");
-    }
-    let access_token = body["access_token"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    if access_token.is_empty() {
-        bail!("token response had no access_token");
-    }
+        ],
+        &CODE_EXCHANGE,
+    )?;
     let refresh_token = body["refresh_token"]
         .as_str()
         .unwrap_or_default()
@@ -216,6 +194,67 @@ pub fn sign_in() -> Result<Tokens> {
         name: if ui_name.is_empty() { name } else { ui_name },
         picture: ui_picture,
     })
+}
+
+/// The authorize URL the browser opens: PKCE `S256` challenge, CSRF `state`,
+/// and the loopback `redirect_uri` the callback listener is bound to.
+pub(super) fn authorize_url(redirect_uri: &str, challenge: &str, state: &str) -> Result<url::Url> {
+    let mut url = url::Url::parse(AUTH_URL).context("parse authorize url")?;
+    url.query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", CLIENT_ID)
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("scope", SCOPES)
+        .append_pair("code_challenge", challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("state", state);
+    Ok(url)
+}
+
+/// How one token-endpoint call names itself in its errors.
+struct GrantCall {
+    request: &'static str,
+    response: &'static str,
+    failed: &'static str,
+}
+
+const CODE_EXCHANGE: GrantCall = GrantCall {
+    request: "token exchange request",
+    response: "token response",
+    failed: "token exchange failed",
+};
+
+const REFRESH: GrantCall = GrantCall {
+    request: "refresh request",
+    response: "refresh response",
+    failed: "token refresh failed",
+};
+
+/// POST one grant to the token endpoint and return its JSON body with the
+/// non-empty `access_token` taken out. Shared by sign-in's code exchange and
+/// [`refresh`], so the status, JSON and missing-token checks cannot drift
+/// apart between the two.
+fn post_token_grant(form: &[(&str, &str)], call: &GrantCall) -> Result<(Value, String)> {
+    let resp = client()?
+        .post(TOKEN_URL)
+        .form(form)
+        .send()
+        .context(call.request)?;
+    let status = resp.status();
+    let body: Value = resp
+        .json()
+        .with_context(|| format!("{} was not JSON", call.response))?;
+    if !status.is_success() {
+        bail!("{} (HTTP {status}): {body}", call.failed);
+    }
+    let access_token = body["access_token"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    if access_token.is_empty() {
+        bail!("{} had no access_token", call.response);
+    }
+    Ok((body, access_token))
 }
 
 /// Fetch the display `name` (+ privacy-relay `email`) from `/oauth/userinfo`, authenticated with a
@@ -248,6 +287,12 @@ pub(super) fn fetch_userinfo(access_token: &str) -> (String, String, String) {
 /// network/format failure, so the UI simply shows no avatar. Requires the `photo` scope to have
 /// yielded a `picture` URL.
 pub fn fetch_avatar(url: &str) -> Option<(u32, u32, Vec<u8>)> {
+    decode_avatar(&download_avatar(url)?)
+}
+
+/// The avatar's bytes, from an `https` URL only and never more than
+/// [`MAX_AVATAR_BYTES`], whatever the server claims or sends.
+fn download_avatar(url: &str) -> Option<Vec<u8>> {
     if url.is_empty() {
         return None;
     }
@@ -272,7 +317,14 @@ pub fn fetch_avatar(url: &str) -> Option<(u32, u32, Vec<u8>)> {
     if bytes.len() as u64 > MAX_AVATAR_BYTES {
         return None;
     }
-    let dimensions = image::ImageReader::new(std::io::Cursor::new(&bytes))
+    Some(bytes)
+}
+
+/// Decode avatar bytes into `(width, height, rgba8)`. The dimensions are read
+/// from the header first, so an image over [`MAX_AVATAR_DIMENSION`] is refused
+/// before it is decoded (a small file can still claim a huge canvas).
+pub(super) fn decode_avatar(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let dimensions = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .ok()?
         .into_dimensions()
@@ -280,7 +332,7 @@ pub fn fetch_avatar(url: &str) -> Option<(u32, u32, Vec<u8>)> {
     if dimensions.0 > MAX_AVATAR_DIMENSION || dimensions.1 > MAX_AVATAR_DIMENSION {
         return None;
     }
-    let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
     let (w, h) = (img.width(), img.height());
     Some((w, h, img.into_raw()))
 }
@@ -290,27 +342,14 @@ pub fn refresh(refresh_token: &str) -> Result<Tokens> {
     if refresh_token.is_empty() {
         bail!("no refresh token stored — sign in again");
     }
-    let resp = client()?
-        .post(TOKEN_URL)
-        .form(&[
+    let (body, access_token) = post_token_grant(
+        &[
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
             ("client_id", CLIENT_ID),
-        ])
-        .send()
-        .context("refresh request")?;
-    let status = resp.status();
-    let body: Value = resp.json().context("refresh response was not JSON")?;
-    if !status.is_success() {
-        bail!("token refresh failed (HTTP {status}): {body}");
-    }
-    let access_token = body["access_token"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    if access_token.is_empty() {
-        bail!("refresh response had no access_token");
-    }
+        ],
+        &REFRESH,
+    )?;
     // Refresh may rotate the refresh token; keep the new one if present.
     let new_refresh = body["refresh_token"]
         .as_str()

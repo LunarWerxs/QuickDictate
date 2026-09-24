@@ -54,13 +54,7 @@ pub fn store_pull(access_token: &str) -> Result<RemoteDoc> {
     let cached = store_cache().clone();
     let mut rate_limit_retried = false;
     loop {
-        let mut request = client()?
-            .get(format!("{STORE_BASE}/{CLIENT_ID}"))
-            .bearer_auth(access_token);
-        if let Some(cached) = &cached {
-            request = request.header(reqwest::header::IF_NONE_MATCH, &cached.etag);
-        }
-        let resp = request.send().context("store GET")?;
+        let resp = send_pull(access_token, cached.as_ref())?;
         let status = resp.status();
         if status == reqwest::StatusCode::NOT_MODIFIED {
             return cached
@@ -81,38 +75,55 @@ pub fn store_pull(access_token: &str) -> Result<RemoteDoc> {
         if !status.is_success() {
             bail!("could not read cloud settings (HTTP {status}): {body}");
         }
-        let body_version = body.get("version").and_then(Value::as_u64).unwrap_or(0);
-        let server_settings = body
-            .get("server_settings")
-            .cloned()
-            .unwrap_or_else(|| Value::Object(Default::default()));
-        if server_settings
-            .as_object()
-            .is_some_and(|settings| !settings.is_empty())
-        {
-            // Parsed deliberately, but not applied: QuickDictate currently has
-            // no server-authoritative plan/entitlement setting. Keeping this
-            // explicit prevents that tier being mistaken for user preferences.
-            tracing::debug!("connections: server settings received; no supported keys yet");
-        }
-        let doc = RemoteDoc {
-            settings: body
-                .get("settings")
-                .cloned()
-                .unwrap_or_else(|| Value::Object(Default::default())),
-            // The ETag is the authoritative conditional-read version. Fall
-            // back to the body for older/self-hosted implementations.
-            version: etag
-                .as_deref()
-                .and_then(parse_etag_version)
-                .unwrap_or(body_version),
-        };
+        let doc = remote_doc_from_body(&body, etag.as_deref());
         let cache_etag = etag.unwrap_or_else(|| format!("\"{}\"", doc.version));
         *store_cache() = Some(CachedRemoteDoc {
             doc: doc.clone(),
             etag: cache_etag,
         });
         return Ok(doc);
+    }
+}
+
+/// One `GET` of the store document, conditional on the cached ETag if any.
+fn send_pull(
+    access_token: &str,
+    cached: Option<&CachedRemoteDoc>,
+) -> Result<reqwest::blocking::Response> {
+    let mut request = client()?
+        .get(format!("{STORE_BASE}/{CLIENT_ID}"))
+        .bearer_auth(access_token);
+    if let Some(cached) = cached {
+        request = request.header(reqwest::header::IF_NONE_MATCH, &cached.etag);
+    }
+    request.send().context("store GET")
+}
+
+/// The document a successful `GET` returned. Pure, so the version and
+/// missing-field fallbacks are testable without a server.
+pub(super) fn remote_doc_from_body(body: &Value, etag: Option<&str>) -> RemoteDoc {
+    let body_version = body.get("version").and_then(Value::as_u64).unwrap_or(0);
+    let server_settings = body
+        .get("server_settings")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Default::default()));
+    if server_settings
+        .as_object()
+        .is_some_and(|settings| !settings.is_empty())
+    {
+        // Parsed deliberately, but not applied: QuickDictate currently has
+        // no server-authoritative plan/entitlement setting. Keeping this
+        // explicit prevents that tier being mistaken for user preferences.
+        tracing::debug!("connections: server settings received; no supported keys yet");
+    }
+    RemoteDoc {
+        settings: body
+            .get("settings")
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Default::default())),
+        // The ETag is the authoritative conditional-read version. Fall
+        // back to the body for older/self-hosted implementations.
+        version: etag.and_then(parse_etag_version).unwrap_or(body_version),
     }
 }
 
@@ -154,16 +165,8 @@ pub fn store_push(access_token: &str, settings: &Value, base_version: u64) -> Re
                 if conflicts >= 3 {
                     bail!("push kept conflicting with a newer cloud copy; try again");
                 }
-                base = body
-                    .get("current")
-                    .and_then(|current| current.get("version"))
-                    .and_then(Value::as_u64)
-                    .unwrap_or_else(|| {
-                        clear_store_cache();
-                        store_pull(access_token)
-                            .map(|latest| latest.version)
-                            .unwrap_or(base)
-                    });
+                base = conflict_current_version(&body)
+                    .unwrap_or_else(|| refetch_version(access_token, base));
                 continue;
             }
             429 if !rate_limit_retried => {
@@ -179,6 +182,23 @@ pub fn store_push(access_token: &str, settings: &Value, base_version: u64) -> Re
             _ => bail!("could not save to the cloud (HTTP {status}): {body}"),
         }
     }
+}
+
+/// The server's current version from a 409 body (`current.version`), which
+/// is the base the retried push must name.
+pub(super) fn conflict_current_version(body: &Value) -> Option<u64> {
+    body.get("current")
+        .and_then(|current| current.get("version"))
+        .and_then(Value::as_u64)
+}
+
+/// The latest version by a fresh (uncached) pull, for a 409 body that did not
+/// carry one; `fallback` if even that fails.
+fn refetch_version(access_token: &str, fallback: u64) -> u64 {
+    clear_store_cache();
+    store_pull(access_token)
+        .map(|latest| latest.version)
+        .unwrap_or(fallback)
 }
 
 /// `DELETE /v1/app-data/{appId}` — forget the remote doc. Idempotent.

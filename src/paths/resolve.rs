@@ -225,15 +225,7 @@ pub(crate) fn folder_caution(dir: &Path) -> Option<String> {
 /// message loop, so Settings stops repainting until it closes, exactly like
 /// every other app's Browse button.
 pub(crate) fn pick_folder(initial: Option<&Path>) -> Option<PathBuf> {
-    use windows::core::PCWSTR;
-    use windows::Win32::System::Com::{
-        CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_INPROC_SERVER,
-        COINIT_APARTMENTTHREADED,
-    };
-    use windows::Win32::UI::Shell::{
-        FileOpenDialog, IFileOpenDialog, IShellItem, SHCreateItemFromParsingName, FOS_PICKFOLDERS,
-        SIGDN_FILESYSPATH,
-    };
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 
     // The shell dialog needs an initialized apartment. This thread may already
     // have one (eframe/winit initializes COM for drag-and-drop), in which case
@@ -246,6 +238,36 @@ pub(crate) fn pick_folder(initial: Option<&Path>) -> Option<PathBuf> {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
     }
+
+    let dialog = new_folder_dialog()?;
+    // Start in the folder currently in use. Best-effort: a path that no
+    // longer exists just means the picker opens wherever it likes.
+    if let Some(dir) = initial.filter(|d| d.exists()) {
+        start_dialog_in(&dialog, dir);
+    }
+
+    // A cancelled dialog returns HRESULT_FROM_WIN32(ERROR_CANCELLED), which
+    // is indistinguishable here from a real failure and needs the same
+    // handling anyway: keep the folder we have.
+    //
+    // SAFETY: a COM method on the live dialog `new_folder_dialog` returned.
+    unsafe { dialog.Show(None).ok()? };
+    chosen_folder(&dialog)
+}
+
+/// NUL-terminated UTF-16, the shape every `PCWSTR` argument in the picker
+/// helpers below wants. The returned buffer must outlive the call that borrows
+/// its pointer.
+pub(super) fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// A folder-picking `IFileOpenDialog` with QuickDictate's title, or `None`
+/// if the shell will not create or configure one.
+fn new_folder_dialog() -> Option<windows::Win32::UI::Shell::IFileOpenDialog> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+    use windows::Win32::UI::Shell::{FileOpenDialog, IFileOpenDialog, FOS_PICKFOLDERS};
 
     // SAFETY: every call below is a COM method on an interface pointer the
     // runtime just handed us, with arguments of the documented types. Each `?`
@@ -260,23 +282,38 @@ pub(crate) fn pick_folder(initial: Option<&Path>) -> Option<PathBuf> {
                 wide("Choose where QuickDictate keeps its files").as_ptr(),
             ))
             .ok()?;
+        Some(dialog)
+    }
+}
 
-        // Start in the folder currently in use. Best-effort: a path that no
-        // longer exists just means the picker opens wherever it likes.
-        if let Some(dir) = initial.filter(|d| d.exists()) {
-            let wide_dir = wide(&dir.to_string_lossy());
-            if let Ok(item) =
-                SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(wide_dir.as_ptr()), None)
-            {
-                let _ = dialog.SetFolder(&item);
-            }
+/// Point the picker at `dir` before it opens. Failure is ignored: the picker
+/// then opens wherever it likes.
+fn start_dialog_in(dialog: &windows::Win32::UI::Shell::IFileOpenDialog, dir: &Path) {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::Shell::{IShellItem, SHCreateItemFromParsingName};
+
+    let wide_dir = wide(&dir.to_string_lossy());
+    // SAFETY: `wide_dir` is NUL-terminated and outlives the call borrowing it;
+    // `SetFolder` runs only on the item the shell just created.
+    unsafe {
+        if let Ok(item) =
+            SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(wide_dir.as_ptr()), None)
+        {
+            let _ = dialog.SetFolder(&item);
         }
+    }
+}
 
-        // A cancelled dialog returns HRESULT_FROM_WIN32(ERROR_CANCELLED), which
-        // is indistinguishable here from a real failure and needs the same
-        // handling anyway: keep the folder we have.
-        dialog.Show(None).ok()?;
+/// The filesystem path the user confirmed in a dialog that has closed with
+/// OK, or `None` if the shell cannot name it.
+fn chosen_folder(dialog: &windows::Win32::UI::Shell::IFileOpenDialog) -> Option<PathBuf> {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::SIGDN_FILESYSPATH;
 
+    // SAFETY: COM methods on the live dialog and the item it returned; each
+    // `?` bails before the next call. The display name is freed exactly once,
+    // after its last read.
+    unsafe {
         let item = dialog.GetResult().ok()?;
         let raw = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
         let picked = raw.to_string().ok().map(PathBuf::from);

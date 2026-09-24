@@ -2,8 +2,11 @@
 //! Tests for the Connections settings sync.
 
 use super::guard::{credential_patterns, validate_sync_snapshot, CREDENTIAL_PATTERNS};
-use super::schema::{config_to_synced, NEVER_SYNCED, SYNCED_KEYS};
-use super::store::{parse_etag_version, retry_after_seconds};
+use super::oauth::{authorize_url, decode_avatar};
+use super::schema::{config_to_synced, stats_to_synced, NEVER_SYNCED, SYNCED_KEYS};
+use super::store::{
+    conflict_current_version, parse_etag_version, remote_doc_from_body, retry_after_seconds,
+};
 use super::*;
 use crate::config::Config;
 use crate::stats::{DeviceStats, PeriodStats, ProviderStats, UsageStats};
@@ -372,4 +375,118 @@ fn every_config_field_is_synced_or_never_synced() {
             "\"{key}\" is listed in SYNCED_KEYS/NEVER_SYNCED but is not a Config field"
         );
     }
+}
+
+/// The background push after a dictation and the exit flush run on machines
+/// that may not have pulled for hours. Carrying settings, they wrote this
+/// machine's stale values over a newer change made elsewhere, and the next
+/// pull on that other machine undid its own change.
+#[test]
+fn background_stats_push_carries_nothing_but_the_stats() {
+    let mut local = stats_to_synced(&UsageStats::default());
+    let keys: Vec<&str> = local
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, vec![STATS_KEY]);
+
+    // `push_now` merges the cloud's stats in first; the cloud's settings must
+    // not ride along into the outgoing patch.
+    let remote = serde_json::json!({
+        "language": "de-DE",
+        STATS_KEY: stats_to_synced(&UsageStats::default())[STATS_KEY].clone(),
+    });
+    merge_stats(&mut local, &remote);
+    assert!(local.get("language").is_none());
+    assert!(validate_sync_snapshot(&local).is_ok());
+}
+
+#[test]
+fn identity_backfill_takes_new_values_and_never_blanks_known_ones() {
+    let mut creds = Creds {
+        refresh_token: "rt".into(),
+        sub: "sub".into(),
+        email: "known@example.com".into(),
+        name: String::new(),
+        picture: String::new(),
+    };
+    assert!(fill_identity(
+        &mut creds,
+        String::new(),
+        "Ada".into(),
+        "https://example.com/p.png".into()
+    ));
+    assert_eq!(
+        creds.email, "known@example.com",
+        "an empty reply keeps the known email"
+    );
+    assert_eq!(creds.name, "Ada");
+    assert_eq!(creds.picture, "https://example.com/p.png");
+    assert!(
+        !fill_identity(
+            &mut creds,
+            "known@example.com".into(),
+            "Ada".into(),
+            String::new()
+        ),
+        "nothing new is not a change, so nothing is re-sealed"
+    );
+}
+
+#[test]
+fn a_pulled_document_prefers_the_etag_version_and_defaults_missing_fields() {
+    let body = serde_json::json!({ "version": 7, "settings": { "language": "de-DE" } });
+    let doc = remote_doc_from_body(&body, Some("W/\"9\""));
+    assert_eq!(doc.version, 9);
+    assert_eq!(doc.settings["language"], "de-DE");
+    assert_eq!(remote_doc_from_body(&body, None).version, 7);
+    assert_eq!(remote_doc_from_body(&body, Some("not-a-number")).version, 7);
+
+    let empty = remote_doc_from_body(&serde_json::json!({}), None);
+    assert_eq!(empty.version, 0, "never written");
+    assert_eq!(empty.settings, serde_json::json!({}));
+}
+
+#[test]
+fn a_conflict_names_the_version_to_retry_against() {
+    let body = serde_json::json!({ "error": "version_conflict", "current": { "version": 12 } });
+    assert_eq!(conflict_current_version(&body), Some(12));
+    assert_eq!(conflict_current_version(&serde_json::json!({})), None);
+    assert_eq!(conflict_current_version(&serde_json::Value::Null), None);
+}
+
+#[test]
+fn authorize_url_carries_pkce_state_and_the_loopback_redirect() {
+    let url = authorize_url("http://127.0.0.1:5123/oauth/callback", "chal", "st8").unwrap();
+    let pairs: BTreeMap<String, String> = url.query_pairs().into_owned().collect();
+    assert_eq!(pairs["response_type"], "code");
+    assert_eq!(pairs["client_id"], CLIENT_ID);
+    assert_eq!(
+        pairs["redirect_uri"],
+        "http://127.0.0.1:5123/oauth/callback"
+    );
+    assert_eq!(pairs["code_challenge"], "chal");
+    assert_eq!(pairs["code_challenge_method"], "S256");
+    assert_eq!(pairs["state"], "st8");
+    assert_eq!(pairs["scope"], SCOPES);
+}
+
+#[test]
+fn avatar_decoding_refuses_garbage_and_oversized_canvases() {
+    let png = |w: u32, h: u32| {
+        let mut bytes = Vec::new();
+        image::RgbaImage::new(w, h)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        bytes
+    };
+    let (w, h, rgba) = decode_avatar(&png(2, 1)).unwrap();
+    assert_eq!((w, h, rgba.len()), (2, 1, 8));
+    assert!(decode_avatar(b"not an image").is_none());
+    assert!(decode_avatar(&png(MAX_AVATAR_DIMENSION + 1, 1)).is_none());
 }

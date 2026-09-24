@@ -93,6 +93,16 @@ impl KeyEntry {
         matches!(self.status, KeyHealthStatus::Dead | KeyHealthStatus::Quota)
     }
 
+    /// The key just answered (a real session or a probe): Alive, with its
+    /// failure count and any cooldown wiped. One place, so a success and a
+    /// probe can never disagree about what "working again" resets.
+    fn revive(&mut self, now: Instant) {
+        self.status = KeyHealthStatus::Alive;
+        self.last_success = Some(now);
+        self.failures = 0;
+        self.cooldown_until = None;
+    }
+
     /// How much [`KeyPool::acquire_excluding`] wants this key at `now`;
     /// higher is tried first, `None` is not eligible at all. `queued` is
     /// whether this is the pool's last-known-good key. The tiers, highest
@@ -306,10 +316,7 @@ impl KeyPool {
         let label = position_label(&inner.keys, key);
         let mut totals = None;
         if let Some(e) = inner.keys.iter_mut().find(|e| e.value == key) {
-            e.status = KeyHealthStatus::Alive;
-            e.last_success = Some(now);
-            e.failures = 0;
-            e.cooldown_until = None;
+            e.revive(now);
             e.total_audio_ms = e.total_audio_ms.saturating_add(audio_ms);
             e.successful_sessions = e.successful_sessions.saturating_add(1);
             totals = Some((e.total_audio_ms, e.successful_sessions));
@@ -333,10 +340,7 @@ impl KeyPool {
         let now = Instant::now();
         let mut inner = self.inner.write();
         if let Some(e) = inner.keys.iter_mut().find(|e| e.value == key) {
-            e.status = KeyHealthStatus::Alive;
-            e.last_success = Some(now);
-            e.failures = 0;
-            e.cooldown_until = None;
+            e.revive(now);
         }
         if inner.last_good.is_none() {
             inner.last_good = Some(key.to_string());

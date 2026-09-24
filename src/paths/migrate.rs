@@ -5,12 +5,6 @@ use std::path::{Path, PathBuf};
 
 use super::*;
 
-/// NUL-terminated UTF-16, the shape every `PCWSTR` argument above wants. The
-/// returned buffer must outlive the call that borrows its pointer.
-pub(super) fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
 /// Path of the marker recording the active data folder. `None` when Windows
 /// gives us no `LOCALAPPDATA`, in which case the multi-hop migration simply
 /// does not happen -- a missing convenience, never a failure.
@@ -73,6 +67,12 @@ pub(super) fn migrate_into(source_dir: &Path, dest: &Path) -> Vec<String> {
         if !source.exists() {
             continue;
         }
+        if name == "logs" && !holds_our_logs(&source) {
+            // Somebody else's `logs\` beside the exe or in a folder the user
+            // picked despite the caution (see `folder_caution`): not ours to
+            // move.
+            continue;
+        }
         let target = dest.join(name);
         if target.exists() {
             diags.push(format!(
@@ -96,6 +96,22 @@ pub(super) fn migrate_into(source_dir: &Path, dest: &Path) -> Vec<String> {
         }
     }
     diags
+}
+
+/// Whether a `logs` directory is QuickDictate's: it holds at least one file
+/// named `quickdictate*` (the active, rotated, panic and legacy logs all are).
+/// "logs" is a generic name, and a folder that merely has one must not have it
+/// carried off to QuickDictate's data folder.
+pub(super) fn holds_our_logs(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .starts_with("quickdictate")
+        })
+    })
 }
 
 /// Move a file or directory, falling back to copy-then-delete when `rename`
