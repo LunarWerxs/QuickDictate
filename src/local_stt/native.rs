@@ -215,6 +215,10 @@ impl NativeEngine {
         Ok(true)
     }
 
+    /// Decode a whole buffer: split it into clips and join what each decodes to.
+    /// Its signature and empty-input guard repeat `run_one` (one clip) further
+    /// down native.rs. An argument struct is not worth it for four parameters at
+    /// two levels of the same decode; revisit if a third entry point takes them.
     pub(super) unsafe fn run(
         &mut self,
         model_id: &str,

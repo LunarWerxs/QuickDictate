@@ -332,18 +332,19 @@ fn history_cache_stale_is_false_when_neither_version_nor_filter_moved() {
 }
 
 #[test]
-fn history_cache_stale_detects_a_version_bump_with_the_filter_unchanged() {
-    assert!(history_cache_stale(3, 4, "hello", "hello"));
-}
-
-#[test]
-fn history_cache_stale_detects_a_filter_edit_with_the_version_unchanged() {
-    assert!(history_cache_stale(3, 3, "hello", "hell"));
-}
-
-#[test]
-fn history_cache_stale_detects_both_moving_at_once() {
-    assert!(history_cache_stale(3, 5, "hello", "world"));
+fn history_cache_stale_detects_the_version_or_the_filter_moving() {
+    // A version bump with the filter unchanged, a filter edit with the version
+    // unchanged, and both moving at once.
+    for (cached, current, cached_filter, filter) in [
+        (3, 4, "hello", "hello"),
+        (3, 3, "hello", "hell"),
+        (3, 5, "hello", "world"),
+    ] {
+        assert!(
+            history_cache_stale(cached, current, cached_filter, filter),
+            "version {cached}->{current}, filter {cached_filter:?}->{filter:?}"
+        );
+    }
 }
 
 // ---- "Default settings" keeps the keys (review fix F4) --------------------

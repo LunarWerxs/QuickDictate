@@ -59,37 +59,28 @@ fn color_channels_mask_out_unrelated_high_bits() {
 // ---- premultiply ----
 
 #[test]
-fn premultiply_at_full_coverage_keeps_the_channel() {
-    assert_eq!(premultiply(255, 255), 255);
-}
-
-#[test]
-fn premultiply_at_zero_coverage_zeroes_the_channel() {
-    assert_eq!(premultiply(255, 0), 0);
-}
-
-#[test]
-fn premultiply_scales_by_the_coverage_fraction() {
-    // (200 * 128 + 127) / 255 == 100 (integer division).
-    assert_eq!(premultiply(200, 128), 100);
+fn premultiply_scales_the_channel_by_coverage() {
+    // (channel, coverage, expected): full coverage keeps the channel, zero
+    // coverage zeroes it, and in between (200 * 128 + 127) / 255 == 100.
+    for (channel, coverage, expected) in [(255, 255, 255), (255, 0, 0), (200, 128, 100)] {
+        assert_eq!(
+            premultiply(channel, coverage),
+            expected,
+            "premultiply({channel}, {coverage})"
+        );
+    }
 }
 
 // ---- blend ----
 
 #[test]
-fn blend_at_zero_alpha_is_pure_background() {
-    assert_eq!(blend(10, 200, 0), 10);
-}
-
-#[test]
-fn blend_at_full_alpha_is_pure_foreground() {
-    assert_eq!(blend(10, 200, 255), 200);
-}
-
-#[test]
-fn blend_at_half_alpha_is_a_weighted_average() {
-    // (200 * 128 + 10 * 127) / 255 == 105 (integer division).
-    assert_eq!(blend(10, 200, 128), 105);
+fn blend_weights_foreground_over_background_by_alpha() {
+    // (alpha, expected) for background 10 under foreground 200: zero alpha is
+    // pure background, full alpha pure foreground, and half alpha the weighted
+    // average (200 * 128 + 10 * 127) / 255 == 105.
+    for (alpha, expected) in [(0, 10), (255, 200), (128, 105)] {
+        assert_eq!(blend(10, 200, alpha), expected, "blend at alpha {alpha}");
+    }
 }
 
 // ---- version_label ----

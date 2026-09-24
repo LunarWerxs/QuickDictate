@@ -21,58 +21,62 @@ const PARALLEL_DOWNLOAD_WORKERS: usize = 8;
 const DOWNLOAD_BUFFER_BYTES: usize = 1024 * 1024;
 const DOWNLOAD_RANGE_ATTEMPTS: usize = 3;
 
+/// One pinned file on its way into `part`: what every step of a download
+/// needs to fetch it, report progress and stop when cancelled. Built once by
+/// `download_verified` and borrowed by each step below.
+pub(super) struct Fetch<'a> {
+    pub(super) client: &'a reqwest::Client,
+    pub(super) id: &'a str,
+    pub(super) phase: InstallPhase,
+    pub(super) url: &'a str,
+    pub(super) expected_bytes: u64,
+    pub(super) part: &'a Path,
+    pub(super) display_total: u64,
+    pub(super) cancel: &'a AtomicBool,
+}
+
+impl Fetch<'_> {
+    fn report(&self, downloaded: u64) {
+        set_state(self.id, self.phase.clone(), downloaded, self.display_total);
+    }
+}
+
+/// One range of a parallel download, plus the counters every range shares.
+struct Range<'a> {
+    start: u64,
+    end: u64,
+    progress: &'a AtomicU64,
+    failed: &'a AtomicBool,
+}
+
 /// Download `url` into `part`, choosing parallel ranged fetch or a single
 /// stream, and return the resulting file's SHA-256. Split out of
 /// `download_verified` so its choice-of-strategy branching doesn't add to
 /// that function's own retry/cleanup nesting.
-#[allow(clippy::too_many_arguments)]
-fn fetch_to_part(
-    runtime: &tokio::runtime::Runtime,
-    client: &reqwest::Client,
-    id: &str,
-    phase: InstallPhase,
-    url: &str,
-    expected_bytes: u64,
-    part: &Path,
-    display_total: u64,
-    cancel: &AtomicBool,
-) -> Result<String, String> {
+fn fetch_to_part(runtime: &tokio::runtime::Runtime, fetch: &Fetch<'_>) -> Result<String, String> {
+    let expected_bytes = fetch.expected_bytes;
     let parallel = expected_bytes >= PARALLEL_DOWNLOAD_MIN_BYTES
-        && runtime.block_on(server_supports_ranges(client, url, expected_bytes, cancel))?;
+        && runtime.block_on(server_supports_ranges(
+            fetch.client,
+            fetch.url,
+            expected_bytes,
+            fetch.cancel,
+        ))?;
     if parallel {
         tracing::info!(
             "downloading {expected_bytes} bytes with {PARALLEL_DOWNLOAD_WORKERS} parallel ranges"
         );
-        runtime.block_on(download_parallel(
-            client,
-            id,
-            phase,
-            url,
-            expected_bytes,
-            part,
-            display_total,
-            cancel,
-            PARALLEL_DOWNLOAD_WORKERS,
-        ))?;
+        runtime.block_on(download_parallel(fetch, PARALLEL_DOWNLOAD_WORKERS))?;
         set_state(
-            id,
+            fetch.id,
             InstallPhase::VerifyingDownload,
             expected_bytes,
-            display_total,
+            fetch.display_total,
         );
-        hash_file(part, cancel)
+        hash_file(fetch.part, fetch.cancel)
     } else {
         tracing::info!("downloading {expected_bytes} bytes as one HTTP stream");
-        runtime.block_on(download_single(
-            client,
-            id,
-            phase,
-            url,
-            expected_bytes,
-            part,
-            display_total,
-            cancel,
-        ))
+        runtime.block_on(download_single(fetch))
     }
 }
 
@@ -95,17 +99,17 @@ pub(super) fn download_verified(
             .build()
             .map_err(|e| format!("could not start download runtime: {e}"))?;
         let client = download_client()?;
-        let actual = fetch_to_part(
-            &runtime,
-            &client,
+        let fetch = Fetch {
+            client: &client,
             id,
             phase,
             url,
             expected_bytes,
-            &part,
+            part: &part,
             display_total,
             cancel,
-        )?;
+        };
+        let actual = fetch_to_part(&runtime, &fetch)?;
         activate_verified(&actual, expected_sha256, &part, dest, cancel)
     })();
     if result.is_err() {
@@ -242,18 +246,9 @@ async fn server_supports_ranges(
     Ok(true)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn download_single(
-    client: &reqwest::Client,
-    id: &str,
-    phase: InstallPhase,
-    url: &str,
-    expected_bytes: u64,
-    part: &Path,
-    display_total: u64,
-    cancel: &AtomicBool,
-) -> Result<String, String> {
-    let mut response = send_with_cancel(client.get(url), cancel)
+async fn download_single(fetch: &Fetch<'_>) -> Result<String, String> {
+    let (expected_bytes, part, cancel) = (fetch.expected_bytes, fetch.part, fetch.cancel);
+    let mut response = send_with_cancel(fetch.client.get(fetch.url), cancel)
         .await
         .map_err(|e| format!("download failed: {e}"))?;
     check_single_response(&response, expected_bytes)?;
@@ -274,7 +269,7 @@ async fn download_single(
         hasher.update(&chunk);
         file.write_all(&chunk)
             .map_err(|e| format!("download write failed: {e}"))?;
-        set_state(id, phase.clone(), downloaded, display_total);
+        fetch.report(downloaded);
     }
     file.sync_all()
         .map_err(|e| format!("could not flush download: {e}"))?;
@@ -324,18 +319,8 @@ pub(super) fn range_segments(total: u64, workers: usize) -> Vec<(u64, u64)> {
         .collect()
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn download_parallel(
-    client: &reqwest::Client,
-    id: &str,
-    phase: InstallPhase,
-    url: &str,
-    expected_bytes: u64,
-    part: &Path,
-    display_total: u64,
-    cancel: &AtomicBool,
-    workers: usize,
-) -> Result<(), String> {
+pub(super) async fn download_parallel(fetch: &Fetch<'_>, workers: usize) -> Result<(), String> {
+    let (expected_bytes, part, cancel) = (fetch.expected_bytes, fetch.part, fetch.cancel);
     presize_part(part, expected_bytes)?;
     let progress = AtomicU64::new(0);
     let failed = AtomicBool::new(false);
@@ -343,29 +328,16 @@ pub(super) async fn download_parallel(
     let downloads = range_segments(expected_bytes, workers)
         .into_iter()
         .map(|(start, end)| {
-            let client = client.clone();
-            let phase = phase.clone();
-            let progress = &progress;
-            let failed = &failed;
+            let range = Range {
+                start,
+                end,
+                progress: &progress,
+                failed: &failed,
+            };
             let first_error = &first_error;
             async move {
-                let result = download_range(
-                    &client,
-                    id,
-                    phase,
-                    url,
-                    expected_bytes,
-                    start,
-                    end,
-                    part,
-                    display_total,
-                    progress,
-                    cancel,
-                    failed,
-                )
-                .await;
-                if let Err(error) = result {
-                    record_first_error(failed, first_error, error);
+                if let Err(error) = download_range(fetch, &range).await {
+                    record_first_error(range.failed, first_error, error);
                 }
             }
         });
@@ -417,23 +389,17 @@ fn record_first_error(failed: &AtomicBool, first_error: &Mutex<Option<String>>, 
 /// report if every attempt runs out. `Err` only for the cases that should
 /// abort the whole download outright: cancellation, a sibling range failing,
 /// or the server sending more than was asked for.
-#[allow(clippy::too_many_arguments)]
 async fn write_range_chunks(
     response: &mut reqwest::Response,
     file: &mut File,
-    start: u64,
-    end: u64,
+    fetch: &Fetch<'_>,
+    range: &Range<'_>,
     mut next: u64,
-    id: &str,
-    phase: InstallPhase,
-    display_total: u64,
-    progress: &AtomicU64,
-    cancel: &AtomicBool,
-    failed: &AtomicBool,
 ) -> Result<(u64, Option<String>), String> {
+    let (start, end, cancel) = (range.start, range.end, fetch.cancel);
     let mut last_error = Some(format!("response ended before byte {end}"));
     while next <= end {
-        check_aborted(cancel, failed)?;
+        check_aborted(cancel, range.failed)?;
         let limit = (end - next + 1).min(DOWNLOAD_BUFFER_BYTES as u64) as usize;
         let chunk = match next_chunk_with_cancel(response, cancel).await {
             Ok(None) => break,
@@ -452,8 +418,7 @@ async fn write_range_chunks(
         file.write_all(&chunk)
             .map_err(|e| format!("range {start}-{end} write failed: {e}"))?;
         next += n as u64;
-        let downloaded = progress.fetch_add(n as u64, Ordering::AcqRel) + n as u64;
-        set_state(id, phase.clone(), downloaded, display_total);
+        fetch.report(range.progress.fetch_add(n as u64, Ordering::AcqRel) + n as u64);
     }
     if next > end {
         last_error = None;
@@ -461,42 +426,14 @@ async fn write_range_chunks(
     Ok((next, last_error))
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn download_range(
-    client: &reqwest::Client,
-    id: &str,
-    phase: InstallPhase,
-    url: &str,
-    expected_bytes: u64,
-    start: u64,
-    end: u64,
-    part: &Path,
-    display_total: u64,
-    progress: &AtomicU64,
-    cancel: &AtomicBool,
-    failed: &AtomicBool,
-) -> Result<(), String> {
-    let mut file = open_part_at(part, start)?;
+async fn download_range(fetch: &Fetch<'_>, range: &Range<'_>) -> Result<(), String> {
+    let (start, end) = (range.start, range.end);
+    let mut file = open_part_at(fetch.part, start)?;
     let mut next = start;
     let mut last_error = None;
     for attempt in 1..=DOWNLOAD_RANGE_ATTEMPTS {
-        check_aborted(cancel, failed)?;
-        let (updated_next, retry_reason) = attempt_range(
-            client,
-            &mut file,
-            id,
-            phase.clone(),
-            url,
-            expected_bytes,
-            start,
-            end,
-            next,
-            display_total,
-            progress,
-            cancel,
-            failed,
-        )
-        .await?;
+        check_aborted(fetch.cancel, range.failed)?;
+        let (updated_next, retry_reason) = attempt_range(fetch, range, &mut file, next).await?;
         next = updated_next;
         if next > end {
             return Ok(());
@@ -517,39 +454,14 @@ async fn download_range(
 /// request counting as a retry that got nowhere. Split out of
 /// `download_range` so its retry loop does not also nest the per-attempt
 /// branching.
-#[allow(clippy::too_many_arguments)]
 async fn attempt_range(
-    client: &reqwest::Client,
+    fetch: &Fetch<'_>,
+    range: &Range<'_>,
     file: &mut File,
-    id: &str,
-    phase: InstallPhase,
-    url: &str,
-    expected_bytes: u64,
-    start: u64,
-    end: u64,
     next: u64,
-    display_total: u64,
-    progress: &AtomicU64,
-    cancel: &AtomicBool,
-    failed: &AtomicBool,
 ) -> Result<(u64, Option<String>), String> {
-    match request_range(client, url, next, end, expected_bytes, cancel).await {
-        Ok(mut response) => {
-            write_range_chunks(
-                &mut response,
-                file,
-                start,
-                end,
-                next,
-                id,
-                phase,
-                display_total,
-                progress,
-                cancel,
-                failed,
-            )
-            .await
-        }
+    match request_range(fetch, next, range.end).await {
+        Ok(mut response) => write_range_chunks(&mut response, file, fetch, range, next).await,
         Err(retry_reason) => Ok((next, Some(retry_reason))),
     }
 }
@@ -558,23 +470,21 @@ async fn attempt_range(
 /// exactly that range of the pinned file. `Err` is the retry reason the
 /// caller keeps in case every attempt fails.
 async fn request_range(
-    client: &reqwest::Client,
-    url: &str,
+    fetch: &Fetch<'_>,
     next: u64,
     end: u64,
-    expected_bytes: u64,
-    cancel: &AtomicBool,
 ) -> Result<reqwest::Response, String> {
     let response = send_with_cancel(
-        client
-            .get(url)
+        fetch
+            .client
+            .get(fetch.url)
             .header(reqwest::header::RANGE, format!("bytes={next}-{end}")),
-        cancel,
+        fetch.cancel,
     )
     .await
     .map_err(|e| format!("request failed: {e}"))?;
     let remaining = end - next + 1;
-    let expected_range = format!("bytes {next}-{end}/{expected_bytes}");
+    let expected_range = format!("bytes {next}-{end}/{}", fetch.expected_bytes);
     let actual_range = response
         .headers()
         .get(reqwest::header::CONTENT_RANGE)

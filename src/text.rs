@@ -382,8 +382,28 @@ mod tests {
     }
 
     #[test]
-    fn empty_input_stays_empty() {
-        assert_eq!(processor().process(""), "");
+    fn default_processor_cleans_up_dictated_text() {
+        for (input, expected) in [
+            // Empty input stays empty.
+            ("", ""),
+            // json -> JSON, api -> API; 7 words + a finished look -> trailing period.
+            (
+                "let's parse the json from the api",
+                "Let's parse the JSON from the API.",
+            ),
+            // The space before punctuation goes, and the sentence is capitalized.
+            (
+                "hello world , this is a test",
+                "Hello world, this is a test.",
+            ),
+            // Run-together sentences are split and each capitalized.
+            (
+                "first sentence.second sentence here",
+                "First sentence. Second sentence here.",
+            ),
+        ] {
+            assert_eq!(processor().process(input), expected, "input {input:?}");
+        }
     }
 
     #[test]
@@ -392,31 +412,6 @@ mod tests {
         // Lowercased in the input, matched case-insensitively, then the sentence
         // gets its leading capital (auto_punct) but no trailing period (short).
         assert_eq!(p.process("push to github"), "Push to GitHub");
-    }
-
-    #[test]
-    fn developer_terms_are_normalized() {
-        // json -> JSON, api -> API; 7 words + a finished look -> trailing period.
-        assert_eq!(
-            processor().process("let's parse the json from the api"),
-            "Let's parse the JSON from the API."
-        );
-    }
-
-    #[test]
-    fn strips_space_before_punctuation_and_capitalizes() {
-        assert_eq!(
-            processor().process("hello world , this is a test"),
-            "Hello world, this is a test."
-        );
-    }
-
-    #[test]
-    fn splits_and_capitalizes_run_together_sentences() {
-        assert_eq!(
-            processor().process("first sentence.second sentence here"),
-            "First sentence. Second sentence here."
-        );
     }
 
     #[test]

@@ -5,6 +5,10 @@
 //! `Begin` (session start) and `Turn` events; `end_of_turn=true` marks a
 //! finalized turn (→ `Committed`), interim turns are `Partial`. End the session
 //! with `{"type":"Terminate"}`, after which the server flushes and closes.
+//!
+//! The `use` list below is deepgram.rs's, token for token: both are raw-PCM
+//! WebSocket adapters over `ws`. A shared prelude is not worth it for an import
+//! list; revisit if a third adapter needs the same set.
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -26,6 +30,10 @@ const MAX_KEYTERMS: usize = 100;
 pub struct AssemblyAiProvider;
 
 #[async_trait]
+// Same shape as deepgram.rs's impl. A trait default for the 16 kHz format and
+// stall recovery is not worth it: each provider states its own wire format
+// (OpenAI's is 24 kHz), and a default would let a new one forget. Revisit if the
+// trait grows a per-provider config struct.
 impl SttProvider for AssemblyAiProvider {
     fn id(&self) -> &'static str {
         "assemblyai"

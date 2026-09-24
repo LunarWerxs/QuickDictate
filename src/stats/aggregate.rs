@@ -37,6 +37,10 @@ impl ProviderStats {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
+// The first three fields repeat ProviderStats' wire keys above in aggregate.rs.
+// A `#[serde(flatten)]` ProviderStats is not worth it: it would move the synced
+// stats file onto serde's buffered flatten path and rename every counter read,
+// to save three declarations. Revisit if a counter is added to both.
 pub struct PeriodStats {
     #[serde(rename = "w", alias = "words")]
     pub words: u64,
@@ -74,6 +78,9 @@ impl PeriodStats {
     }
 
     pub(super) fn merge_monotonic(&mut self, other: &Self) {
+        // `combine` opens with ProviderStats' three counter lines from aggregate.rs;
+        // sharing them is not worth it without the flatten ruled out on the struct
+        // above. Revisit together with it.
         self.combine(other, u64::max);
     }
 

@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 
 use super::download::{
     download_client, download_parallel, download_verified, range_segments, verify_model_hash_once,
+    Fetch,
 };
 use super::install::{finish_operation, install, InstallPhase};
 use super::native::{join_and_clean, language_cstring, ModelLoadParams, NativeEngine, RunParams};
@@ -443,19 +444,17 @@ fn parallel_downloader_reassembles_http_ranges() {
         .enable_all()
         .build()
         .unwrap();
-    runtime
-        .block_on(download_parallel(
-            &client,
-            "parallel-download-test",
-            InstallPhase::DownloadingModel,
-            &url,
-            data.len() as u64,
-            &path,
-            data.len() as u64,
-            &cancel,
-            4,
-        ))
-        .unwrap();
+    let fetch = Fetch {
+        client: &client,
+        id: "parallel-download-test",
+        phase: InstallPhase::DownloadingModel,
+        url: &url,
+        expected_bytes: data.len() as u64,
+        part: &path,
+        display_total: data.len() as u64,
+        cancel: &cancel,
+    };
+    runtime.block_on(download_parallel(&fetch, 4)).unwrap();
     server.join().unwrap();
     assert_eq!(fs::read(&path).unwrap(), *data);
     let _ = fs::remove_file(path);
