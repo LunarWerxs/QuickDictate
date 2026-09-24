@@ -277,6 +277,11 @@ async fn recover_from_stall(
     state.sink = replacement.sink;
     // A send that failed on the old socket set this; the new one is alive.
     *ws_dead = false;
+    // The recv task kept reading the quiet connection all through the
+    // handshake, and a commit it took from there meanwhile is already pasted.
+    // Catch up now, when that task is about to switch over, so the committed
+    // audio is not replayed into the replacement and typed a second time.
+    watch.sync(state);
     let replay: Vec<Vec<i16>> = watch.segment.iter().cloned().collect();
     let samples: usize = replay.iter().map(Vec::len).sum();
     tracing::info!(
@@ -336,17 +341,7 @@ async fn recover_dead_socket(
 /// stall watchdog for providers that support recovery.
 async fn send_task_live_phase(state: &mut SendTaskState, sent: &mut SentAudio, ws_dead: &mut bool) {
     let mut watch = state.recovery.is_some().then(|| StallWatch::new(state));
-    loop {
-        if state.release_pending.load(Ordering::Acquire) || *ws_dead {
-            break;
-        }
-        let chunk_opt = tokio::select! {
-            v = state.samples_rx.recv() => v,
-            _ = tokio::time::sleep(Duration::from_millis(30)) => continue,
-        };
-        let Some(chunk) = chunk_opt else {
-            break;
-        };
+    while let Some(chunk) = next_live_chunk(state, *ws_dead).await {
         // Classify before shipping so the phantom-finalization guard (recv
         // task) can tell a commit backed by real speech from one conjured out
         // of the trailing silence the live phase also forwards. Only speech
@@ -370,16 +365,44 @@ async fn send_task_live_phase(state: &mut SendTaskState, sent: &mut SentAudio, w
             continue;
         }
         if let Some(watch) = watch.as_mut() {
-            if watch.observe(state, chunk, is_speech) {
-                let cause = format!(
-                    "provider went quiet: no transcript for {:.1} s while {} speech chunk(s) went out",
-                    watch.quiet_since.elapsed().as_secs_f64(),
-                    watch.speech_since_activity
-                );
-                recover_from_stall(state, watch, ws_dead, &cause).await;
-            }
+            watch_for_stall(state, watch, chunk, is_speech, ws_dead).await;
         }
     }
+}
+
+/// The live phase's next mic chunk, or `None` once the hotkey is released,
+/// the socket is dead, or the capture side is gone. Wakes every 30 ms while
+/// no audio arrives, so a release is noticed promptly.
+async fn next_live_chunk(state: &mut SendTaskState, ws_dead: bool) -> Option<Vec<i16>> {
+    loop {
+        if state.release_pending.load(Ordering::Acquire) || ws_dead {
+            return None;
+        }
+        tokio::select! {
+            v = state.samples_rx.recv() => return v,
+            _ = tokio::time::sleep(Duration::from_millis(30)) => {}
+        }
+    }
+}
+
+/// Show one shipped live chunk to the stall watchdog, and replace the
+/// connection if the watchdog trips on it.
+async fn watch_for_stall(
+    state: &mut SendTaskState,
+    watch: &mut StallWatch,
+    chunk: Vec<i16>,
+    is_speech: bool,
+    ws_dead: &mut bool,
+) {
+    if !watch.observe(state, chunk, is_speech) {
+        return;
+    }
+    let cause = format!(
+        "provider went quiet: no transcript for {:.1} s while {} speech chunk(s) went out",
+        watch.quiet_since.elapsed().as_secs_f64(),
+        watch.speech_since_activity
+    );
+    recover_from_stall(state, watch, ws_dead, &cause).await;
 }
 
 /// Phase 2 of [`run_send_task`]: keep listening through the user-configured

@@ -33,6 +33,22 @@ pub(super) fn is_phantom_finalization(
     released && speech_now == speech_at_last_commit
 }
 
+/// The stall watchdog's verdict for one live-phase tick: the server has said
+/// nothing (no partial, no commit) for `quiet_for` while `speech_chunks_since`
+/// speech-bearing chunks went out, and this press still has reconnects left.
+/// Both halves matter: silence from the server is normal while the USER is
+/// silent, and a provider that answers the first words of a sentence a couple
+/// of seconds late must not be reconnected out from under a working session.
+pub(super) fn stall_tripped(
+    quiet_for: Duration,
+    speech_chunks_since: u64,
+    reconnects_so_far: u32,
+) -> bool {
+    reconnects_so_far < MAX_STALL_RECONNECTS
+        && quiet_for >= STALL_AFTER
+        && speech_chunks_since >= STALL_MIN_SPEECH_CHUNKS
+}
+
 /// Did a mid-session transport failure actually cost the user any speech?
 /// Only when it did is the red "!" pip honest. Three cases:
 ///
@@ -58,24 +74,40 @@ pub(super) fn is_phantom_finalization(
 /// alarms around. The count is still logged next to the chunk totals, because
 /// it is exactly what you want when diagnosing a press after the fact.
 #[inline]
-/// The stall watchdog's verdict for one live-phase tick: the server has said
-/// nothing (no partial, no commit) for `quiet_for` while `speech_chunks_since`
-/// speech-bearing chunks went out, and this press still has reconnects left.
-/// Both halves matter: silence from the server is normal while the USER is
-/// silent, and a provider that answers the first words of a sentence a couple
-/// of seconds late must not be reconnected out from under a working session.
-pub(super) fn stall_tripped(
-    quiet_for: Duration,
-    speech_chunks_since: u64,
-    reconnects_so_far: u32,
-) -> bool {
-    reconnects_so_far < MAX_STALL_RECONNECTS
-        && quiet_for >= STALL_AFTER
-        && speech_chunks_since >= STALL_MIN_SPEECH_CHUNKS
-}
-
 pub(super) fn transport_failure_lost_speech(words: u64, socket_died: bool) -> bool {
     words == 0 && socket_died
+}
+
+/// What the error pip says when the socket died under a press that typed
+/// nothing, but no read error was recorded to name the cause: a server that
+/// closes cleanly ends the inbound half without one.
+pub(super) const CUT_OFF_MID_PRESS: &str =
+    "the provider closed the connection mid-press, before any words came back";
+
+/// Which failure recorded during a press, if any, ends it with the error pip.
+///
+/// * `provider_failure`, one the adapter reported itself
+///   (`SttEvent::ProviderFailure`: a local model that would not load, a
+///   Google upload whose every retry failed), whenever the press typed
+///   nothing. The adapter contract is that such a failure surfaces, and with
+///   nothing on screen the pip is the only way the user learns the dictation
+///   is gone. Once words did land it is logged instead, like a teardown.
+/// * Otherwise a transport failure, only when it cost speech (see
+///   [`transport_failure_lost_speech`]). That holds whether or not a read
+///   error was recorded, since a clean close records none.
+pub(super) fn failure_to_surface<'a>(
+    words: u64,
+    socket_died: bool,
+    provider_failure: Option<&'a str>,
+    transport_failure: Option<&'a str>,
+) -> Option<&'a str> {
+    match provider_failure {
+        Some(message) if words == 0 => Some(message),
+        _ if transport_failure_lost_speech(words, socket_died) => {
+            Some(transport_failure.unwrap_or(CUT_OFF_MID_PRESS))
+        }
+        _ => None,
+    }
 }
 
 pub(super) fn transcripts_equivalent(left: &str, right: &str) -> bool {

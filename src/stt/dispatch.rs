@@ -11,8 +11,8 @@ use crate::key_checks;
 use crate::keys::{FailKind, KeyPool};
 use crate::state::App;
 
-use super::provider::{ProviderSession, SttEvent, SttProvider, SttSessionOpts};
-use super::{assemblyai, dashscope, deepgram, elevenlabs, google, local, openai};
+use super::provider::{ProviderSession, ProviderStream, SttEvent, SttProvider, SttSessionOpts};
+use super::{assemblyai, dashscope, deepgram, elevenlabs, google, local, openai, CONNECT_TIMEOUT};
 
 /// Build the provider selected in settings.json. Unknown ids fall back to
 /// ElevenLabs (the baseline) with a warning. Providers are cheap unit structs,
@@ -188,34 +188,21 @@ pub(super) async fn check_account(
     opts: &SttSessionOpts,
     audio: Duration,
 ) -> AccountVerdict {
-    let connect = tokio::time::timeout(Duration::from_secs(6), provider.connect(key, opts));
     let ProviderSession {
         mut sink,
         mut stream,
-    } = match connect.await {
-        Err(_) => return AccountVerdict::Inconclusive("connect timed out"),
-        Ok(Err(e)) => {
-            return match provider.classify_connect_error(&e) {
-                FailKind::Transient => AccountVerdict::Inconclusive("connect failed"),
-                kind => AccountVerdict::Failed(kind),
-            }
-        }
-        Ok(Ok(session)) => session,
+    } = match connect_probe(provider, key, opts).await {
+        Ok(session) => session,
+        Err(None) => return AccountVerdict::Inconclusive("connect timed out"),
+        Err(Some(FailKind::Transient)) => return AccountVerdict::Inconclusive("connect failed"),
+        Err(Some(kind)) => return AccountVerdict::Failed(kind),
     };
     let chunk = account_chunk(opts.sample_rate);
     let chunks = audio.as_millis() / 100;
     // `Some(outcome)` if the stream settled it first; `None` if the whole
     // stream went out and the listening window passed without a word.
     let heard = tokio::select! {
-        heard = async {
-            loop {
-                match stream.recv_event().await {
-                    Ok(Some(SttEvent::KeyFailure(kind))) => return Some(kind),
-                    Ok(Some(_)) => continue,
-                    Ok(None) | Err(_) => return None,
-                }
-            }
-        } => Some(heard),
+        heard = first_key_failure(stream.as_mut()) => Some(heard),
         () = async {
             for _ in 0..chunks {
                 // A refused send means the server closed the socket; the
@@ -301,14 +288,13 @@ async fn probe_key(
     key: &str,
     opts: &SttSessionOpts,
 ) -> Result<(), FailKind> {
-    let connect = tokio::time::timeout(Duration::from_secs(6), provider.connect(key, opts));
     let ProviderSession {
         mut sink,
         mut stream,
-    } = match connect.await {
-        Err(_) => return Err(FailKind::Transient), // timed out — network, not the key
-        Ok(Err(e)) => return Err(provider.classify_connect_error(&e)),
-        Ok(Ok(s)) => s,
+    } = match connect_probe(provider, key, opts).await {
+        Ok(session) => session,
+        // A timeout is the network's doing, not the key's.
+        Err(refused) => return Err(refused.unwrap_or(FailKind::Transient)),
     };
     // ~0.1 s of silence: harmless for streaming providers (no VAD trigger),
     // and gives batch providers a body to submit.
@@ -318,21 +304,45 @@ async fn probe_key(
         // Batch: the key is only exercised by the recognize POST in commit().
         let _ = sink.commit().await;
     }
-    let listen = tokio::time::timeout(Duration::from_millis(1500), async {
-        loop {
-            match stream.recv_event().await {
-                Ok(Some(SttEvent::KeyFailure(kind))) => return Some(kind),
-                Ok(Some(_)) => continue, // SessionStarted / partials — fine
-                Ok(None) | Err(_) => return None,
-            }
-        }
-    });
+    let listen = tokio::time::timeout(
+        Duration::from_millis(1500),
+        first_key_failure(stream.as_mut()),
+    );
     match listen.await {
         Ok(Some(kind)) => Err(kind),
         // Timeout (quiet stream) or clean close: the provider accepted the key.
         _ => {
             let _ = sink.close().await;
             Ok(())
+        }
+    }
+}
+
+/// Connect for a key probe or an account check, under the same bound a
+/// press's own connect has ([`CONNECT_TIMEOUT`]). `Err(None)` is a handshake
+/// that timed out, which is the network's doing and says nothing about the
+/// key; `Err(Some(kind))` is the provider refusing it, classified.
+async fn connect_probe(
+    provider: &dyn SttProvider,
+    key: &str,
+    opts: &SttSessionOpts,
+) -> Result<ProviderSession, Option<FailKind>> {
+    match tokio::time::timeout(CONNECT_TIMEOUT, provider.connect(key, opts)).await {
+        Ok(Ok(session)) => Ok(session),
+        Ok(Err(e)) => Err(Some(provider.classify_connect_error(&e))),
+        Err(_) => Err(None),
+    }
+}
+
+/// Read `stream` until the provider blames the key, and say how. `None` once
+/// the stream ends, cleanly or not, without doing so. Everything else
+/// (session start, partials, commits) is not a verdict and is skipped.
+async fn first_key_failure(stream: &mut dyn ProviderStream) -> Option<FailKind> {
+    loop {
+        match stream.recv_event().await {
+            Ok(Some(SttEvent::KeyFailure(kind))) => return Some(kind),
+            Ok(Some(_)) => continue,
+            Ok(None) | Err(_) => return None,
         }
     }
 }
@@ -425,6 +435,30 @@ mod tests {
         };
         let verdict = check_account(&provider, "k", &check_opts(), TWELVE_SECONDS).await;
         assert!(matches!(verdict, AccountVerdict::Inconclusive(_)));
+    }
+
+    /// The startup / "Test keys" probe: a key the provider blames fails with
+    /// the provider's own verdict; one it just listens to passes.
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_fails_only_the_keys_the_provider_blames() {
+        let quiet = super::super::mock::MockProvider {
+            script: vec![SttEvent::SessionStarted, SttEvent::Partial("hm".into())],
+            hold_open: true,
+            ..Default::default()
+        };
+        assert_eq!(probe_key(&quiet, "k", &check_opts()).await, Ok(()));
+        let refused = super::super::mock::MockProvider {
+            script: vec![
+                SttEvent::SessionStarted,
+                SttEvent::KeyFailure(FailKind::Exhausted),
+            ],
+            hold_open: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            probe_key(&refused, "k", &check_opts()).await,
+            Err(FailKind::Exhausted)
+        );
     }
 
     /// Which providers the stall watchdog may reconnect, each measured against

@@ -32,7 +32,14 @@ pub(super) struct SessionAccumulators {
     pub(super) last_commit_text: Arc<parking_lot::Mutex<String>>,
     pub(super) transcribed_words: Arc<AtomicU64>,
     pub(super) key_fail_kind: Arc<parking_lot::Mutex<Option<FailKind>>>,
+    /// A failure the adapter reported itself (`SttEvent::ProviderFailure`).
+    /// Kept apart from `transport_failure` because the end of the press
+    /// treats them differently: this one is surfaced whenever the press typed
+    /// nothing, a transport error only when it cut the user off (see
+    /// [`failure_to_surface`](super::heuristics::failure_to_surface)).
     pub(super) provider_failure: Arc<parking_lot::Mutex<Option<String>>>,
+    /// The first read error off the socket. A replacement connection clears it.
+    pub(super) transport_failure: Arc<parking_lot::Mutex<Option<String>>>,
 }
 
 impl SessionAccumulators {
@@ -46,6 +53,7 @@ impl SessionAccumulators {
             transcribed_words: Arc::new(AtomicU64::new(0)),
             key_fail_kind: Arc::new(parking_lot::Mutex::new(None)),
             provider_failure: Arc::new(parking_lot::Mutex::new(None)),
+            transport_failure: Arc::new(parking_lot::Mutex::new(None)),
         }
     }
 }
@@ -169,7 +177,7 @@ fn adopt_replacement(
         .recv_app
         .word_count
         .store(committed_words, Ordering::Release);
-    if state.acc.provider_failure.lock().take().is_some() {
+    if state.acc.transport_failure.lock().take().is_some() {
         tracing::info!(
             "session[{epoch}] clearing the transport failure: the press carries on over a replacement connection"
         );
@@ -208,7 +216,7 @@ fn classify_stream_read(
         }
         Err(e) => {
             // A read error mid-utterance is NOT a clean end of stream.
-            // Recording it in `provider_failure` is what makes
+            // Recording it in `transport_failure` is what makes
             // run_session return Err, so the retry shell can rotate or
             // the pip can show an error. Without this a dropped socket
             // was indistinguishable from the provider finishing
@@ -222,7 +230,7 @@ fn classify_stream_read(
             // erroring on that flashed the pip after a dictation the
             // user watched succeed. A successful replacement clears it.
             tracing::warn!("session[{epoch}] recv error: {e}");
-            let mut slot = state.acc.provider_failure.lock();
+            let mut slot = state.acc.transport_failure.lock();
             if slot.is_none() {
                 *slot = Some(format!("transport failed mid-session: {e}"));
             }
@@ -395,32 +403,70 @@ fn handle_committed_event(
         && is_phantom_finalization(released, speech_now, *last_commit_speech)
         && looks_like_short_answer(&final_text)
     {
-        *state.acc.dropped_phantom_buf.lock() = Some(final_text.clone());
-        let mut partial = state.acc.last_partial_buf.lock();
-        if transcripts_equivalent(&partial, &final_text) {
-            partial.clear();
-        }
-        if state.log_transcripts {
-            tracing::info!(
-                "session[{epoch}] dropped phantom finalization (no speech since last commit): {final_text}"
-            );
-        } else {
-            tracing::info!(
-                "session[{epoch}] dropped phantom finalization (no speech since last commit): {} char(s)",
-                final_text.chars().count()
-            );
-        }
+        drop_phantom_commit(state, final_text);
         return;
     }
 
+    record_kept_commit(state, committed_words, &final_text);
+    *last_commit_speech = speech_now;
+
+    // Hybrid paste flow:
+    //   before release              -> HOLD (accumulate)
+    //   after release               -> LIVE (paste each chunk)
+    //   delay_until_release = false -> LIVE throughout
+    if state.delay_until_release && !released {
+        hold_commit(state, final_text);
+    } else {
+        log_transcript(
+            epoch,
+            state.log_transcripts,
+            "committed (live, append)",
+            &final_text,
+        );
+        deliver_transcript(&state.recv_app.transcript_tx, final_text);
+    }
+}
+
+/// Log recognized text: the text itself only when the user opted into
+/// `log_transcripts`, otherwise just its length. Log files end up attached to
+/// bug reports, so every site that would log a transcript goes through here
+/// rather than repeating the opt-in check it could get wrong.
+pub(super) fn log_transcript(epoch: u64, log_transcripts: bool, what: &str, text: &str) {
+    if log_transcripts {
+        tracing::info!("session[{epoch}] {what}: {text}");
+    } else {
+        tracing::info!("session[{epoch}] {what}: {} char(s)", text.chars().count());
+    }
+}
+
+/// Throw away a commit the phantom guard caught, remembering it (and clearing
+/// a partial that says the same) so the end-of-session fallback cannot
+/// promote those words anyway.
+fn drop_phantom_commit(state: &RecvTaskState, final_text: String) {
+    *state.acc.dropped_phantom_buf.lock() = Some(final_text.clone());
+    let mut partial = state.acc.last_partial_buf.lock();
+    if transcripts_equivalent(&partial, &final_text) {
+        partial.clear();
+    }
+    log_transcript(
+        state.epoch,
+        state.log_transcripts,
+        "dropped phantom finalization (no speech since last commit)",
+        &final_text,
+    );
+}
+
+/// Book a commit the guard kept: the durable-text flag, the segment boundary
+/// the send task's replay buffer starts over at, the partial it supersedes,
+/// and the word counts.
+fn record_kept_commit(state: &RecvTaskState, committed_words: &mut u32, final_text: &str) {
     // A transcript we're keeping. Mark that we have durable
-    // committed text (disarms the last-partial fallback) and
-    // advance the speech baseline for the next phantom check.
+    // committed text (disarms the last-partial fallback); the caller
+    // advances the speech baseline for the next phantom check.
     // Set ONLY for kept commits: a dropped phantom must not trip
     // this, or a session whose only real content arrived as a
     // partial would lose its promotion fallback.
     state.acc.committed_flag.store(true, Ordering::Release);
-    *last_commit_speech = speech_now;
     state.commits_seen.fetch_add(1, Ordering::AcqRel);
 
     // This commit supersedes every partial up to this point, so
@@ -432,7 +478,7 @@ fn handle_committed_event(
     // after the first commit, so a final segment whose
     // finalization timed out was discarded outright.
     state.acc.last_partial_buf.lock().clear();
-    *state.acc.last_commit_text.lock() = final_text.clone();
+    *state.acc.last_commit_text.lock() = final_text.to_owned();
 
     let chunk_words = final_text.split_whitespace().count() as u32;
     *committed_words = committed_words.saturating_add(chunk_words);
@@ -444,46 +490,30 @@ fn handle_committed_event(
         .recv_app
         .word_count
         .store(*committed_words, Ordering::Release);
+}
 
-    // Hybrid paste flow:
-    //   before release              -> HOLD (accumulate)
-    //   after release               -> LIVE (paste each chunk)
-    //   delay_until_release = false -> LIVE throughout
-    if state.delay_until_release && !released {
-        if state.log_transcripts {
-            tracing::info!("session[{epoch}] committed (held until release): {final_text}");
-        } else {
-            tracing::info!(
-                "session[{epoch}] committed (held until release): {} char(s)",
-                final_text.chars().count()
-            );
-        }
-        let prefix = {
-            let mut held = state.acc.chunks_buf.lock();
-            held.push(final_text);
-            // Same join the release flush will do, so a hit is
-            // an exact-text hit rather than a near miss.
-            state.speculate_polish.then(|| held.join(" "))
-        };
-        // Free time: the user is still talking and none of
-        // this is on screen yet, so run the cleanup pass over
-        // everything committed so far. If they release while
-        // it is still thinking, the deadline race takes over
-        // and nothing here has cost them anything.
-        if let Some(prefix) = prefix {
-            if let Some(settings) = state.polish_settings.as_ref() {
-                state.recv_app.polish.speculate(settings, &prefix);
-            }
-        }
-    } else {
-        if state.log_transcripts {
-            tracing::info!("session[{epoch}] committed (live, append): {final_text}");
-        } else {
-            tracing::info!(
-                "session[{epoch}] committed (live, append): {} char(s)",
-                final_text.chars().count()
-            );
-        }
-        deliver_transcript(&state.recv_app.transcript_tx, final_text);
+/// Hold a pre-release commit for the release flush, and speculate the
+/// cleanup pass over everything held so far.
+fn hold_commit(state: &RecvTaskState, final_text: String) {
+    log_transcript(
+        state.epoch,
+        state.log_transcripts,
+        "committed (held until release)",
+        &final_text,
+    );
+    let prefix = {
+        let mut held = state.acc.chunks_buf.lock();
+        held.push(final_text);
+        // Same join the release flush will do, so a hit is
+        // an exact-text hit rather than a near miss.
+        state.speculate_polish.then(|| held.join(" "))
+    };
+    // Free time: the user is still talking and none of
+    // this is on screen yet, so run the cleanup pass over
+    // everything committed so far. If they release while
+    // it is still thinking, the deadline race takes over
+    // and nothing here has cost them anything.
+    if let (Some(prefix), Some(settings)) = (prefix, state.polish_settings.as_ref()) {
+        state.recv_app.polish.speculate(settings, &prefix);
     }
 }

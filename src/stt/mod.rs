@@ -189,10 +189,11 @@ pub fn start_session(app: Arc<App>, keys: Arc<KeyPool>) -> SttHandle {
         // The retry-with-key-rotation shell and the post-session outcome
         // handling are both split into named async fns below, purely to
         // keep this spawned block's cognitive load down -- see their doc
-        // comments. Behavior is unchanged.
-        let final_res = run_session_with_retries(
+        // comments. The outcome is reported against the pool the press
+        // actually drew from, which a Per-App Profile may have switched.
+        let (keys, final_res) = run_session_with_retries(
             app2.clone(),
-            Arc::clone(&keys),
+            keys,
             Arc::clone(&stop),
             epoch,
             Arc::clone(&session_usage),
@@ -216,7 +217,8 @@ pub fn start_session(app: Arc<App>, keys: Arc<KeyPool>) -> SttHandle {
 /// not the key's), when no untried key is left, or when the user lets go
 /// mid-rotation — in which case the key failure is still reported, not
 /// swallowed. Split out of `start_session`'s spawned block purely to keep its
-/// cognitive load down.
+/// cognitive load down. Returns the key pool the press drew from (see
+/// [`Press::pool`]) with its result.
 async fn run_session_with_retries(
     app2: Arc<App>,
     keys: Arc<KeyPool>,
@@ -224,9 +226,10 @@ async fn run_session_with_retries(
     epoch: u64,
     session_usage: Arc<parking_lot::Mutex<SessionUsage>>,
     duck: Option<crate::duck::DuckGuard>,
-) -> Result<()> {
+) -> (Arc<KeyPool>, Result<()>) {
     let mut press = Press {
         duck,
+        exe_at_start: crate::focus::foreground_exe_name(),
         ..Press::default()
     };
     let user_aborted = || stop.load(Ordering::Acquire) || app2.current_session_epoch() != epoch;
@@ -254,14 +257,14 @@ async fn run_session_with_retries(
             tracing::error!(
                 "session[{epoch}] no untried API key left after {} attempt(s); giving up ({})",
                 press.tried.len(),
-                keys.summary()
+                press.pool_or(&keys).summary()
             );
             break attempt_res;
         }
         if press.tried.len() >= MAX_KEYS_PER_PRESS {
             tracing::error!(
                 "session[{epoch}] {MAX_KEYS_PER_PRESS} keys rejected in one press; giving up ({})",
-                keys.summary()
+                press.pool_or(&keys).summary()
             );
             break attempt_res;
         }
@@ -280,13 +283,24 @@ async fn run_session_with_retries(
     // However the press ended, its microphone is done: let other apps back up
     // (a no-op when the last attempt already did, see `run_session`).
     drop(press.duck.take());
+    let keys = press.pool.take().unwrap_or(keys);
     flush_carry(&app2, &keys, epoch, press.carry, &session_usage);
-    res
+    (keys, res)
 }
 
 /// What one press carries from attempt to attempt of the retry shell.
 #[derive(Default)]
 struct Press {
+    /// The foreground app when the hotkey went down, which picks the Per-App
+    /// Profile (provider, language, vocabulary). Resolved once per press, so
+    /// a key rotation after the user switched windows keeps dictating in the
+    /// profile they started in.
+    exe_at_start: Option<String>,
+    /// The key pool the attempts drew from, set by each attempt before it
+    /// acquires a key. A profile that names another provider runs on that
+    /// provider's pool, and the error pip, the pool summaries and the usage
+    /// of carried words must all speak of that pool, not the default one.
+    pool: Option<Arc<KeyPool>>,
     /// Keys this press has already used, so it never circles back to one that
     /// just failed; `run_session` appends the key each attempt acquires.
     tried: Vec<String>,
@@ -300,6 +314,13 @@ struct Press {
     /// waiting on the final transcript; an attempt that aborts leaves it for
     /// the next one, so a key retry never lets the music back in mid-press.
     duck: Option<crate::duck::DuckGuard>,
+}
+
+impl Press {
+    /// The pool this press drew from, or `default` before any attempt did.
+    fn pool_or<'a>(&'a self, default: &'a Arc<KeyPool>) -> &'a Arc<KeyPool> {
+        self.pool.as_ref().unwrap_or(default)
+    }
 }
 
 /// The press is over and no attempt took the carried text: paste it now
@@ -352,36 +373,7 @@ async fn finish_session(
         crate::sync::schedule_stats_push(Arc::clone(&app2));
     }
     if let Err(e) = final_res {
-        let abort = SessionAbort::of(&e);
-        match abort {
-            Some(SessionAbort::KeyRejected) => tracing::error!(
-                "session[{epoch}] no API key worked for this press -- check provider credit / pool health ({})",
-                keys.summary()
-            ),
-            Some(SessionAbort::ConnectTimedOut(_)) => tracing::error!("session[{epoch}] {e}"),
-            None => tracing::error!("session error: {e:#}"),
-        }
-        if app2.current_session_epoch() == epoch {
-            // Name the actual cause, but only when the failure was actually
-            // key-shaped. The pool's `last_failure` outlives the session
-            // (prewarm marks quota-limited keys at startup), so consulting
-            // it for a NON-key failure misattributes: a mic or network error
-            // on a machine whose spare keys sat at Quota would show "out of
-            // credit" for a dictation that never touched those keys.
-            let kind = match abort {
-                Some(SessionAbort::KeyRejected) => error_kind_for(&keys),
-                Some(SessionAbort::ConnectTimedOut(_)) => crate::state::ErrorKind::Network,
-                None => crate::state::ErrorKind::Generic,
-            };
-            app2.raise_error(kind);
-            let app_for_clear = Arc::clone(&app2);
-            app2.rt.spawn(async move {
-                tokio::time::sleep(ERROR_PIP_VISIBLE).await;
-                if app_for_clear.current_session_epoch() == epoch {
-                    app_for_clear.clear_status_if(Status::Error, Status::Idle);
-                }
-            });
-        }
+        report_session_error(&app2, &keys, epoch, &e);
     } else if app2.current_session_epoch() == epoch {
         // Whichever post-release state this press left the pip in (see
         // `session_loop::status_after_release`), the transcript is in now.
@@ -389,6 +381,49 @@ async fn finish_session(
             app2.clear_status_if(Status::Finalizing, Status::Idle);
         }
     }
+}
+
+/// Log why the press failed and, while it is still the current press, show
+/// the error pip naming the cause.
+fn report_session_error(app: &Arc<App>, keys: &KeyPool, epoch: u64, e: &anyhow::Error) {
+    let abort = SessionAbort::of(e);
+    match abort {
+        Some(SessionAbort::KeyRejected) => tracing::error!(
+            "session[{epoch}] no API key worked for this press -- check provider credit / pool health ({})",
+            keys.summary()
+        ),
+        Some(SessionAbort::ConnectTimedOut(_)) => tracing::error!("session[{epoch}] {e}"),
+        None => tracing::error!("session error: {e:#}"),
+    }
+    if app.current_session_epoch() != epoch {
+        return;
+    }
+    // Name the actual cause, but only when the failure was actually
+    // key-shaped. The pool's `last_failure` outlives the session (prewarm
+    // marks quota-limited keys at startup), so consulting it for a NON-key
+    // failure misattributes: a mic or network error on a machine whose spare
+    // keys sat at Quota would show "out of credit" for a dictation that never
+    // touched those keys.
+    let kind = match abort {
+        Some(SessionAbort::KeyRejected) => error_kind_for(keys),
+        Some(SessionAbort::ConnectTimedOut(_)) => crate::state::ErrorKind::Network,
+        None => crate::state::ErrorKind::Generic,
+    };
+    show_error_pip(app, epoch, kind);
+}
+
+/// Raise the error pip for `epoch`'s press, then put it back to Idle after
+/// [`ERROR_PIP_VISIBLE`] unless a newer press owns the pip by then. The one
+/// place both halves live, so every failure path clears the pip the same way.
+fn show_error_pip(app: &Arc<App>, epoch: u64, kind: crate::state::ErrorKind) {
+    app.raise_error(kind);
+    let app_for_clear = Arc::clone(app);
+    app.rt.spawn(async move {
+        tokio::time::sleep(ERROR_PIP_VISIBLE).await;
+        if app_for_clear.current_session_epoch() == epoch {
+            app_for_clear.clear_status_if(Status::Error, Status::Idle);
+        }
+    });
 }
 
 /// Map what the key pool observed this run onto the pip/tooltip cause.
@@ -503,11 +538,10 @@ async fn run_session(
         return Ok(());
     }
 
-    let connected =
-        match establish_connected_session(&app, keys, &stop, epoch, &mut press.tried).await? {
-            Some(connected) => connected,
-            None => return Ok(()),
-        };
+    let connected = match establish_connected_session(&app, keys, epoch, press).await? {
+        Some(connected) => connected,
+        None => return Ok(()),
+    };
     let ConnectedSession {
         cfg,
         keys,
@@ -653,17 +687,7 @@ async fn run_session(
         stream_swap,
     }));
 
-    while !stop.load(Ordering::Acquire) {
-        if app.current_session_epoch() != epoch {
-            break;
-        }
-        // Break the moment we know the session is unusable so the retry shell
-        // sees the failure without waiting for the user to press again.
-        if ctx.acc.key_fail_kind.lock().is_some() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    wait_while_held(&app, &stop, epoch, &ctx.acc).await;
 
     // Fast-fail: if the provider already told us the key is dead, skip the
     // entire finalize and hand back to the retry shell to rotate keys.
@@ -716,4 +740,20 @@ async fn run_session(
     }
 
     finish_session_outcome(&ctx, audio_ms, speech_chunks, &sent)
+}
+
+/// Keep the attempt listening while the user holds the dictation: until they
+/// let go, a newer press starts, or the provider has already rejected the key.
+async fn wait_while_held(app: &App, stop: &AtomicBool, epoch: u64, acc: &SessionAccumulators) {
+    while !stop.load(Ordering::Acquire) {
+        if app.current_session_epoch() != epoch {
+            break;
+        }
+        // Break the moment we know the session is unusable so the retry shell
+        // sees the failure without waiting for the user to press again.
+        if acc.key_fail_kind.lock().is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }

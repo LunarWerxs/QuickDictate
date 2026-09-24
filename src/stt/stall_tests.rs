@@ -9,7 +9,7 @@ use std::time::Duration;
 use super::connect::Reconnector;
 use super::heuristics::stall_tripped;
 use super::mock::MockProvider;
-use super::provider::{ProviderSession, SttProvider, SttSessionOpts};
+use super::provider::{AudioFormat, ConnectError, ProviderSession, SttProvider, SttSessionOpts};
 use super::send_task::{run_send_task, SendTaskState, StallRecovery};
 use super::{SentAudio, MAX_STALL_RECONNECTS, STALL_AFTER, STALL_MIN_SPEECH_CHUNKS};
 
@@ -54,18 +54,26 @@ async fn spawn_send_task(with_recovery: bool) -> Harness {
 
 async fn spawn_send_task_on(with_recovery: bool, provider: MockProvider) -> Harness {
     let provider = Arc::new(provider);
+    let reconnect_via = with_recovery.then(|| Arc::clone(&provider) as Arc<dyn SttProvider>);
+    spawn_send_task_via(provider, reconnect_via, Arc::new(AtomicU64::new(0))).await
+}
+
+/// The general harness: the first connection comes from `provider`, a
+/// replacement from `reconnect_via` (`None`: no stall recovery), and
+/// `commits_seen` is the count the recv task would bump on each kept commit.
+async fn spawn_send_task_via(
+    provider: Arc<MockProvider>,
+    reconnect_via: Option<Arc<dyn SttProvider>>,
+    commits_seen: Arc<AtomicU64>,
+) -> Harness {
     let ProviderSession { sink, stream: _ } = provider.connect("k", &opts()).await.unwrap();
     let (samples_tx, samples_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(64);
     let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(1);
     let release_pending = Arc::new(AtomicBool::new(false));
     let server_activity = Arc::new(AtomicU64::new(0));
     let stream_dead = Arc::new(AtomicBool::new(false));
-    let recovery = with_recovery.then(|| StallRecovery {
-        reconnect: Reconnector::new(
-            Arc::clone(&provider) as Arc<dyn SttProvider>,
-            "k".into(),
-            opts(),
-        ),
+    let recovery = reconnect_via.map(|via| StallRecovery {
+        reconnect: Reconnector::new(via, "k".into(), opts()),
         stream_tx,
         epoch: 7,
     });
@@ -79,7 +87,7 @@ async fn spawn_send_task_on(with_recovery: bool, provider: MockProvider) -> Harn
         tail_quiet: Duration::from_millis(800),
         tail_max: Duration::from_millis(1800),
         server_activity: Arc::clone(&server_activity),
-        commits_seen: Arc::new(AtomicU64::new(0)),
+        commits_seen,
         stream_dead: Arc::clone(&stream_dead),
         recovery,
     };
@@ -140,6 +148,59 @@ async fn a_quiet_server_is_replaced_and_the_segment_replayed() {
         "replayed audio is not counted as new audio"
     );
     assert!(!sent.socket_died);
+}
+
+/// A replacement whose handshake takes long enough for the quiet connection
+/// to deliver a late commit meanwhile: each connect bumps the commit count,
+/// as the recv task does when it pastes one.
+struct CommitsDuringHandshake {
+    inner: Arc<MockProvider>,
+    commits_seen: Arc<AtomicU64>,
+}
+
+#[async_trait::async_trait]
+impl SttProvider for CommitsDuringHandshake {
+    fn id(&self) -> &'static str {
+        self.inner.id()
+    }
+
+    fn required_audio_format(&self) -> AudioFormat {
+        self.inner.required_audio_format()
+    }
+
+    async fn connect(
+        &self,
+        key: &str,
+        opts: &SttSessionOpts,
+    ) -> Result<ProviderSession, ConnectError> {
+        self.commits_seen.fetch_add(1, Ordering::AcqRel);
+        self.inner.connect(key, opts).await
+    }
+}
+
+/// The quiet server commits the stalled sentence while the replacement is
+/// still connecting. That sentence is pasted already; replaying its audio
+/// into the replacement would type it a second time.
+#[tokio::test(start_paused = true)]
+async fn a_commit_that_lands_during_the_handshake_is_not_replayed() {
+    let provider = Arc::new(MockProvider::default());
+    let commits_seen = Arc::new(AtomicU64::new(0));
+    let slow = Arc::new(CommitsDuringHandshake {
+        inner: Arc::clone(&provider),
+        commits_seen: Arc::clone(&commits_seen),
+    });
+    let mut h = spawn_send_task_via(provider, Some(slow), commits_seen).await;
+    speak(&h, 60).await;
+
+    assert_eq!(h.provider.connects.load(Ordering::Acquire), 2);
+    assert!(h.stream_rx.try_recv().is_ok());
+    assert_eq!(
+        h.provider.sent_chunks.load(Ordering::Acquire),
+        60,
+        "the committed segment must not be replayed"
+    );
+    let sent = finish(h).await;
+    assert_eq!(sent.chunks, 60);
 }
 
 #[tokio::test(start_paused = true)]

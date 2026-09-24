@@ -13,9 +13,9 @@ use anyhow::{anyhow, Result};
 use crate::keys::{FailKind, KeyPool};
 use crate::state::App;
 
-use super::heuristics::{transcripts_equivalent, transport_failure_lost_speech};
+use super::heuristics::{failure_to_surface, transcripts_equivalent};
 use super::provider::AudioFormat;
-use super::recv_task::SessionAccumulators;
+use super::recv_task::{log_transcript, SessionAccumulators};
 use super::{
     audio_duration_ms, deliver_transcript, SentAudio, SessionAbort, SessionUsage, TAIL_MIN,
 };
@@ -161,21 +161,28 @@ pub(super) fn enter_release_phase(
 
     // Then flush anything held during the session so release feels snappy.
     let release_flush: Vec<String> = std::mem::take(&mut *ctx.acc.chunks_buf.lock());
-    if !release_flush.is_empty() {
-        let joined = release_flush.join(" ");
-        if !app.session_discarded(epoch) {
-            tracing::info!(
-                "session[{epoch}] release flush: {} chunk(s), {} chars",
-                release_flush.len(),
-                joined.chars().count()
-            );
-            deliver_transcript(&app.transcript_tx, joined);
-        } else {
-            tracing::info!(
-                "session[{epoch}] skipping release flush because the user discarded this dictation"
-            );
-        }
+    flush_held(app, epoch, &release_flush, "release flush");
+}
+
+/// Paste held commit chunks as one transcript, unless the user discarded the
+/// dictation. `what` names the flush in its log lines.
+fn flush_held(app: &App, epoch: u64, chunks: &[String], what: &str) {
+    if chunks.is_empty() {
+        return;
     }
+    if app.session_discarded(epoch) {
+        tracing::info!(
+            "session[{epoch}] skipping {what} because the user discarded this dictation"
+        );
+        return;
+    }
+    let joined = chunks.join(" ");
+    tracing::info!(
+        "session[{epoch}] {what}: {} chunk(s), {} chars",
+        chunks.len(),
+        joined.chars().count()
+    );
+    deliver_transcript(&app.transcript_tx, joined);
 }
 
 /// Join the send task, bounded so a stuck provider can't hang the whole
@@ -241,21 +248,7 @@ pub(super) fn promote_tail_transcript(app: &Arc<App>, ctx: &SessionFinalizeCtx) 
     let last_partial = std::mem::take(&mut *ctx.acc.last_partial_buf.lock());
     let dropped_phantom = ctx.acc.dropped_phantom_buf.lock().take();
 
-    if !held_chunks.is_empty() {
-        let joined = held_chunks.join(" ");
-        if !app.session_discarded(epoch) {
-            tracing::info!(
-                "session[{epoch}] flushing {} held commit chunk(s), {} chars total",
-                held_chunks.len(),
-                joined.chars().count()
-            );
-            deliver_transcript(&app.transcript_tx, joined);
-        } else {
-            tracing::info!(
-                "session[{epoch}] skipping held commit flush because the user discarded this dictation"
-            );
-        }
-    }
+    flush_held(app, epoch, &held_chunks, "held commit flush");
 
     // The last-partial fallback is now per SEGMENT, not per session: a kept
     // commit clears the partial buffer, so anything left here is speech that
@@ -273,44 +266,57 @@ pub(super) fn promote_tail_transcript(app: &Arc<App>, ctx: &SessionFinalizeCtx) 
     // used to be dropped as "superseded". Only a dictation the user threw
     // away on purpose (the replay long-press) is withheld.
     let had_partial = !last_partial.is_empty();
-    let partial_was_dropped_phantom = dropped_phantom
-        .as_deref()
-        .is_some_and(|phantom| transcripts_equivalent(phantom, &last_partial));
+    if had_partial {
+        promote_last_partial(app, ctx, last_partial, dropped_phantom.as_deref());
+    }
+    had_partial
+}
+
+/// Paste the trailing partial as the end of the transcript, unless it is the
+/// phantom the guard already dropped, a repeat of the last commit, or part of
+/// a dictation the user discarded.
+fn promote_last_partial(
+    app: &App,
+    ctx: &SessionFinalizeCtx,
+    last_partial: String,
+    dropped_phantom: Option<&str>,
+) {
+    let epoch = ctx.epoch;
+    if dropped_phantom.is_some_and(|phantom| transcripts_equivalent(phantom, &last_partial)) {
+        tracing::info!(
+            "session[{epoch}] suppressing last partial because it matches a dropped phantom finalization"
+        );
+        return;
+    }
     // Belt and braces: if a provider re-emits the committed text as a trailing
     // partial, promoting it would paste the same words twice.
     let partial_repeats_last_commit = {
         let last = ctx.acc.last_commit_text.lock();
         !last.is_empty() && transcripts_equivalent(&last, &last_partial)
     };
-    if had_partial && partial_was_dropped_phantom {
-        tracing::info!(
-            "session[{epoch}] suppressing last partial because it matches a dropped phantom finalization"
-        );
-    } else if had_partial && partial_repeats_last_commit {
+    if partial_repeats_last_commit {
         tracing::info!(
             "session[{epoch}] suppressing last partial because it repeats the last commit"
         );
-    } else if had_partial && !app.session_discarded(epoch) {
-        ctx.acc.transcribed_words.fetch_add(
-            last_partial.split_whitespace().count() as u64,
-            Ordering::AcqRel,
-        );
-        if ctx.log_transcripts {
-            tracing::info!("session[{epoch}] promoting last partial: {last_partial}");
-        } else {
-            tracing::info!(
-                "session[{epoch}] promoting last partial: {} char(s)",
-                last_partial.chars().count()
-            );
-        }
-        deliver_transcript(&app.transcript_tx, last_partial);
-    } else if had_partial {
+        return;
+    }
+    if app.session_discarded(epoch) {
         tracing::info!(
             "session[{epoch}] skipping last partial because the user discarded this dictation"
         );
+        return;
     }
-
-    had_partial
+    ctx.acc.transcribed_words.fetch_add(
+        last_partial.split_whitespace().count() as u64,
+        Ordering::AcqRel,
+    );
+    log_transcript(
+        epoch,
+        ctx.log_transcripts,
+        "promoting last partial",
+        &last_partial,
+    );
+    deliver_transcript(&app.transcript_tx, last_partial);
 }
 
 /// Session bookkeeping once finalize is done: rotate/credit the key,
@@ -324,15 +330,25 @@ pub(super) fn finish_session_outcome(
     sent: &SentAudio,
 ) -> Result<()> {
     let epoch = ctx.epoch;
+    let words = ctx.acc.transcribed_words.load(Ordering::Acquire);
+    let provider_failure = ctx.acc.provider_failure.lock().take();
+    let transport_failure = ctx.acc.transport_failure.lock().take();
+    let failure = failure_to_surface(
+        words,
+        sent.socket_died,
+        provider_failure.as_deref(),
+        transport_failure.as_deref(),
+    )
+    .map(str::to_owned);
     // Happy path only reaches here (fast-fail returned above on failure).
     let key_failure = *ctx.acc.key_fail_kind.lock();
     if let Some(kind) = key_failure {
         ctx.keys.mark_failed(&ctx.key, kind);
         tracing::warn!("session[{epoch}] ended with FAILED key ({kind:?}); pool will rotate");
-    } else if ctx.requires_api_key {
+    } else if ctx.requires_api_key && failure.is_none() {
+        // A press that lost the user's words does not vouch for its key.
         ctx.keys.mark_success(&ctx.key, audio_ms);
     }
-    let words = ctx.acc.transcribed_words.load(Ordering::Acquire);
     if words > 0 {
         ctx.session_usage
             .lock()
@@ -343,32 +359,58 @@ pub(super) fn finish_session_outcome(
     if key_failure.is_some() {
         return Err(SessionAbort::KeyRejected.into());
     }
-    if let Some(message) = ctx.acc.provider_failure.lock().take() {
-        // A transport that died without costing the user anything is a
-        // teardown, not a failure. ElevenLabs in particular often drops the TCP
-        // connection without a closing handshake, so `recv_event` reports
-        // "Connection reset without closing handshake" on sessions that lost
-        // nothing at all. Raising the error pip for those is a lie. The point
-        // of recording a mid-session transport error is the case where speech
-        // was LOST, so gate on exactly that (see
-        // `transport_failure_lost_speech`).
-        if !transport_failure_lost_speech(words, sent.socket_died) {
-            if words > 0 {
-                tracing::info!(
-                    "session[{epoch}] transport dropped during teardown after delivering \
-                     {words} word(s); not surfacing an error ({message})"
-                );
-            } else {
-                tracing::info!(
-                    "session[{epoch}] transport dropped on an empty dictation -- the provider \
-                     returned no words at all ({speech_chunks} chunk(s) were above our silence \
-                     floor), so there is no transcript to lose; not surfacing an error \
-                     ({message})"
-                );
-            }
-            return Ok(());
-        }
+    if let Some(message) = failure {
         return Err(anyhow!(message));
     }
+    log_quiet_failures(
+        epoch,
+        words,
+        speech_chunks,
+        provider_failure.as_deref(),
+        transport_failure.as_deref(),
+    );
     Ok(())
+}
+
+/// Say why the failures recorded during a press that ends without the error
+/// pip (see [`failure_to_surface`]) did not earn one.
+fn log_quiet_failures(
+    epoch: u64,
+    words: u64,
+    speech_chunks: u64,
+    provider_failure: Option<&str>,
+    transport_failure: Option<&str>,
+) {
+    if let Some(message) = provider_failure {
+        // Only reached with words delivered: on an empty press it surfaces.
+        tracing::warn!(
+            "session[{epoch}] the provider reported a failure after delivering {words} \
+             word(s), so part of this dictation may be missing; not surfacing an error \
+             ({message})"
+        );
+    }
+    let Some(message) = transport_failure else {
+        return;
+    };
+    // A transport that died without costing the user anything is a
+    // teardown, not a failure. ElevenLabs in particular often drops the TCP
+    // connection without a closing handshake, so `recv_event` reports
+    // "Connection reset without closing handshake" on sessions that lost
+    // nothing at all. Raising the error pip for those is a lie. The point
+    // of recording a mid-session transport error is the case where speech
+    // was LOST, so gate on exactly that (see
+    // `transport_failure_lost_speech`).
+    if words > 0 {
+        tracing::info!(
+            "session[{epoch}] transport dropped during teardown after delivering \
+             {words} word(s); not surfacing an error ({message})"
+        );
+    } else {
+        tracing::info!(
+            "session[{epoch}] transport dropped on an empty dictation -- the provider \
+             returned no words at all ({speech_chunks} chunk(s) were above our silence \
+             floor), so there is no transcript to lose; not surfacing an error \
+             ({message})"
+        );
+    }
 }
