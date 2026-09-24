@@ -10,9 +10,6 @@ use windows::Win32::UI::WindowsAndMessaging::{MSG, WM_HOTKEY, WM_TIMER};
 
 use crate::mouse_hook::{self};
 
-/// How often the loop re-registers its hotkeys. `RegisterHotKey` bindings can
-/// silently die across sleep/resume, session lock/unlock, RDP reconnects, and
-/// display changes; periodically re-arming them (SageThumbs-style self-healing)
 use super::*;
 
 /// Everything `dispatch_hotkey_message` needs that does NOT change between
@@ -37,51 +34,52 @@ pub(super) struct HotkeyBindings<'a> {
 /// as its own function purely to keep the loop's cognitive load down; the
 /// behavior is identical to having it inline.
 pub(super) fn dispatch_hotkey_message(msg: &MSG, b: &HotkeyBindings<'_>, tx: &Sender<HotkeyEvent>) {
-    let HotkeyBindings {
-        toggle_id,
-        hold_id,
-        kb_toggle,
-        kb_hold,
-        has_mouse,
-        reinsert_hold_duration,
-    } = *b;
     if msg.message == WM_TIMER {
-        let mut all_registered = true;
-        unsafe {
-            if let Some((combo, mods, vk)) = kb_toggle {
-                all_registered &= register_one(toggle_id, combo, *mods, *vk, true);
-            }
-            if let Some((combo, mods, vk)) = kb_hold {
-                all_registered &= register_one(hold_id, combo, *mods, *vk, true);
-            }
-        }
-        if has_mouse {
-            // Windows silently removes a low-level hook that overruns
-            // LowLevelHooksTimeout, so the mouse side needs the same
-            // periodic re-arm the keyboard side gets. No-op when the hook
-            // is still live.
-            all_registered &= mouse_hook::ensure_installed();
-        }
-        note_rearm_result(all_registered);
-        tracing::debug!("hotkeys re-armed");
-        return;
+        rearm_hotkeys(b);
+    } else if msg.message == WM_HOTKEY {
+        dispatch_hotkey_press(msg.wParam.0 as i32, b, tx);
     }
-    if msg.message != WM_HOTKEY {
-        return;
+}
+
+/// The periodic re-arm tick: re-register every keyboard binding, reinstall
+/// the mouse hook, and feed the outcome to `hotkeys_blocked()`.
+fn rearm_hotkeys(b: &HotkeyBindings<'_>) {
+    let mut all_registered = true;
+    unsafe {
+        if let Some((combo, mods, vk)) = b.kb_toggle {
+            all_registered &= register_one(b.toggle_id, combo, *mods, *vk, true);
+        }
+        if let Some((combo, mods, vk)) = b.kb_hold {
+            all_registered &= register_one(b.hold_id, combo, *mods, *vk, true);
+        }
     }
-    let id = msg.wParam.0 as i32;
+    if b.has_mouse {
+        // Windows silently removes a low-level hook that overruns
+        // LowLevelHooksTimeout, so the mouse side needs the same
+        // periodic re-arm the keyboard side gets. The hook is reinstalled
+        // every time, because a removed hook cannot be told from a live one.
+        all_registered &= mouse_hook::ensure_installed();
+    }
+    note_rearm_result(all_registered);
+    tracing::debug!("hotkeys re-armed");
+}
+
+/// Turn one `WM_HOTKEY` (the binding `id` fired) into its press event, and
+/// start the poller that reports the long press or release Windows never
+/// sends a message for.
+fn dispatch_hotkey_press(id: i32, b: &HotkeyBindings<'_>, tx: &Sender<HotkeyEvent>) {
     tracing::info!("WM_HOTKEY received: id={id}");
     // Only a keyboard binding can produce WM_HOTKEY; a mouse binding drives
     // its own press/release/long-press entirely inside the hook, so the
     // pollers here stay on the keyboard vk they were written for.
-    if id == toggle_id {
+    if id == b.toggle_id {
         let _ = tx.send(HotkeyEvent::TogglePressed);
-        if let Some((_, _, vk)) = kb_toggle {
-            spawn_long_press_poller(*vk, tx.clone(), reinsert_hold_duration);
+        if let Some((_, _, vk)) = b.kb_toggle {
+            spawn_long_press_poller(*vk, tx.clone(), b.reinsert_hold_duration);
         }
-    } else if id == hold_id {
+    } else if id == b.hold_id {
         let _ = tx.send(HotkeyEvent::HoldPressed);
-        if let Some((_, _, vk)) = kb_hold {
+        if let Some((_, _, vk)) = b.kb_hold {
             spawn_release_poller(*vk, tx.clone());
         }
     }

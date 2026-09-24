@@ -96,14 +96,28 @@ pub(crate) fn load_from(path: &Path) -> Vec<(String, SystemTime)> {
         .collect()
 }
 
-/// Write the whole list (newest first). Returns the error as text; callers
-/// log it and carry on, because a history that could not be saved is still a
-/// history that works for the rest of this session.
-pub fn save(entries: &[HistoryEntry]) -> Result<(), String> {
-    save_to(&path(), entries)
+/// Serializes every write and delete of the file, and the snapshot each write
+/// saves. The output worker, a Settings save and the updater all save, from
+/// different threads, into the one pid-named `.tmp`: unserialized, one save
+/// truncates another's half-written temp file, and whichever renames last can
+/// install garbage, or an older list over a newer one.
+static FILE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// Write the whole list (newest first) that `snapshot` returns. Returns the
+/// error as text; callers log it and carry on, because a history that could
+/// not be saved is still a history that works for the rest of this session.
+pub fn save(snapshot: impl FnOnce() -> Vec<HistoryEntry>) -> Result<(), String> {
+    save_to(&path(), snapshot)
 }
 
-pub(crate) fn save_to(path: &Path, entries: &[HistoryEntry]) -> Result<(), String> {
+/// `snapshot` runs under [`FILE_LOCK`], so the save that lands last also took
+/// the newest snapshot: one that snapshotted earlier can never overwrite it.
+pub(crate) fn save_to(
+    path: &Path,
+    snapshot: impl FnOnce() -> Vec<HistoryEntry>,
+) -> Result<(), String> {
+    let _file = FILE_LOCK.lock();
+    let entries = snapshot();
     let file = HistoryFile {
         version: FORMAT_VERSION,
         entries: entries
@@ -118,11 +132,19 @@ pub(crate) fn save_to(path: &Path, entries: &[HistoryEntry]) -> Result<(), Strin
             })
             .collect(),
     };
+    write_json_atomically(path, &file)
+}
+
+/// Write `value` as JSON to a `.tmp` beside `path`, flush it, then rename it
+/// over `path`, so a crash mid-write leaves the previous file intact rather
+/// than a truncated one. The temp name is only unique per process, so the
+/// caller must serialize writers of the same `path`.
+pub(crate) fn write_json_atomically(path: &Path, value: &impl Serialize) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
     }
-    let json = serde_json::to_vec_pretty(&file)
+    let json = serde_json::to_vec_pretty(value)
         .map_err(|e| format!("could not serialize {}: {e}", path.display()))?;
     let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
     let mut out =
@@ -147,6 +169,7 @@ pub fn remove() {
 }
 
 pub(crate) fn remove_at(path: &Path) {
+    let _file = FILE_LOCK.lock();
     match fs::remove_file(path) {
         Ok(()) => tracing::info!("history: removed {}", path.display()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -175,8 +198,10 @@ mod tests {
     #[test]
     fn round_trips_newest_first_with_timestamps() {
         let path = scratch("roundtrip");
-        let entries = vec![entry(2, "second", 200), entry(1, "first", 100)];
-        save_to(&path, &entries).unwrap();
+        save_to(&path, || {
+            vec![entry(2, "second", 200), entry(1, "first", 100)]
+        })
+        .unwrap();
         let back = load_from(&path);
         assert_eq!(back.len(), 2);
         assert_eq!(back[0].0, "second");
@@ -196,13 +221,64 @@ mod tests {
     #[test]
     fn a_second_save_replaces_the_first() {
         let path = scratch("replace");
-        save_to(&path, &[entry(1, "old", 1)]).unwrap();
-        save_to(&path, &[entry(2, "new", 2), entry(1, "old", 1)]).unwrap();
+        save_to(&path, || vec![entry(1, "old", 1)]).unwrap();
+        save_to(&path, || vec![entry(2, "new", 2), entry(1, "old", 1)]).unwrap();
         let back = load_from(&path);
         assert_eq!(
             back.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
             ["new", "old"]
         );
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Regression: saves from different threads shared one `.tmp` and raced.
+    /// A save that snapshots while another is still mid-save must land after
+    /// it, so the newer list is what stays on disk.
+    #[test]
+    fn a_later_snapshot_is_never_overwritten_by_an_earlier_one() {
+        let path = scratch("ordering");
+        let (inside_tx, inside_rx) = std::sync::mpsc::channel();
+        let slow = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                save_to(&path, || {
+                    inside_tx.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(100));
+                    vec![entry(1, "older", 1)]
+                })
+            })
+        };
+        inside_rx.recv().unwrap();
+        save_to(&path, || vec![entry(2, "newer", 2), entry(1, "older", 1)]).unwrap();
+        slow.join().unwrap().unwrap();
+        assert_eq!(load_from(&path)[0].0, "newer");
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Regression: concurrent saves truncated each other's temp file, and the
+    /// losing rename failed with NotFound. Every save must succeed and leave a
+    /// whole, parseable file.
+    #[test]
+    fn concurrent_saves_all_succeed_and_leave_a_whole_file() {
+        let path = scratch("concurrent");
+        let savers: Vec<_> = (0..8u64)
+            .map(|id| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    (0..5)
+                        .map(|_| {
+                            save_to(&path, || vec![entry(id, &"x".repeat(id as usize + 1), id)])
+                        })
+                        .collect::<Result<Vec<()>, String>>()
+                })
+            })
+            .collect();
+        for saver in savers {
+            saver.join().unwrap().unwrap();
+        }
+        let back = load_from(&path);
+        assert_eq!(back.len(), 1);
+        assert!(back[0].0.chars().all(|c| c == 'x'));
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -251,7 +327,7 @@ mod tests {
         let path = scratch("remove");
         remove_at(&path);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        save_to(&path, &[entry(1, "x", 1)]).unwrap();
+        save_to(&path, || vec![entry(1, "x", 1)]).unwrap();
         remove_at(&path);
         assert!(!path.exists());
         let _ = fs::remove_dir_all(path.parent().unwrap());

@@ -109,6 +109,63 @@ fn resolved_input_name() -> Option<String> {
         .and_then(|(d, _)| d.description().ok().map(|desc| desc.name().to_string()))
 }
 
+/// The device's name for the log, or empty when Windows will not say.
+fn device_name(device: &cpal::Device) -> String {
+    device
+        .description()
+        .map(|desc| desc.name().to_string())
+        .unwrap_or_default()
+}
+
+/// Make a newly opened device the current one: publish its format to the
+/// shared atomics (each session's resampler rebuilds from them on the next
+/// callback) and log the switch, saying how it came about (`how`).
+fn adopt_device(
+    (device, supported): (cpal::Device, cpal::SupportedStreamConfig),
+    device_rate: &AtomicU32,
+    channels: &AtomicUsize,
+    how: &str,
+) -> (cpal::Device, cpal::SupportedStreamConfig) {
+    device_rate.store(supported.sample_rate(), Ordering::Release);
+    channels.store(supported.channels() as usize, Ordering::Release);
+    tracing::info!(
+        "AudioSource: {how} '{}' @ {} Hz, {} ch",
+        device_name(&device),
+        supported.sample_rate(),
+        supported.channels(),
+    );
+    (device, supported)
+}
+
+/// Sleep for `total` in `HEALTH_POLL` steps so shutdown never has to sit
+/// through a full delay to join this thread. False as soon as `stop` is set.
+pub(super) fn sleep_unless_stopped(stop: &AtomicBool, total: std::time::Duration) -> bool {
+    let mut waited = std::time::Duration::ZERO;
+    while waited < total {
+        if stop.load(Ordering::Acquire) {
+            return false;
+        }
+        std::thread::sleep(HEALTH_POLL);
+        waited += HEALTH_POLL;
+    }
+    true
+}
+
+/// Poll for a working input device (the user may replug the mic or Windows
+/// may promote another device) until one opens, or `None` once the app shuts
+/// down.
+fn wait_for_input(stop: &AtomicBool) -> Option<(cpal::Device, cpal::SupportedStreamConfig)> {
+    loop {
+        if !sleep_unless_stopped(stop, REOPEN_RETRY_DELAY) {
+            return None;
+        }
+        match resolve_input() {
+            Ok(found) => return Some(found),
+            Err(e) => tracing::debug!("AudioSource reopen attempt failed: {e:#}"),
+        }
+    }
+}
+
 /// Why `stream_until_failure` returned without an error.
 enum StreamOutcome {
     /// The app is shutting down.
@@ -134,8 +191,7 @@ pub(super) fn run_global_capture(
     device: cpal::Device,
     supported: cpal::SupportedStreamConfig,
 ) {
-    let mut device = device;
-    let mut supported = supported;
+    let mut current = (device, supported);
     loop {
         match stream_until_failure(
             &sessions,
@@ -143,27 +199,16 @@ pub(super) fn run_global_capture(
             &healthy,
             &device_rate,
             &channels,
-            &device,
-            &supported,
+            &current.0,
+            &current.1,
         ) {
             Ok(StreamOutcome::Shutdown) => return,
             // A different microphone should be in use now. Nothing has failed,
             // so reopen immediately and stay "healthy" throughout — a device
             // swap is not a degraded state and must not raise the error pip.
             Ok(StreamOutcome::DeviceChanged) => match resolve_input() {
-                Ok((d, s)) => {
-                    device_rate.store(s.sample_rate(), Ordering::Release);
-                    channels.store(s.channels() as usize, Ordering::Release);
-                    tracing::info!(
-                        "AudioSource: now on '{}' @ {} Hz, {} ch",
-                        d.description()
-                            .map(|desc| desc.name().to_string())
-                            .unwrap_or_default(),
-                        s.sample_rate(),
-                        s.channels(),
-                    );
-                    device = d;
-                    supported = s;
+                Ok(next) => {
+                    current = adopt_device(next, &device_rate, &channels, "now on");
                     continue;
                 }
                 Err(e) => {
@@ -182,39 +227,11 @@ pub(super) fn run_global_capture(
                 tracing::error!("AudioSource capture failed: {e:#}; will retry the device");
             }
         }
-        // Reopen retry: poll for a working default input device (the user may
-        // replug the mic or Windows may promote another device) until one
-        // opens or the app shuts down.
-        loop {
-            // Wait out the retry delay in HEALTH_POLL steps so shutdown()
-            // never has to sit through a full delay to join this thread.
-            let mut waited = std::time::Duration::ZERO;
-            while waited < REOPEN_RETRY_DELAY {
-                if stop.load(Ordering::Acquire) {
-                    return;
-                }
-                std::thread::sleep(HEALTH_POLL);
-                waited += HEALTH_POLL;
-            }
-            match resolve_input() {
-                Ok((d, s)) => {
-                    device_rate.store(s.sample_rate(), Ordering::Release);
-                    channels.store(s.channels() as usize, Ordering::Release);
-                    tracing::info!(
-                        "AudioSource: reopened '{}' @ {} Hz, {} ch",
-                        d.description()
-                            .map(|desc| desc.name().to_string())
-                            .unwrap_or_default(),
-                        s.sample_rate(),
-                        s.channels(),
-                    );
-                    device = d;
-                    supported = s;
-                    break;
-                }
-                Err(e) => tracing::debug!("AudioSource reopen attempt failed: {e:#}"),
-            }
-        }
+        // Degraded: stay unhealthy until a device opens again.
+        let Some(next) = wait_for_input(&stop) else {
+            return;
+        };
+        current = adopt_device(next, &device_rate, &channels, "reopened");
     }
 }
 
@@ -230,94 +247,113 @@ fn stream_until_failure(
     device: &cpal::Device,
     supported: &cpal::SupportedStreamConfig,
 ) -> Result<StreamOutcome> {
-    let sample_format = supported.sample_format();
-    let mut config: cpal::StreamConfig = supported.config();
-    config.buffer_size = cpal::BufferSize::Default;
-    // A stream error (e.g. the mic is unplugged mid-session) arrives out-of-band:
-    // cpal keeps the Stream object alive but stops delivering data, so without
-    // this the app would keep "listening" while capturing nothing. Flip the
-    // shared health flag so callers can detect it (and the outer loop can
-    // rebuild the stream). Built fresh per match-arm because
-    // build_input_stream consumes the closure.
-    let make_err_fn = || {
-        let healthy = Arc::clone(healthy);
-        move |e: cpal::Error| {
-            if stream_survives(e.kind()) {
-                tracing::warn!("audio: {e} (the stream keeps running)");
-                return;
-            }
-            tracing::error!("audio stream error: {e}");
-            healthy.store(false, Ordering::Release);
-        }
+    let feed = FeedTargets {
+        sessions: Arc::clone(sessions),
+        device_rate: Arc::clone(device_rate),
+        channels: Arc::clone(channels),
     };
-
-    let stream: cpal::Stream = match sample_format {
-        cpal::SampleFormat::F32 => {
-            let sessions = Arc::clone(sessions);
-            let device_rate = Arc::clone(device_rate);
-            let channels = Arc::clone(channels);
-            let mut scratch: Vec<i16> = Vec::new();
-            device.build_input_stream(
-                config,
-                move |data: &[f32], _| {
-                    scratch.clear();
-                    scratch.reserve(data.len());
-                    for s in data {
-                        scratch.push(f32_to_i16(*s));
-                    }
-                    feed_sessions(&sessions, &device_rate, &channels, &scratch);
-                },
-                make_err_fn(),
-                None,
-            )?
-        }
-        cpal::SampleFormat::I16 => {
-            let sessions = Arc::clone(sessions);
-            let device_rate = Arc::clone(device_rate);
-            let channels = Arc::clone(channels);
-            device.build_input_stream(
-                config,
-                move |data: &[i16], _| {
-                    // WASAPI already gave us the exact representation the
-                    // resamplers consume, so avoid copying every callback into
-                    // an otherwise-identical scratch buffer.
-                    feed_sessions(&sessions, &device_rate, &channels, data);
-                },
-                make_err_fn(),
-                None,
-            )?
-        }
-        cpal::SampleFormat::U16 => {
-            let sessions = Arc::clone(sessions);
-            let device_rate = Arc::clone(device_rate);
-            let channels = Arc::clone(channels);
-            let mut scratch: Vec<i16> = Vec::new();
-            device.build_input_stream(
-                config,
-                move |data: &[u16], _| {
-                    scratch.clear();
-                    scratch.reserve(data.len());
-                    for s in data {
-                        scratch.push((*s as i32 - 32768) as i16);
-                    }
-                    feed_sessions(&sessions, &device_rate, &channels, &scratch);
-                },
-                make_err_fn(),
-                None,
-            )?
-        }
-        other => return Err(anyhow!("unsupported sample format {other:?}")),
-    };
+    let stream = build_stream(device, supported, feed, stream_error_handler(healthy))?;
 
     stream.play().map_err(|e| anyhow!("stream.play: {e}"))?;
     healthy.store(true, Ordering::Release);
     tracing::info!("AudioSource: streaming");
 
-    let open_name = device
-        .description()
-        .map(|desc| desc.name().to_string())
-        .unwrap_or_default();
+    let open_name = device_name(device);
     watch_stream(stream, stop, healthy, &open_name)
+}
+
+/// A stream error (e.g. the mic is unplugged mid-session) arrives out-of-band:
+/// cpal keeps the Stream object alive but stops delivering data, so without
+/// this the app would keep "listening" while capturing nothing. Flip the
+/// shared health flag so callers can detect it (and the outer loop can
+/// rebuild the stream).
+fn stream_error_handler(healthy: &Arc<AtomicBool>) -> impl FnMut(cpal::Error) + Send + 'static {
+    let healthy = Arc::clone(healthy);
+    move |e: cpal::Error| {
+        if stream_survives(e.kind()) {
+            tracing::warn!("audio: {e} (the stream keeps running)");
+            return;
+        }
+        tracing::error!("audio stream error: {e}");
+        healthy.store(false, Ordering::Release);
+    }
+}
+
+/// What every capture callback feeds: the live sessions, and the device
+/// format their resamplers are checked against.
+struct FeedTargets {
+    sessions: Arc<parking_lot::RwLock<Vec<SessionEntry>>>,
+    device_rate: Arc<AtomicU32>,
+    channels: Arc<AtomicUsize>,
+}
+
+impl FeedTargets {
+    fn feed(&self, data: &[i16]) {
+        feed_sessions(&self.sessions, &self.device_rate, &self.channels, data);
+    }
+}
+
+/// Open the device's input stream in its native sample format, with every
+/// callback fed to the sessions as i16.
+fn build_stream(
+    device: &cpal::Device,
+    supported: &cpal::SupportedStreamConfig,
+    feed: FeedTargets,
+    err_fn: impl FnMut(cpal::Error) + Send + 'static,
+) -> Result<cpal::Stream> {
+    let mut config: cpal::StreamConfig = supported.config();
+    config.buffer_size = cpal::BufferSize::Default;
+    Ok(match supported.sample_format() {
+        cpal::SampleFormat::F32 => {
+            build_converting_stream(device, config, feed, err_fn, f32_to_i16)?
+        }
+        cpal::SampleFormat::I16 => device.build_input_stream(
+            config,
+            move |data: &[i16], _| {
+                // WASAPI already gave us the exact representation the
+                // resamplers consume, so avoid copying every callback into
+                // an otherwise-identical scratch buffer.
+                feed.feed(data);
+            },
+            err_fn,
+            None,
+        )?,
+        cpal::SampleFormat::U16 => {
+            build_converting_stream(device, config, feed, err_fn, u16_to_i16)?
+        }
+        other => return Err(anyhow!("unsupported sample format {other:?}")),
+    })
+}
+
+/// An input stream whose native samples must become i16 before the feed.
+/// The scratch buffer lives in the callback and keeps its capacity, so after
+/// the first callback the conversion allocates nothing. Generic over
+/// `convert` (not a fn pointer) so each format's loop still compiles to an
+/// inlined per-sample conversion.
+fn build_converting_stream<T>(
+    device: &cpal::Device,
+    config: cpal::StreamConfig,
+    feed: FeedTargets,
+    err_fn: impl FnMut(cpal::Error) + Send + 'static,
+    convert: impl Fn(T) -> i16 + Send + 'static,
+) -> Result<cpal::Stream>
+where
+    T: cpal::SizedSample + 'static,
+{
+    let mut scratch: Vec<i16> = Vec::new();
+    Ok(device.build_input_stream(
+        config,
+        move |data: &[T], _| {
+            scratch.clear();
+            scratch.reserve(data.len());
+            for s in data {
+                scratch.push(convert(*s));
+            }
+            feed.feed(&scratch);
+        },
+        err_fn,
+        None,
+    )?)
 }
 
 /// Stream errors that report something the stream already lived through,

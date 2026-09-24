@@ -16,10 +16,11 @@ use windows::Win32::UI::WindowsAndMessaging::{GetMessageW, KillTimer, SetTimer, 
 
 use crate::mouse_hook::{self, is_mouse_vk, MouseBinding};
 
-/// How often the loop re-registers its hotkeys. `RegisterHotKey` bindings can
-/// silently die across sleep/resume, session lock/unlock, RDP reconnects, and
-/// display changes; periodically re-arming them (SageThumbs-style self-healing)
 use super::*;
+
+/// One configured hotkey as parsed: the combo as written, its modifiers and
+/// its virtual-key code.
+type ParsedCombo = (String, u32, u32);
 
 /// (Re)register one hotkey. `quiet` suppresses the per-registration log line
 /// (used by the periodic re-arm so the log isn't spammed every minute).
@@ -57,31 +58,17 @@ pub(super) unsafe fn register_one(id: i32, combo: &str, mods: u32, vk: u32, quie
 /// (the pre-fix behavior). Attempts are quiet; this fn owns the summary logs.
 fn register_initial(
     toggle_id: i32,
-    toggle: Option<&(String, u32, u32)>,
+    toggle: Option<&ParsedCombo>,
     hold_id: i32,
-    hold: Option<&(String, u32, u32)>,
+    hold: Option<&ParsedCombo>,
 ) {
     let deadline = Instant::now() + STARTUP_REGISTER_BUDGET;
     let mut toggle_done = toggle.is_none();
     let mut hold_done = hold.is_none();
     let mut retried = false;
     loop {
-        if !toggle_done {
-            if let Some((combo, mods, vk)) = toggle {
-                if unsafe { register_one(toggle_id, combo, *mods, *vk, true) } {
-                    toggle_done = true;
-                    tracing::info!("Registered toggle hotkey {combo} (vk=0x{vk:02X})");
-                }
-            }
-        }
-        if !hold_done {
-            if let Some((combo, mods, vk)) = hold {
-                if unsafe { register_one(hold_id, combo, *mods, *vk, true) } {
-                    hold_done = true;
-                    tracing::info!("Registered hold hotkey {combo} (vk=0x{vk:02X})");
-                }
-            }
-        }
+        register_if_pending(&mut toggle_done, toggle_id, toggle, "toggle");
+        register_if_pending(&mut hold_done, hold_id, hold, "hold");
         if (toggle_done && hold_done) || Instant::now() >= deadline {
             break;
         }
@@ -99,6 +86,117 @@ fn register_initial(
     }
 }
 
+/// One `register_initial` attempt for one binding: register it unless it is
+/// already `done` (or not configured), and log the success that attempt owns.
+fn register_if_pending(done: &mut bool, id: i32, binding: Option<&ParsedCombo>, label: &str) {
+    if *done {
+        return;
+    }
+    if let Some((combo, mods, vk)) = binding {
+        if unsafe { register_one(id, combo, *mods, *vk, true) } {
+            *done = true;
+            tracing::info!("Registered {label} hotkey {combo} (vk=0x{vk:02X})");
+        }
+    }
+}
+
+/// Parse one configured combo into `(combo, mods, vk)`, parsed once so the
+/// periodic re-arm can re-register without re-parsing. `None` or empty means
+/// the hotkey is not configured.
+fn parse_binding(combo: Option<&str>) -> Result<Option<ParsedCombo>> {
+    let Some(combo) = combo.filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let (mods, vk) = parse_combo(combo)?;
+    Ok(Some((combo.to_string(), mods, vk)))
+}
+
+/// The configured bindings that name a mouse button, as the hook wants them.
+fn mouse_bindings_for(bindings: [(i32, Option<&ParsedCombo>); 2]) -> Vec<MouseBinding> {
+    bindings
+        .into_iter()
+        .filter_map(|(id, binding)| {
+            let (_, mods, vk) = binding?;
+            is_mouse_vk(*vk).then_some(MouseBinding {
+                id,
+                vk: *vk,
+                // MOD_NOREPEAT is a RegisterHotKey concept with no meaning to
+                // a hook; strip it so the hook's exact-match compare works.
+                mods: *mods & !MOD_NOREPEAT.0,
+            })
+        })
+        .collect()
+}
+
+/// Hand the mouse bindings to the hook and install it. Must run on the
+/// hotkey thread: see the comment at the install call.
+fn start_mouse_hook(
+    mouse_bindings: Vec<MouseBinding>,
+    configured: [Option<&ParsedCombo>; 2],
+    b: &HotkeyBindings<'_>,
+    mouse_passthrough: bool,
+    tx: &Sender<HotkeyEvent>,
+) {
+    for (combo, _, vk) in configured.into_iter().flatten() {
+        if is_mouse_vk(*vk) {
+            tracing::info!("Binding mouse hotkey {combo} (vk=0x{vk:02X})");
+        }
+    }
+    mouse_hook::configure(
+        mouse_bindings,
+        tx.clone(),
+        mouse_passthrough,
+        b.reinsert_hold_duration,
+        b.toggle_id,
+        b.hold_id,
+    );
+    // Installed from *this* thread on purpose: Windows dispatches a
+    // low-level hook's callback onto the installing thread while it pumps
+    // messages, and the loop below is that pump.
+    mouse_hook::ensure_installed();
+}
+
+/// Pump this thread's messages until shutdown or `WM_QUIT`, handing each one
+/// to `dispatch_hotkey_message`.
+fn pump_hotkey_messages(b: &HotkeyBindings<'_>, tx: &Sender<HotkeyEvent>, stop_flag: &AtomicBool) {
+    let mut msg = MSG::default();
+    loop {
+        if stop_flag.load(Ordering::Acquire) {
+            break;
+        }
+        let got =
+            unsafe { GetMessageW(&mut msg, windows::Win32::Foundation::HWND::default(), 0, 0).0 };
+        if got <= 0 {
+            break;
+        } // 0 = WM_QUIT, -1 = error
+
+        dispatch_hotkey_message(&msg, b, tx);
+    }
+}
+
+/// Undo what `run_hotkey_loop` claimed: the re-arm timer, the keyboard
+/// registrations and the mouse hook.
+fn release_hotkeys(b: &HotkeyBindings<'_>, rearm_timer: usize) {
+    unsafe {
+        let null_hwnd = windows::Win32::Foundation::HWND::default();
+        if rearm_timer != 0 {
+            let _ = KillTimer(null_hwnd, rearm_timer);
+        }
+        if b.kb_toggle.is_some() {
+            let _ = UnregisterHotKey(null_hwnd, b.toggle_id);
+        }
+        if b.kb_hold.is_some() {
+            let _ = UnregisterHotKey(null_hwnd, b.hold_id);
+        }
+    }
+    // Drop the hook before we return, so a replacement process (Save &
+    // Restart, or the self-updater) isn't racing a stale hook of ours for the
+    // same buttons.
+    if b.has_mouse {
+        mouse_hook::uninstall();
+    }
+}
+
 pub(super) fn run_hotkey_loop(
     toggle_combo: Option<String>,
     hold_combo: Option<String>,
@@ -109,22 +207,12 @@ pub(super) fn run_hotkey_loop(
 ) -> Result<()> {
     let toggle_id = 1i32;
     let hold_id = 2i32;
-    // (combo, mods, vk) for each configured hotkey, parsed once so the
-    // periodic re-arm can re-register without re-parsing.
-    let mut toggle: Option<(String, u32, u32)> = None;
-    let mut hold: Option<(String, u32, u32)> = None;
 
     // Parse the combos up front. A parse error is a genuine config mistake (a
     // bad key name) and stays fatal; an OS *registration* failure below does
     // NOT abort us -- see `register_initial`.
-    if let Some(combo) = toggle_combo.as_deref().filter(|s| !s.is_empty()) {
-        let (mods, vk) = parse_combo(combo)?;
-        toggle = Some((combo.to_string(), mods, vk));
-    }
-    if let Some(combo) = hold_combo.as_deref().filter(|s| !s.is_empty()) {
-        let (mods, vk) = parse_combo(combo)?;
-        hold = Some((combo.to_string(), mods, vk));
-    }
+    let toggle = parse_binding(toggle_combo.as_deref())?;
+    let hold = parse_binding(hold_combo.as_deref())?;
 
     // Two mechanisms, split by what the binding actually is. `RegisterHotKey`
     // is keyboard-only -- it cannot express a mouse button at all -- so a
@@ -133,42 +221,27 @@ pub(super) fn run_hotkey_loop(
     // identical either way; only the acquisition differs.
     let kb_toggle = toggle.as_ref().filter(|(_, _, vk)| !is_mouse_vk(*vk));
     let kb_hold = hold.as_ref().filter(|(_, _, vk)| !is_mouse_vk(*vk));
-    let mouse_bindings: Vec<MouseBinding> =
-        [(toggle_id, toggle.as_ref()), (hold_id, hold.as_ref())]
-            .into_iter()
-            .filter_map(|(id, binding)| {
-                let (_, mods, vk) = binding?;
-                is_mouse_vk(*vk).then_some(MouseBinding {
-                    id,
-                    vk: *vk,
-                    // MOD_NOREPEAT is a RegisterHotKey concept with no meaning to
-                    // a hook; strip it so the hook's exact-match compare works.
-                    mods: *mods & !MOD_NOREPEAT.0,
-                })
-            })
-            .collect();
-    let has_mouse = !mouse_bindings.is_empty();
+    let mouse_bindings =
+        mouse_bindings_for([(toggle_id, toggle.as_ref()), (hold_id, hold.as_ref())]);
+    let bindings = HotkeyBindings {
+        toggle_id,
+        hold_id,
+        kb_toggle,
+        kb_hold,
+        has_mouse: !mouse_bindings.is_empty(),
+        reinsert_hold_duration,
+    };
 
     register_initial(toggle_id, kb_toggle, hold_id, kb_hold);
 
-    if has_mouse {
-        for (combo, _, vk) in [toggle.as_ref(), hold.as_ref()].into_iter().flatten() {
-            if is_mouse_vk(*vk) {
-                tracing::info!("Binding mouse hotkey {combo} (vk=0x{vk:02X})");
-            }
-        }
-        mouse_hook::configure(
+    if bindings.has_mouse {
+        start_mouse_hook(
             mouse_bindings,
-            tx.clone(),
+            [toggle.as_ref(), hold.as_ref()],
+            &bindings,
             mouse_passthrough,
-            reinsert_hold_duration,
-            toggle_id,
-            hold_id,
+            &tx,
         );
-        // Installed from *this* thread on purpose: Windows dispatches a
-        // low-level hook's callback onto the installing thread while it pumps
-        // messages, and the loop below is that pump.
-        mouse_hook::ensure_installed();
     }
 
     // Self-healing re-arm: RegisterHotKey bindings can silently die across
@@ -183,48 +256,7 @@ pub(super) fn run_hotkey_loop(
         )
     };
 
-    let mut msg = MSG::default();
-    loop {
-        if stop_flag.load(Ordering::Acquire) {
-            break;
-        }
-        let got =
-            unsafe { GetMessageW(&mut msg, windows::Win32::Foundation::HWND::default(), 0, 0).0 };
-        if got <= 0 {
-            break;
-        } // 0 = WM_QUIT, -1 = error
-
-        dispatch_hotkey_message(
-            &msg,
-            &HotkeyBindings {
-                toggle_id,
-                hold_id,
-                kb_toggle,
-                kb_hold,
-                has_mouse,
-                reinsert_hold_duration,
-            },
-            &tx,
-        );
-    }
-
-    unsafe {
-        let null_hwnd = windows::Win32::Foundation::HWND::default();
-        if rearm_timer != 0 {
-            let _ = KillTimer(null_hwnd, rearm_timer);
-        }
-        if kb_toggle.is_some() {
-            let _ = UnregisterHotKey(null_hwnd, toggle_id);
-        }
-        if kb_hold.is_some() {
-            let _ = UnregisterHotKey(null_hwnd, hold_id);
-        }
-    }
-    // Drop the hook before we return, so a replacement process (Save &
-    // Restart, or the self-updater) isn't racing a stale hook of ours for the
-    // same buttons.
-    if has_mouse {
-        mouse_hook::uninstall();
-    }
+    pump_hotkey_messages(&bindings, &tx, &stop_flag);
+    release_hotkeys(&bindings, rearm_timer);
     Ok(())
 }

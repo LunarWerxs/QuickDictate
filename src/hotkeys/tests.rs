@@ -208,3 +208,37 @@ fn vk_table_maps_the_known_keys() {
     assert_eq!(vk_for("nope"), None);
     assert_eq!(vk_for("A"), None); // case-sensitive: expects lowercase
 }
+
+#[test]
+fn every_function_key_maps_and_only_its_canonical_spelling_does() {
+    // The F-key codes are computed, not tabled, so pin all 24 against the
+    // Windows VK_F1..VK_F24 range and make sure no number-shaped spelling
+    // that was never a key name slips through the parse.
+    for n in 1..=24u32 {
+        assert_eq!(vk_for(&format!("f{n}")), Some(0x6F + n), "f{n}");
+    }
+    for not_a_key in [
+        "f0",
+        "f25",
+        "f01",
+        "f+1",
+        "f-1",
+        "f1a",
+        "fx",
+        "f99999999999",
+    ] {
+        assert_eq!(vk_for(not_a_key), None, "{not_a_key}");
+    }
+}
+
+#[test]
+fn modifiers_are_order_independent_and_a_repeat_is_harmless() {
+    assert_eq!(
+        parse_combo("shift+ctrl+f5").unwrap(),
+        parse_combo("ctrl+shift+f5").unwrap()
+    );
+    assert_eq!(
+        parse_combo("ctrl+ctrl+f5").unwrap(),
+        (MOD_CONTROL.0 | MOD_NOREPEAT.0, 0x74)
+    );
+}

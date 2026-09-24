@@ -16,14 +16,15 @@ use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender};
 use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_QUIT};
 
-/// How often the loop re-registers its hotkeys. `RegisterHotKey` bindings can
-/// silently die across sleep/resume, session lock/unlock, RDP reconnects, and
-/// display changes; periodically re-arming them (SageThumbs-style self-healing)
 pub use combo::parse_combo;
 
 use dispatch::*;
 use register::*;
 
+/// How often the loop re-registers its hotkeys. `RegisterHotKey` bindings can
+/// silently die across sleep/resume, session lock/unlock, RDP reconnects, and
+/// display changes; periodically re-arming them (SageThumbs-style self-healing)
+/// brings a dead binding back within a minute instead of at the next restart.
 const REARM_INTERVAL_MS: u32 = 60_000;
 
 /// How long we keep retrying the *initial* hotkey registration before giving
