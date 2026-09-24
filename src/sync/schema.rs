@@ -52,6 +52,8 @@ pub(super) const SYNCED_KEYS: &[&str] = &[
     "auto_punct",
     "hotkeys_enabled",
     "enable_sound",
+    "duck_other_audio",
+    "duck_volume_percent",
     "close_behavior",
     "mouse_follower_enabled",
     "mouse_hotkey_passthrough",

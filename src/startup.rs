@@ -414,6 +414,12 @@ pub(crate) fn bring_up_app(
     // Keep the HKCU Run entry in sync with the run_at_startup setting.
     autostart::reconcile(app.config.load().run_at_startup);
 
+    // Put back any app a previous run quieted and never restored (it crashed
+    // or was killed mid-dictation). Windows keeps per-app volume across
+    // launches, so without this the music would stay muted. Off the startup
+    // path: it only posts to the duck worker, and only if there is a list.
+    crate::duck::recover_after_crash();
+
     // Prewarm: probe the active provider's keys in the background so dead ones
     // are pre-marked and a validated key is queued before the first hotkey.
     if app.config.load().prewarm_keys {

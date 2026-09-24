@@ -3,6 +3,45 @@
 
 use super::*;
 
+/// What the "Other audio" dropdown offers: leave it alone (`None`), or the
+/// percentage of their own volume other apps keep while you dictate, `0`
+/// meaning muted. A hand-edited percentage outside this list still shows, as
+/// "Lower to N%", and survives a Save untouched.
+pub(crate) const DUCK_CHOICES: [Option<u8>; 6] =
+    [None, Some(0), Some(10), Some(20), Some(30), Some(50)];
+
+pub(crate) fn duck_label(choice: Option<u8>) -> String {
+    match choice {
+        None => "Leave as is".into(),
+        Some(0) => "Mute".into(),
+        Some(percent) => format!("Lower to {percent}%"),
+    }
+}
+
+/// The "Other audio" dropdown over `duck_other_audio` + `duck_volume_percent`.
+/// Choosing "Leave as is" keeps the percentage, so switching back later
+/// returns to the level last used.
+fn duck_combo(ui: &mut egui::Ui, on: &mut bool, percent: &mut u8) -> egui::Response {
+    let current = on.then_some(*percent);
+    egui::ComboBox::from_id_salt("duck_other_audio")
+        .width(120.0)
+        .selected_text(duck_label(current))
+        .show_ui(ui, |ui| {
+            for choice in DUCK_CHOICES {
+                if ui
+                    .selectable_label(current == choice, duck_label(choice))
+                    .clicked()
+                {
+                    *on = choice.is_some();
+                    if let Some(p) = choice {
+                        *percent = p;
+                    }
+                }
+            }
+        })
+        .response
+}
+
 impl super::SettingsApp {
     /// A hotkey text field with a small, subtle "record" dot tucked into its
     /// right edge (instead of a separate wide button). Click the dot to arm
@@ -165,6 +204,15 @@ impl super::SettingsApp {
                             "reinsert_hold",
                         )
                         .on_hover_text(TIP_REPASTE);
+                        ui.end_row();
+
+                        ui.label("Other audio").on_hover_text(TIP_DUCK);
+                        duck_combo(
+                            ui,
+                            &mut self.draft.duck_other_audio,
+                            &mut self.draft.duck_volume_percent,
+                        )
+                        .on_hover_text(TIP_DUCK);
                         ui.end_row();
                     });
                 egui::Grid::new("dict_timing_right")

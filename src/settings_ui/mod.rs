@@ -141,6 +141,10 @@ const TIP_REPASTE: &str = "Hold your toggle hotkey this long to re-paste your mo
 const TIP_LISTEN_TAIL: &str = "After you stop talking, QuickDictate keeps listening this long \
      before finalizing — raise it if trailing words get cut off, lower it for a snappier finish. \
      Applies to your next dictation.";
+const TIP_DUCK: &str = "Mute or turn down music, videos and every other app while you dictate, \
+     so nothing plays over you or ends up in the transcript. Each app goes back to its own volume \
+     the moment QuickDictate stops listening, and one you adjust mid-dictation keeps your change. \
+     Applies to your next dictation.";
 const TIP_POLISH: &str = "Before pasting, have an AI repair the sentence breaks a pause made \
      the recognizer invent, plus obviously misheard words. It never rewords you: it can only \
      return small exact-match edits, and anything that rewrites more than a quarter of what you \

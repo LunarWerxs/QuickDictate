@@ -178,6 +178,10 @@ pub fn start_session(app: Arc<App>, keys: Arc<KeyPool>) -> SttHandle {
     let epoch = app.next_session_epoch();
     let app2 = Arc::clone(&app);
     let stats_session_guard = app.stats.session_guard();
+    // Quiet other apps (opt-in) from the moment of the press, so the music is
+    // already down while the provider connects. Only posts to the duck
+    // worker, so the hotkey thread never waits on the audio service.
+    let duck = crate::duck::begin(&app.config.load());
     app.rt.spawn(async move {
         let _stats_session_guard = stats_session_guard;
         let session_usage = Arc::new(parking_lot::Mutex::new(SessionUsage::default()));
@@ -191,6 +195,7 @@ pub fn start_session(app: Arc<App>, keys: Arc<KeyPool>) -> SttHandle {
             Arc::clone(&stop),
             epoch,
             Arc::clone(&session_usage),
+            duck,
         )
         .await;
         finish_session(app2, keys, epoch, session_usage, final_res).await;
@@ -217,24 +222,22 @@ async fn run_session_with_retries(
     stop: Arc<AtomicBool>,
     epoch: u64,
     session_usage: Arc<parking_lot::Mutex<SessionUsage>>,
+    duck: Option<crate::duck::DuckGuard>,
 ) -> Result<()> {
-    let mut tried: Vec<String> = Vec::new();
-    // Text an aborted attempt had transcribed but not yet pasted. The next
-    // attempt starts with it; whatever is still here when the press ends is
-    // pasted anyway, so a key dying mid-sentence never eats the sentences
-    // before it.
-    let mut carry: Vec<String> = Vec::new();
+    let mut press = Press {
+        duck,
+        ..Press::default()
+    };
     let user_aborted = || stop.load(Ordering::Acquire) || app2.current_session_epoch() != epoch;
     let res = loop {
-        let before = tried.len();
+        let before = press.tried.len();
         let attempt_res = run_session(
             app2.clone(),
             Arc::clone(&keys),
             Arc::clone(&stop),
             epoch,
             Arc::clone(&session_usage),
-            &mut tried,
-            &mut carry,
+            &mut press,
         )
         .await;
         let rejected = matches!(
@@ -244,17 +247,17 @@ async fn run_session_with_retries(
         if !rejected {
             break attempt_res;
         }
-        if tried.len() == before {
+        if press.tried.len() == before {
             // The attempt never got a key: nothing untried is left. The
             // pool's summary says why (every key rejected, or none configured).
             tracing::error!(
                 "session[{epoch}] no untried API key left after {} attempt(s); giving up ({})",
-                tried.len(),
+                press.tried.len(),
                 keys.summary()
             );
             break attempt_res;
         }
-        if tried.len() >= MAX_KEYS_PER_PRESS {
+        if press.tried.len() >= MAX_KEYS_PER_PRESS {
             tracing::error!(
                 "session[{epoch}] {MAX_KEYS_PER_PRESS} keys rejected in one press; giving up ({})",
                 keys.summary()
@@ -270,11 +273,32 @@ async fn run_session_with_retries(
         }
         tracing::warn!(
             "session[{epoch}] key {} of this press was rejected; trying the next untried key",
-            tried.len()
+            press.tried.len()
         );
     };
-    flush_carry(&app2, &keys, epoch, carry, &session_usage);
+    // However the press ended, its microphone is done: let other apps back up
+    // (a no-op when the last attempt already did, see `run_session`).
+    drop(press.duck.take());
+    flush_carry(&app2, &keys, epoch, press.carry, &session_usage);
     res
+}
+
+/// What one press carries from attempt to attempt of the retry shell.
+#[derive(Default)]
+struct Press {
+    /// Keys this press has already used, so it never circles back to one that
+    /// just failed; `run_session` appends the key each attempt acquires.
+    tried: Vec<String>,
+    /// Text an aborted attempt had transcribed but not yet pasted. The next
+    /// attempt starts with it; whatever is still here when the press ends is
+    /// pasted anyway, so a key dying mid-sentence never eats the sentences
+    /// before it.
+    carry: Vec<String>,
+    /// Keeps other apps quiet while held (see [`crate::duck`]). The attempt
+    /// that gets as far as the microphone stopping drops it right then, before
+    /// waiting on the final transcript; an attempt that aborts leaves it for
+    /// the next one, so a key retry never lets the music back in mid-press.
+    duck: Option<crate::duck::DuckGuard>,
 }
 
 /// The press is over and no attempt took the carried text: paste it now
@@ -458,19 +482,19 @@ fn audio_duration_ms(samples: u64, sample_rate: u32) -> u64 {
     samples.saturating_mul(1_000) / sample_rate as u64
 }
 
-/// One attempt at a session on one key. `tried` is the press's memory of the
-/// keys it has already used; the key this attempt acquires is appended so the
-/// retry shell never hands it out again for the same press. `carry` is the
-/// text earlier attempts of this press transcribed but never pasted: this
-/// attempt takes it over, and gives back its own if it aborts.
+/// One attempt at a session on one key. `press.tried` is the press's memory of
+/// the keys it has already used; the key this attempt acquires is appended so
+/// the retry shell never hands it out again for the same press.
+/// `press.carry` is the text earlier attempts of this press transcribed but
+/// never pasted: this attempt takes it over, and gives back its own if it
+/// aborts.
 async fn run_session(
     app: Arc<App>,
     keys: Arc<KeyPool>,
     stop: Arc<AtomicBool>,
     epoch: u64,
     session_usage: Arc<parking_lot::Mutex<SessionUsage>>,
-    tried: &mut Vec<String>,
-    carry: &mut Vec<String>,
+    press: &mut Press,
 ) -> Result<()> {
     tracing::info!("session[{epoch}] starting");
 
@@ -478,10 +502,11 @@ async fn run_session(
         return Ok(());
     }
 
-    let connected = match establish_connected_session(&app, keys, &stop, epoch, tried).await? {
-        Some(connected) => connected,
-        None => return Ok(()),
-    };
+    let connected =
+        match establish_connected_session(&app, keys, &stop, epoch, &mut press.tried).await? {
+            Some(connected) => connected,
+            None => return Ok(()),
+        };
     let ConnectedSession {
         cfg,
         keys,
@@ -601,7 +626,7 @@ async fn run_session(
 
     // Reset the live word counter at the start of every session, then let it
     // reflect whatever an earlier attempt of this press already earned.
-    let carried_words = seed_from_carry(&app, &ctx, carry).min(u32::MAX as u64) as u32;
+    let carried_words = seed_from_carry(&app, &ctx, &mut press.carry).min(u32::MAX as u64) as u32;
     app.word_count.store(carried_words, Ordering::Release);
     // Drop any answer speculated for the PREVIOUS press. It is keyed by exact
     // text so it could not be misapplied anyway, but a new dictation should
@@ -643,7 +668,8 @@ async fn run_session(
     // entire finalize and hand back to the retry shell to rotate keys.
     let early_key_failure = *ctx.acc.key_fail_kind.lock();
     if let Some(kind) = early_key_failure {
-        return abort_for_early_key_failure(&ctx, kind, send_task, recv_task, carry).await;
+        return abort_for_early_key_failure(&ctx, kind, send_task, recv_task, &mut press.carry)
+            .await;
     }
 
     enter_release_phase(&app, &ctx, tail_quiet, tail_max, &release_pending);
@@ -657,6 +683,10 @@ async fn run_session(
     // floor (Google's 45 s dwarfs any tail).
     let send_deadline = finalize_timeout.max(tail_max + Duration::from_millis(600));
     let sent = join_send_task(send_task, &ctx, send_deadline).await;
+    // The send task is done with the microphone (its listening tail included),
+    // so other apps can come back up now rather than after the wait for the
+    // final transcript below, which for a batch provider is a whole upload.
+    drop(press.duck.take());
     let audio_ms = audio_duration_ms(sent.samples, fmt.sample_rate);
     // `speech` is the end-of-session gate's evidence that the user actually
     // said something (see `transport_failure_lost_speech`), so log it here

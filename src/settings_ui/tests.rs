@@ -223,6 +223,26 @@ fn history_matches_is_case_insensitive_and_empty_filter_matches_everything() {
     assert!(!history_matches("zzz", "Well, HELLO there"));
 }
 
+// ---- "Other audio" dropdown ----------------------------------------------
+
+#[test]
+fn other_audio_choices_read_the_way_the_settings_mean_them() {
+    use super::dictation::{duck_label, DUCK_CHOICES};
+    assert_eq!(
+        DUCK_CHOICES[0], None,
+        "leaving other apps alone comes first"
+    );
+    assert_eq!(duck_label(None), "Leave as is");
+    assert_eq!(duck_label(Some(0)), "Mute");
+    assert_eq!(duck_label(Some(20)), "Lower to 20%");
+    // A hand-edited level still names itself instead of posing as a preset.
+    assert_eq!(duck_label(Some(35)), "Lower to 35%");
+    // The defaults are "off, and mute once switched on".
+    let cfg = Config::default();
+    assert!(!cfg.duck_other_audio);
+    assert_eq!(cfg.duck_volume_percent, 0);
+}
+
 #[test]
 fn truncate_preview_keeps_short_text_and_ellipsizes_long_text() {
     assert_eq!(truncate_preview("short", 10), "short");

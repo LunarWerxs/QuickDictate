@@ -10,6 +10,8 @@
   "auto_punct": true,
   "hotkeys_enabled": true,
   "enable_sound": false,
+  "duck_other_audio": false,
+  "duck_volume_percent": 0,
   "close_behavior": "minimize",
   "window_width": 280,
   "window_height": 140,

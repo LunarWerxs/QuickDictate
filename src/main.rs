@@ -16,6 +16,8 @@ mod config;
 /// as a dismissible banner offering to open the (opt-in) redacted error report. See its module doc.
 mod crash_banner;
 mod dev_trigger;
+/// Quieting other apps' audio while a dictation is listening (opt-in). See its module doc.
+mod duck;
 /// Opt-in, local-only crash/error report builder. See its module doc.
 mod error_report;
 /// An occasional, cadence-gated "how's it going?" feedback prompt - its own small state machine,
@@ -115,6 +117,10 @@ fn main() -> Result<()> {
     // runtime alive until every physical dictation has finalized and its stats
     // write is durable, then let process exit hand the mutex to the child.
     started.app.stats.finish_sessions_and_flush();
+    // Every press has finished listening by now, so put back any app still
+    // quieted before the process (and the worker thread that knows which
+    // apps they are) goes away.
+    duck::shutdown(Duration::from_secs(2));
     sync::flush_before_exit(&started.app, Duration::from_secs(6));
     audio.shutdown();
     // Give in-flight pastes a moment to finish.

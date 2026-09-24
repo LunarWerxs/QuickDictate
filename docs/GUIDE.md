@@ -96,6 +96,8 @@ Everything lives in `settings.json` (copied from `settings.example.json`). The f
 | `clipboard_restore_delay_ms` | Delay before restoring your previous clipboard contents after a clipboard-paste, in ms (default `300`) |
 | `auto_space` / `auto_newline` / `auto_punct` | Output formatting toggles (bool) |
 | `enable_sound` | Play a sound on state changes (bool) |
+| `duck_other_audio` | Mute or turn down every other app that is playing sound (music, videos, calls) while you dictate, and put each one back the moment QuickDictate stops listening (bool, default `false`). Uses the per-app volume the Windows Volume mixer shows, so the system volume and QuickDictate's own sounds are untouched; an app whose volume you change mid-dictation keeps your change. Settings -> Dictation -> **Other audio** |
+| `duck_volume_percent` | How loud other apps stay while `duck_other_audio` is on, as a percentage of their own volume: `0` (default) mutes them, `20` leaves them at a fifth |
 | `enable_logging` | Write `logs\quickdictate.log` beside the exe (bool) |
 | `log_transcripts` | Also log your full dictated text, not just summaries (bool, default `false`; deep debugging only) |
 | `max_log_mb` | Log-file rotation cap, in MB, before `quickdictate.log` is rolled over (default `5`) |

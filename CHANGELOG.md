@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-09-24
+
+### Added
+
+- **Mute or turn down your music while you dictate.** Settings -> Dictation -> **Other audio**
+  offers "Mute" or "Lower to 10/20/30/50%". When a press starts, every other app that is playing
+  sound (music, a video, a call) goes quiet, and the moment QuickDictate stops listening each one
+  comes back to exactly where it was. It works on each app's own volume, the sliders the Windows
+  Volume mixer shows, so the system volume and QuickDictate's start/stop sounds are untouched.
+  - An app you adjust mid-dictation keeps your change: only a volume still as QuickDictate left it
+    is put back.
+  - Something that starts playing mid-dictation is quieted too, within a second.
+  - Back-to-back presses share one duck, so the music does not pop up between them.
+  - A crash cannot leave your music muted for good. Windows remembers per-app volume across
+    launches, so the quieted apps are listed in `quickdictate-ducked-apps.json` while a press is
+    live, and the next launch puts back anything a crash or a killed process left down, including
+    an app that was closed while it was quiet.
+
+  Off by default. It never waits on the press: the volume changes happen on their own thread.
+
 ## [1.0.0] - 2026-09-20
 
 ### Fixed

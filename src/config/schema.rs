@@ -149,6 +149,21 @@ pub struct Config {
     pub hotkeys_enabled: bool,
     #[serde(default = "default_false")]
     pub enable_sound: bool,
+    /// Quiet other apps while you dictate (see [`crate::duck`]). When a press
+    /// starts, every other app that is playing sound -- music, a video, a
+    /// call -- drops to `duck_volume_percent` of its own volume, and each one
+    /// goes back to where it was the moment the microphone stops listening.
+    /// It is the per-app volume the Windows Volume mixer shows, so the system
+    /// volume and QuickDictate's own sounds are untouched, and an app whose
+    /// volume you change mid-dictation keeps your change. Off by default.
+    /// Read per press, so a change applies to your next dictation.
+    #[serde(default = "default_false")]
+    pub duck_other_audio: bool,
+    /// How loud other apps stay while `duck_other_audio` is on, as a
+    /// percentage of their own volume: `0` (the default) mutes them, `20`
+    /// leaves them at a fifth. `100` or more changes nothing.
+    #[serde(default)]
+    pub duck_volume_percent: u8,
     #[serde(default = "default_close")]
     pub close_behavior: String,
     #[serde(default = "default_width")]
@@ -506,6 +521,8 @@ impl Default for Config {
             auto_punct: true,
             hotkeys_enabled: true,
             enable_sound: false,
+            duck_other_audio: false,
+            duck_volume_percent: 0,
             close_behavior: default_close(),
             window_width: default_width(),
             window_height: default_height(),
