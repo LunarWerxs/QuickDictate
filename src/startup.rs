@@ -105,23 +105,33 @@ pub(crate) fn single_instance_guard() -> bool {
     // This also makes the stats flush a true boundary: no late old-process
     // write can race a child that has already loaded an earlier snapshot.
     if std::env::args().any(|a| a == "--updated" || a == "--relaunch") {
-        tracing::info!("single-instance: deliberate respawn waiting for old instance to exit");
-        let wait = unsafe { WaitForSingleObject(handle, INFINITE) };
-        if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
-            // INFINITE cannot time out. Fail open on the only remaining case
-            // (WAIT_FAILED) so a rare OS error cannot make the app disappear
-            // completely after the old process has already committed to exit.
-            tracing::error!(
-                "single-instance: respawn mutex wait failed ({wait:?}); continuing cautiously"
-            );
-        }
-        tracing::info!("single-instance: respawn hand-off complete");
+        wait_for_old_instance(handle);
         return true;
     }
+    activate_running_instance();
+    false
+}
 
-    // Another instance is already running. Find its overlay window (the one
-    // always-alive top-level window QuickDictate owns) and ask it to reveal
-    // Settings, exactly like the tray menu's "Settings…" item would.
+/// The respawn half of [`single_instance_guard`]: block until the old
+/// instance releases (or abandons) the mutex `handle` names.
+fn wait_for_old_instance(handle: windows::Win32::Foundation::HANDLE) {
+    tracing::info!("single-instance: deliberate respawn waiting for old instance to exit");
+    let wait = unsafe { WaitForSingleObject(handle, INFINITE) };
+    if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
+        // INFINITE cannot time out. Fail open on the only remaining case
+        // (WAIT_FAILED) so a rare OS error cannot make the app disappear
+        // completely after the old process has already committed to exit.
+        tracing::error!(
+            "single-instance: respawn mutex wait failed ({wait:?}); continuing cautiously"
+        );
+    }
+    tracing::info!("single-instance: respawn hand-off complete");
+}
+
+/// Another instance is already running. Find its overlay window (the one
+/// always-alive top-level window QuickDictate owns) and ask it to reveal
+/// Settings, exactly like the tray menu's "Settings…" item would.
+fn activate_running_instance() {
     let class_name = wide_z(crate::ui::OVERLAY_CLASS_NAME);
     let msg_name = wide_z(crate::ui::ACTIVATE_MESSAGE_NAME);
     let msg_id = unsafe { RegisterWindowMessageW(PCWSTR(msg_name.as_ptr())) };
@@ -134,7 +144,7 @@ pub(crate) fn single_instance_guard() -> bool {
                 if let Err(e) = post {
                     tracing::warn!("single-instance: PostMessageW failed: {e}");
                 }
-                return false;
+                return;
             }
         }
         // First instance may still be mid-boot (overlay not created yet).
@@ -146,7 +156,6 @@ pub(crate) fn single_instance_guard() -> bool {
         "single-instance: another instance is running but its window was not found after {}ms; exiting anyway",
         ACTIVATE_RETRY_ATTEMPTS as u64 * ACTIVATE_RETRY_INTERVAL.as_millis() as u64
     );
-    false
 }
 
 fn should_open_settings_on_start(is_settings_relaunch: bool, has_usable_key: bool) -> bool {
@@ -330,15 +339,43 @@ pub(crate) fn init_audio_pipeline(cfg: &Config) -> Result<Arc<AudioSource>> {
 }
 
 /// Everything `main` gets back from [`bring_up_app`]: the handles the event
-/// loop needs, plus the background-worker join handles that must simply stay
-/// alive for the app's lifetime (never read again, so each is `_`-prefixed).
+/// loop needs, the output worker's join handle (waited on at exit), plus the
+/// background-worker join handles that must simply stay alive for the app's
+/// lifetime (never read again, so each is `_`-prefixed).
 pub(crate) struct Started {
     pub(crate) app: Arc<App>,
     pub(crate) keys: Arc<KeyPool>,
     pub(crate) hotkeys: HotkeyManager,
-    _output_join: std::thread::JoinHandle<()>,
+    output_join: std::thread::JoinHandle<()>,
     _ui_join: std::thread::JoinHandle<()>,
     _dev_trigger: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Started {
+    /// Wait, at most `limit`, for the output worker to exit. WHY: a paste
+    /// already running when shutdown began puts the user's clipboard back
+    /// only after `clipboard_restore_delay_ms`, on that thread; exiting first
+    /// leaves the transcript on their clipboard for good. An idle worker
+    /// quits within 50 ms of `app.shutdown`, so this normally returns at once.
+    pub(crate) fn wait_for_output(self, limit: Duration) {
+        if !join_within(self.output_join, limit) {
+            tracing::warn!("shutdown: output worker still busy after {limit:?}; exiting anyway");
+        }
+    }
+}
+
+/// Join `handle` if its thread finishes within `limit`; `false` if it is
+/// still running then (it is left detached, and dies with the process).
+fn join_within(handle: std::thread::JoinHandle<()>, limit: Duration) -> bool {
+    let deadline = std::time::Instant::now() + limit;
+    while !handle.is_finished() {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = handle.join();
+    true
 }
 
 /// Construct the `App`, open Settings if this is a first run or a Save &
@@ -433,7 +470,7 @@ pub(crate) fn bring_up_app(
     }
 
     // Output (clipboard paste) worker.
-    let _output_join = output::spawn(Arc::clone(&app));
+    let output_join = output::spawn(Arc::clone(&app));
 
     // UI (tray + cursor pip).
     let _ui_join = ui::spawn(Arc::clone(&app));
@@ -470,7 +507,7 @@ pub(crate) fn bring_up_app(
         app,
         keys,
         hotkeys,
-        _output_join,
+        output_join,
         _ui_join,
         _dev_trigger,
     })
@@ -509,5 +546,21 @@ mod tests {
     #[test]
     fn nothing_on_never_starts_the_panic_log() {
         assert!(!should_record_panics(false, false, false));
+    }
+
+    #[test]
+    fn join_within_joins_a_thread_that_finishes_in_time() {
+        let handle = std::thread::spawn(|| std::thread::sleep(Duration::from_millis(20)));
+        assert!(join_within(handle, Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn join_within_gives_up_on_a_thread_that_outlives_the_limit() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let _ = rx.recv();
+        });
+        assert!(!join_within(handle, Duration::from_millis(30)));
+        drop(tx);
     }
 }

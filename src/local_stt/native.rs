@@ -87,6 +87,11 @@ struct Loaded {
 pub(super) struct NativeEngine {
     api: NativeApi,
     loaded: Option<Loaded>,
+    /// Set once a run fails on the GPU (status 8) and is retried on CPU.
+    /// Sticky for this engine's life: without it every later dictation and
+    /// prewarm would free the CPU session, reload the model on GPU, fail
+    /// again and reload it on CPU, paying two full model loads each time.
+    gpu_failed: bool,
 }
 
 impl Drop for NativeEngine {
@@ -147,7 +152,11 @@ impl NativeEngine {
                 c_string((api.status_string)(status))
             ));
         }
-        Ok(Self { api, loaded: None })
+        Ok(Self {
+            api,
+            loaded: None,
+            gpu_failed: false,
+        })
     }
 
     unsafe fn ensure_model(&mut self, model_id: &str, cpu_only: bool) -> Result<(), String> {
@@ -196,7 +205,7 @@ impl NativeEngine {
     }
 
     pub(super) unsafe fn prewarm(&mut self, model_id: &str) -> Result<bool, String> {
-        self.ensure_model(model_id, false)?;
+        self.ensure_model(model_id, self.gpu_failed)?;
         if self.loaded.as_ref().is_some_and(|loaded| loaded.warmed) {
             return Ok(false);
         }
@@ -216,64 +225,84 @@ impl NativeEngine {
         if pcm_i16.is_empty() {
             return Ok(None);
         }
-        self.ensure_model(model_id, false)?;
-        let ranges = if model_id == "cohere-q5" {
-            cohere_chunk_ranges(pcm_i16, 16_000)
-        } else {
-            std::iter::once(0..pcm_i16.len()).collect()
-        };
-        if ranges.len() > 1 {
-            tracing::info!(
-                "local STT splitting {:.1}s Cohere audio into {} quiet-boundary clip(s)",
-                pcm_i16.len() as f32 / 16_000.0,
-                ranges.len()
-            );
-        }
-
+        self.ensure_model(model_id, self.gpu_failed)?;
+        let ranges = clip_ranges(model_id, pcm_i16);
         let mut parts = Vec::with_capacity(ranges.len());
         for (index, range) in ranges.into_iter().enumerate() {
             if cancel.load(Ordering::Acquire) {
                 return Err("local transcription was cancelled".into());
             }
-            let clip = &pcm_i16[range.clone()];
-            let mut text = unsafe { self.run_one(model_id, language, clip, cancel)? };
-
-            // If even a <=35 s clip loops, retry that clip as two smaller
-            // quiet-boundary decodes before resorting to the conservative
-            // sentence-run collapse below.
-            if model_id == "cohere-q5"
-                && text
-                    .as_deref()
-                    .is_some_and(|text| collapse_pathological_repetitions(text).1 > 0)
-                && clip.len() >= 16_000 * 10
-            {
-                let low = clip.len() * 2 / 5;
-                let high = clip.len() * 3 / 5;
-                let split = quietest_cut(clip, low, high, 16_000).unwrap_or(clip.len() / 2);
-                tracing::warn!(
-                    "local STT Cohere clip {} entered a repetition loop; retrying as two shorter clips",
-                    index + 1
-                );
-                text = join_transcript_parts([
-                    unsafe { self.run_one(model_id, language, &clip[..split], cancel)? }
-                        .unwrap_or_default(),
-                    unsafe { self.run_one(model_id, language, &clip[split..], cancel)? }
-                        .unwrap_or_default(),
-                ]);
-            }
-            if let Some(text) = text {
+            let clip = &pcm_i16[range];
+            if let Some(text) = unsafe { self.run_clip(model_id, language, clip, index, cancel)? } {
                 parts.push(text);
             }
         }
+        Ok(join_and_clean(parts))
+    }
 
-        let Some(joined) = join_transcript_parts(parts) else {
-            return Ok(None);
-        };
-        let (cleaned, dropped) = collapse_pathological_repetitions(&joined);
-        if dropped > 0 {
-            tracing::warn!("local STT removed {dropped} repeated unit(s) from a decoder loop");
+    /// Decode one clip. If even a <=35 s Cohere clip loops, retry that clip
+    /// as two smaller quiet-boundary decodes before resorting to the
+    /// conservative sentence-run collapse in [`join_and_clean`].
+    unsafe fn run_clip(
+        &mut self,
+        model_id: &str,
+        language: &str,
+        clip: &[i16],
+        index: usize,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<Option<String>, String> {
+        let text = unsafe { self.run_one(model_id, language, clip, cancel)? };
+        let looped = model_id == "cohere-q5"
+            && text
+                .as_deref()
+                .is_some_and(|text| collapse_pathological_repetitions(text).1 > 0)
+            && clip.len() >= 16_000 * 10;
+        if !looped {
+            return Ok(text);
         }
-        Ok((!cleaned.is_empty()).then_some(cleaned))
+        let low = clip.len() * 2 / 5;
+        let high = clip.len() * 3 / 5;
+        let split = quietest_cut(clip, low, high, 16_000).unwrap_or(clip.len() / 2);
+        tracing::warn!(
+            "local STT Cohere clip {} entered a repetition loop; retrying as two shorter clips",
+            index + 1
+        );
+        Ok(join_transcript_parts([
+            unsafe { self.run_one(model_id, language, &clip[..split], cancel)? }
+                .unwrap_or_default(),
+            unsafe { self.run_one(model_id, language, &clip[split..], cancel)? }
+                .unwrap_or_default(),
+        ]))
+    }
+
+    /// The loaded session, or `missing` as the error. `run_one` is only
+    /// reached through `run`, which calls `ensure_model` first -- but "only
+    /// reached through" is an invariant a future caller can break, and
+    /// breaking it here would abort a background thread with no console to
+    /// print to. Report it as the error it is instead.
+    fn session(&self, missing: &str) -> Result<*mut Session, String> {
+        self.loaded
+            .as_ref()
+            .map(|loaded| loaded.session)
+            .ok_or_else(|| missing.to_string())
+    }
+
+    /// Point the session's abort callback at `cancel`, then decode `pcm`.
+    unsafe fn decode(
+        &self,
+        session: *mut Session,
+        pcm: &[f32],
+        params: &RunParams,
+        cancel: &Arc<AtomicBool>,
+    ) -> Status {
+        unsafe {
+            (self.api.set_abort)(
+                session,
+                Some(abort_callback),
+                Arc::as_ptr(cancel) as *mut c_void,
+            );
+            (self.api.run)(session, pcm.as_ptr(), pcm.len() as c_int, params)
+        }
     }
 
     unsafe fn run_one(
@@ -287,63 +316,26 @@ impl NativeEngine {
             return Ok(None);
         }
         let pcm: Vec<f32> = pcm_i16.iter().map(|&v| v as f32 / 32768.0).collect();
-        let language = if language.trim().is_empty() || language.eq_ignore_ascii_case("auto") {
-            None
-        } else {
-            Some(
-                CString::new(language)
-                    .map_err(|_| "local transcription language contains a NUL byte".to_string())?,
-            )
-        };
+        let language = language_cstring(language)?;
         let mut params = std::mem::zeroed::<RunParams>();
         unsafe { (self.api.run_params_init)(&mut params) };
         params.language = language
             .as_ref()
             .map(|s| s.as_ptr())
             .unwrap_or(std::ptr::null());
-        // `run_one` is only reached through `run`, which calls `ensure_model`
-        // first -- but "only reached through" is an invariant a future caller
-        // can break, and breaking it here would abort a background thread with
-        // no console to print to. Report it as the error it is instead.
-        let session = self
-            .loaded
-            .as_ref()
-            .ok_or("no local model is loaded")?
-            .session;
-        unsafe {
-            (self.api.set_abort)(
-                session,
-                Some(abort_callback),
-                Arc::as_ptr(cancel) as *mut c_void,
-            )
-        };
-        let mut status =
-            unsafe { (self.api.run)(session, pcm.as_ptr(), pcm.len() as c_int, &params) };
+        let session = self.session("no local model is loaded")?;
+        let mut status = unsafe { self.decode(session, &pcm, &params, cancel) };
         // A GPU driver can initialize successfully yet fail on its first graph.
         // transcribe.cpp explicitly makes this recoverable by reloading on CPU.
         if status == 8 {
             tracing::warn!("local STT GPU run failed; retrying this model on CPU");
+            self.gpu_failed = true;
             self.ensure_model(model_id, true)?;
-            let session = self
-                .loaded
-                .as_ref()
-                .ok_or("the CPU reload left no local model loaded")?
-                .session;
-            unsafe {
-                (self.api.set_abort)(
-                    session,
-                    Some(abort_callback),
-                    Arc::as_ptr(cancel) as *mut c_void,
-                )
-            };
-            status = unsafe { (self.api.run)(session, pcm.as_ptr(), pcm.len() as c_int, &params) };
+            let session = self.session("the CPU reload left no local model loaded")?;
+            status = unsafe { self.decode(session, &pcm, &params, cancel) };
         }
         // Re-read: the GPU-failure branch above may have swapped the session.
-        let session = self
-            .loaded
-            .as_ref()
-            .ok_or("no local model is loaded")?
-            .session;
+        let session = self.session("no local model is loaded")?;
         if status == 13 || cancel.load(Ordering::Acquire) {
             return Err("local transcription was cancelled".into());
         }
@@ -360,6 +352,47 @@ impl NativeEngine {
         let text = text.trim().to_string();
         Ok((!text.is_empty()).then_some(text))
     }
+}
+
+/// The clips one utterance is decoded as: Cohere audio is cut at quiet
+/// boundaries (its decoder loops on long input), every other model takes the
+/// whole utterance in one pass.
+fn clip_ranges(model_id: &str, pcm_i16: &[i16]) -> Vec<std::ops::Range<usize>> {
+    let ranges = if model_id == "cohere-q5" {
+        cohere_chunk_ranges(pcm_i16, 16_000)
+    } else {
+        std::iter::once(0..pcm_i16.len()).collect()
+    };
+    if ranges.len() > 1 {
+        tracing::info!(
+            "local STT splitting {:.1}s Cohere audio into {} quiet-boundary clip(s)",
+            pcm_i16.len() as f32 / 16_000.0,
+            ranges.len()
+        );
+    }
+    ranges
+}
+
+/// Join the clips' texts and collapse any decoder loop that survived the
+/// per-clip retry. `None` when nothing is left.
+pub(super) fn join_and_clean(parts: Vec<String>) -> Option<String> {
+    let joined = join_transcript_parts(parts)?;
+    let (cleaned, dropped) = collapse_pathological_repetitions(&joined);
+    if dropped > 0 {
+        tracing::warn!("local STT removed {dropped} repeated unit(s) from a decoder loop");
+    }
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+/// The run's language hint: `None` (let the model detect it) for blank or
+/// `auto`, otherwise the code as a C string.
+pub(super) fn language_cstring(language: &str) -> Result<Option<CString>, String> {
+    if language.trim().is_empty() || language.eq_ignore_ascii_case("auto") {
+        return Ok(None);
+    }
+    CString::new(language)
+        .map(Some)
+        .map_err(|_| "local transcription language contains a NUL byte".to_string())
 }
 
 unsafe extern "C" fn abort_callback(user_data: *mut c_void) -> bool {

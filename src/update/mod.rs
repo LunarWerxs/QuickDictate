@@ -166,6 +166,13 @@ pub fn pending_update() -> Option<String> {
     PENDING_UPDATE.lock().ok().and_then(|g| g.clone())
 }
 
+/// Publish (or clear, with `None`) the waiting update [`pending_update`] reports.
+fn set_pending_update(tag: Option<String>) {
+    if let Ok(mut slot) = PENDING_UPDATE.lock() {
+        *slot = tag;
+    }
+}
+
 fn client() -> Option<reqwest::blocking::Client> {
     reqwest::blocking::Client::builder()
         .user_agent(USER_AGENT)
@@ -239,7 +246,14 @@ pub fn check() -> UpdateCheck {
     let Some(tag) = json.get("tag_name").and_then(|v| v.as_str()) else {
         return UpdateCheck::Failed;
     };
-    match (parse_ver(tag), parse_ver(env!("CARGO_PKG_VERSION"))) {
+    compare_tag(tag, env!("CARGO_PKG_VERSION"))
+}
+
+/// `tag` against the `current` version. One comparison shared by the live
+/// check and the fresh-cache path, so the two cannot disagree about what
+/// counts as newer.
+pub(super) fn compare_tag(tag: &str, current: &str) -> UpdateCheck {
+    match (parse_ver(tag), parse_ver(current)) {
         (Some(latest), Some(current)) if latest > current => {
             UpdateCheck::Available(tag.trim_start_matches(['v', 'V']).to_string())
         }

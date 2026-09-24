@@ -123,7 +123,9 @@ fn main() -> Result<()> {
     duck::shutdown(Duration::from_secs(2));
     sync::flush_before_exit(&started.app, Duration::from_secs(6));
     audio.shutdown();
-    // Give in-flight pastes a moment to finish.
-    std::thread::sleep(Duration::from_millis(50));
+    // Let an in-flight paste finish, including its clipboard restore (a fixed
+    // 50 ms here was shorter than the default 300 ms restore delay).
+    let restore_delay = Duration::from_millis(started.app.config.load().clipboard_restore_delay_ms);
+    started.wait_for_output(restore_delay + Duration::from_secs(1));
     Ok(())
 }

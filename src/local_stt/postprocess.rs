@@ -211,29 +211,7 @@ fn collapse_pathological_token_cycles(text: &str) -> (String, usize) {
     let mut index = 0usize;
     let mut dropped_tokens = 0usize;
     while index < tokens.len() {
-        let max_cycle =
-            PATHOLOGICAL_MAX_CYCLE_TOKENS.min((tokens.len() - index) / PATHOLOGICAL_CYCLE_RUN);
-        let mut found = None;
-        for cycle_len in 1..=max_cycle {
-            let motif = &tokens[index..index + cycle_len];
-            let mut cycles = 1usize;
-            while index + (cycles + 1) * cycle_len <= tokens.len()
-                && tokens[index + cycles * cycle_len..index + (cycles + 1) * cycle_len]
-                    .iter()
-                    .map(|token| token.normalized.as_str())
-                    .eq(motif.iter().map(|token| token.normalized.as_str()))
-            {
-                cycles += 1;
-            }
-            if cycles >= PATHOLOGICAL_CYCLE_RUN
-                && cycles * cycle_len >= PATHOLOGICAL_MIN_REPEATED_TOKENS
-            {
-                found = Some((cycle_len, cycles));
-                break;
-            }
-        }
-
-        if let Some((cycle_len, cycles)) = found {
+        if let Some((cycle_len, cycles)) = pathological_cycle_at(&tokens, index) {
             let keep_end = index + PATHOLOGICAL_CYCLES_TO_KEEP * cycle_len - 1;
             let run_end = index + cycles * cycle_len - 1;
             removals.push((tokens[keep_end].end, tokens[run_end].end));
@@ -248,14 +226,48 @@ fn collapse_pathological_token_cycles(text: &str) -> (String, usize) {
     if removals.is_empty() {
         return (text.to_string(), 0);
     }
+    (cut_byte_ranges(text, &removals), dropped_tokens)
+}
+
+/// The shortest motif starting at `index` that repeats back to back often
+/// enough to count as a decoder loop, as `(cycle_len, cycles)`.
+fn pathological_cycle_at(tokens: &[WordSpan], index: usize) -> Option<(usize, usize)> {
+    let max_cycle =
+        PATHOLOGICAL_MAX_CYCLE_TOKENS.min((tokens.len() - index) / PATHOLOGICAL_CYCLE_RUN);
+    (1..=max_cycle).find_map(|cycle_len| {
+        let cycles = repeated_cycles(tokens, index, cycle_len);
+        (cycles >= PATHOLOGICAL_CYCLE_RUN && cycles * cycle_len >= PATHOLOGICAL_MIN_REPEATED_TOKENS)
+            .then_some((cycle_len, cycles))
+    })
+}
+
+/// How many times the `cycle_len`-token motif at `index` occurs back to back
+/// (at least 1: the motif itself).
+fn repeated_cycles(tokens: &[WordSpan], index: usize, cycle_len: usize) -> usize {
+    let motif = &tokens[index..index + cycle_len];
+    let mut cycles = 1usize;
+    while index + (cycles + 1) * cycle_len <= tokens.len()
+        && tokens[index + cycles * cycle_len..index + (cycles + 1) * cycle_len]
+            .iter()
+            .map(|token| token.normalized.as_str())
+            .eq(motif.iter().map(|token| token.normalized.as_str()))
+    {
+        cycles += 1;
+    }
+    cycles
+}
+
+/// `text` with each `(start, end)` byte range removed. The ranges are in
+/// order and do not overlap.
+fn cut_byte_ranges(text: &str, removals: &[(usize, usize)]) -> String {
     let mut output = String::with_capacity(text.len());
     let mut cursor = 0usize;
-    for (start, end) in removals {
+    for &(start, end) in removals {
         output.push_str(&text[cursor..start]);
         cursor = end;
     }
     output.push_str(&text[cursor..]);
-    (output, dropped_tokens)
+    output
 }
 
 pub(super) fn collapse_pathological_repetitions(text: &str) -> (String, usize) {

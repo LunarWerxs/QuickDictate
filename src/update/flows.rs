@@ -78,53 +78,14 @@ pub fn spawn_startup_check(app: Arc<App>) {
         return;
     }
     std::thread::spawn(move || {
-        let mut relaunching = false;
-        let fresh = read_cache()
-            .map(|(ts, _)| now_secs().saturating_sub(ts) < CHECK_INTERVAL_SECS)
-            .unwrap_or(false);
-        if fresh {
-            tracing::debug!("update: skipping auto-check (cache fresh)");
-        } else {
-            match check() {
-                UpdateCheck::Available(tag) => {
-                    write_cache(&tag);
-                    if let Ok(mut slot) = PENDING_UPDATE.lock() {
-                        *slot = Some(tag.clone());
-                    }
-                    if app.config.load().update_auto_install {
-                        tracing::info!("update: v{tag} available; installing silently (opted in)");
-                        relaunching = install_silently(&app, &tag);
-                    } else {
-                        // Default since v0.5.4. The URL and the SHA-256 both
-                        // come out of the release payload, so hash pinning
-                        // proves the bytes match what was uploaded, not that
-                        // the maintainer meant to upload them. Anything able
-                        // to publish a release would otherwise reach every
-                        // install unattended within a day. The click on the
-                        // About pill is the consent.
-                        tracing::info!(
-                            "update: v{tag} available; waiting for the user to confirm \
-                             (set update_auto_install to install silently)"
-                        );
-                    }
-                }
-                UpdateCheck::UpToDate => {
-                    write_cache(env!("CARGO_PKG_VERSION"));
-                    if let Ok(mut slot) = PENDING_UPDATE.lock() {
-                        *slot = None;
-                    }
-                    tracing::info!("update: up to date");
-                }
-                UpdateCheck::Failed => {
-                    // Silent: no release yet / offline is not the user's problem.
-                    // Stamp the cache with the short retry window: bounded
-                    // network chatter while offline, without one boot-time
-                    // blip suppressing a real update notice for a day.
-                    write_cache_failed();
-                    tracing::info!("update: auto-check failed (silent); retrying in about an hour");
-                }
+        let relaunching = match read_cache() {
+            Some((ts, tag)) if cache_is_fresh(ts, now_secs()) => {
+                tracing::debug!("update: skipping auto-check (cache fresh)");
+                republish_cached(&tag);
+                false
             }
-        }
+            _ => run_startup_check(&app),
+        };
         // Leave the lock held if we relaunched (the process is exiting) so a
         // concurrent manual install can't spawn a second child; otherwise free
         // it for the next check.
@@ -132,6 +93,62 @@ pub fn spawn_startup_check(app: Arc<App>) {
             IN_FLIGHT.store(false, Ordering::Release);
         }
     });
+}
+
+/// A fresh cache skips the network, but still remembers the latest tag the
+/// last check found. Republish it when it is newer than this build: without
+/// that, any restart within 24 h of finding an update (Save & Restart, a
+/// reboot) blanked the tray tooltip and the Settings banner until the next
+/// day's check, and updates are notify-only by default.
+fn republish_cached(tag: &str) {
+    if let UpdateCheck::Available(tag) = compare_tag(tag, env!("CARGO_PKG_VERSION")) {
+        tracing::info!("update: v{tag} available (cached); waiting for the user to confirm");
+        set_pending_update(Some(tag));
+    }
+}
+
+/// One real network check and what follows from it. Returns `true` iff the
+/// silent install relaunched the app.
+fn run_startup_check(app: &App) -> bool {
+    match check() {
+        UpdateCheck::Available(tag) => on_update_available(app, &tag),
+        UpdateCheck::UpToDate => {
+            write_cache(env!("CARGO_PKG_VERSION"));
+            set_pending_update(None);
+            tracing::info!("update: up to date");
+            false
+        }
+        UpdateCheck::Failed => {
+            // Silent: no release yet / offline is not the user's problem.
+            // Stamp the cache with the short retry window: bounded
+            // network chatter while offline, without one boot-time
+            // blip suppressing a real update notice for a day.
+            write_cache_failed();
+            tracing::info!("update: auto-check failed (silent); retrying in about an hour");
+            false
+        }
+    }
+}
+
+/// Cache and publish a newer release, then install it only if the user opted
+/// in. Returns `true` iff the silent install relaunched the app.
+fn on_update_available(app: &App, tag: &str) -> bool {
+    write_cache(tag);
+    set_pending_update(Some(tag.to_string()));
+    if app.config.load().update_auto_install {
+        tracing::info!("update: v{tag} available; installing silently (opted in)");
+        return install_silently(app, tag);
+    }
+    // Default since v0.5.4. The URL and the SHA-256 both come out of the
+    // release payload, so hash pinning proves the bytes match what was
+    // uploaded, not that the maintainer meant to upload them. Anything able
+    // to publish a release would otherwise reach every install unattended
+    // within a day. The click on the About pill is the consent.
+    tracing::info!(
+        "update: v{tag} available; waiting for the user to confirm \
+         (set update_auto_install to install silently)"
+    );
+    false
 }
 
 /// Startup housekeeping: delete the `.old` exe left by a previous self-update,
