@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-09-24
+
+A whole-codebase review (eight reviewers, every serious finding put to a skeptic) found 51
+problems; this release fixes the ones below, plus the Architect's duplication and complexity
+items, and adds the fade.
+
 ### Added
 
 - **Other audio fades instead of snapping.** With Settings -> Dictation -> **Other audio** on,
@@ -24,6 +30,57 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A short press no longer vanishes when you let go before the provider connects.** Releasing
+  during the handshake threw the whole press away, so whether a quick "sounds good" was typed
+  depended on network latency. The buffered audio is now sent and transcribed.
+- **A failed dictation now says so.** A provider error on a press that produced no words (the
+  local model failing, Google rate-limiting its only upload, a server closing the connection
+  mid-press) used to end quietly with no pip, and the key was even credited with a success. It now
+  raises the error pip, and a key that failed is never marked good.
+- **A sentence is no longer typed twice after a stalled connection is replaced**, when the old
+  server's late answer lands during the reconnect.
+- **Wrong keys are no longer benched.** OpenAI's generic `invalid_request_error`, a DashScope
+  parameter or throttling error, a Google 400 about the audio, and a server hiccup on Deepgram,
+  AssemblyAI, DashScope or OpenAI all used to mark a good key dead or out of credit; they are now
+  treated as the passing faults they are.
+- **Local dictation past six minutes keeps its first six minutes** instead of losing everything.
+- **The local model remembers a GPU failure**, instead of loading twice (GPU, then CPU) on every
+  dictation after the first.
+- **Per-app profiles stay put for the whole press.** A key retry used to re-read the profile from
+  whichever window was in front by then, and the pip, error kind and usage stats now follow the
+  provider the profile actually chose.
+- **"Scratch that" is safer**: held Ctrl or Alt no longer turns its backspaces into
+  delete-word or undo, it only undoes the most recent paste into the same field, and repeated
+  undos walk back one paste at a time.
+- **Your clipboard is never lost to a busy clipboard.** If QuickDictate cannot save what was on
+  it, it types the text instead of pasting over it.
+- **An ellipsis or a trailing hyphen no longer gets a period added** at the end of a paste.
+- **A dictation still running when the app quits or updates is now pasted and saved to history**
+  instead of dropped, and the clipboard is restored before the process exits.
+- **Settings could not load? Your settings file is no longer overwritten with defaults** at
+  startup; it is backed up to `settings.json.bad` and reported. A settings file saved with a
+  byte-order mark now loads.
+- **"Encrypt keys at rest" now covers the AI-cleanup key too**, and **"Default settings" keeps
+  that key and the encryption choice** as its dialog promised.
+- **Settings sync in the background now pushes only your usage stats**, never this machine's
+  possibly stale preferences over newer ones from another PC.
+- **The anonymized usage rollup reports only this PC's numbers**, not totals merged in from your
+  other synced machines.
+- **Settings window**: keys typed into an open key manager are no longer lost when you close the
+  window; "Save and restart" no longer stalls if the window is closed while it syncs; the app's
+  own saves (including the tray's hide-icon switch) no longer set off the "settings.json was
+  edited" prompt; a sync pull no longer writes your unsaved edits or skips the save's side
+  effects; a missing Segoe UI Semibold font can no longer crash the window.
+- **Updates**: the "update available" notice survives a restart and comes back after an error
+  tooltip clears; clicking Update after a staged install relaunches instead of failing with
+  "Access is denied"; a hung downloaded exe is killed instead of locking the swap.
+- **Hotkeys and mouse buttons**: a mouse-button hotkey whose hook Windows silently removed comes
+  back within a minute; a press queued during local processing that ended in an error no longer
+  starts a dictation later on its own.
+- **History** saves from different threads can no longer overwrite a newer list with an older
+  one, and the About box no longer leaks two bitmaps each time it opens.
+- **Error reports** mask dictated text that `log_transcripts` wrote to the log tail.
+- **Moving the data folder** no longer carries off a `logs` folder that is not QuickDictate's.
 - **The list of quieted apps now moves with your data folder**, so moving the folder can no longer
   strand a crash's leftovers where the next launch does not look.
 - **An app that a crash left quiet and that only starts playing mid-dictation** is put back before
