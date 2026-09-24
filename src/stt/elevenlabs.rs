@@ -9,17 +9,15 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::Engine;
-use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 use tokio_tungstenite::tungstenite::Message;
 
 use super::provider::{
     i16_slice_as_bytes, provider_failure, summarize_frame, AudioFormat, ConnectError,
-    ProviderSession, ProviderSink, ProviderStream, RecvError, SendError, SttEvent, SttProvider,
-    SttSessionOpts,
+    ProviderSession, ProviderSink, SendError, SttEvent, SttProvider, SttSessionOpts,
 };
-use super::ws::{self, WsConn, WsReader, WsSink};
+use super::ws::{self, WsConn, WsSink};
 use crate::keys::FailKind;
 
 const WS_URL: &str = "wss://api.elevenlabs.io/v1/speech-to-text/realtime";
@@ -83,16 +81,16 @@ impl SttProvider for ElevenLabsProvider {
     ) -> Result<ProviderSession, ConnectError> {
         let model = opts.model.as_deref().unwrap_or(MODEL_ID);
         let conn = connect_with_vocabulary_fallback(key, model, opts).await?;
-        let (sink, stream) = conn.split();
+        let (sink, reader) = ws::split(conn);
         Ok(ProviderSession {
             sink: Box::new(ElevenLabsSink {
                 sink,
                 frame_tail: audio_frame_tail(opts.sample_rate),
                 sample_rate: opts.sample_rate,
             }),
-            stream: Box::new(ElevenLabsStream {
-                ws: WsReader::new(stream),
-            }),
+            // Non-JSON keep-alive, unknown type, or empty transcript map to
+            // nothing, so the reader keeps going past them.
+            stream: Box::new(ws::MappedStream::with_close(reader, map_frame, close_event)),
         })
     }
 }
@@ -168,17 +166,7 @@ fn build_url(model: &str, opts: &SttSessionOpts) -> String {
         "{WS_URL}?language_code={lang}&model_id={model}&audio_format=pcm_16000&commit_strategy=vad",
         lang = opts.language,
     );
-    if !opts.custom_vocabulary.is_empty() {
-        let terms: Vec<&str> = opts
-            .custom_vocabulary
-            .iter()
-            .take(MAX_KEYTERMS)
-            .map(String::as_str)
-            .collect();
-        let json = serde_json::to_string(&terms).unwrap_or_default();
-        url.push_str("&keyterms=");
-        url.push_str(&url::form_urlencoded::byte_serialize(json.as_bytes()).collect::<String>());
-    }
+    ws::push_json_terms(&mut url, "keyterms", &opts.custom_vocabulary, MAX_KEYTERMS);
     url
 }
 
@@ -247,19 +235,6 @@ impl ProviderSink for ElevenLabsSink {
         // transcript before the Close races in.
         tokio::time::sleep(PRE_CLOSE_DELAY).await;
         ws::send(&mut self.sink, Message::Close(None)).await
-    }
-}
-
-struct ElevenLabsStream {
-    ws: WsReader,
-}
-
-#[async_trait]
-impl ProviderStream for ElevenLabsStream {
-    async fn recv_event(&mut self) -> Result<Option<SttEvent>, RecvError> {
-        // Non-JSON keep-alive, unknown type, or empty transcript map to
-        // nothing, so the reader keeps going past them.
-        self.ws.recv_with_close(map_frame, close_event).await
     }
 }
 

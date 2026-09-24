@@ -11,10 +11,8 @@
 
 use async_trait::async_trait;
 use base64::Engine;
-use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
-use tokio_tungstenite::tungstenite::Message;
 
 use super::provider::{
     i16_slice_as_bytes, server_error_event, AudioFormat, ConnectError, ProviderSession,
@@ -69,15 +67,13 @@ impl SttProvider for OpenAiProvider {
         // Configure the transcription session (GA Realtime shape). Manual commit
         // (turn_detection = null) so we control end-of-utterance.
         let update = build_session_update(model, opts).to_string();
-        conn.send(Message::Text(update.into()))
-            .await
-            .map_err(|e| ConnectError(format!("session.update send: {e}")))?;
+        ws::send_setup(&mut conn, "session.update", update).await?;
 
-        let (sink, stream) = conn.split();
+        let (sink, ws) = ws::split(conn);
         Ok(ProviderSession {
             sink: Box::new(OpenAiSink { sink }),
             stream: Box::new(OpenAiStream {
-                ws: WsReader::new(stream),
+                ws,
                 accum: String::new(),
             }),
         })
