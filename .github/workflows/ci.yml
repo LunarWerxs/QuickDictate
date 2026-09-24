@@ -107,23 +107,23 @@ jobs:
         run: cargo deny check
 
   msrv:
-    name: MSRV (Rust 1.93)
+    name: MSRV (Rust 1.95)
     if: github.event_name != 'schedule'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      # `cargo +1.93` overrides rust-toolchain.toml's `stable` pin for these
+      # `cargo +1.95` overrides rust-toolchain.toml's `stable` pin for these
       # commands only; installing it as the default would defeat the pin for
       # everything else in the job.
       - name: Install the MSRV toolchain
-        run: rustup toolchain install 1.93-x86_64-pc-windows-msvc --profile minimal
+        run: rustup toolchain install 1.95-x86_64-pc-windows-msvc --profile minimal
       # Keep this in step with Cargo.toml's `rust-version`. The job is what makes
       # that field a tested fact rather than a hopeful comment: without it,
       # `rust-version` drifts the moment anyone uses a newer std API.
       - name: Check on the MSRV
-        run: cargo +1.93-x86_64-pc-windows-msvc check --locked --all-targets
+        run: cargo +1.95-x86_64-pc-windows-msvc check --locked --all-targets
 
   unused-deps:
     name: cargo-machete (unused dependencies)

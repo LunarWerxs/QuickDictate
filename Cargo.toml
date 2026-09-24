@@ -13,7 +13,7 @@ publish = false
 # The oldest compiler this is TESTED against (CI's `msrv` job builds it), not a
 # claim about the oldest that happens to work. Raise it deliberately, and only
 # when something actually needs a newer feature.
-rust-version = "1.93"
+rust-version = "1.95"
 
 [[bin]]
 name = "quickdictate"
@@ -93,11 +93,11 @@ arc-swap = "1"
 # PNG decode/resize for the About box artwork (LunarWerx wordmark, GitHub mark).
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 # Settings window (tray → "Settings…"). glow backend keeps it lean-ish.
-eframe = { version = "0.35", default-features = false, features = [
+eframe = { version = "0.36", default-features = false, features = [
     "default_fonts",
     "glow",
 ] }
-# Must match eframe 0.35's winit (for EventLoopBuilderExtWindows so the settings
+# Must match eframe 0.36's winit, 0.30.x (for EventLoopBuilderExtWindows so the settings
 # window can run on a non-main thread).
 winit = "0.30"
 # HTTPS client: check-for-update (blocking API on worker threads) + the Google
@@ -106,10 +106,14 @@ winit = "0.30"
 # Windows, uses the system cert store). Shares the one stack tokio-tungstenite
 # already pulls, so we avoid bundling a second full rustls + ring + webpki-roots
 # pile (the whole Mozilla CA set) purely for HTTP.
-reqwest = { version = "0.12", default-features = false, features = [
+reqwest = { version = "0.13", default-features = false, features = [
     "native-tls",
     "json",
     "blocking",
+    # 0.13 made these opt-in: form bodies for the OAuth token exchange, and
+    # reading the Windows proxy settings, which 0.12 always did.
+    "form",
+    "system-proxy",
 ] }
 bytes = "1"
 # Optional local-STT packs are downloaded at runtime, never embedded in this
@@ -148,6 +152,4 @@ windows = { version = "0.58", features = [
 ] }
 tray-icon = "0.25.0"
 # HKCU Run-key management for the run_at_startup setting.
-# 0.100 requires rustc 1.95, above the 1.93 floor this crate declares (rust-version, ci.yml and
-# scripts/check.ps1 all name it); 0.6.1 is the newest release under it. Bump when the floor moves.
-windows-registry = "0.6.1"
+windows-registry = "0.100"

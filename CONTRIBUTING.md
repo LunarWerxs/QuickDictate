@@ -24,7 +24,7 @@ pwsh -File scripts\check.ps1 -Full    # + release build and exe validation
 | Tests (incl. fuzz) | `cargo test --locked` | `check` |
 | Supply chain | `cargo deny check` | `deny` |
 | Unused deps | `cargo machete` | `unused-deps` |
-| Oldest compiler | `cargo +1.93 check` | `msrv` |
+| Oldest compiler | `cargo +1.95 check` | `msrv` |
 
 Install it as a pre-push hook once per clone, so a push that would go red is
 stopped on your machine instead of leaving a red X on a public repo while you

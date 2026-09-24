@@ -14,6 +14,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   audio** (on by default) switches it off for an instant change. Either way each app ends exactly
   where it did before, so a fade never changes what gets put back.
 
+### Changed
+
+- **Building from source now needs Rust 1.95** (was 1.93). Two dependencies had moved past the old
+  floor and were held back for it; with it raised, the settings window is on eframe 0.36, HTTPS on
+  reqwest 0.13 (still the Windows TLS stack, and still honouring the Windows proxy settings), and
+  the Start-with-Windows switch on windows-registry 0.100. Nothing changes for anyone running the
+  released exe.
+
 ### Fixed
 
 - **The list of quieted apps now moves with your data folder**, so moving the folder can no longer

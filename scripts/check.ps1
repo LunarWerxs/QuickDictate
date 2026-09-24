@@ -100,7 +100,7 @@ try {
 
         # Mirrors ci.yml -> `msrv` job. Keep the version in step with
         # Cargo.toml's `rust-version` and with ci.yml; all three name it.
-        $msrv = '1.93-x86_64-pc-windows-msvc'
+        $msrv = '1.95-x86_64-pc-windows-msvc'
         $installed = (rustup toolchain list) -match [regex]::Escape($msrv)
         if ($installed) {
             # A scratch target dir: the MSRV's artifacts are not interchangeable
