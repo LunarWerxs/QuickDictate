@@ -15,6 +15,7 @@ mod google;
 mod local;
 mod openai;
 pub mod provider;
+mod ws;
 
 mod connect;
 mod dispatch;

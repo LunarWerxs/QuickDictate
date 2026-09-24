@@ -70,6 +70,7 @@ impl SttProvider for LocalProvider {
                 event_tx: Some(event_tx),
                 cancel: Arc::new(AtomicBool::new(false)),
                 finished: false,
+                limit_hit: false,
             }),
             stream: Box::new(LocalStream { event_rx }),
         })
@@ -84,6 +85,9 @@ struct LocalSink {
     event_tx: Option<mpsc::UnboundedSender<SttEvent>>,
     cancel: Arc<AtomicBool>,
     finished: bool,
+    /// Set once the recording reached `MAX_AUDIO_SECONDS`, so the warning is
+    /// logged once rather than per dropped chunk.
+    limit_hit: bool,
 }
 
 impl Drop for LocalSink {
@@ -94,17 +98,22 @@ impl Drop for LocalSink {
 
 #[async_trait]
 impl ProviderSink for LocalSink {
+    /// Past the limit the audio is dropped but the send still succeeds. An
+    /// error here reads as a dead socket to the runner, which then skips
+    /// `commit`, and the minutes already buffered were never transcribed:
+    /// the user got an error and no text at all. Now `commit` transcribes
+    /// the first `MAX_AUDIO_SECONDS`.
     async fn send_audio(&mut self, pcm: &[i16]) -> Result<(), SendError> {
         let max_samples = self.sample_rate as usize * MAX_AUDIO_SECONDS;
-        if self.pcm.len().saturating_add(pcm.len()) > max_samples {
-            let message =
-                format!("local dictation exceeded the {MAX_AUDIO_SECONDS}-second safety limit");
-            if let Some(tx) = &self.event_tx {
-                let _ = tx.send(SttEvent::ProviderFailure(message.clone()));
-            }
-            return Err(SendError(message));
+        let room = max_samples.saturating_sub(self.pcm.len());
+        self.pcm.extend_from_slice(&pcm[..pcm.len().min(room)]);
+        if pcm.len() > room && !self.limit_hit {
+            self.limit_hit = true;
+            tracing::warn!(
+                "local dictation reached the {MAX_AUDIO_SECONDS}-second safety limit; \
+                 transcribing the first {MAX_AUDIO_SECONDS} s and dropping the rest"
+            );
         }
-        self.pcm.extend_from_slice(pcm);
         Ok(())
     }
 
@@ -161,5 +170,35 @@ mod tests {
     #[test]
     fn local_pcm_bound_stays_small() {
         assert_eq!(16_000 * MAX_AUDIO_SECONDS * size_of::<i16>(), 11_520_000);
+    }
+
+    fn sink(sample_rate: u32) -> LocalSink {
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        LocalSink {
+            model_id: "test".into(),
+            language: "en".into(),
+            sample_rate,
+            pcm: Vec::new(),
+            event_tx: Some(event_tx),
+            cancel: Arc::new(AtomicBool::new(false)),
+            finished: false,
+            limit_hit: false,
+        }
+    }
+
+    // Over the limit used to return Err: the runner read that as a dead
+    // socket, skipped commit, and the whole buffered recording was lost.
+    #[tokio::test]
+    async fn going_over_the_limit_keeps_the_first_part_and_the_session() {
+        // One sample per second makes the limit MAX_AUDIO_SECONDS samples.
+        let mut sink = sink(1);
+        sink.send_audio(&vec![1; MAX_AUDIO_SECONDS - 2])
+            .await
+            .unwrap();
+        sink.send_audio(&[2; 5]).await.unwrap();
+        sink.send_audio(&[3; 5]).await.unwrap();
+        assert_eq!(sink.pcm.len(), MAX_AUDIO_SECONDS);
+        assert_eq!(&sink.pcm[MAX_AUDIO_SECONDS - 3..], &[1, 2, 2]);
+        assert!(sink.limit_hit);
     }
 }

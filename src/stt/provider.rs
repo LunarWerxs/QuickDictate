@@ -257,32 +257,76 @@ pub(crate) fn i16_slice_as_bytes(samples: &[i16]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(samples.as_ptr() as *const u8, samples.len() * 2) }
 }
 
+/// Lowercase markers of an account that is out of money or allowance.
+const EXHAUSTED_MARKERS: &[&str] = &[
+    "insufficient",
+    "quota",
+    "billing",
+    "credit",
+    "arrearage",     // DashScope: account out of balance
+    "good standing", // DashScope arrearage message
+    "balance",
+    "payment",
+];
+
+/// Lowercase markers of a credential the provider refused outright.
+const INVALID_MARKERS: &[&str] = &["401", "403", "invalid", "unauthorized"];
+
+/// Lowercase markers of a credential that is only being throttled.
+const RATE_LIMIT_MARKERS: &[&str] = &["429", "rate", "too many"];
+
 /// Best-effort FailKind from an error/close string. Providers that expose a
 /// real HTTP status should prefer that; this is the substring fallback the
 /// original ElevenLabs path used and the default `classify_connect_error`.
+/// The groups are checked in order, so a billing problem is never masked by
+/// a coincidental "401" or "429" in the same message.
 pub(crate) fn classify_by_substring(msg: &str) -> FailKind {
     let lower = msg.to_ascii_lowercase();
-    if lower.contains("insufficient")
-        || lower.contains("quota")
-        || lower.contains("billing")
-        || lower.contains("credit")
-        || lower.contains("arrearage")     // DashScope: account out of balance
-        || lower.contains("good standing") // DashScope arrearage message
-        || lower.contains("balance")
-        || lower.contains("payment")
-    {
+    let has_any = |markers: &[&str]| markers.iter().any(|m| lower.contains(m));
+    if has_any(EXHAUSTED_MARKERS) {
         FailKind::Exhausted
-    } else if lower.contains("401")
-        || lower.contains("403")
-        || lower.contains("invalid")
-        || lower.contains("unauthorized")
-    {
+    } else if has_any(INVALID_MARKERS) {
         FailKind::Invalid
-    } else if lower.contains("429") || lower.contains("rate") || lower.contains("too many") {
+    } else if has_any(RATE_LIMIT_MARKERS) {
         FailKind::RateLimit
     } else {
         FailKind::Transient
     }
+}
+
+/// The event for an error a provider reported MID-STREAM, once its adapter
+/// has read a [`FailKind`] out of it.
+///
+/// Only a verdict on the credential (refused, out of credit, throttled) is a
+/// key failure. Anything else is the server's own problem. A key failure
+/// aborts the attempt, and with one key there is nothing to rotate to, so the
+/// press ended while the user was still talking and everything said after the
+/// error was lost. As a provider failure the press keeps going: if the server
+/// then closes or goes quiet, the stall watchdog replaces the connection with
+/// the text intact. ElevenLabs learned this first; every streaming adapter
+/// maps its errors through here so they cannot drift apart again.
+pub(crate) fn server_error_event(provider_id: &str, kind: FailKind, frame: &str) -> SttEvent {
+    match kind {
+        FailKind::Invalid | FailKind::Exhausted | FailKind::RateLimit => SttEvent::KeyFailure(kind),
+        FailKind::Transient => provider_failure(provider_id, frame),
+    }
+}
+
+/// A [`SttEvent::ProviderFailure`] that names the frame which caused it, so
+/// the log line that surfaces it is diagnosable.
+pub(crate) fn provider_failure(provider_id: &str, frame: &str) -> SttEvent {
+    SttEvent::ProviderFailure(format!("{provider_id} sent {}", summarize_frame(frame)))
+}
+
+/// A frame as it should appear in a log line: a bounded slice of the body.
+/// Never carries audio (the servers send none) and never a key.
+pub(crate) fn summarize_frame(text: &str) -> String {
+    const MAX: usize = 240;
+    let mut out: String = text.chars().take(MAX).collect();
+    if text.chars().count() > MAX {
+        out.push('…');
+    }
+    out
 }
 
 #[cfg(test)]
@@ -375,5 +419,31 @@ mod tests {
             classify_by_substring("401 unauthorized, rate this call as denied"),
             FailKind::Invalid
         );
+    }
+
+    // A verdict on the credential rotates the key; the server's own trouble
+    // must not, or a single-key press ends mid-sentence.
+    #[test]
+    fn only_a_credential_verdict_is_a_key_failure_mid_stream() {
+        for kind in [FailKind::Invalid, FailKind::Exhausted, FailKind::RateLimit] {
+            assert!(
+                matches!(server_error_event("x", kind, "{}"), SttEvent::KeyFailure(k) if k == kind),
+                "{kind:?}"
+            );
+        }
+        assert!(matches!(
+            server_error_event("deepgram", FailKind::Transient, r#"{"type":"Error"}"#),
+            SttEvent::ProviderFailure(m) if m == r#"deepgram sent {"type":"Error"}"#
+        ));
+    }
+
+    #[test]
+    fn frame_summary_is_bounded() {
+        let long = format!(
+            r#"{{"message_type":"warning","error":"{}"}}"#,
+            "a".repeat(1000)
+        );
+        assert!(summarize_frame(&long).chars().count() <= 241);
+        assert_eq!(summarize_frame("short"), "short");
     }
 }

@@ -7,17 +7,14 @@
 //! server flushes finals and closes on its own.
 
 use async_trait::async_trait;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use serde::Deserialize;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use super::provider::{
-    i16_slice_as_bytes, AudioFormat, ConnectError, ProviderSession, ProviderSink, ProviderStream,
-    RecvError, SendError, SttEvent, SttProvider, SttSessionOpts,
+    classify_by_substring, server_error_event, AudioFormat, ConnectError, ProviderSession,
+    ProviderSink, ProviderStream, RecvError, SendError, SttEvent, SttProvider, SttSessionOpts,
 };
+use super::ws::{self, WsReader, WsSink};
 
 const WS_URL: &str = "wss://api.deepgram.com/v1/listen";
 const MODEL_ID: &str = "nova-3";
@@ -25,13 +22,6 @@ const MODEL_ID: &str = "nova-3";
 /// not a term count; we don't tokenize client-side, so this bounds the term
 /// *count* as a conservative stand-in for that limit.
 const MAX_KEYTERMS: usize = 100;
-
-type WsSink = futures_util::stream::SplitSink<
-    WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
-    Message,
->;
-type WsStream =
-    futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>;
 
 pub struct DeepgramProvider;
 
@@ -61,25 +51,17 @@ impl SttProvider for DeepgramProvider {
         opts: &SttSessionOpts,
     ) -> Result<ProviderSession, ConnectError> {
         let model = opts.model.as_deref().unwrap_or(MODEL_ID);
-        let url = build_url(model, opts);
-        let mut request = url
-            .as_str()
-            .into_client_request()
-            .map_err(|e| ConnectError(format!("ws request: {e}")))?;
-        request.headers_mut().insert(
+        let conn = ws::connect(
+            &build_url(model, opts),
             "Authorization",
-            HeaderValue::from_str(&format!("Token {key}"))
-                .map_err(|e| ConnectError(format!("bad key header: {e}")))?,
-        );
-        let (ws, _resp) = tokio_tungstenite::connect_async(request)
-            .await
-            .map_err(|e| ConnectError(format!("ws connect failed: {e}")))?;
-        let (sink, stream) = ws.split();
+            &format!("Token {key}"),
+        )
+        .await?;
+        let (sink, stream) = conn.split();
         Ok(ProviderSession {
             sink: Box::new(DeepgramSink { sink }),
             stream: Box::new(DeepgramStream {
-                stream,
-                closed: false,
+                ws: WsReader::new(stream),
             }),
         })
     }
@@ -125,30 +107,20 @@ struct DeepgramSink {
 impl ProviderSink for DeepgramSink {
     async fn send_audio(&mut self, pcm: &[i16]) -> Result<(), SendError> {
         // Raw little-endian PCM16 binary frame — no envelope.
-        let bytes = i16_slice_as_bytes(pcm).to_vec();
-        self.sink
-            .send(Message::Binary(bytes.into()))
-            .await
-            .map_err(|e| SendError(e.to_string()))
+        ws::send_pcm(&mut self.sink, pcm).await
     }
 
     async fn commit(&mut self) -> Result<(), SendError> {
         // Tell Deepgram to flush interim → final and close. The server then
         // sends any remaining finals and closes the socket itself.
-        self.sink
-            .send(Message::Text("{\"type\":\"CloseStream\"}".into()))
-            .await
-            .map_err(|e| SendError(e.to_string()))
+        ws::send_text(&mut self.sink, "{\"type\":\"CloseStream\"}").await
     }
 
     async fn keepalive(&mut self) -> Result<(), SendError> {
         // Deepgram closes a stream after ~10 s with no audio (NET-0001). This is
         // its documented keepalive: resets that timer without adding any audio.
         // A transport ping does NOT prevent that close, so it must be this JSON.
-        self.sink
-            .send(Message::Text("{\"type\":\"KeepAlive\"}".into()))
-            .await
-            .map_err(|e| SendError(e.to_string()))
+        ws::send_text(&mut self.sink, "{\"type\":\"KeepAlive\"}").await
     }
 
     async fn close(&mut self) -> Result<(), SendError> {
@@ -159,41 +131,15 @@ impl ProviderSink for DeepgramSink {
 }
 
 struct DeepgramStream {
-    stream: WsStream,
-    closed: bool,
+    ws: WsReader,
 }
 
 #[async_trait]
 impl ProviderStream for DeepgramStream {
     async fn recv_event(&mut self) -> Result<Option<SttEvent>, RecvError> {
-        if self.closed {
-            return Ok(None);
-        }
-        loop {
-            let msg = match self.stream.next().await {
-                Some(m) => m,
-                None => {
-                    self.closed = true;
-                    return Ok(None);
-                }
-            };
-            let text = match msg {
-                Ok(Message::Text(t)) => t.to_string(),
-                Ok(Message::Close(c)) => {
-                    self.closed = true;
-                    let reason = c.as_ref().map(|f| f.reason.to_string()).unwrap_or_default();
-                    return Ok(Some(SttEvent::Closed(
-                        (!reason.is_empty()).then_some(reason),
-                    )));
-                }
-                Ok(_) => continue, // binary/ping/pong — nothing to map
-                Err(e) => return Err(RecvError(e.to_string())),
-            };
-            if let Some(ev) = map_frame(&text) {
-                return Ok(Some(ev));
-            }
-            // Metadata / SpeechStarted / UtteranceEnd / empty transcript: keep reading.
-        }
+        // Metadata / SpeechStarted / UtteranceEnd / empty transcript map to
+        // nothing, so the reader keeps going past them.
+        self.ws.recv(map_frame).await
     }
 }
 
@@ -239,10 +185,13 @@ fn map_frame(text: &str) -> Option<SttEvent> {
             }
         }
         // Deepgram surfaces auth/quota problems at the handshake (a connect
-        // error), so a mid-stream Error frame is rare; classify defensively
-        // rather than dropping the session silently.
-        "Error" => Some(SttEvent::KeyFailure(
-            super::provider::classify_by_substring(text),
+        // error), so a mid-stream Error frame is rare and usually the
+        // server's own trouble. Only one that names the key rotates it; any
+        // other keeps the press alive rather than ending it mid-sentence.
+        "Error" => Some(server_error_event(
+            "deepgram",
+            classify_by_substring(text),
+            text,
         )),
         _ => None,
     }
@@ -293,6 +242,16 @@ mod tests {
         assert!(matches!(
             map_frame(r#"{"type":"Error","description":"401 Unauthorized"}"#),
             Some(SttEvent::KeyFailure(FailKind::Invalid))
+        ));
+    }
+
+    #[test]
+    fn a_server_error_mid_stream_keeps_the_press_alive() {
+        // Was KeyFailure(Transient): with one key the attempt aborted and
+        // everything said after the error was lost.
+        assert!(matches!(
+            map_frame(r#"{"type":"Error","description":"internal server error"}"#),
+            Some(SttEvent::ProviderFailure(m)) if m.starts_with("deepgram sent")
         ));
     }
 

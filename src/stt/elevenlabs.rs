@@ -9,18 +9,17 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::Engine;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use super::provider::{
-    AudioFormat, ConnectError, ProviderSession, ProviderSink, ProviderStream, RecvError, SendError,
-    SttEvent, SttProvider, SttSessionOpts,
+    i16_slice_as_bytes, provider_failure, summarize_frame, AudioFormat, ConnectError,
+    ProviderSession, ProviderSink, ProviderStream, RecvError, SendError, SttEvent, SttProvider,
+    SttSessionOpts,
 };
+use super::ws::{self, WsConn, WsReader, WsSink};
 use crate::keys::FailKind;
 
 const WS_URL: &str = "wss://api.elevenlabs.io/v1/speech-to-text/realtime";
@@ -34,12 +33,8 @@ const MAX_KEYTERMS: usize = 50;
 /// ElevenLabs enough time to flush the final transcript.
 const PRE_CLOSE_DELAY: Duration = Duration::from_millis(300);
 
-type WsSink = futures_util::stream::SplitSink<
-    WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
-    Message,
->;
-type WsStream =
-    futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>;
+/// Everything of an audio frame before its base64 samples.
+const AUDIO_FRAME_HEAD: &str = "{\"message_type\":\"input_audio_chunk\",\"audio_base_64\":\"";
 
 pub struct ElevenLabsProvider;
 
@@ -87,76 +82,77 @@ impl SttProvider for ElevenLabsProvider {
         opts: &SttSessionOpts,
     ) -> Result<ProviderSession, ConnectError> {
         let model = opts.model.as_deref().unwrap_or(MODEL_ID);
-
-        // Two-shot connect, and only when a custom vocabulary is actually set.
-        // The `keyterms` parameter's name and limits come from ElevenLabs' own
-        // AsyncAPI spec, but their docs show no literal wire example, so the
-        // encoding here is inferred from the identical shape AssemblyAI uses.
-        // ElevenLabs is also the DEFAULT provider. If that guess is wrong the
-        // server rejects the upgrade, and a user who typed a few words into
-        // the vocabulary box would find dictation simply broken. So: if the
-        // handshake fails with a vocabulary attached, drop it and try once
-        // more. Losing the biasing is a small regression; losing dictation is
-        // not. Remove this fallback once a live run confirms the encoding.
-        let attempts: &[bool] = if opts.custom_vocabulary.is_empty() {
-            &[false]
-        } else {
-            &[true, false]
-        };
-        let mut last_err: Option<ConnectError> = None;
-        let mut connected = None;
-        for (i, &with_vocabulary) in attempts.iter().enumerate() {
-            let url = if with_vocabulary {
-                build_url(model, opts)
-            } else {
-                build_url(
-                    model,
-                    &SttSessionOpts {
-                        custom_vocabulary: Vec::new(),
-                        ..opts.clone()
-                    },
-                )
-            };
-            let mut request = url
-                .as_str()
-                .into_client_request()
-                .map_err(|e| ConnectError(format!("ws request: {e}")))?;
-            request.headers_mut().insert(
-                "xi-api-key",
-                HeaderValue::from_str(key)
-                    .map_err(|e| ConnectError(format!("bad key header: {e}")))?,
-            );
-            match tokio_tungstenite::connect_async(request).await {
-                Ok((ws, _resp)) => {
-                    if i > 0 {
-                        tracing::warn!(
-                            "elevenlabs: the server rejected the connection with keyterms \
-                             attached; reconnected without recognition biasing"
-                        );
-                    }
-                    connected = Some(ws);
-                    break;
-                }
-                Err(e) => last_err = Some(ConnectError(format!("ws connect failed: {e}"))),
-            }
-        }
-        let ws = match connected {
-            Some(ws) => ws,
-            None => return Err(last_err.unwrap_or(ConnectError("ws connect failed".into()))),
-        };
-        let (sink, stream) = ws.split();
+        let conn = connect_with_vocabulary_fallback(key, model, opts).await?;
+        let (sink, stream) = conn.split();
         Ok(ProviderSession {
             sink: Box::new(ElevenLabsSink {
                 sink,
-                buf: String::with_capacity(8192),
-                engine: base64::engine::general_purpose::STANDARD,
+                frame_tail: audio_frame_tail(opts.sample_rate),
                 sample_rate: opts.sample_rate,
             }),
             stream: Box::new(ElevenLabsStream {
-                stream,
-                closed: false,
+                ws: WsReader::new(stream),
             }),
         })
+    }
+}
+
+/// Two-shot connect, and only when a custom vocabulary is actually set.
+/// The `keyterms` parameter's name and limits come from ElevenLabs' own
+/// AsyncAPI spec, but their docs show no literal wire example, so the
+/// encoding here is inferred from the identical shape AssemblyAI uses.
+/// ElevenLabs is also the DEFAULT provider. If that guess is wrong the
+/// server rejects the upgrade, and a user who typed a few words into
+/// the vocabulary box would find dictation simply broken. So: if the
+/// handshake fails with a vocabulary attached, drop it and try once
+/// more. Losing the biasing is a small regression; losing dictation is
+/// not. Remove this fallback once a live run confirms the encoding.
+async fn connect_with_vocabulary_fallback(
+    key: &str,
+    model: &str,
+    opts: &SttSessionOpts,
+) -> Result<WsConn, ConnectError> {
+    let attempts: &[bool] = if opts.custom_vocabulary.is_empty() {
+        &[false]
+    } else {
+        &[true, false]
+    };
+    let mut last_err: Option<ConnectError> = None;
+    for (i, &with_vocabulary) in attempts.iter().enumerate() {
+        let request = ws::request(
+            &attempt_url(model, opts, with_vocabulary),
+            "xi-api-key",
+            key,
+        )?;
+        match ws::open(request).await {
+            Ok(conn) => {
+                if i > 0 {
+                    tracing::warn!(
+                        "elevenlabs: the server rejected the connection with keyterms \
+                         attached; reconnected without recognition biasing"
+                    );
+                }
+                return Ok(conn);
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or(ConnectError("ws connect failed".into())))
+}
+
+/// The URL for one connect attempt: with the vocabulary as `keyterms`, or
+/// the same session without it.
+fn attempt_url(model: &str, opts: &SttSessionOpts, with_vocabulary: bool) -> String {
+    if with_vocabulary {
+        build_url(model, opts)
+    } else {
+        build_url(
+            model,
+            &SttSessionOpts {
+                custom_vocabulary: Vec::new(),
+                ..opts.clone()
+            },
+        )
     }
 }
 
@@ -188,28 +184,37 @@ fn build_url(model: &str, opts: &SttSessionOpts) -> String {
 
 struct ElevenLabsSink {
     sink: WsSink,
-    /// Reused across chunks to avoid a per-frame allocation, exactly as the
-    /// original `ship()` did.
-    buf: String,
-    engine: base64::engine::general_purpose::GeneralPurpose,
+    /// Everything of an audio frame after its samples; it depends only on
+    /// the session's sample rate, so it is formatted once, not per chunk.
+    frame_tail: String,
     sample_rate: u32,
+}
+
+/// The part of every audio frame after its base64 samples.
+fn audio_frame_tail(sample_rate: u32) -> String {
+    format!("\",\"sample_rate\":{sample_rate}}}")
+}
+
+/// One audio frame, built straight into a String of exactly its final
+/// length. The socket takes ownership of it, and a String whose length is its
+/// capacity converts without another allocation, so each chunk costs one
+/// allocation and one base64 pass. A reused scratch buffer could not save
+/// that: the socket needs a frame it owns, so it had to be cloned per chunk.
+fn audio_frame(pcm: &[i16], tail: &str) -> String {
+    let bytes = i16_slice_as_bytes(pcm);
+    // Padded base64: four characters per started group of three bytes.
+    let encoded_len = bytes.len().div_ceil(3) * 4;
+    let mut frame = String::with_capacity(AUDIO_FRAME_HEAD.len() + encoded_len + tail.len());
+    frame.push_str(AUDIO_FRAME_HEAD);
+    base64::engine::general_purpose::STANDARD.encode_string(bytes, &mut frame);
+    frame.push_str(tail);
+    frame
 }
 
 #[async_trait]
 impl ProviderSink for ElevenLabsSink {
     async fn send_audio(&mut self, pcm: &[i16]) -> Result<(), SendError> {
-        let bytes = super::provider::i16_slice_as_bytes(pcm);
-        self.buf.clear();
-        self.buf
-            .push_str("{\"message_type\":\"input_audio_chunk\",\"audio_base_64\":\"");
-        self.engine.encode_string(bytes, &mut self.buf);
-        self.buf.push_str("\",\"sample_rate\":");
-        self.buf.push_str(&self.sample_rate.to_string());
-        self.buf.push('}');
-        self.sink
-            .send(Message::Text(self.buf.clone().into()))
-            .await
-            .map_err(|e| SendError(e.to_string()))
+        ws::send_text(&mut self.sink, audio_frame(pcm, &self.frame_tail)).await
     }
 
     async fn commit(&mut self) -> Result<(), SendError> {
@@ -220,10 +225,7 @@ impl ProviderSink for ElevenLabsSink {
             "commit": true,
         })
         .to_string();
-        self.sink
-            .send(Message::Text(commit.into()))
-            .await
-            .map_err(|e| SendError(e.to_string()))
+        ws::send_text(&mut self.sink, commit).await
     }
 
     async fn keepalive(&mut self) -> Result<(), SendError> {
@@ -237,67 +239,37 @@ impl ProviderSink for ElevenLabsSink {
             "sample_rate": self.sample_rate,
         })
         .to_string();
-        self.sink
-            .send(Message::Text(ka.into()))
-            .await
-            .map_err(|e| SendError(e.to_string()))
+        ws::send_text(&mut self.sink, ka).await
     }
 
     async fn close(&mut self) -> Result<(), SendError> {
         // Match the original: give ElevenLabs a beat to flush the final
         // transcript before the Close races in.
         tokio::time::sleep(PRE_CLOSE_DELAY).await;
-        self.sink
-            .send(Message::Close(None))
-            .await
-            .map_err(|e| SendError(e.to_string()))
+        ws::send(&mut self.sink, Message::Close(None)).await
     }
 }
 
 struct ElevenLabsStream {
-    stream: WsStream,
-    /// Set once we've observed the transport close so the next `recv_event`
-    /// reports end-of-stream.
-    closed: bool,
+    ws: WsReader,
 }
 
 #[async_trait]
 impl ProviderStream for ElevenLabsStream {
     async fn recv_event(&mut self) -> Result<Option<SttEvent>, RecvError> {
-        if self.closed {
-            return Ok(None);
-        }
-        loop {
-            let msg = match self.stream.next().await {
-                Some(m) => m,
-                None => {
-                    self.closed = true;
-                    return Ok(None);
-                }
-            };
-            let text = match msg {
-                Ok(Message::Text(t)) => t.to_string(),
-                Ok(Message::Close(c)) => {
-                    self.closed = true;
-                    let reason = c.as_ref().map(|f| f.reason.to_string()).unwrap_or_default();
-                    // A close reason that blames the key's account (out of
-                    // credit, terms never accepted) is a KeyFailure, so the
-                    // runner rotates to the next key and carries the text.
-                    if let Some(kind) = close_key_failure(&reason) {
-                        return Ok(Some(SttEvent::KeyFailure(kind)));
-                    }
-                    return Ok(Some(SttEvent::Closed(
-                        (!reason.is_empty()).then_some(reason),
-                    )));
-                }
-                Ok(_) => continue, // ping/pong/binary — nothing to map
-                Err(e) => return Err(RecvError(e.to_string())),
-            };
-            if let Some(ev) = map_frame(&text) {
-                return Ok(Some(ev));
-            }
-            // Non-JSON keep-alive, unknown type, or empty transcript: keep reading.
-        }
+        // Non-JSON keep-alive, unknown type, or empty transcript map to
+        // nothing, so the reader keeps going past them.
+        self.ws.recv_with_close(map_frame, close_event).await
+    }
+}
+
+/// A close reason that blames the key's account (out of credit, terms never
+/// accepted) is a KeyFailure, so the runner rotates to the next key and
+/// carries the text. Any other close is a plain close.
+fn close_event(reason: String) -> SttEvent {
+    match close_key_failure(&reason) {
+        Some(kind) => SttEvent::KeyFailure(kind),
+        None => ws::closed_event(reason),
     }
 }
 
@@ -313,7 +285,8 @@ struct Incoming {
 /// from `recv_event` so it can be fixture-tested without a live socket.
 fn map_frame(text: &str) -> Option<SttEvent> {
     let parsed: Incoming = serde_json::from_str(text).ok()?;
-    match parsed.message_type.as_deref().unwrap_or("") {
+    let message_type = parsed.message_type.as_deref().unwrap_or("");
+    match message_type {
         "session_started" => Some(SttEvent::SessionStarted),
         "partial_transcript" => {
             let t = parsed.text?;
@@ -329,19 +302,17 @@ fn map_frame(text: &str) -> Option<SttEvent> {
                 .to_string();
             (!final_text.is_empty()).then_some(SttEvent::Committed(final_text))
         }
-        "quota_exceeded" => Some(SttEvent::KeyFailure(FailKind::Exhausted)),
-        "auth_error" | "invalid_api_key" | "unauthorized" => {
-            Some(SttEvent::KeyFailure(FailKind::Invalid))
-        }
-        "unaccepted_terms" => {
-            warn_unaccepted_terms();
-            Some(SttEvent::KeyFailure(FailKind::Invalid))
-        }
-        // `rate_limited` is the name in ElevenLabs' own AsyncAPI spec; the
-        // other two are kept for whatever older builds observed.
-        "rate_limited" | "rate_limit_exceeded" | "too_many_requests" => {
-            Some(SttEvent::KeyFailure(FailKind::RateLimit))
-        }
+        _ => map_control_frame(message_type, text),
+    }
+}
+
+/// Every frame that is not a transcript: a verdict on the key, an advisory,
+/// or an error. Checked in that order.
+fn map_control_frame(message_type: &str, text: &str) -> Option<SttEvent> {
+    if let Some(kind) = frame_key_failure(message_type) {
+        return Some(SttEvent::KeyFailure(kind));
+    }
+    match message_type {
         // Advisory frames the spec documents. None of them ends the session
         // or blames the key, but a session that went quiet after one is only
         // diagnosable if the log shows it, so they are never dropped silently.
@@ -364,9 +335,9 @@ fn map_frame(text: &str) -> Option<SttEvent> {
         // going: if the server then closes or goes quiet, the stall watchdog
         // replaces the connection with the text intact, and the failure is
         // only surfaced if the press ends having delivered nothing.
-        t if t.contains("error") || t == "invalid_request" || t == "chunk_size_exceeded" => Some(
-            SttEvent::ProviderFailure(format!("elevenlabs sent {}", summarize_frame(text))),
-        ),
+        t if t.contains("error") || t == "invalid_request" || t == "chunk_size_exceeded" => {
+            Some(provider_failure("elevenlabs", text))
+        }
         "" => None,
         _ => {
             tracing::debug!("elevenlabs: ignoring frame {}", summarize_frame(text));
@@ -375,15 +346,20 @@ fn map_frame(text: &str) -> Option<SttEvent> {
     }
 }
 
-/// A frame as it should appear in a log line: its type and a bounded slice of
-/// the body. Never carries audio (the server sends none) and never a key.
-fn summarize_frame(text: &str) -> String {
-    const MAX: usize = 240;
-    let mut out: String = text.chars().take(MAX).collect();
-    if text.chars().count() > MAX {
-        out.push('…');
+/// The frame types that are a verdict on the key itself.
+fn frame_key_failure(message_type: &str) -> Option<FailKind> {
+    match message_type {
+        "quota_exceeded" => Some(FailKind::Exhausted),
+        "auth_error" | "invalid_api_key" | "unauthorized" => Some(FailKind::Invalid),
+        "unaccepted_terms" => {
+            warn_unaccepted_terms();
+            Some(FailKind::Invalid)
+        }
+        // `rate_limited` is the name in ElevenLabs' own AsyncAPI spec; the
+        // other two are kept for whatever older builds observed.
+        "rate_limited" | "rate_limit_exceeded" | "too_many_requests" => Some(FailKind::RateLimit),
+        _ => None,
     }
-    out
 }
 
 /// What a close-frame reason says about the key, if anything.
@@ -553,13 +529,18 @@ mod tests {
     }
 
     #[test]
-    fn frame_summary_is_bounded() {
-        let long = format!(
-            r#"{{"message_type":"warning","error":"{}"}}"#,
-            "a".repeat(1000)
+    fn audio_frame_is_the_documented_envelope_at_exactly_its_length() {
+        let frame = audio_frame(&[1, 2, 3], &audio_frame_tail(16_000));
+        assert_eq!(
+            frame,
+            r#"{"message_type":"input_audio_chunk","audio_base_64":"AQACAAMA","sample_rate":16000}"#
         );
-        assert!(summarize_frame(&long).chars().count() <= 241);
-        assert_eq!(summarize_frame("short"), "short");
+        // Length == capacity is what lets the socket take the String without
+        // another allocation.
+        assert_eq!(frame.len(), frame.capacity());
+        // A length that is not a multiple of three still sizes exactly.
+        let frame = audio_frame(&[7; 1601], &audio_frame_tail(16_000));
+        assert_eq!(frame.len(), frame.capacity());
     }
 
     fn test_opts(vocab: Vec<&str>) -> SttSessionOpts {
