@@ -32,6 +32,16 @@ pub(super) struct KeysModalState {
     pub(super) bulk_error: bool,
 }
 
+impl KeysModalState {
+    /// The keys this editor holds, as its Done button commits them: the rows
+    /// trimmed, blanks dropped, each key kept once in first-seen order. A
+    /// paste still sitting in the bulk editor is not part of it: Done is
+    /// hidden until that editor is saved (merged into the rows) or cancelled.
+    pub(super) fn into_committed(self) -> Vec<String> {
+        deduped_key_values(&self.rows)
+    }
+}
+
 /// The text-replacements modal's own scratch state.
 pub(super) struct ReplacementsModalState {
     pub(super) rows: Vec<(String, String)>,
@@ -77,6 +87,22 @@ pub(super) enum Modal {
     /// `SettingsApp::external_change_pending`). `SettingsApp::pending_save_kind`
     /// remembers what to actually do once the user picks Overwrite.
     ExternalChange,
+}
+
+impl Modal {
+    /// Fold a key-manager or text-replacements editor into `draft` exactly as
+    /// its Done button does, the keys going to the `keys_target` pool. Done
+    /// and a window close (`commit_open_editor`) both commit through here, so
+    /// the two can never come to write different things. Any other modal has
+    /// nothing to commit and is handed back, for the caller to keep or close.
+    pub(super) fn commit_into(self, draft: &mut Config, keys_target: &str) -> Option<Modal> {
+        match self {
+            Modal::Keys(state) => *keys_of(draft, keys_target) = state.into_committed(),
+            Modal::Replacements(state) => draft.text_replacements = state.into_committed(),
+            other => return Some(other),
+        }
+        None
+    }
 }
 
 // ---- Connections settings-sync UI state ------------------------------------
@@ -434,5 +460,165 @@ impl SettingsApp {
                 self.save_and_sync(ctx);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keys_editor(values: &[&str]) -> KeysModalState {
+        KeysModalState {
+            rows: values
+                .iter()
+                .map(|v| KeyRow {
+                    value: (*v).to_string(),
+                    verdict: Verdict::Untested,
+                })
+                .collect(),
+            add_text: String::new(),
+            bulk: false,
+            bulk_text: String::new(),
+            bulk_note: String::new(),
+            bulk_error: false,
+        }
+    }
+
+    fn replacements_editor(rows: &[(&str, &str)]) -> ReplacementsModalState {
+        ReplacementsModalState {
+            rows: rows
+                .iter()
+                .map(|(f, t)| ((*f).to_string(), (*t).to_string()))
+                .collect(),
+            add_from: String::new(),
+            add_to: String::new(),
+            bulk: false,
+            bulk_text: String::new(),
+        }
+    }
+
+    // ---- Closing with an editor open (review fix F2) ----------------------
+
+    #[test]
+    fn an_open_replacements_editor_commits_exactly_what_done_would() {
+        let rows_mode = ReplacementsModalState {
+            rows: vec![
+                ("Github".into(), "GitHub".into()),
+                ("   ".into(), "blank from is dropped".into()),
+            ],
+            add_from: String::new(),
+            add_to: String::new(),
+            bulk: false,
+            bulk_text: "ignored => outside text mode".into(),
+        };
+        assert_eq!(
+            rows_mode.into_committed().into_iter().collect::<Vec<_>>(),
+            vec![("Github".to_string(), "GitHub".to_string())]
+        );
+
+        // Left in text-editor mode: the text is what gets committed, not the rows.
+        let bulk_mode = ReplacementsModalState {
+            rows: vec![("stale".into(), "row".into())],
+            add_from: String::new(),
+            add_to: String::new(),
+            bulk: true,
+            bulk_text: "Chat GPT => ChatGPT\n\nno separator".into(),
+        };
+        assert_eq!(
+            bulk_mode.into_committed().into_iter().collect::<Vec<_>>(),
+            vec![("Chat GPT".to_string(), "ChatGPT".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_blank_from_is_dropped_in_text_editor_mode_too() {
+        let mut editor = replacements_editor(&[]);
+        editor.bulk = true;
+        editor.bulk_text = "  => orphan\n\t= also orphan\nok => fine".into();
+        assert_eq!(
+            editor.into_committed().into_iter().collect::<Vec<_>>(),
+            vec![("ok".to_string(), "fine".to_string())]
+        );
+    }
+
+    #[test]
+    fn an_open_keys_editor_commits_trimmed_deduped_rows_and_not_a_pending_paste() {
+        let mut editor = keys_editor(&[" key-a ", "", "   ", "key-b", "key-a"]);
+        // A paste left in the bulk editor was never saved into the rows.
+        editor.bulk = true;
+        editor.bulk_text = "key-c".into();
+        assert_eq!(editor.into_committed(), vec!["key-a", "key-b"]);
+    }
+
+    #[test]
+    fn a_committed_keys_editor_writes_the_pool_it_was_opened_on() {
+        let mut cfg = Config {
+            stt_provider: "deepgram".into(),
+            deepgram_keys: vec!["old-dg".into()],
+            polish_keys: vec!["old-polish".into()],
+            ..Config::default()
+        };
+
+        // The provider target resolves to whichever provider the draft selects.
+        let rest =
+            Modal::Keys(keys_editor(&["dg-1", "dg-2"])).commit_into(&mut cfg, KEYS_TARGET_PROVIDER);
+        assert!(rest.is_none(), "a committed editor closes");
+        assert_eq!(cfg.deepgram_keys, vec!["dg-1", "dg-2"]);
+        assert_eq!(cfg.polish_keys, vec!["old-polish"]);
+
+        let rest =
+            Modal::Keys(keys_editor(&["polish-1"])).commit_into(&mut cfg, KEYS_TARGET_POLISH);
+        assert!(rest.is_none());
+        assert_eq!(cfg.polish_keys, vec!["polish-1"]);
+        assert_eq!(cfg.deepgram_keys, vec!["dg-1", "dg-2"]);
+    }
+
+    #[test]
+    fn a_committed_replacements_editor_replaces_the_whole_map() {
+        let mut cfg = Config::default();
+        cfg.text_replacements
+            .insert("removed in the editor".into(), "gone".into());
+        let editor = replacements_editor(&[("Github", "GitHub")]);
+        let rest = Modal::Replacements(editor).commit_into(&mut cfg, KEYS_TARGET_PROVIDER);
+        assert!(rest.is_none(), "a committed editor closes");
+        assert_eq!(
+            cfg.text_replacements.into_iter().collect::<Vec<_>>(),
+            vec![("Github".to_string(), "GitHub".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_modal_that_is_not_an_editor_is_handed_back_and_commits_nothing() {
+        let mut cfg = Config::default();
+        let target = KEYS_TARGET_POLISH;
+        assert!(matches!(
+            Modal::Stats.commit_into(&mut cfg, target),
+            Some(Modal::Stats)
+        ));
+        assert!(matches!(
+            Modal::DefaultReset.commit_into(&mut cfg, target),
+            Some(Modal::DefaultReset)
+        ));
+        assert!(matches!(
+            Modal::UnsavedChanges.commit_into(&mut cfg, target),
+            Some(Modal::UnsavedChanges)
+        ));
+        assert!(matches!(
+            Modal::ExternalChange.commit_into(&mut cfg, target),
+            Some(Modal::ExternalChange)
+        ));
+        assert!(!configs_differ(&cfg, &Config::default()));
+    }
+
+    #[test]
+    fn a_fresh_history_cache_reads_as_an_empty_history() {
+        // Version 0 matches a still-empty history, so no rebuild runs until
+        // something changes; the cache must already say "empty", or the page
+        // reads "No matches." instead of "No dictations yet this session."
+        let cache = HistoryCache::default();
+        assert!(cache.history_empty);
+        assert_eq!(cache.version, 0);
+        assert!(cache.filter.is_empty());
+        assert!(cache.rows.is_empty());
     }
 }

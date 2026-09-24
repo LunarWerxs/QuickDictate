@@ -298,21 +298,14 @@ impl super::SettingsApp {
     /// borrow of `self.modal`.
     fn apply_modal_action(&mut self, action: ModalAction) {
         match action {
-            ModalAction::Commit | ModalAction::CommitAndSave => match self.modal.take() {
-                Some(Modal::Keys(state)) => {
-                    let id = self.keys_target.clone();
-                    *keys_of(&mut self.draft, &id) = deduped_key_values(&state.rows);
+            ModalAction::Commit | ModalAction::CommitAndSave => {
+                // Done closes whichever modal is up. An editor's rows are
+                // committed first, the same commit a window close folds in
+                // (`commit_open_editor`); any other modal is simply dropped.
+                if let Some(modal) = self.modal.take() {
+                    let _ = modal.commit_into(&mut self.draft, &self.keys_target);
                 }
-                Some(Modal::Replacements(state)) => {
-                    // The same commit a window close folds in (`commit_open_editor`).
-                    self.draft.text_replacements = state.into_committed();
-                }
-                Some(Modal::Stats)
-                | Some(Modal::DefaultReset)
-                | Some(Modal::UnsavedChanges)
-                | Some(Modal::ExternalChange) => {}
-                None => {}
-            },
+            }
             ModalAction::Cancel => {
                 self.modal = None;
                 self.stats_reset_confirm = false;
