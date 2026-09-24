@@ -481,30 +481,27 @@ async fn download_range(
     let mut last_error = None;
     for attempt in 1..=DOWNLOAD_RANGE_ATTEMPTS {
         check_aborted(cancel, failed)?;
-        match request_range(client, url, next, end, expected_bytes, cancel).await {
-            Ok(mut response) => {
-                let (updated_next, retry_reason) = write_range_chunks(
-                    &mut response,
-                    &mut file,
-                    start,
-                    end,
-                    next,
-                    id,
-                    phase.clone(),
-                    display_total,
-                    progress,
-                    cancel,
-                    failed,
-                )
-                .await?;
-                next = updated_next;
-                if next > end {
-                    return Ok(());
-                }
-                last_error = retry_reason;
-            }
-            Err(retry_reason) => last_error = Some(retry_reason),
+        let (updated_next, retry_reason) = attempt_range(
+            client,
+            &mut file,
+            id,
+            phase.clone(),
+            url,
+            expected_bytes,
+            start,
+            end,
+            next,
+            display_total,
+            progress,
+            cancel,
+            failed,
+        )
+        .await?;
+        next = updated_next;
+        if next > end {
+            return Ok(());
         }
+        last_error = retry_reason;
         if attempt < DOWNLOAD_RANGE_ATTEMPTS {
             tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;
         }
@@ -513,6 +510,48 @@ async fn download_range(
         "range {start}-{end} failed after {DOWNLOAD_RANGE_ATTEMPTS} attempts: {}",
         last_error.unwrap_or_else(|| "range did not start".into())
     ))
+}
+
+/// One attempt at the rest of a range: request bytes `next..=end` and write
+/// what arrives. Returns the offset reached and the retry reason, a rejected
+/// request counting as a retry that got nowhere. Split out of
+/// `download_range` so its retry loop does not also nest the per-attempt
+/// branching.
+#[allow(clippy::too_many_arguments)]
+async fn attempt_range(
+    client: &reqwest::Client,
+    file: &mut File,
+    id: &str,
+    phase: InstallPhase,
+    url: &str,
+    expected_bytes: u64,
+    start: u64,
+    end: u64,
+    next: u64,
+    display_total: u64,
+    progress: &AtomicU64,
+    cancel: &AtomicBool,
+    failed: &AtomicBool,
+) -> Result<(u64, Option<String>), String> {
+    match request_range(client, url, next, end, expected_bytes, cancel).await {
+        Ok(mut response) => {
+            write_range_chunks(
+                &mut response,
+                file,
+                start,
+                end,
+                next,
+                id,
+                phase,
+                display_total,
+                progress,
+                cancel,
+                failed,
+            )
+            .await
+        }
+        Err(retry_reason) => Ok((next, Some(retry_reason))),
+    }
 }
 
 /// Request bytes `next..=end` and accept the response only when it is

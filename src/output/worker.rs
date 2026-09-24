@@ -28,15 +28,8 @@ pub(crate) fn request_stop() {
     STOP.store(true, Ordering::Release);
 }
 
-#[allow(
-    clippy::expect_used,
-    reason = "a thread that cannot be spawned at startup is unrecoverable; the panic message is the only diagnostic there is"
-)]
 pub fn spawn(app: Arc<App>) -> std::thread::JoinHandle<()> {
-    std::thread::Builder::new()
-        .name("qd-output".into())
-        .spawn(move || run(app))
-        .expect("spawn output thread")
+    crate::threads::spawn_named("qd-output", move || run(app))
 }
 
 fn run(app: Arc<App>) {
