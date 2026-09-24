@@ -18,7 +18,6 @@
 //! the worst case is one more check.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -95,25 +94,8 @@ pub(crate) fn record_pass_in(path: &Path, provider: &str, key: &str) -> Result<(
         version: FORMAT_VERSION,
         passed,
     };
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
-    }
-    let json = serde_json::to_vec_pretty(&file)
-        .map_err(|e| format!("could not serialize {}: {e}", path.display()))?;
-    // Same atomic swap as `history_store`: a crash mid-write leaves the
-    // previous file intact.
-    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-    let mut out =
-        fs::File::create(&tmp).map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
-    out.write_all(&json)
-        .and_then(|()| out.sync_all())
-        .map_err(|e| format!("could not flush {}: {e}", tmp.display()))?;
-    drop(out);
-    fs::rename(&tmp, path).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        format!("could not save {}: {e}", path.display())
-    })
+    // WRITE_LOCK, held above, is the serialization the helper asks for.
+    crate::paths::write_json_atomically(path, &file)
 }
 
 #[cfg(test)]

@@ -408,12 +408,13 @@ impl Worker {
             }
             return;
         }
-        match std::fs::write(&path, plan::leftovers_json(&all)) {
+        // Atomic, so a crash while writing can never leave a torn list that
+        // reads as empty and strands the apps it named.
+        let written = crate::paths::write_json_atomically(&path, &plan::leftovers_file(&all));
+        match written {
             Ok(()) => self.on_disk = true,
             Err(e) => tracing::warn!(
-                "duck: could not record the quieted apps in {} ({e}); a crash now would leave \
-                 them quiet",
-                path.display()
+                "duck: could not record the quieted apps ({e}); a crash now would leave them quiet"
             ),
         }
     }

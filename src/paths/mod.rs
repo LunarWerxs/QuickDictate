@@ -95,6 +95,37 @@ static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// filesystem up to eight times and would otherwise do so on every repaint.
 static DEFAULT_DIR: OnceLock<PathBuf> = OnceLock::new();
 
+/// Write `value` as JSON to a `.tmp` beside `path`, flush it, then rename it
+/// over `path`, so a crash mid-write leaves the previous file intact rather
+/// than a truncated one. Every small state file in the data folder goes
+/// through here. The temp name is only unique per process, so the caller must
+/// serialize writers of the same `path`.
+pub(crate) fn write_json_atomically(
+    path: &Path,
+    value: &impl serde::Serialize,
+) -> Result<(), String> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
+    }
+    let json = serde_json::to_vec_pretty(value)
+        .map_err(|e| format!("could not serialize {}: {e}", path.display()))?;
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    let mut out = std::fs::File::create(&tmp)
+        .map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
+    out.write_all(&json)
+        .and_then(|()| out.sync_all())
+        .map_err(|e| format!("could not flush {}: {e}", tmp.display()))?;
+    drop(out);
+    // `rename` replaces an existing target on Windows (MOVEFILE_REPLACE_EXISTING
+    // under the hood), so the old file is swapped out in one step.
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("could not save {}: {e}", path.display())
+    })
+}
+
 /// Directory holding the running executable, or `.` if it cannot be
 /// determined. This is the historical data folder and remains the default.
 pub(crate) fn exe_dir() -> PathBuf {

@@ -169,13 +169,18 @@ pub(super) fn parse_leftovers(text: &str, now_ms: u64) -> Vec<Leftover> {
     }
 }
 
-/// The file text for `apps`.
-pub(super) fn leftovers_json(apps: &[Leftover]) -> String {
-    serde_json::to_string_pretty(&LeftoversOut {
+/// What gets written to [`LEFTOVERS_FILE`] for `apps`.
+pub(super) fn leftovers_file(apps: &[Leftover]) -> impl Serialize + '_ {
+    LeftoversOut {
         version: LEFTOVERS_VERSION,
         apps,
-    })
-    .unwrap_or_default()
+    }
+}
+
+/// The file text for `apps`.
+#[cfg(test)]
+pub(super) fn leftovers_json(apps: &[Leftover]) -> String {
+    serde_json::to_string_pretty(&leftovers_file(apps)).unwrap_or_default()
 }
 
 /// Add `entry`, replacing any older record of the same app on the same

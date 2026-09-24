@@ -16,7 +16,6 @@
 //! stopping the app for.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -132,33 +131,7 @@ pub(crate) fn save_to(
             })
             .collect(),
     };
-    write_json_atomically(path, &file)
-}
-
-/// Write `value` as JSON to a `.tmp` beside `path`, flush it, then rename it
-/// over `path`, so a crash mid-write leaves the previous file intact rather
-/// than a truncated one. The temp name is only unique per process, so the
-/// caller must serialize writers of the same `path`.
-pub(crate) fn write_json_atomically(path: &Path, value: &impl Serialize) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
-    }
-    let json = serde_json::to_vec_pretty(value)
-        .map_err(|e| format!("could not serialize {}: {e}", path.display()))?;
-    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-    let mut out =
-        fs::File::create(&tmp).map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
-    out.write_all(&json)
-        .and_then(|()| out.sync_all())
-        .map_err(|e| format!("could not flush {}: {e}", tmp.display()))?;
-    drop(out);
-    // `rename` replaces an existing target on Windows (MOVEFILE_REPLACE_EXISTING
-    // under the hood), so the old file is swapped out in one step.
-    fs::rename(&tmp, path).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        format!("could not save {}: {e}", path.display())
-    })
+    crate::paths::write_json_atomically(path, &file)
 }
 
 /// Delete the file, if there is one. Called when `persist_history` is turned
