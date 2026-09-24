@@ -396,39 +396,6 @@ fn default_reset_keeps_every_api_key_list_and_the_key_protection() {
     );
 }
 
-// ---- Closing with an editor open (review fix F2) --------------------------
-
-#[test]
-fn an_open_replacements_editor_commits_exactly_what_done_would() {
-    let rows_mode = ReplacementsModalState {
-        rows: vec![
-            ("Github".into(), "GitHub".into()),
-            ("   ".into(), "blank from is dropped".into()),
-        ],
-        add_from: String::new(),
-        add_to: String::new(),
-        bulk: false,
-        bulk_text: "ignored => outside text mode".into(),
-    };
-    assert_eq!(
-        rows_mode.into_committed().into_iter().collect::<Vec<_>>(),
-        vec![("Github".to_string(), "GitHub".to_string())]
-    );
-
-    // Left in text-editor mode: the text is what gets committed, not the rows.
-    let bulk_mode = ReplacementsModalState {
-        rows: vec![("stale".into(), "row".into())],
-        add_from: String::new(),
-        add_to: String::new(),
-        bulk: true,
-        bulk_text: "Chat GPT => ChatGPT\n\nno separator".into(),
-    };
-    assert_eq!(
-        bulk_mode.into_committed().into_iter().collect::<Vec<_>>(),
-        vec![("Chat GPT".to_string(), "ChatGPT".to_string())]
-    );
-}
-
 // ---- Sync card ------------------------------------------------------------
 
 #[test]

@@ -157,15 +157,8 @@ impl SettingsApp {
     /// `Modal` state until Done, so a key added a moment ago was invisible to
     /// `draft_is_dirty` and vanished with the hidden window.
     pub(crate) fn commit_open_editor(&mut self) {
-        match self.modal.take() {
-            Some(Modal::Keys(state)) => {
-                let id = self.keys_target.clone();
-                *keys_of(&mut self.draft, &id) = deduped_key_values(&state.rows);
-            }
-            Some(Modal::Replacements(state)) => {
-                self.draft.text_replacements = state.into_committed();
-            }
-            other => self.modal = other,
+        if let Some(modal) = self.modal.take() {
+            self.modal = modal.commit_into(&mut self.draft, &self.keys_target);
         }
     }
     /// Snapshot settings.json's mtime when "Edit settings.json…" is opened, so

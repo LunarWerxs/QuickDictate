@@ -540,6 +540,46 @@ unsafe fn close_about(hwnd: HWND) -> LRESULT {
     LRESULT(0)
 }
 
+/// The window's own lifetime: creation, closing, teardown, and a DPI move.
+/// `None` for anything else.
+unsafe fn on_lifecycle_message(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> Option<LRESULT> {
+    match msg {
+        WM_CREATE => Some(on_wm_create(hwnd)),
+        WM_DPICHANGED => Some(on_wm_dpichanged(hwnd, lparam)),
+        WM_CLOSE => Some(close_about(hwnd)),
+        WM_DESTROY => Some(on_wm_destroy(hwnd, msg, wparam, lparam)),
+        WM_NCDESTROY => Some(on_wm_ncdestroy(hwnd, msg, wparam, lparam)),
+        _ => None,
+    }
+}
+
+/// What the user sees and touches: the owner-drawn pills, the spinner tick,
+/// clicks, the hand cursor, and Esc. `None` for anything else, including a
+/// timer or key this box does not own, so those reach `DefWindowProcW`.
+unsafe fn on_interaction_message(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> Option<LRESULT> {
+    match msg {
+        WM_DRAWITEM => Some(on_wm_drawitem(hwnd, lparam)),
+        WM_TIMER if wparam.0 == SPINNER_TIMER => Some(on_wm_timer(hwnd)),
+        WM_COMMAND => Some(on_wm_command(hwnd, wparam)),
+        WM_SETCURSOR => Some(on_wm_setcursor(hwnd, msg, wparam, lparam)),
+        // Esc closes (plain window — no dialog manager to send IDCANCEL).
+        WM_KEYDOWN if wparam.0 == 0x1B => Some(close_about(hwnd)),
+        _ => None,
+    }
+}
+
+/// Each group of messages has its own dispatcher, tried in turn; whatever
+/// none of them claims goes to `DefWindowProcW`.
 extern "system" fn about_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         if let Some(r) = on_ctlcolor(msg, wparam, lparam) {
@@ -548,19 +588,12 @@ extern "system" fn about_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
         if let Some(r) = on_about_message(hwnd, msg, wparam, lparam) {
             return r;
         }
-        match msg {
-            WM_CREATE => on_wm_create(hwnd),
-            WM_DRAWITEM => on_wm_drawitem(hwnd, lparam),
-            WM_TIMER if wparam.0 == SPINNER_TIMER => on_wm_timer(hwnd),
-            WM_COMMAND => on_wm_command(hwnd, wparam),
-            WM_SETCURSOR => on_wm_setcursor(hwnd, msg, wparam, lparam),
-            // Esc closes (plain window — no dialog manager to send IDCANCEL).
-            WM_KEYDOWN if wparam.0 == 0x1B => close_about(hwnd),
-            WM_DPICHANGED => on_wm_dpichanged(hwnd, lparam),
-            WM_CLOSE => close_about(hwnd),
-            WM_DESTROY => on_wm_destroy(hwnd, msg, wparam, lparam),
-            WM_NCDESTROY => on_wm_ncdestroy(hwnd, msg, wparam, lparam),
-            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        if let Some(r) = on_lifecycle_message(hwnd, msg, wparam, lparam) {
+            return r;
         }
+        if let Some(r) = on_interaction_message(hwnd, msg, wparam, lparam) {
+            return r;
+        }
+        DefWindowProcW(hwnd, msg, wparam, lparam)
     }
 }

@@ -246,7 +246,31 @@ mod tests {
         });
         // No renderer here to upload the font atlas to; epaint 0.36 asserts
         // that a frame's texture updates are consumed, so say so explicitly.
+        // Cleared before any assertion: a failing one would otherwise panic
+        // again in that check while unwinding and abort the test binary.
         output.textures_delta.clear();
+        let heading = output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(shape) if shape.galley.text() == "Settings" => {
+                    Some(shape.galley.clone())
+                }
+                _ => None,
+            });
+        let heading = heading.expect("the heading was painted as a text shape");
+        assert!(
+            heading
+                .job
+                .sections
+                .iter()
+                .all(|s| s.format.font_id == semibold(15.0)),
+            "the heading was laid out in the semibold family"
+        );
+        assert!(
+            heading.num_vertices > 0,
+            "the fallback family produced actual glyphs, not an empty galley"
+        );
     }
 
     #[test]
