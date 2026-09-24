@@ -4,6 +4,8 @@
 //! Everything here expects COM to be initialized on the calling thread; only
 //! the duck worker calls it.
 
+use std::time::Duration;
+
 use windows::core::{Interface, PWSTR};
 use windows::Win32::Foundation::{BOOL, S_OK};
 use windows::Win32::Media::Audio::{
@@ -13,7 +15,7 @@ use windows::Win32::Media::Audio::{
 };
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL};
 
-use super::plan::{Change, Level};
+use super::plan::{self, Change, Level};
 
 /// The session managers of every active output device, so a duck reaches
 /// the speakers and the headphones alike.
@@ -138,19 +140,80 @@ impl AppSession {
         }
     }
 
-    /// Make `change`. `false` when the audio service refused it.
+    /// Make `change` at once. `false` when the audio service refused it.
     pub(super) fn apply(&self, change: Change) -> bool {
+        match change {
+            Change::Mute => self.set_muted(true),
+            Change::Unmute => self.set_muted(false),
+            Change::Volume(volume) => self.set_volume(volume),
+        }
+    }
+
+    fn set_volume(&self, volume: f32) -> bool {
         // SAFETY: as in `Mixer::open`. A null event context is documented as
         // allowed; nothing here needs to recognize its own change events.
         unsafe {
-            match change {
-                Change::Mute => self.volume.SetMute(BOOL::from(true), std::ptr::null()),
-                Change::Unmute => self.volume.SetMute(BOOL::from(false), std::ptr::null()),
-                Change::Volume(volume) => self
-                    .volume
-                    .SetMasterVolume(volume.clamp(0.0, 1.0), std::ptr::null()),
-            }
+            self.volume
+                .SetMasterVolume(volume.clamp(0.0, 1.0), std::ptr::null())
         }
         .is_ok()
     }
+
+    fn set_muted(&self, muted: bool) -> bool {
+        // SAFETY: as in `set_volume`.
+        unsafe { self.volume.SetMute(BOOL::from(muted), std::ptr::null()) }.is_ok()
+    }
+}
+
+/// One app's change, as `glide` makes it: the app, how it reads now, and the
+/// change to make.
+pub(super) type Move<'a> = (&'a AppSession, Level, Change);
+
+/// Make every move as a fade over `over` instead of a jump, all apps together.
+/// It ends in exactly the state `AppSession::apply` would leave, so restoring
+/// and the leftovers file never need to know a fade happened: a mute still
+/// keeps the slider where it was, it just gets there by way of silence, and
+/// an unmute swells up from nothing to where the slider sits.
+///
+/// Returns, per move, whether it landed. One that fails part-way is sent to
+/// its louder end (where the app started when going down, its target when
+/// coming back), so a hiccup never strands an app half-quiet.
+pub(super) fn glide(moves: &[Move<'_>], over: Duration) -> Vec<bool> {
+    let mut ok = vec![true; moves.len()];
+    let mut ramps = Vec::with_capacity(moves.len());
+    for (i, (app, now, change)) in moves.iter().enumerate() {
+        ramps.push(match change {
+            Change::Mute => (now.volume, 0.0),
+            Change::Unmute => {
+                ok[i] = app.set_volume(0.0) && app.set_muted(false);
+                (0.0, now.volume)
+            }
+            Change::Volume(target) => (now.volume, *target),
+        });
+    }
+    let steps = plan::fade_steps(over);
+    for step in 1..=steps {
+        let t = step as f32 / steps as f32;
+        for (i, (app, _, _)) in moves.iter().enumerate() {
+            if ok[i] {
+                let (from, to) = ramps[i];
+                ok[i] = app.set_volume(plan::fade_level(from, to, t));
+            }
+        }
+        if step < steps {
+            std::thread::sleep(plan::FADE_STEP);
+        }
+    }
+    for (i, (app, now, change)) in moves.iter().enumerate() {
+        if ok[i] && *change == Change::Mute {
+            // Silent now: mute, then put the slider back where it was.
+            ok[i] = app.set_muted(true) && app.set_volume(now.volume);
+        }
+        if !ok[i] {
+            let (from, to) = ramps[i];
+            let _ = app.set_muted(false);
+            let _ = app.set_volume(from.max(to));
+        }
+    }
+    ok
 }

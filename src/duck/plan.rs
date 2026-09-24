@@ -1,7 +1,36 @@
 //! The pure decisions behind ducking -- what an app is set to, and whether it
 //! is still ours to put back -- plus the leftovers file that outlives a crash.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
+
+/// With fading on (`Config::duck_fade`), how long other apps take to glide
+/// down when a press starts. Short on purpose: the music has to be out of the
+/// way before the first word lands.
+pub(super) const FADE_DOWN: Duration = Duration::from_millis(250);
+/// ...and how long they take to swell back once the microphone stops. Longer,
+/// so the music eases back in rather than jumping on the last word.
+pub(super) const FADE_UP: Duration = Duration::from_millis(600);
+/// One volume step per this much time during a fade: about 50 a second, far
+/// finer than an ear can pick apart as steps.
+pub(super) const FADE_STEP: Duration = Duration::from_millis(20);
+
+/// The volume `t` of the way through a fade from `from` to `to` (`t` in
+/// 0..=1, clamped). A smoothstep curve, so the change eases in and out
+/// instead of lurching at either end.
+pub(super) fn fade_level(from: f32, to: f32, t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    let eased = t * t * (3.0 - 2.0 * t);
+    from + (to - from) * eased
+}
+
+/// How many steps a fade of `over` takes: never zero, so even a zero-length
+/// fade lands on its target.
+pub(super) fn fade_steps(over: Duration) -> u32 {
+    let steps = over.as_millis() / FADE_STEP.as_millis().max(1);
+    u32::try_from(steps).unwrap_or(u32::MAX).max(1)
+}
 
 /// How close a read-back volume must be to the one we set to count as
 /// "still as we left it". The audio service stores the level as a float that
@@ -12,7 +41,7 @@ pub(super) const SAME_LEVEL: f32 = 0.01;
 /// The file, in the data folder, listing every app ducked and not yet put
 /// back. Present only while a press is ducking, or when a previous run left
 /// something down.
-pub(super) const LEFTOVERS_FILE: &str = "quickdictate-ducked-apps.json";
+pub(crate) const LEFTOVERS_FILE: &str = "quickdictate-ducked-apps.json";
 const LEFTOVERS_VERSION: u32 = 1;
 /// A leftover older than this is dropped unrestored. By then the user has
 /// long since set that app's volume the way they want it, and unmuting it a

@@ -7,8 +7,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
-use super::mixer::{AppSession, Mixer};
-use super::plan::{self, Leftover, Level, LEFTOVERS_FILE};
+use super::mixer::{self, AppSession, Mixer, Move};
+use super::plan::{self, Change, Leftover, Level, FADE_DOWN, FADE_UP, LEFTOVERS_FILE};
 
 /// While ducked, how often to look for apps that started playing after the
 /// press began (a video that autoplays, a song someone hits play on), so they
@@ -16,8 +16,9 @@ use super::plan::{self, Leftover, Level, LEFTOVERS_FILE};
 const RESCAN: Duration = Duration::from_secs(1);
 
 pub(super) enum Cmd {
-    /// Quiet every app playing sound, to `percent` of its volume (0 = mute).
-    Duck { percent: u8 },
+    /// Quiet every app playing sound, to `percent` of its volume (0 = mute),
+    /// gliding there when `fade` is on.
+    Duck { percent: u8, fade: bool },
     /// Put back everything the current duck changed.
     Restore,
     /// Put back whatever an earlier run left ducked.
@@ -64,7 +65,7 @@ fn run(rx: &Receiver<Cmd>) {
             }
         };
         match cmd {
-            Cmd::Duck { percent } => worker.duck(percent),
+            Cmd::Duck { percent, fade } => worker.duck(percent, fade),
             Cmd::Restore => worker.restore(),
             Cmd::Recover => worker.recover(),
             Cmd::Shutdown(ack) => {
@@ -92,6 +93,18 @@ fn verb(percent: u8) -> String {
     }
 }
 
+/// Make every move, gliding over `fade` when there is one, and report per
+/// move whether it landed.
+fn make_moves(moves: &[Move<'_>], fade: Option<Duration>) -> Vec<bool> {
+    match fade {
+        Some(over) => mixer::glide(moves, over),
+        None => moves
+            .iter()
+            .map(|(app, _, change)| app.apply(*change))
+            .collect(),
+    }
+}
+
 struct Worker {
     /// Apps an earlier duck left down and could not yet put back (see
     /// `plan::Leftover`), mirrored to [`LEFTOVERS_FILE`].
@@ -105,6 +118,7 @@ struct Worker {
 /// The duck in force for the current press(es).
 struct Ducked {
     percent: u8,
+    fade: bool,
     mixer: Mixer,
     apps: Vec<DuckedApp>,
     /// Instances already decided on while playing (ducked, or left alone as
@@ -131,10 +145,10 @@ impl DuckedApp {
 }
 
 impl Ducked {
-    /// Duck every app playing sound that this press has not decided on yet.
-    /// Returns the names of the ones it quieted.
-    fn sweep(&mut self) -> Vec<String> {
-        let mut quieted = Vec::new();
+    /// Every app playing sound that this press has not decided on yet, with
+    /// how it reads and what ducking does to it. Marks each as decided.
+    fn newcomers(&mut self) -> Vec<(AppSession, Level, Change)> {
+        let mut planned = Vec::new();
         for app in self.mixer.sessions() {
             // Not-yet-playing apps stay undecided, so a later rescan still
             // catches them if they start mid-dictation.
@@ -145,20 +159,11 @@ impl Ducked {
             let Some(found) = app.level() else {
                 continue;
             };
-            let Some(change) = plan::duck(found, self.percent) else {
-                continue;
-            };
-            if app.apply(change) {
-                quieted.push(plan::app_name(&app.session).to_string());
-                self.apps.push(DuckedApp {
-                    original: found,
-                    set: found.after(change),
-                    at_ms: now_ms(),
-                    app,
-                });
+            if let Some(change) = plan::duck(found, self.percent) {
+                planned.push((app, found, change));
             }
         }
-        quieted
+        planned
     }
 }
 
@@ -177,13 +182,10 @@ impl Worker {
         }
     }
 
-    fn duck(&mut self, percent: u8) {
+    fn duck(&mut self, percent: u8, fade: bool) {
         if self.ducked.is_some() {
             return;
         }
-        // An app a crash left quiet has to be put back first, or this duck
-        // would record the quiet volume as the one to return to.
-        self.recover();
         let started = Instant::now();
         let mixer = match Mixer::open() {
             Ok(mixer) => mixer,
@@ -194,51 +196,103 @@ impl Worker {
                 return;
             }
         };
-        let mut ducked = Ducked {
+        self.ducked = Some(Ducked {
             percent,
+            fade,
             mixer,
             apps: Vec::new(),
             seen: HashSet::new(),
-        };
-        let quieted = ducked.sweep();
+        });
+        let quieted = self.quiet_newcomers();
         tracing::info!(
-            "duck: {} {} app(s) in {} ms{}",
+            "duck: {} {} app(s) in {} ms{}{}",
             verb(percent),
             quieted.len(),
             started.elapsed().as_millis(),
+            if fade { ", fading" } else { "" },
             if quieted.is_empty() {
                 String::new()
             } else {
                 format!(" ({})", quieted.join(", "))
             }
         );
-        self.ducked = Some(ducked);
-        if !quieted.is_empty() {
-            self.persist();
-        }
     }
 
     fn rescan(&mut self) {
-        let Some(ducked) = self.ducked.as_mut() else {
-            return;
-        };
-        let quieted = ducked.sweep();
-        if !quieted.is_empty() {
+        let quieted = self.quiet_newcomers();
+        if let (false, Some(ducked)) = (quieted.is_empty(), &self.ducked) {
             tracing::info!(
                 "duck: {} {} more app(s) that started mid-dictation ({})",
                 verb(ducked.percent),
                 quieted.len(),
                 quieted.join(", ")
             );
-            self.persist();
         }
+    }
+
+    /// Duck every app that started playing since this press last looked, and
+    /// return the names of the ones it quieted. Shared by the first sweep and
+    /// every rescan.
+    fn quiet_newcomers(&mut self) -> Vec<String> {
+        // An app a crash left quiet has to be put back first, or this duck
+        // would record the quiet volume as the one to return to. It matters
+        // on a rescan too: such an app may only start playing mid-dictation.
+        self.recover();
+        let Some(ducked) = self.ducked.as_mut() else {
+            return Vec::new();
+        };
+        let planned = ducked.newcomers();
+        if planned.is_empty() {
+            return Vec::new();
+        }
+        let fade = ducked.fade.then_some(FADE_DOWN);
+        let at_ms = now_ms();
+        // Written down before any volume moves, so even a crash in the middle
+        // of the fade leaves a list the next launch can put right.
+        let pending: Vec<Leftover> = planned
+            .iter()
+            .map(|(app, found, change)| Leftover {
+                session: app.session.clone(),
+                original: *found,
+                set: found.after(*change),
+                at_ms,
+            })
+            .collect();
+        self.persist_with(&pending);
+
+        let moves: Vec<Move<'_>> = planned
+            .iter()
+            .map(|(app, found, change)| (app, *found, *change))
+            .collect();
+        let landed = make_moves(&moves, fade);
+        drop(moves);
+
+        let mut quieted = Vec::new();
+        if let Some(ducked) = self.ducked.as_mut() {
+            for ((app, found, change), ok) in planned.into_iter().zip(landed) {
+                if ok {
+                    quieted.push(plan::app_name(&app.session).to_string());
+                    ducked.apps.push(DuckedApp {
+                        original: found,
+                        set: found.after(change),
+                        at_ms,
+                        app,
+                    });
+                }
+            }
+        }
+        // Now exactly what landed.
+        self.persist();
+        quieted
     }
 
     fn restore(&mut self) {
         let Some(ducked) = self.ducked.take() else {
             return;
         };
-        let (mut restored, mut kept, mut unreachable) = (0usize, 0usize, 0usize);
+        let (mut kept, mut unreachable) = (0usize, 0usize);
+        let mut moves: Vec<Move<'_>> = Vec::new();
+        let mut owners: Vec<&DuckedApp> = Vec::new();
         for app in &ducked.apps {
             // Closed while it was ducked: Windows kept the lowered volume for
             // that app's next launch, so it becomes a leftover `recover` puts
@@ -254,12 +308,21 @@ impl Worker {
                 continue;
             };
             match plan::restore(app.original, app.set, now) {
-                Some(change) if app.app.apply(change) => restored += 1,
-                Some(_) => {
-                    plan::upsert(&mut self.leftovers, app.leftover());
-                    unreachable += 1;
+                Some(change) => {
+                    moves.push((&app.app, now, change));
+                    owners.push(app);
                 }
                 None => kept += 1,
+            }
+        }
+        let landed = make_moves(&moves, ducked.fade.then_some(FADE_UP));
+        let mut restored = 0usize;
+        for (app, ok) in owners.into_iter().zip(landed) {
+            if ok {
+                restored += 1;
+            } else {
+                plan::upsert(&mut self.leftovers, app.leftover());
+                unreachable += 1;
             }
         }
         if !ducked.apps.is_empty() {
@@ -320,11 +383,19 @@ impl Worker {
     /// Mirror the leftovers, plus everything ducked right now, to disk; or
     /// delete the file when there is nothing to put back.
     fn persist(&mut self) {
+        self.persist_with(&[]);
+    }
+
+    /// [`Self::persist`], plus `pending`: changes about to be made.
+    fn persist_with(&mut self, pending: &[Leftover]) {
         let mut all = self.leftovers.clone();
         if let Some(ducked) = &self.ducked {
             for app in &ducked.apps {
                 plan::upsert(&mut all, app.leftover());
             }
+        }
+        for left in pending {
+            plan::upsert(&mut all, left.clone());
         }
         let path = crate::paths::data_file(LEFTOVERS_FILE);
         if all.is_empty() {

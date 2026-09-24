@@ -298,6 +298,12 @@ impl super::SettingsApp {
                 .on_hover_text("Show a small dot near your text cursor while dictation is active.");
                 blue_check(right, &mut self.draft.enable_sound, "Start/stop sounds")
                     .on_hover_text("Play a short sound when dictation starts and stops.");
+                // Only means something while "Other audio" quiets other apps.
+                let ducking = self.draft.duck_other_audio;
+                right.add_enabled_ui(ducking, |ui| {
+                    blue_check(ui, &mut self.draft.duck_fade, "Fade other audio")
+                        .on_hover_text(TIP_DUCK_FADE);
+                });
                 right.add_space(4.0);
                 // A plain button in a column would stretch full-width (columns
                 // use a justified layout); a horizontal wrapper lets it size to

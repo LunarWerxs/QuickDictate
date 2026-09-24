@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Other audio fades instead of snapping.** With Settings -> Dictation -> **Other audio** on,
+  music now glides down over a quarter second as you start and swells back over about half a
+  second when QuickDictate stops listening, instead of cutting out and jumping back. **Fade other
+  audio** (on by default) switches it off for an instant change. Either way each app ends exactly
+  where it did before, so a fade never changes what gets put back.
+
+### Fixed
+
+- **The list of quieted apps now moves with your data folder**, so moving the folder can no longer
+  strand a crash's leftovers where the next launch does not look.
+- **An app that a crash left quiet and that only starts playing mid-dictation** is put back before
+  it is quieted again, so its quiet volume is never mistaken for its normal one.
+- **Every duck is written down before any volume moves**, so even a crash in the middle of a fade
+  leaves a list the next launch can repair.
+
 ## [1.1.0] - 2026-09-24
 
 ### Added

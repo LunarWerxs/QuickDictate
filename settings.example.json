@@ -12,6 +12,7 @@
   "enable_sound": false,
   "duck_other_audio": false,
   "duck_volume_percent": 0,
+  "duck_fade": true,
   "close_behavior": "minimize",
   "window_width": 280,
   "window_height": 140,

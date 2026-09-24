@@ -164,6 +164,12 @@ pub struct Config {
     /// leaves them at a fifth. `100` or more changes nothing.
     #[serde(default)]
     pub duck_volume_percent: u8,
+    /// Glide other apps down and back up instead of switching them in one
+    /// jump, while `duck_other_audio` is on: a quarter second down as a press
+    /// starts, a little over half a second back up once the microphone stops.
+    /// On by default. Off makes the change instant.
+    #[serde(default = "default_true")]
+    pub duck_fade: bool,
     #[serde(default = "default_close")]
     pub close_behavior: String,
     #[serde(default = "default_width")]
@@ -523,6 +529,7 @@ impl Default for Config {
             enable_sound: false,
             duck_other_audio: false,
             duck_volume_percent: 0,
+            duck_fade: true,
             close_behavior: default_close(),
             window_width: default_width(),
             window_height: default_height(),

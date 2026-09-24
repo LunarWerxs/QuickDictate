@@ -5,7 +5,9 @@
 //! `duck_volume_percent` of its own volume, or is muted at 0, and the moment
 //! the microphone stops listening each one goes back to where it was. It is
 //! the per-app volume the Windows Volume mixer shows, so the system volume and
-//! QuickDictate's own start/stop sounds are never touched.
+//! QuickDictate's own start/stop sounds are never touched. With
+//! `Config::duck_fade` on (the default) both changes are quick fades rather
+//! than jumps; either way they end in exactly the same state.
 //!
 //! Three rules keep it from ever doing more than the user asked for:
 //!
@@ -50,6 +52,7 @@ use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
 
 use crate::config::Config;
+pub(crate) use plan::LEFTOVERS_FILE;
 use worker::Cmd;
 
 /// Presses currently holding a [`DuckGuard`].
@@ -121,6 +124,7 @@ pub(crate) fn begin(cfg: &Config) -> Option<DuckGuard> {
     if presses.start() {
         send(Cmd::Duck {
             percent: cfg.duck_volume_percent.min(100),
+            fade: cfg.duck_fade,
         });
     }
     Some(DuckGuard { _private: () })
@@ -130,7 +134,7 @@ pub(crate) fn begin(cfg: &Config) -> Option<DuckGuard> {
 /// restore. Starts the worker only when there is such a list on disk, and
 /// runs whether or not ducking is still switched on.
 pub(crate) fn recover_after_crash() {
-    if crate::paths::data_file(plan::LEFTOVERS_FILE).exists() {
+    if crate::paths::data_file(LEFTOVERS_FILE).exists() {
         send(Cmd::Recover);
     }
 }

@@ -70,6 +70,42 @@ fn restore_never_touches_an_app_ducking_did_not_change() {
 }
 
 #[test]
+fn a_fade_starts_and_ends_exactly_on_its_levels_and_never_overshoots() {
+    for (from, to) in [(0.8_f32, 0.0_f32), (0.0, 0.8), (0.6, 0.12), (0.12, 0.6)] {
+        assert_eq!(fade_level(from, to, 0.0), from);
+        assert!((fade_level(from, to, 1.0) - to).abs() < 1e-6);
+        let (lo, hi) = (from.min(to), from.max(to));
+        let mut last = from;
+        for step in 1..=20 {
+            let v = fade_level(from, to, step as f32 / 20.0);
+            assert!(
+                (lo - 1e-6..=hi + 1e-6).contains(&v),
+                "{v} outside {lo}..{hi}"
+            );
+            // Monotonic: a fade never wobbles back the other way.
+            assert!((v - last) * (to - from) >= -1e-6);
+            last = v;
+        }
+    }
+    // Out-of-range progress is clamped rather than extrapolated.
+    assert_eq!(fade_level(0.5, 0.0, -1.0), 0.5);
+    assert_eq!(fade_level(0.5, 0.0, 2.0), 0.0);
+}
+
+#[test]
+fn fades_are_quick_down_gentle_up_and_always_take_at_least_one_step() {
+    assert!(FADE_DOWN < FADE_UP, "out of the way fast, back in gently");
+    assert!(FADE_DOWN <= std::time::Duration::from_millis(300));
+    assert_eq!(fade_steps(FADE_DOWN), 12);
+    assert_eq!(fade_steps(std::time::Duration::ZERO), 1);
+    let cfg = crate::config::Config::default();
+    assert!(
+        cfg.duck_fade,
+        "fading is the default once ducking is switched on"
+    );
+}
+
+#[test]
 fn only_the_first_press_ducks_and_only_the_last_restores() {
     let mut presses = Presses::default();
     assert!(presses.start(), "first press ducks");

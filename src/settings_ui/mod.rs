@@ -145,6 +145,8 @@ const TIP_DUCK: &str = "Mute or turn down music, videos and every other app whil
      so nothing plays over you or ends up in the transcript. Each app goes back to its own volume \
      the moment QuickDictate stops listening, and one you adjust mid-dictation keeps your change. \
      Applies to your next dictation.";
+const TIP_DUCK_FADE: &str = "Glide other apps down as you start and back up when you stop, \
+     instead of cutting them off and snapping them back. Uses the \"Other audio\" setting above.";
 const TIP_POLISH: &str = "Before pasting, have an AI repair the sentence breaks a pause made \
      the recognizer invent, plus obviously misheard words. It never rewords you: it can only \
      return small exact-match edits, and anything that rewrites more than a quarter of what you \
