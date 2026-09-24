@@ -53,6 +53,12 @@ pub fn provider_streams_interim_text(cfg: &Config) -> bool {
     make_provider(cfg).streams_interim_text()
 }
 
+/// [`provider_streams_interim_text`] for a given provider id, which a Per-App
+/// Profile may have chosen over `cfg.stt_provider`.
+pub fn provider_id_streams_interim_text(id: &str, cfg: &Config) -> bool {
+    make_provider_id(id, cfg).streams_interim_text()
+}
+
 /// Startup key prewarm (§owner request, 2026-07-04): probe every key of the
 /// active provider in config order, mark dead/limited ones failed (so the
 /// session's `acquire` never wastes a press on them), and queue the first

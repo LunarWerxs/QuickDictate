@@ -34,10 +34,15 @@ fn refresh_key_pool(app: &Arc<App>, keys: &mut Arc<KeyPool>) {
 /// (Google POSTs the recording then, OpenAI answers ~0.9 s after it) gets
 /// `Finalizing`: the same spinner, no queue. A streaming provider has already
 /// shown its words, so its pip goes as soon as you let go.
-fn status_after_release(cfg: &crate::config::Config) -> Status {
-    if cfg.stt_provider.eq_ignore_ascii_case("local") {
+///
+/// `provider` is the one the press actually runs on (a Per-App Profile may
+/// pick another than `cfg.stt_provider`); `None`, before the press has
+/// resolved it, falls back to the global choice.
+fn status_after_release(cfg: &crate::config::Config, provider: Option<&str>) -> Status {
+    let id = provider.unwrap_or(&cfg.stt_provider);
+    if id.eq_ignore_ascii_case("local") {
         Status::Processing
-    } else if !stt::provider_streams_interim_text(cfg) {
+    } else if !stt::provider_id_streams_interim_text(id, cfg) {
         Status::Finalizing
     } else {
         Status::Idle
@@ -110,7 +115,8 @@ fn begin_session(
 /// Stop the live session: show the provider's post-release status first,
 /// then signal the session to finish.
 fn end_session(app: &Arc<App>, active: &mut Option<SttHandle>, why: &str) {
-    app.set_status(status_after_release(&app.config.load()));
+    let provider = active.as_ref().and_then(SttHandle::provider);
+    app.set_status(status_after_release(&app.config.load(), provider));
     if let Some(h) = active.take() {
         tracing::info!("Stopping session ({why})");
         h.stop();
@@ -273,15 +279,53 @@ mod tests {
             stt_provider: id.into(),
             ..crate::config::Config::default()
         };
-        assert_eq!(status_after_release(&with("local")), Status::Processing);
-        assert_eq!(status_after_release(&with("LOCAL")), Status::Processing);
+        assert_eq!(
+            status_after_release(&with("local"), None),
+            Status::Processing
+        );
+        assert_eq!(
+            status_after_release(&with("LOCAL"), None),
+            Status::Processing
+        );
         // Commit-only cloud providers keep the pip up while the transcript is
         // on its way, without queueing the next press behind it.
-        assert_eq!(status_after_release(&with("google")), Status::Finalizing);
-        assert_eq!(status_after_release(&with("openai")), Status::Finalizing);
+        assert_eq!(
+            status_after_release(&with("google"), None),
+            Status::Finalizing
+        );
+        assert_eq!(
+            status_after_release(&with("openai"), None),
+            Status::Finalizing
+        );
         for streaming in ["elevenlabs", "deepgram", "assemblyai", "dashscope"] {
-            assert_eq!(status_after_release(&with(streaming)), Status::Idle);
+            assert_eq!(status_after_release(&with(streaming), None), Status::Idle);
         }
+    }
+
+    #[test]
+    fn the_pip_follows_the_provider_the_press_resolved_not_the_global_one() {
+        let global_streaming = crate::config::Config {
+            stt_provider: "elevenlabs".into(),
+            ..crate::config::Config::default()
+        };
+        // A profile put this press on the local model: its release must queue
+        // and spin, exactly as if Local were the global choice.
+        assert_eq!(
+            status_after_release(&global_streaming, Some("local")),
+            Status::Processing
+        );
+        assert_eq!(
+            status_after_release(&global_streaming, Some("google")),
+            Status::Finalizing
+        );
+        let global_local = crate::config::Config {
+            stt_provider: "local".into(),
+            ..crate::config::Config::default()
+        };
+        assert_eq!(
+            status_after_release(&global_local, Some("deepgram")),
+            Status::Idle
+        );
     }
 
     #[test]

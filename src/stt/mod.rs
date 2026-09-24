@@ -32,7 +32,7 @@ mod send_task;
 mod tests;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -52,7 +52,9 @@ use send_task::{run_send_task, SendTaskState, StallRecovery};
 #[cfg(test)]
 mod stall_tests;
 
-pub use dispatch::{provider_streams_interim_text, spawn_key_test, spawn_prewarm};
+pub use dispatch::{
+    provider_id_streams_interim_text, provider_streams_interim_text, spawn_key_test, spawn_prewarm,
+};
 
 const TAIL_MIN: Duration = Duration::from_millis(250);
 
@@ -159,6 +161,10 @@ pub struct SttHandle {
     /// Set true when the session task exits (clean or errored). Main uses this
     /// to tell whether the active handle is still doing work.
     pub done: Arc<AtomicBool>,
+    /// The provider this press runs on once it has resolved it: a Per-App
+    /// Profile may pick another than `Config::stt_provider`. What the pip
+    /// shows after release depends on it (see `session_loop`).
+    provider: Arc<OnceLock<String>>,
 }
 
 impl SttHandle {
@@ -168,6 +174,12 @@ impl SttHandle {
 
     pub fn is_done(&self) -> bool {
         self.done.load(Ordering::Acquire)
+    }
+
+    /// The provider id this press resolved, or `None` in the instant before
+    /// its task first ran.
+    pub fn provider(&self) -> Option<&str> {
+        self.provider.get().map(String::as_str)
     }
 }
 
@@ -183,6 +195,8 @@ pub fn start_session(app: Arc<App>, keys: Arc<KeyPool>) -> SttHandle {
     // already down while the provider connects. Only posts to the duck
     // worker, so the hotkey thread never waits on the audio service.
     let duck = crate::duck::begin(&app.config.load());
+    let provider = Arc::new(OnceLock::new());
+    let provider_ret = Arc::clone(&provider);
     app.rt.spawn(async move {
         let _stats_session_guard = stats_session_guard;
         let session_usage = Arc::new(parking_lot::Mutex::new(SessionUsage::default()));
@@ -198,6 +212,7 @@ pub fn start_session(app: Arc<App>, keys: Arc<KeyPool>) -> SttHandle {
             epoch,
             Arc::clone(&session_usage),
             duck,
+            provider,
         )
         .await;
         finish_session(app2, keys, epoch, session_usage, final_res).await;
@@ -206,6 +221,7 @@ pub fn start_session(app: Arc<App>, keys: Arc<KeyPool>) -> SttHandle {
     SttHandle {
         stop: stop_ret,
         done: done_ret,
+        provider: provider_ret,
     }
 }
 
@@ -226,12 +242,23 @@ async fn run_session_with_retries(
     epoch: u64,
     session_usage: Arc<parking_lot::Mutex<SessionUsage>>,
     duck: Option<crate::duck::DuckGuard>,
+    provider: Arc<OnceLock<String>>,
 ) -> (Arc<KeyPool>, Result<()>) {
     let mut press = Press {
         duck,
         exe_at_start: crate::focus::foreground_exe_name(),
         ..Press::default()
     };
+    // Published at once, the same way `establish_connected_session` resolves
+    // it, so a release that comes before the handshake finishes still shows
+    // the right pip for a profile's provider.
+    {
+        let cfg = app2.config.load();
+        let id = cfg
+            .provider_for_exe(press.exe_at_start.as_deref())
+            .unwrap_or_else(|| cfg.stt_provider.clone());
+        let _ = provider.set(id);
+    }
     let user_aborted = || stop.load(Ordering::Acquire) || app2.current_session_epoch() != epoch;
     let res = loop {
         let before = press.tried.len();
