@@ -1,4 +1,4 @@
-# Local CI — runs the EXACT gates .github/workflows/ci.yml runs, so you never
+# Local CI - runs the EXACT gates .github/workflows/ci.yml runs, so you never
 # wait on GitHub to find out a push is red. Run this before every commit.
 #
 #   pwsh -File scripts\check.ps1          # fmt + clippy + test + supply chain
@@ -45,7 +45,7 @@ function Step($name, [scriptblock] $cmd) {
 function RequireTool($exe, $installHint) {
     if (Get-Command $exe -ErrorAction SilentlyContinue) { return $true }
     Write-Host "`n=== $exe ===" -ForegroundColor Cyan
-    Write-Host "  SKIPPED — $exe is not installed. CI still runs it." -ForegroundColor Yellow
+    Write-Host "  SKIPPED - $exe is not installed. CI still runs it." -ForegroundColor Yellow
     Write-Host "  Install with: $installHint" -ForegroundColor Yellow
     $script:skipped += $exe
     return $false
@@ -137,11 +137,11 @@ finally {
 
 $sw.Stop()
 if ($fail) {
-    Write-Host "`n[check] RED in $([int]$sw.Elapsed.TotalSeconds)s — fix before pushing." -ForegroundColor Red
+    Write-Host "`n[check] RED in $([int]$sw.Elapsed.TotalSeconds)s - fix before pushing." -ForegroundColor Red
     exit 1
 }
 if ($skipped.Count -gt 0) {
-    Write-Host "`n[check] GREEN in $([int]$sw.Elapsed.TotalSeconds)s, but $($skipped -join ', ') did not run — CI will." -ForegroundColor Yellow
+    Write-Host "`n[check] GREEN in $([int]$sw.Elapsed.TotalSeconds)s, but $($skipped -join ', ') did not run - CI will." -ForegroundColor Yellow
     exit 0
 }
-Write-Host "`n[check] ALL GREEN in $([int]$sw.Elapsed.TotalSeconds)s — safe to push." -ForegroundColor Green
+Write-Host "`n[check] ALL GREEN in $([int]$sw.Elapsed.TotalSeconds)s - safe to push." -ForegroundColor Green
