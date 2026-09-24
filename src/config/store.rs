@@ -10,6 +10,28 @@ use std::path::{Path, PathBuf};
 use super::defaults::default_local_model;
 use super::{Config, EXAMPLE_JSON};
 
+/// Serializes every write of settings.json by this process: Settings, the
+/// tray's hide-icon toggle and the install id all write through the one
+/// `.tmp` name, and two unserialized writers truncate each other's temp file.
+static WRITE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+/// See [`Config::last_self_write`].
+static LAST_SELF_WRITE: parking_lot::Mutex<Option<std::time::SystemTime>> =
+    parking_lot::Mutex::new(None);
+
+/// Write settings.json's full text. Write-then-rename, so a crash, power loss
+/// or AV lock mid-write can never leave a truncated settings.json (which would
+/// silently wipe the user's API keys and preferences on the next load);
+/// rename() is atomic on the same volume, which the sibling temp path
+/// guarantees. Records the resulting mtime as this process's own write.
+fn write_settings_text(path: &Path, text: &str) -> anyhow::Result<()> {
+    let _guard = WRITE_LOCK.lock();
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, text.as_bytes())?;
+    fs::rename(&tmp, path)?;
+    *LAST_SELF_WRITE.lock() = fs::metadata(path).and_then(|m| m.modified()).ok();
+    Ok(())
+}
+
 impl Config {
     /// Whether a `settings.json` found in an ANCESTOR of the exe directory may
     /// be adopted. Debug builds: always (that is the dev-run convenience).
@@ -286,15 +308,15 @@ impl Config {
         } else {
             serde_json::to_string_pretty(self)?
         };
-        // Write-then-rename so a crash, power loss, or AV lock mid-write can
-        // never leave a truncated settings.json (which would silently wipe the
-        // user's API keys and preferences on the next load). Same atomic idiom
-        // as sync.rs::save_creds; rename() is atomic on the same volume, which
-        // the sibling temp path guarantees.
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, pretty.as_bytes())?;
-        fs::rename(&tmp, path)?;
-        Ok(())
+        write_settings_text(path, &pretty)
+    }
+
+    /// settings.json's modification time right after this process last wrote
+    /// it, so a check for someone else's hand-edit can tell the app's own
+    /// saves (Settings, the tray's hide-icon toggle, the install id) apart
+    /// from an editor's.
+    pub(crate) fn last_self_write() -> Option<std::time::SystemTime> {
+        *LAST_SELF_WRITE.lock()
     }
 
     /// Replace a removed or otherwise unknown local-model id with the current
@@ -332,11 +354,7 @@ impl Config {
                 EMPTY_SLOT,
                 &format!("\"install_id\": \"{}\"", self.install_id),
             );
-            // Same write-then-rename idiom as save().
-            let tmp = path.with_extension("json.tmp");
-            fs::write(&tmp, filled.as_bytes())?;
-            fs::rename(&tmp, path)?;
-            return Ok(());
+            return write_settings_text(path, &filled);
         }
         let mut on_disk = parse_settings(&text).map_err(|e| {
             anyhow::anyhow!("{} does not parse ({e}); leaving it alone", path.display())

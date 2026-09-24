@@ -187,13 +187,16 @@ impl SettingsApp {
         }
     }
     /// Whether settings.json has changed on disk since `note_editor_opened`
-    /// last ran. `false` when no editor session is being tracked (the common
-    /// case) or if the file's mtime can't be read.
+    /// last ran, by someone other than this app. `false` when no editor
+    /// session is being tracked (the common case) or if the file's mtime can't
+    /// be read. A write this process made itself (the tray's hide-icon toggle,
+    /// the install id; see `Config::last_self_write`) is not a hand-edit.
     pub(crate) fn external_change_pending(&self) -> bool {
         let Some(opened_at) = self.editor_opened_at else {
             return false;
         };
-        settings_mtime().is_some_and(|mtime| mtime > opened_at)
+        settings_mtime()
+            .is_some_and(|mtime| mtime > opened_at && Some(mtime) != Config::last_self_write())
     }
     pub(crate) fn validate(&self) -> Result<(), String> {
         crate::hotkeys::parse_combo(&self.draft.toggle_hotkey)
