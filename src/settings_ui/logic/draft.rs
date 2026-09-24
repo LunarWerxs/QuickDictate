@@ -80,7 +80,11 @@ impl SettingsApp {
         self.history_selected.clear();
         self.editor_opened_at = None;
         self.pending_save_kind = None;
-        self.pending_restart = None;
+        // `pending_restart` is deliberately NOT cleared: it is not leftover UI
+        // state but a committed "Save and restart" whose save already landed.
+        // Dropping it on a quick re-open silently skipped the relaunch the
+        // user asked for, so it survives, along with the push it waits on
+        // (`sync.rx`, kept below), for `poll_pending_restart` to finish.
         // `nudge_ask` and `feedback_ask` are deliberately NOT cleared here. Closing the window is
         // not an answer, and each ask is already stamped in its own persisted state either way -
         // so clearing it would hide a prompt the user still owes an answer to while spending it
@@ -100,7 +104,9 @@ impl SettingsApp {
         self.sync.avatar = None;
         self.sync.note.clear();
         self.sync.is_error = false;
-        self.sync.rx = None;
+        if self.pending_restart.is_none() {
+            self.sync.rx = None;
+        }
         self.sync.resume_kicked = false;
     }
     /// Rebuild the vocabulary text-editor scratch buffers (global + one per
@@ -123,17 +129,11 @@ impl SettingsApp {
     /// actually write — so the multiline editors don't need to stay in sync
     /// with `draft` on every keystroke.
     pub(crate) fn fold_vocabulary_into_draft(&mut self) {
-        self.draft.custom_vocabulary = parse_vocabulary(&self.vocabulary_text);
-        for (p, buf) in self
-            .draft
-            .profiles
-            .iter_mut()
-            .zip(self.profile_vocab_text.iter())
-        {
-            if p.custom_vocabulary.is_some() {
-                p.custom_vocabulary = Some(parse_vocabulary(buf));
-            }
-        }
+        fold_vocabulary(
+            &mut self.draft,
+            &self.vocabulary_text,
+            &self.profile_vocab_text,
+        );
     }
     /// Whether `self.draft` (plus whatever the vocabulary editors currently
     /// hold) differs from what's actually saved on disk right now. Backs the
@@ -143,25 +143,48 @@ impl SettingsApp {
     pub(crate) fn draft_is_dirty(&self) -> bool {
         let saved = self.app.config.load_full();
         let mut snapshot = self.draft.clone();
-        snapshot.custom_vocabulary = parse_vocabulary(&self.vocabulary_text);
-        for (p, buf) in snapshot
-            .profiles
-            .iter_mut()
-            .zip(self.profile_vocab_text.iter())
-        {
-            if p.custom_vocabulary.is_some() {
-                p.custom_vocabulary = Some(parse_vocabulary(buf));
-            }
-        }
+        fold_vocabulary(
+            &mut snapshot,
+            &self.vocabulary_text,
+            &self.profile_vocab_text,
+        );
         configs_differ(&snapshot, &saved)
+    }
+    /// Fold an open key-manager or text-replacements editor into `draft`
+    /// exactly as its Done button would, and close it; any other modal is
+    /// left as it is. Run when the window is asked to close: `egui::Modal`
+    /// does not block the title-bar X, and an editor's rows live only in its
+    /// `Modal` state until Done, so a key added a moment ago was invisible to
+    /// `draft_is_dirty` and vanished with the hidden window.
+    pub(crate) fn commit_open_editor(&mut self) {
+        match self.modal.take() {
+            Some(Modal::Keys(state)) => {
+                let id = self.keys_target.clone();
+                *keys_of(&mut self.draft, &id) = deduped_key_values(&state.rows);
+            }
+            Some(Modal::Replacements(state)) => {
+                self.draft.text_replacements = state.into_committed();
+            }
+            other => self.modal = other,
+        }
     }
     /// Snapshot settings.json's mtime when "Edit settings.json…" is opened, so
     /// a later Save can tell a hand-edit landed on disk in the meantime (see
     /// `external_change_pending`) instead of silently clobbering it with
     /// whatever's in the draft.
     pub(crate) fn note_editor_opened(&mut self) {
-        let path = Config::settings_path();
-        self.editor_opened_at = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        self.editor_opened_at = settings_mtime();
+    }
+    /// Re-snapshot settings.json's mtime after this window itself wrote the
+    /// file, while an editor session is being tracked. Without it, the
+    /// window's own Save moved the mtime past the snapshot, so every later
+    /// Save claimed a hand-edit and offered Reload, which threw away the
+    /// edits made since. A no-op (and no filesystem read) when no session is
+    /// tracked.
+    pub(crate) fn refresh_editor_snapshot(&mut self) {
+        if self.editor_opened_at.is_some() {
+            self.editor_opened_at = settings_mtime();
+        }
     }
     /// Whether settings.json has changed on disk since `note_editor_opened`
     /// last ran. `false` when no editor session is being tracked (the common
@@ -170,10 +193,7 @@ impl SettingsApp {
         let Some(opened_at) = self.editor_opened_at else {
             return false;
         };
-        let path = Config::settings_path();
-        std::fs::metadata(&path)
-            .and_then(|m| m.modified())
-            .is_ok_and(|mtime| mtime > opened_at)
+        settings_mtime().is_some_and(|mtime| mtime > opened_at)
     }
     pub(crate) fn validate(&self) -> Result<(), String> {
         crate::hotkeys::parse_combo(&self.draft.toggle_hotkey)
@@ -190,4 +210,24 @@ impl SettingsApp {
         }
         Ok(())
     }
+}
+
+/// Parse the vocabulary scratch buffers (global + one per profile) over
+/// `cfg`, trimming blank lines (see `parse_vocabulary`). One function for
+/// both the save and the dirty check, so the check always compares exactly
+/// what a save would write.
+fn fold_vocabulary(cfg: &mut Config, global: &str, per_profile: &[String]) {
+    cfg.custom_vocabulary = parse_vocabulary(global);
+    for (p, buf) in cfg.profiles.iter_mut().zip(per_profile) {
+        if p.custom_vocabulary.is_some() {
+            p.custom_vocabulary = Some(parse_vocabulary(buf));
+        }
+    }
+}
+
+/// settings.json's last-write time, or `None` if it can't be read.
+fn settings_mtime() -> Option<std::time::SystemTime> {
+    std::fs::metadata(Config::settings_path())
+        .and_then(|m| m.modified())
+        .ok()
 }

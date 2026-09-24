@@ -57,20 +57,22 @@ impl SettingsApp {
             }
         }
         for (key, ok) in done {
-            self.testing_left = self.testing_left.saturating_sub(1);
-            self.verdicts.retain(|(k, _)| *k != key);
-            self.verdicts.push((key.clone(), ok));
-            if let Some(Modal::Keys(state)) = &mut self.modal {
-                if let Some(r) = state.rows.iter_mut().find(|r| r.value == key) {
-                    r.verdict = if ok { Verdict::Ok } else { Verdict::Fail };
-                }
-            }
+            self.record_verdict(key, ok);
         }
         if self.testing_left == 0 {
             self.test_rx = None;
         }
     }
-    // Which auto-opened modal (if any) a headless shot should land on, keyed by
-    // `QUICKDICTATE_UI_OPEN`. Split out of `screenshot_hook` so the frame-timing
-    // logic there isn't buried under this dispatch's own branching.
+    /// Record one finished probe: replace the key's previous verdict and
+    /// update its row in the key manager, if that is the modal on screen.
+    fn record_verdict(&mut self, key: String, ok: bool) {
+        self.testing_left = self.testing_left.saturating_sub(1);
+        self.verdicts.retain(|(k, _)| *k != key);
+        if let Some(Modal::Keys(state)) = &mut self.modal {
+            if let Some(r) = state.rows.iter_mut().find(|r| r.value == key) {
+                r.verdict = if ok { Verdict::Ok } else { Verdict::Fail };
+            }
+        }
+        self.verdicts.push((key, ok));
+    }
 }

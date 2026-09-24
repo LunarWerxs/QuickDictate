@@ -140,6 +140,35 @@ pub(super) fn combo_from_pointer(
     Some(with_modifiers(name, mods))
 }
 
+/// What one input event means to a hotkey field that is recording:
+/// `Some(None)` for Escape (cancel), `Some(Some(combo))` for a bindable key
+/// or mouse button press, and `None` for everything else, so the field keeps
+/// listening. Key repeats and releases are ignored, and so are presses that
+/// can't be bound (see [`combo_from_event`], [`combo_from_pointer`]).
+pub(super) fn capture_from_event(ev: &egui::Event) -> Option<Option<String>> {
+    match ev {
+        egui::Event::Key {
+            key,
+            pressed: true,
+            repeat: false,
+            modifiers,
+            ..
+        } => {
+            if *key == egui::Key::Escape {
+                return Some(None);
+            }
+            combo_from_event(*key, *modifiers).map(Some)
+        }
+        egui::Event::PointerButton {
+            button,
+            pressed: true,
+            modifiers,
+            ..
+        } => combo_from_pointer(*button, *modifiers).map(Some),
+        _ => None,
+    }
+}
+
 /// Whether two hotkey combo strings parse to the identical (modifiers, vk)
 /// pair — the condition `SettingsApp::validate` rejects, since Windows can
 /// only register one of two identical `RegisterHotKey` calls and the loser

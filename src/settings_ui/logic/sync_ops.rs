@@ -4,7 +4,7 @@
 use crate::settings_ui::*;
 
 impl SettingsApp {
-    /// Spawn a sync worker; its `SyncEvent` result is drained in `update`.
+    /// Spawn a sync worker; its `SyncEvent` result is drained in `logic`.
     /// Only one runs at a time (`self.sync.rx`), which serializes the
     /// sign-in / resume / push / disconnect operations.
     pub(crate) fn spawn_sync(
@@ -100,10 +100,16 @@ impl SettingsApp {
             };
             return;
         };
-        let config_changed = crate::sync::apply_synced_to_config(&mut self.draft, remote);
+        // The pull is merged into a copy of the SAVED config, which is what
+        // gets written, and only then into the draft so the page shows it.
+        // Writing the draft instead persisted any unsaved edits along with
+        // the pull, unvalidated.
+        let mut pulled = (*self.app.config.load_full()).clone();
+        let config_changed = crate::sync::apply_synced_to_config(&mut pulled, remote);
         let stats_changed = crate::sync::synced_stats(remote)
             .is_some_and(|stats| self.app.stats.apply_synced(stats));
         if config_changed {
+            crate::sync::apply_synced_to_config(&mut self.draft, remote);
             // The pull mutated `draft.custom_vocabulary` /
             // `draft.profiles[..].custom_vocabulary` directly, bypassing the
             // scratch buffers the vocabulary editors actually render (see
@@ -114,10 +120,14 @@ impl SettingsApp {
             // fold that stale text back over the just-pulled vocabulary,
             // reverting the cloud value right back.
             self.resync_vocabulary_scratch();
-            // Persist + hot-store so the pulled prefs take effect.
-            let path = Config::settings_path();
-            let _ = self.draft.save(&path);
-            self.app.config.store(Arc::new(self.draft.clone()));
+            // Persist through Save's own path so the pulled prefs take effect
+            // the same way: hot-store, and the microphone / local-model hooks.
+            if let Err(e) = self.persist(pulled) {
+                self.sync.is_error = true;
+                self.sync.note =
+                    format!("Pulled your synced settings, but saving them failed: {e}");
+                return;
+            }
         }
         self.sync.note = if config_changed || stats_changed {
             "Updated from your Connections account.".into()
