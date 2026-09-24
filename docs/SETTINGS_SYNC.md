@@ -24,6 +24,23 @@ itself. Once signed in:
   from the server, and drops the local sign-in, everything reverts to
   local-only.
 
+### How two machines merge (since 1.2.1)
+
+Sync is a three-way merge. Each machine remembers the cloud copy it last saw
+(`quickdictate-sync-baseline.json` in the data folder; it holds preferences
+only, never keys) and compares against it:
+
+- **Save** sends only the settings you changed on this machine since that
+  copy, so a machine that hasn't pulled lately can't overwrite a newer change
+  made on your other machine. A text replacement you delete stays deleted.
+- **Pull** applies only what changed in the cloud since that copy, so a change
+  you saved while offline isn't reverted either.
+- With no baseline yet (first sign-in, or after **Stop syncing**, which
+  deletes it), the first exchange falls back to the whole document.
+
+The merge code is `changes_since` / `remote_changes` in `src/sync/schema.rs`;
+the baseline file is owned by `src/sync/baseline.rs`.
+
 ## What syncs and what never does
 
 - **Syncs:** portable preferences only, mode, language, toggle/hold hotkeys,
@@ -39,7 +56,7 @@ itself. Once signed in:
 
 The two lists are enforced in code: every settings field must be declared
 either synced or machine-local (`SYNCED_KEYS` / `NEVER_SYNCED` in
-`src/sync.rs`), and a test fails the build if a new field is in neither, so
+`src/sync/schema.rs`), and a test fails the build if a new field is in neither, so
 nothing can silently start or stop syncing again.
 
 Your API keys, dictation audio, and recognized text never leave your machine
