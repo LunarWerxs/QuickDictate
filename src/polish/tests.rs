@@ -60,6 +60,28 @@ fn an_ambiguous_before_is_rejected() {
 }
 
 #[test]
+fn an_overlapping_second_occurrence_is_still_ambiguous() {
+    // The second "no no" starts inside the first one; a non-overlapping
+    // search never sees it.
+    assert!(apply_edits(
+        "I said no no no to that whole plan today",
+        &[edit("no no", "no")]
+    )
+    .is_none());
+    // Multi-byte text right after the hit must not split a char.
+    assert!(apply_edits("é é é and then some more words", &[edit("é é", "é")]).is_none());
+    // A genuinely unique `before` still applies.
+    assert_eq!(
+        apply_edits(
+            "I said no no to that whole plan today",
+            &[edit("no no", "no")]
+        )
+        .as_deref(),
+        Some("I said no to that whole plan today")
+    );
+}
+
+#[test]
 fn overlapping_edits_are_rejected() {
     assert!(apply_edits(
         "alpha beta gamma",

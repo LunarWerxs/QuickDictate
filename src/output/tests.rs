@@ -59,11 +59,85 @@ fn undo_counts_grapheme_clusters_not_scalars() {
 }
 
 #[test]
-fn a_failed_paste_publishes_no_undo_target() {
-    // Guards the invariant paste_processed relies on: LAST_PASTE_TARGET is
-    // cleared up front and only set again on a Typed outcome, so a
-    // "scratch that" after a failed paste finds nothing to undo.
-    *LAST_PASTE_TARGET.lock() = Some((0x1234, Some("editor.exe".into())));
-    *LAST_PASTE_TARGET.lock() = None;
-    assert!(LAST_PASTE_TARGET.lock().is_none());
+fn clipboard_text_is_nul_terminated_little_endian_utf16() {
+    assert_eq!(unicode_clipboard_bytes(""), vec![0, 0]);
+    assert_eq!(
+        unicode_clipboard_bytes("A😀"),
+        vec![0x41, 0x00, 0x3D, 0xD8, 0x00, 0xDE, 0x00, 0x00]
+    );
+}
+
+fn target(window: isize, focus: isize, exe: &str) -> PasteTarget {
+    PasteTarget {
+        window,
+        focus,
+        exe: Some(exe.to_string()),
+    }
+}
+
+#[test]
+fn only_the_newest_paste_is_undoable() {
+    let mut targets = UndoTargets::new();
+    targets.push(1, target(0x10, 0x11, "outlook.exe"));
+    targets.push(2, target(0x20, 0x21, "slack.exe"));
+    // Entry 1 is behind entry 2: its length is no longer what backspaces
+    // would remove.
+    assert!(targets.target_for(1).is_none());
+    assert_eq!(
+        targets.target_for(2),
+        Some(&target(0x20, 0x21, "slack.exe"))
+    );
+}
+
+#[test]
+fn a_second_scratch_that_checks_the_older_paste_target_not_the_undone_one() {
+    // Outlook email, then "ok" in Slack. After undoing "ok", the next undo
+    // must be judged against OUTLOOK, so saying it again while still in
+    // Slack is refused instead of sending the email's length into Slack.
+    let mut targets = UndoTargets::new();
+    targets.push(1, target(0x10, 0x11, "outlook.exe"));
+    targets.push(2, target(0x20, 0x21, "slack.exe"));
+    targets.pop();
+    let older = targets.target_for(1);
+    assert_eq!(older, Some(&target(0x10, 0x11, "outlook.exe")));
+    assert_ne!(older, Some(&target(0x20, 0x21, "slack.exe")));
+}
+
+#[test]
+fn a_history_entry_without_a_recorded_paste_is_not_undoable() {
+    // A failed paste still records history but no target; a restart keeps
+    // history but not targets. Either way the newest entry has no target.
+    let mut targets = UndoTargets::new();
+    targets.push(1, target(0x10, 0x11, "editor.exe"));
+    assert!(targets.target_for(2).is_none());
+    targets.clear();
+    assert!(targets.target_for(1).is_none());
+}
+
+#[test]
+fn another_field_of_the_same_window_is_a_different_target() {
+    assert_ne!(target(0x10, 0x11, "app.exe"), target(0x10, 0x12, "app.exe"));
+    assert_ne!(
+        target(0x10, 0x11, "app.exe"),
+        target(0x10, 0x11, "other.exe")
+    );
+}
+
+#[test]
+fn the_undo_stack_is_capped_oldest_first() {
+    let mut targets = UndoTargets::new();
+    for id in 0..200u64 {
+        targets.push(id, target(0x10, 0x11, "editor.exe"));
+    }
+    assert!(targets.target_for(199).is_some());
+    // Pop back through everything that is kept; the oldest ones were dropped.
+    let mut reachable = 0;
+    for id in (0..200u64).rev() {
+        if targets.target_for(id).is_none() {
+            break;
+        }
+        reachable += 1;
+        targets.pop();
+    }
+    assert_eq!(reachable, 50);
 }

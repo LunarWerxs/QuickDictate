@@ -35,7 +35,15 @@ pub(super) fn paste_via_clipboard(text: &str, restore_delay_ms: u64) -> Result<(
     // a failed SetClipboardData and including a panic, runs the restore.
     // Previously a failure between EmptyClipboard and the restore block lost
     // the user's clipboard permanently.
-    let mut guard = ClipboardGuard::new(snapshot_clipboard());
+    //
+    // No snapshot, no borrowing. The snapshot only fails when another process
+    // held the clipboard through every retry, and our own write retries too,
+    // so it usually won once that holder let go: the paste went ahead with
+    // nothing to restore and silently replaced whatever the user had copied.
+    // The error sends `paste` to its keystroke fallback instead.
+    let snapshot = snapshot_clipboard()
+        .ok_or_else(|| anyhow!("could not snapshot the clipboard, so not borrowing it"))?;
+    let mut guard = ClipboardGuard::new(snapshot);
 
     set_clipboard_unicode(text)?;
     // Clipboard "version" right after our write. If it differs at restore
@@ -72,7 +80,7 @@ struct ClipboardSnapshot {
 /// `?` return or a panic between EmptyClipboard and the restore used to
 /// destroy the user's clipboard with only a log line to show for it.
 struct ClipboardGuard {
-    snapshot: Option<ClipboardSnapshot>,
+    snapshot: ClipboardSnapshot,
     /// The sequence number we expect to still see. `None` means we never got
     /// as far as writing our own text, so anything on the clipboard now is
     /// wreckage from a partial write and should be replaced unconditionally.
@@ -80,7 +88,7 @@ struct ClipboardGuard {
 }
 
 impl ClipboardGuard {
-    fn new(snapshot: Option<ClipboardSnapshot>) -> Self {
+    fn new(snapshot: ClipboardSnapshot) -> Self {
         Self {
             snapshot,
             expect_seq: None,
@@ -90,10 +98,6 @@ impl ClipboardGuard {
 
 impl Drop for ClipboardGuard {
     fn drop(&mut self) {
-        let Some(snapshot) = self.snapshot.take() else {
-            tracing::debug!("clipboard: nothing was snapshotted, so nothing to restore");
-            return;
-        };
         if let Some(expected) = self.expect_seq {
             let now = unsafe { GetClipboardSequenceNumber() };
             if now != expected {
@@ -104,7 +108,7 @@ impl Drop for ClipboardGuard {
                 return;
             }
         }
-        if let Err(e) = restore_clipboard(&snapshot) {
+        if let Err(e) = restore_clipboard(&self.snapshot) {
             tracing::warn!("failed to restore the prior clipboard contents: {e:#}");
         }
     }
@@ -145,11 +149,7 @@ pub(super) fn is_hglobal_format(fmt: u32) -> bool {
 /// clipboard and go invalid the moment `EmptyClipboard` runs, so everything
 /// has to be copied out here, while we still hold the clipboard open.
 fn snapshot_clipboard() -> Option<ClipboardSnapshot> {
-    open_clipboard().ok()?;
-    let snapshot = read_all_open_formats();
-    unsafe {
-        let _ = CloseClipboard();
-    }
+    let snapshot = with_open_clipboard(|| Ok(read_all_open_formats())).ok()?;
     if !snapshot.skipped.is_empty() {
         // Debug, not warn: skipping exotic formats is the designed common
         // case (see should_snapshot_format), not an anomaly worth alarming
@@ -254,33 +254,50 @@ fn read_global_format(fmt: u32) -> Option<Vec<u8>> {
 
 /// Put a snapshot back, format by format, in the order it was captured.
 fn restore_clipboard(snapshot: &ClipboardSnapshot) -> Result<()> {
-    open_clipboard()?;
-    let result = (|| -> Result<()> {
-        unsafe {
-            EmptyClipboard()?;
-            for (fmt, bytes) in &snapshot.formats {
-                // GlobalAlloc(0) is legal but useless; a zero-length format
-                // was already filtered out in read_global_format.
-                let hglob = GlobalAlloc(GMEM_MOVEABLE, bytes.len())?;
-                if hglob.0.is_null() {
-                    return Err(anyhow!("GlobalAlloc null restoring format {fmt}"));
-                }
-                let dst = GlobalLock(hglob) as *mut u8;
-                if dst.is_null() {
-                    let _ = GlobalFree(hglob);
-                    return Err(anyhow!("GlobalLock null restoring format {fmt}"));
-                }
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
-                let _ = GlobalUnlock(hglob);
-                if SetClipboardData(*fmt, HANDLE(hglob.0)).is_err() {
-                    // Ownership did NOT transfer, so this block is ours to free.
-                    let _ = GlobalFree(hglob);
-                    return Err(anyhow!("SetClipboardData failed restoring format {fmt}"));
-                }
-            }
-            Ok(())
+    with_open_clipboard(|| {
+        unsafe { EmptyClipboard()? };
+        for (fmt, bytes) in &snapshot.formats {
+            // GlobalAlloc(0) is legal but useless; a zero-length format
+            // was already filtered out in read_global_format.
+            put_open_clipboard_data(*fmt, bytes)?;
         }
-    })();
+        Ok(())
+    })
+}
+
+/// Copy `bytes` into a fresh movable HGLOBAL and hand it to the clipboard as
+/// format `fmt`. The clipboard must already be open, and emptied by us. On
+/// success the clipboard owns the block; on every failure it is still ours,
+/// so it is freed here.
+fn put_open_clipboard_data(fmt: u32, bytes: &[u8]) -> Result<()> {
+    unsafe {
+        let hglob = GlobalAlloc(GMEM_MOVEABLE, bytes.len())?;
+        if hglob.0.is_null() {
+            return Err(anyhow!("GlobalAlloc null for clipboard format {fmt}"));
+        }
+        let dst = GlobalLock(hglob) as *mut u8;
+        if dst.is_null() {
+            let _ = GlobalFree(hglob);
+            return Err(anyhow!("GlobalLock null for clipboard format {fmt}"));
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+        let _ = GlobalUnlock(hglob);
+        if SetClipboardData(fmt, HANDLE(hglob.0)).is_err() {
+            // Ownership did NOT transfer, so this block is ours to free.
+            let _ = GlobalFree(hglob);
+            return Err(anyhow!(
+                "SetClipboardData failed for clipboard format {fmt}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Run `f` with the clipboard open, and close it again whatever `f` returns.
+/// Holding it open any longer blocks every other app's copy and paste.
+fn with_open_clipboard<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+    open_clipboard()?;
+    let result = f();
     unsafe {
         let _ = CloseClipboard();
     }
@@ -300,37 +317,19 @@ fn open_clipboard() -> Result<()> {
 }
 
 pub(super) fn set_clipboard_unicode(text: &str) -> Result<()> {
-    let mut utf16: Vec<u16> = text.encode_utf16().collect();
-    utf16.push(0);
-    let byte_size = utf16.len() * std::mem::size_of::<u16>();
+    let bytes = unicode_clipboard_bytes(text);
+    with_open_clipboard(|| {
+        unsafe { EmptyClipboard()? };
+        put_open_clipboard_data(CF_UNICODETEXT.0 as u32, &bytes)
+    })
+}
 
-    open_clipboard()?;
-    let result = (|| -> Result<()> {
-        unsafe {
-            EmptyClipboard()?;
-            let hglob = GlobalAlloc(GMEM_MOVEABLE, byte_size)?;
-            if hglob.0.is_null() {
-                return Err(anyhow!("GlobalAlloc null"));
-            }
-            let dst = GlobalLock(hglob) as *mut u16;
-            if dst.is_null() {
-                let _ = GlobalFree(hglob);
-                return Err(anyhow!("GlobalLock null"));
-            }
-            std::ptr::copy_nonoverlapping(utf16.as_ptr(), dst, utf16.len());
-            let _ = GlobalUnlock(hglob);
-            let h = HANDLE(hglob.0);
-            match SetClipboardData(CF_UNICODETEXT.0 as u32, h) {
-                Ok(_) => Ok(()),
-                Err(_) => {
-                    let _ = GlobalFree(hglob);
-                    Err(anyhow!("SetClipboardData failed"))
-                }
-            }
-        }
-    })();
-    unsafe {
-        let _ = CloseClipboard();
-    }
-    result
+/// `text` as CF_UNICODETEXT wants it: NUL-terminated UTF-16, little-endian
+/// (the only byte order Windows runs on). Built before the clipboard is
+/// opened, so no other app waits on our encoding.
+pub(super) fn unicode_clipboard_bytes(text: &str) -> Vec<u8> {
+    text.encode_utf16()
+        .chain(std::iter::once(0))
+        .flat_map(u16::to_le_bytes)
+        .collect()
 }

@@ -199,14 +199,14 @@ fn process_transcript(
 /// text preceded the command phrase, processes and pastes that as the new
 /// chunk.
 ///
-/// Refuses to fire if focus has moved since that paste (see
-/// [`LAST_PASTE_TARGET`]): blind backspaces into a window QuickDictate did not
-/// write to would delete the user's own content.
+/// Refuses to fire unless that entry is the newest paste on record and focus
+/// is still where it landed (see [`UndoTargets`]): blind backspaces into a
+/// window QuickDictate did not write to would delete the user's own content.
 ///
 /// If there is no previous chunk to undo, this is a no-op (logged at debug)
 /// -- we never invent backspaces without a known prior paste. Only ever
 /// undoes the single most recent chunk; repeated commands require repeated
-/// "scratch that"s (each becomes its own transcript / history entry).
+/// "scratch that"s, each reaching one paste further back.
 pub(super) fn handle_scratch_that(
     app: &App,
     remaining_raw: &str,
@@ -218,27 +218,8 @@ pub(super) fn handle_scratch_that(
         tracing::debug!("voice command: \"scratch that\" heard, but no previous paste to undo");
         return;
     };
-
-    // Only undo if focus is still where the text landed. Backspaces are blind:
-    // if the user alt-tabbed, clicked into another field, or typed more since
-    // the paste, they would delete content QuickDictate never wrote.
-    let now_hwnd = focus::foreground_window_id();
-    let now_exe = focus::foreground_exe_name();
-    let target = LAST_PASTE_TARGET.lock().clone();
-    match target {
-        Some((hwnd, ref exe)) if Some(hwnd) == now_hwnd && *exe == now_exe => {}
-        Some(_) => {
-            tracing::warn!(
-                "voice command: \"scratch that\" ignored -- focus moved since the last paste \
-                 (now {:?}); refusing to send backspaces into a different window",
-                now_exe.as_deref().unwrap_or("<unknown>")
-            );
-            return;
-        }
-        None => {
-            tracing::debug!("voice command: \"scratch that\" heard, but no paste target recorded");
-            return;
-        }
+    if !focus_unchanged_since_paste(last.id) {
+        return;
     }
 
     // Backspace deletes one GRAPHEME CLUSTER in most editors, not one Unicode
@@ -251,8 +232,10 @@ pub(super) fn handle_scratch_that(
         return;
     }
     // Drop the now-undone entry so a second "scratch that" doesn't see the
-    // same (already-removed) text as still "most recent" and re-undo it.
+    // same (already-removed) text as still "most recent" and re-undo it, and
+    // its target with it so the paste before becomes the undoable one.
     app.undo_last_history();
+    UNDO_TARGETS.lock().pop();
 
     if remaining_raw.trim().is_empty() {
         return;
@@ -267,6 +250,30 @@ pub(super) fn handle_scratch_that(
         return;
     }
     paste_processed(app, &processed, true, cfg.log_transcripts);
+}
+
+/// Whether history entry `entry_id` is the newest paste on record AND focus is
+/// still in the window and control it was typed into. Backspaces are blind: if
+/// the user alt-tabbed or clicked into another native field since the paste,
+/// they would delete content QuickDictate never wrote. (Typing more into the
+/// same field, or switching tabs inside an app that draws its own fields, is
+/// invisible from here; see [`focus::foreground_focus_ids`].)
+fn focus_unchanged_since_paste(entry_id: u64) -> bool {
+    let target = UNDO_TARGETS.lock().target_for(entry_id).cloned();
+    let Some(target) = target else {
+        tracing::debug!("voice command: \"scratch that\" heard, but no paste target recorded");
+        return false;
+    };
+    let now = PasteTarget::current();
+    if now.as_ref() == Some(&target) {
+        return true;
+    }
+    tracing::warn!(
+        "voice command: \"scratch that\" ignored -- focus moved since the last paste \
+         (now {:?}); refusing to send backspaces into a different window",
+        now.and_then(|t| t.exe).as_deref().unwrap_or("<unknown>")
+    );
+    false
 }
 
 /// [`TextProcessor::process`] behind the same panic boundary as `paste()`:
@@ -304,10 +311,9 @@ pub(super) fn paste_processed(
 
     // Where this is about to land, for "scratch that". Captured BEFORE
     // injection (by the time the keystrokes are consumed the foreground
-    // window may already have changed) but only PUBLISHED if the text
+    // window may already have changed) but only RECORDED once the text
     // actually got typed, so an undo can never chase a paste that failed.
-    let target = focus::foreground_window_id().map(|h| (h, exe_at_paste_time()));
-    *LAST_PASTE_TARGET.lock() = None;
+    let target = PasteTarget::current();
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         paste(processed, restore_delay_ms)
@@ -319,11 +325,10 @@ pub(super) fn paste_processed(
     if save_as_last {
         app.record_history(processed.to_string());
     }
+    let typed = matches!(result, Ok(Ok(PasteOutcome::Typed)));
+    track_undo_target(app, (typed && save_as_last).then_some(target).flatten());
     match result {
-        Ok(Ok(PasteOutcome::Typed)) => {
-            tracing::info!("paste OK");
-            *LAST_PASTE_TARGET.lock() = target;
-        }
+        Ok(Ok(PasteOutcome::Typed)) => tracing::info!("paste OK"),
         Ok(Ok(PasteOutcome::LeftOnClipboard)) => {
             tracing::error!(
                 "the focused window runs elevated, so Windows discards injected keystrokes; \
@@ -342,8 +347,19 @@ pub(super) fn paste_processed(
     }
 }
 
-/// The foreground exe at paste time, resolved once so the value stored in
-/// [`LAST_PASTE_TARGET`] and the one used for profile matching agree.
-fn exe_at_paste_time() -> Option<String> {
-    focus::foreground_exe_name()
+/// Keep [`UNDO_TARGETS`] in step with the paste that just ran. `target` is
+/// `Some` only for a paste that was typed AND recorded a history entry, which
+/// becomes the newest undoable paste. Anything else (a replay, which records
+/// no entry, a failed paste, text left on the clipboard) put an unknown number
+/// of characters after every earlier paste, so none of those is safe to undo.
+fn track_undo_target(app: &App, target: Option<PasteTarget>) {
+    let entry_id = target
+        .is_some()
+        .then(|| app.history.lock().most_recent().map(|entry| entry.id))
+        .flatten();
+    let mut targets = UNDO_TARGETS.lock();
+    match target.zip(entry_id) {
+        Some((target, id)) => targets.push(id, target),
+        None => targets.clear(),
+    }
 }
