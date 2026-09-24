@@ -18,8 +18,9 @@
 //!   `about`            -> open the About window (UI testing without the tray)
 //!   `quit`             -> sets the shutdown flag on the App
 //!
-//! On bind, the chosen port is written to `<exe_dir>/quickdictate-dev-port.txt`
-//! so a test harness can discover it without hard-coding.
+//! On bind, the chosen port is written to `<data_dir>/quickdictate-dev-port.txt`
+//! (`crate::paths::data_dir`, not the exe's folder) so a test harness can
+//! discover it without hard-coding.
 
 use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
@@ -77,7 +78,7 @@ fn parse_command(cmd: &str) -> Command {
     }
 }
 
-/// The dev-trigger port file's path given the exe's own directory.
+/// The dev-trigger port file's path given the app's data directory.
 fn port_file_path_in(dir: &Path) -> PathBuf {
     dir.join("quickdictate-dev-port.txt")
 }
@@ -123,80 +124,107 @@ fn run(app: Arc<App>, tx: Sender<HotkeyEvent>, socket: UdpSocket) {
         .ok();
     let mut buf = [0u8; 256];
     while !app.shutdown.load(Ordering::Acquire) {
-        let n = match socket.recv(&mut buf) {
-            Ok(n) => n,
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                continue;
-            }
-            Err(e) => {
-                tracing::warn!("dev_trigger: recv error: {e}");
-                continue;
-            }
+        let Some(n) = recv_datagram(&socket, &mut buf) else {
+            continue;
         };
         let cmd = std::str::from_utf8(&buf[..n]).unwrap_or("").trim();
-        // `fake:<text>` embeds dictated-looking text straight in the command;
-        // only echo it verbatim when the user has opted into full-text
-        // transcript logging, same as every other transcript log site.
-        if cmd.starts_with("fake:") && !app.config.load().log_transcripts {
-            tracing::info!(
-                "dev_trigger: received 'fake:' command ({} char(s))",
-                cmd.len() - "fake:".len()
-            );
-        } else {
-            tracing::info!("dev_trigger: received '{cmd}'");
-        }
-        match parse_command(cmd) {
-            Command::Toggle => {
-                let _ = tx.send(HotkeyEvent::TogglePressed);
-            }
-            Command::ToggleLong => {
-                let _ = tx.send(HotkeyEvent::ToggleLongPressed);
-            }
-            Command::HoldPress => {
-                let _ = tx.send(HotkeyEvent::HoldPressed);
-            }
-            Command::HoldRelease => {
-                let _ = tx.send(HotkeyEvent::HoldReleased);
-            }
-            Command::PasteLast => {
-                let _ = app.replay_tx.send(None);
-            }
-            Command::PasteHistory(i) => {
-                // Test hook for the "Recent transcriptions" tray submenu:
-                // replay history entry N (0 = most recent) without clicking.
-                let _ = app.replay_tx.send(Some(i));
-            }
-            Command::BadPasteHistory => {
-                tracing::warn!("dev_trigger: bad paste_history index in '{cmd}'");
-            }
-            Command::About => {
-                // Test hook: open the About window without clicking the tray.
-                crate::about::show_about();
-            }
-            Command::Settings => {
-                // Test hook: open the Settings window without clicking the tray.
-                crate::settings_ui::show_settings(Arc::clone(&app));
-            }
-            Command::Fake(text) => {
-                tracing::info!(
-                    "dev_trigger: injecting fake transcript ({} chars)",
-                    text.chars().count()
-                );
-                let _ = app.transcript_tx.send(text);
-            }
-            Command::Quit => {
-                app.shutdown.store(true, Ordering::Release);
-                break;
-            }
-            Command::Unknown => tracing::warn!("dev_trigger: unknown command '{cmd}'"),
+        log_received(&app, cmd);
+        if dispatch(&app, &tx, cmd) == Flow::Stop {
+            break;
         }
     }
     if let Some(path) = port_file_path() {
         let _ = std::fs::remove_file(path);
     }
+}
+
+/// One datagram's length, or `None` when the read timed out (the 250 ms
+/// timeout is what lets the loop notice `app.shutdown`) or failed.
+fn recv_datagram(socket: &UdpSocket, buf: &mut [u8]) -> Option<usize> {
+    match socket.recv(buf) {
+        Ok(n) => Some(n),
+        Err(ref e)
+            if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut =>
+        {
+            None
+        }
+        Err(e) => {
+            tracing::warn!("dev_trigger: recv error: {e}");
+            None
+        }
+    }
+}
+
+/// `fake:<text>` embeds dictated-looking text straight in the command; only
+/// echo it verbatim when the user has opted into full-text transcript
+/// logging, same as every other transcript log site.
+fn log_received(app: &App, cmd: &str) {
+    if cmd.starts_with("fake:") && !app.config.load().log_transcripts {
+        tracing::info!(
+            "dev_trigger: received 'fake:' command ({} char(s))",
+            cmd.len() - "fake:".len()
+        );
+    } else {
+        tracing::info!("dev_trigger: received '{cmd}'");
+    }
+}
+
+/// Whether the receive loop keeps going after a command.
+#[derive(Debug, PartialEq)]
+enum Flow {
+    Continue,
+    Stop,
+}
+
+/// Act on one command line; only `quit` stops the loop.
+fn dispatch(app: &Arc<App>, tx: &Sender<HotkeyEvent>, cmd: &str) -> Flow {
+    match parse_command(cmd) {
+        Command::Toggle => {
+            let _ = tx.send(HotkeyEvent::TogglePressed);
+        }
+        Command::ToggleLong => {
+            let _ = tx.send(HotkeyEvent::ToggleLongPressed);
+        }
+        Command::HoldPress => {
+            let _ = tx.send(HotkeyEvent::HoldPressed);
+        }
+        Command::HoldRelease => {
+            let _ = tx.send(HotkeyEvent::HoldReleased);
+        }
+        Command::PasteLast => {
+            let _ = app.replay_tx.send(None);
+        }
+        Command::PasteHistory(i) => {
+            // Test hook for the "Recent transcriptions" tray submenu:
+            // replay history entry N (0 = most recent) without clicking.
+            let _ = app.replay_tx.send(Some(i));
+        }
+        Command::BadPasteHistory => {
+            tracing::warn!("dev_trigger: bad paste_history index in '{cmd}'");
+        }
+        Command::About => {
+            // Test hook: open the About window without clicking the tray.
+            crate::about::show_about();
+        }
+        Command::Settings => {
+            // Test hook: open the Settings window without clicking the tray.
+            crate::settings_ui::show_settings(Arc::clone(app));
+        }
+        Command::Fake(text) => {
+            tracing::info!(
+                "dev_trigger: injecting fake transcript ({} chars)",
+                text.chars().count()
+            );
+            let _ = app.transcript_tx.send(text);
+        }
+        Command::Quit => {
+            app.shutdown.store(true, Ordering::Release);
+            return Flow::Stop;
+        }
+        Command::Unknown => tracing::warn!("dev_trigger: unknown command '{cmd}'"),
+    }
+    Flow::Continue
 }
 
 #[cfg(test)]

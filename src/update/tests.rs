@@ -34,6 +34,71 @@ fn a_final_release_outranks_its_own_prerelease() {
 }
 
 #[test]
+fn compare_tag_reports_only_a_strictly_newer_tag_as_available() {
+    assert_eq!(
+        compare_tag("v1.2.0", "1.1.9"),
+        UpdateCheck::Available("1.2.0".into())
+    );
+    assert_eq!(compare_tag("1.1.9", "1.1.9"), UpdateCheck::UpToDate);
+    assert_eq!(compare_tag("1.0.0", "1.1.9"), UpdateCheck::UpToDate);
+    assert_eq!(compare_tag("garbage", "1.1.9"), UpdateCheck::Failed);
+    // A fresh cache written by an up-to-date or failed check holds the
+    // running version itself, which must not be republished as an update.
+    assert_eq!(
+        compare_tag(env!("CARGO_PKG_VERSION"), env!("CARGO_PKG_VERSION")),
+        UpdateCheck::UpToDate
+    );
+}
+
+#[test]
+fn cache_is_fresh_only_inside_the_check_interval() {
+    let now = 1_000_000;
+    assert!(cache_is_fresh(now, now));
+    assert!(cache_is_fresh(now - CHECK_INTERVAL_SECS + 1, now));
+    assert!(!cache_is_fresh(now - CHECK_INTERVAL_SECS, now));
+}
+
+#[test]
+fn a_cache_stamped_in_the_future_reads_as_stale() {
+    // The clock was set ahead, then corrected: saturating_sub used to read
+    // this as 0 s old and suppress auto-checks until that date.
+    let now = 1_000_000;
+    assert!(!cache_is_fresh(now + 1, now));
+    assert!(!cache_is_fresh(now + 30 * 24 * 60 * 60, now));
+}
+
+#[test]
+fn a_staged_swap_is_relaunched_into_instead_of_downloaded_again() {
+    let staged = std::path::PathBuf::from("C:\\apps\\quickdictate.exe");
+    *STAGED_SWAP.lock().unwrap() = Some((staged.clone(), "9.9.9".into()));
+    let result = staged_or_swap("9.9.10");
+    *STAGED_SWAP.lock().unwrap() = None;
+    assert_eq!(result, Ok((staged, "9.9.9".to_string())));
+}
+
+#[test]
+fn wait_or_kill_returns_the_status_of_a_child_that_exits() {
+    let mut child = std::process::Command::new("cmd")
+        .args(["/C", "exit 3"])
+        .spawn()
+        .unwrap();
+    let status = wait_or_kill(&mut child, std::time::Duration::from_secs(20)).unwrap();
+    assert_eq!(status.code(), Some(3));
+}
+
+#[test]
+fn wait_or_kill_kills_a_child_that_outlives_the_limit() {
+    let mut child = std::process::Command::new("ping")
+        .args(["-n", "30", "127.0.0.1"])
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    assert!(wait_or_kill(&mut child, std::time::Duration::from_millis(100)).is_none());
+    // Reaped, not abandoned: it no longer runs (and so no longer locks its exe).
+    assert!(child.try_wait().unwrap().is_some());
+}
+
+#[test]
 fn install_id_is_a_lowercase_v4_uuid_and_unique() {
     let a = new_install_id().expect("system RNG available");
     let b = new_install_id().expect("system RNG available");

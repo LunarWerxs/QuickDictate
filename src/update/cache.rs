@@ -29,6 +29,14 @@ pub(super) fn read_cache() -> Option<(u64, String)> {
     Some((ts, tag))
 }
 
+/// Whether a cache stamped at `ts` still suppresses the auto-check at `now`.
+/// A stamp from the future (the clock was set ahead, then corrected) reads as
+/// stale: `saturating_sub` would make it 0 s old, and checks would stay off
+/// until the clock caught up with it.
+pub(super) fn cache_is_fresh(ts: u64, now: u64) -> bool {
+    ts <= now && now - ts < CHECK_INTERVAL_SECS
+}
+
 pub(super) fn write_cache(tag: &str) {
     if let Some(p) = cache_path() {
         let _ = std::fs::write(p, format!("{}\n{}\n", now_secs(), tag));

@@ -5,8 +5,9 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::{Child, ExitStatus, Stdio};
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::*;
 
@@ -118,39 +119,57 @@ pub(super) fn verify_exe_bytes(bytes: &[u8], asset: &Asset) -> bool {
 fn verify_exe_version(path: &Path, expected: &str) -> bool {
     // Bounded. `Command::output()` blocks forever if the child never exits,
     // and this child is a binary we just downloaded, so "it hangs" is squarely
-    // in scope. Run the wait on a helper thread and give up after
-    // VERSION_CHECK_TIMEOUT; a downloaded exe that will not answer --version
-    // promptly has already failed the check.
+    // in scope. Give up after VERSION_CHECK_TIMEOUT; a downloaded exe that
+    // will not answer --version promptly has already failed the check. The
+    // child is killed then, not just abandoned: a hung child keeps
+    // `.exe.new` locked, and every later update would fail to overwrite it.
     const VERSION_CHECK_TIMEOUT: Duration = Duration::from_secs(20);
-    let expected = expected.trim_start_matches(['v', 'V']).to_string();
-    let path = path.to_path_buf();
-    let (tx, rx) = std::sync::mpsc::channel();
-    let spawn = std::thread::Builder::new()
-        .name("qd-update-verify".into())
-        .spawn(move || {
-            let verdict = std::process::Command::new(&path)
-                .arg("--version")
-                .output()
-                .is_ok_and(|output| {
-                    output.status.success()
-                        && String::from_utf8_lossy(&output.stdout).trim() == expected
-                });
-            let _ = tx.send(verdict);
-        });
-    if spawn.is_err() {
-        tracing::warn!("update: could not spawn the version self-check");
+    let expected = expected.trim_start_matches(['v', 'V']);
+    let mut child = match std::process::Command::new(path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            tracing::warn!("update: could not run the version self-check: {e}");
+            return false;
+        }
+    };
+    let Some(status) = wait_or_kill(&mut child, VERSION_CHECK_TIMEOUT) else {
+        tracing::warn!(
+            "update: downloaded executable did not answer --version within \
+             {VERSION_CHECK_TIMEOUT:?}; refusing to install it"
+        );
         return false;
+    };
+    // Read after exit: a real `--version` is one short line, far below the
+    // pipe buffer, so it cannot block the child. One that floods stdout
+    // instead blocks, times out above, and is killed: it fails closed.
+    let mut stdout = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = pipe.read_to_string(&mut stdout);
     }
-    match rx.recv_timeout(VERSION_CHECK_TIMEOUT) {
-        Ok(verdict) => verdict,
-        Err(_) => {
-            tracing::warn!(
-                "update: downloaded executable did not answer --version within \
-                 {VERSION_CHECK_TIMEOUT:?}; refusing to install it"
-            );
-            false
+    status.success() && stdout.trim() == expected
+}
+
+/// The child's exit status if it exits within `limit`. Otherwise (or if its
+/// state cannot be read) the child is killed and reaped, and `None` returned.
+pub(super) fn wait_or_kill(child: &mut Child, limit: Duration) -> Option<ExitStatus> {
+    const POLL: Duration = Duration::from_millis(50);
+    let deadline = Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL),
+            _ => break,
         }
     }
+    let _ = child.kill();
+    let _ = child.wait();
+    None
 }
 
 /// Download the new exe, verify it, and swap it into place. Returns the path to
@@ -166,10 +185,23 @@ pub(super) fn download_and_swap(tag: &str) -> Result<PathBuf, String> {
     if asset_tag != tag {
         tracing::info!("update: release moved while prompting ({tag} -> {asset_tag}); continuing");
     }
+    let bytes = download_release_bytes(&asset)?;
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let new = exe.with_extension("exe.new");
+    write_and_reverify(&new, &bytes, &asset, &asset_tag)?;
+    swap_in(&exe, &new)?;
+    if let Ok(mut staged) = STAGED_SWAP.lock() {
+        *staged = Some((exe.clone(), tag.to_string()));
+    }
+    Ok(exe)
+}
+
+/// The release asset's bytes, capped at [`MAX_EXE_BYTES`] and verified
+/// (MZ header, size, SHA-256) before anything touches disk.
+fn download_release_bytes(asset: &Asset) -> Result<Vec<u8>, String> {
     if asset.size > MAX_EXE_BYTES {
         return Err("release asset is implausibly large".into());
     }
-
     tracing::info!("update: downloading {}", asset.url);
     let mut resp = client()
         .ok_or("http client init failed")?
@@ -190,35 +222,66 @@ pub(super) fn download_and_swap(tag: &str) -> Result<PathBuf, String> {
     if bytes.len() as u64 > MAX_EXE_BYTES {
         return Err("downloaded file exceeds the size cap".into());
     }
-    if !verify_exe_bytes(&bytes, &asset) {
+    if !verify_exe_bytes(&bytes, asset) {
         return Err("downloaded file failed verification".into());
     }
+    Ok(bytes)
+}
 
-    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-    let new = exe.with_extension("exe.new");
-    let old = exe.with_extension("exe.old");
-    std::fs::write(&new, &bytes).map_err(|e| format!("write {}: {e}", new.display()))?;
-    // Re-read + re-verify from disk to close the TOCTOU window (as SageThumbs
-    // does before launching its installer).
-    let reread = std::fs::read(&new).map_err(|e| format!("re-read: {e}"))?;
-    if !verify_exe_bytes(&reread, &asset) {
-        let _ = std::fs::remove_file(&new);
+/// Write `bytes` to `new`, then re-read + re-verify from disk to close the
+/// TOCTOU window (as SageThumbs does before launching its installer), and
+/// run the version self-check. `new` is removed on any verification failure.
+fn write_and_reverify(
+    new: &Path,
+    bytes: &[u8],
+    asset: &Asset,
+    asset_tag: &str,
+) -> Result<(), String> {
+    std::fs::write(new, bytes).map_err(|e| format!("write {}: {e}", new.display()))?;
+    let reread = std::fs::read(new).map_err(|e| format!("re-read: {e}"))?;
+    if !verify_exe_bytes(&reread, asset) {
+        let _ = std::fs::remove_file(new);
         return Err("on-disk verification failed".into());
     }
-    if !verify_exe_version(&new, &asset_tag) {
-        let _ = std::fs::remove_file(&new);
+    if !verify_exe_version(new, asset_tag) {
+        let _ = std::fs::remove_file(new);
         return Err("downloaded executable failed its version self-check".into());
     }
+    Ok(())
+}
 
-    // The swap: a running exe can be renamed on Windows, just not deleted.
+/// The swap: a running exe can be renamed on Windows, just not deleted, so
+/// the current one moves aside to `.exe.old` and `new` takes its name.
+fn swap_in(exe: &Path, new: &Path) -> Result<(), String> {
+    let old = exe.with_extension("exe.old");
     let _ = std::fs::remove_file(&old);
-    std::fs::rename(&exe, &old).map_err(|e| format!("rename current exe: {e}"))?;
-    if let Err(e) = std::fs::rename(&new, &exe) {
+    std::fs::rename(exe, &old).map_err(|e| format!("rename current exe: {e}"))?;
+    if let Err(e) = std::fs::rename(new, exe) {
         // Roll back so the app still launches next time.
-        let _ = std::fs::rename(&old, &exe);
+        let _ = std::fs::rename(&old, exe);
         return Err(format!("swap in new exe: {e}"));
     }
-    Ok(exe)
+    Ok(())
+}
+
+/// The exe path and tag of an update this process already swapped into
+/// place; the running image is now `.exe.old`. Set once a swap succeeds.
+/// WHY: the auto path can stage a swap without relaunching (a dictation was
+/// live), and the update stays advertised. A second download-and-swap then
+/// always fails, because `.exe.old` is the running image and cannot be
+/// replaced, and it leaves `.exe.new` behind. Relaunching into the staged
+/// exe is all that is left to do.
+pub(super) static STAGED_SWAP: Mutex<Option<(PathBuf, String)>> = Mutex::new(None);
+
+/// The exe to relaunch into and the tag it carries: the swap this process
+/// already staged if there is one, otherwise a fresh download-and-swap.
+pub(super) fn staged_or_swap(tag: &str) -> Result<(PathBuf, String), String> {
+    let staged = STAGED_SWAP.lock().ok().and_then(|g| g.clone());
+    if let Some((exe, staged_tag)) = staged {
+        tracing::info!("update: v{staged_tag} is already staged; relaunching into it");
+        return Ok((exe, staged_tag));
+    }
+    download_and_swap(tag).map(|exe| (exe, tag.to_string()))
 }
 
 /// Which windows the new process should put back after a relaunch: the ones
@@ -299,11 +362,9 @@ pub fn download_and_install_now(tag: &str) -> Result<(), String> {
     // and Settings behind it when it was) after the relaunch, so the user
     // lands back where they were and sees the new version on the pill.
     let reopen = Reopen::current();
-    let result = download_and_swap(tag).and_then(|exe| relaunch(&exe, tag, reopen));
+    let result = staged_or_swap(tag).and_then(|(exe, tag)| relaunch(&exe, &tag, reopen));
     if result.is_ok() {
-        if let Ok(mut slot) = PENDING_UPDATE.lock() {
-            *slot = None;
-        }
+        set_pending_update(None);
     }
     if result.is_err() {
         // Free the lock so a later retry can run. On success we intentionally

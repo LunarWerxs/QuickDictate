@@ -71,16 +71,59 @@ pub(crate) fn redact(line: &str) -> String {
     out
 }
 
-/// Last `max_lines` lines of `path`, each redacted, oldest first. Empty when
-/// the file doesn't exist or can't be read -- a missing log is not an error
-/// here, it just means there is nothing to include.
+/// Log messages that carry dictated text once the user turns on "Log full
+/// dictated text" (`Config::log_transcripts`): `stt::recv_task`,
+/// `stt::finalize`, `output::worker` and `dev_trigger`'s `fake:` echo. Group 1
+/// is the marker, kept so the line still shows what happened; group 2 is the
+/// text after it. With the toggle off these same sites log only a count.
+static TRANSCRIPT_MARKERS: Lazy<Regex> = Lazy::new(|| {
+    literal_regex(concat!(
+        r"(session\[\d+\] (?:partial|promoting last partial|committed \([^)]*\)",
+        r"|dropped phantom finalization \([^)]*\)): ",
+        r"|pasting \d+ char\(s\): ",
+        r"|replaying saved transcription \(\d+ char\(s\)\): ",
+        r"|dev_trigger: received 'fake:)(.+)$",
+    ))
+});
+
+/// The count-only tail those same sites log when `log_transcripts` is off.
+static COUNT_ONLY_TAIL: Lazy<Regex> =
+    Lazy::new(|| literal_regex(r"^(?:' command \()?\d+ char\(s\)\)?$"));
+
+/// What stands in for masked dictated text.
+const TRANSCRIPT_MASK: &str = "[dictated text removed]";
+
+/// Mask the dictated text in a transcript-bearing log line. WHY: the report
+/// promises "no dictated text", but with `log_transcripts` on the log tail
+/// holds the user's recent dictations word for word, and they are told to
+/// attach the report to a public issue.
+fn mask_transcript(line: &str) -> String {
+    TRANSCRIPT_MARKERS
+        .replace(line, |caps: &regex::Captures| {
+            let tail = caps.get(2).map_or("", |m| m.as_str());
+            if COUNT_ONLY_TAIL.is_match(tail) {
+                format!("{}{tail}", &caps[1])
+            } else {
+                format!("{}{TRANSCRIPT_MASK}", &caps[1])
+            }
+        })
+        .into_owned()
+}
+
+/// Last `max_lines` lines of `path`, each with dictated text masked and
+/// secrets redacted, oldest first. Empty when the file doesn't exist or can't
+/// be read -- a missing log is not an error here, it just means there is
+/// nothing to include.
 pub(crate) fn tail_redacted(path: &Path, max_lines: usize) -> Vec<String> {
     let Ok(contents) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
     let lines: Vec<&str> = contents.lines().collect();
     let start = lines.len().saturating_sub(max_lines);
-    lines[start..].iter().map(|l| redact(l)).collect()
+    lines[start..]
+        .iter()
+        .map(|l| redact(&mask_transcript(l)))
+        .collect()
 }
 
 /// Everything [`build_report`] needs, gathered by the caller (`settings_ui`)
@@ -98,8 +141,8 @@ pub(crate) struct ReportInputs<'a> {
 }
 
 /// Assemble the plain-text report a user reviews before saving. Never
-/// includes audio or dictated text, and the log tails passed in are expected
-/// to already be redacted by [`tail_redacted`].
+/// includes audio or dictated text: the log tails passed in are expected to
+/// already be masked and redacted by [`tail_redacted`].
 pub(crate) fn build_report(inputs: &ReportInputs) -> String {
     let mut out = String::new();
     out.push_str("QuickDictate error report\n");
@@ -210,6 +253,63 @@ mod tests {
         let line = "session token qWeRtYuIoPaSdFgHjKlZxCvBnM0123456789";
         assert!(redact(line).contains("[REDACTED]"));
         assert!(!redact(line).contains("qWeRtYuIoP"));
+    }
+
+    #[test]
+    fn mask_transcript_removes_dictated_text_but_keeps_the_marker() {
+        let cases = [
+            "INFO stt: session[3] partial: hello there",
+            "INFO stt: session[3] promoting last partial: hello there",
+            "INFO stt: session[3] committed (live, append): hello there",
+            "INFO stt: session[3] committed (held until release): hello there",
+            "INFO stt: session[3] dropped phantom finalization (no speech since last commit): hello there",
+            "INFO output: pasting 11 char(s): \"hello there\"",
+            "INFO output: replaying saved transcription (11 char(s)): \"hello there\"",
+            "INFO dev_trigger: received 'fake:hello there'",
+        ];
+        for line in cases {
+            let masked = mask_transcript(line);
+            assert!(!masked.contains("hello"), "{line} -> {masked}");
+            assert!(masked.ends_with(TRANSCRIPT_MASK), "{line} -> {masked}");
+        }
+        assert_eq!(
+            mask_transcript("session[3] committed (live, append): hello"),
+            "session[3] committed (live, append): [dictated text removed]"
+        );
+    }
+
+    #[test]
+    fn mask_transcript_leaves_count_only_and_unrelated_lines_alone() {
+        for line in [
+            "INFO stt: session[3] partial: 12 char(s)",
+            "INFO stt: session[3] committed (live, append): 12 char(s)",
+            "INFO dev_trigger: received 'fake:' command (12 char(s))",
+            "INFO dev_trigger: received 'toggle'",
+            "2026-09-04T12:00:00Z INFO stt: session started provider=elevenlabs",
+        ] {
+            assert_eq!(mask_transcript(line), line);
+        }
+    }
+
+    #[test]
+    fn tail_redacted_masks_dictated_text_in_the_log_tail() {
+        let dir =
+            std::env::temp_dir().join(format!("qd-error-report-mask-tests-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tail.log");
+        std::fs::write(
+            &path,
+            "INFO output: pasting 14 char(s): \"my secret plan\"\nline2\n",
+        )
+        .unwrap();
+
+        let tail = tail_redacted(&path, 10);
+        assert_eq!(tail.len(), 2);
+        assert!(!tail[0].contains("secret plan"));
+        assert!(tail[0].contains(TRANSCRIPT_MASK));
+        assert_eq!(tail[1], "line2");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

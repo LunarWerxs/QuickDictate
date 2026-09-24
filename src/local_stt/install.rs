@@ -194,9 +194,11 @@ pub fn start_install(id: &str) -> Result<(), String> {
         return Ok(());
     }
     let cancel = claim_operation(id, InstallPhase::DownloadingRuntime, spec.download_bytes)?;
-    let spawn = std::thread::Builder::new()
-        .name(format!("qd-model-install-{}", spec.id))
-        .spawn(move || {
+    spawn_operation(
+        &spec,
+        format!("qd-model-install-{}", spec.id),
+        "model installer",
+        move || {
             let result = install(&spec, &cancel);
             if cancel.load(Ordering::Acquire) {
                 tracing::info!("local model '{}' install cancelled", spec.id);
@@ -215,28 +217,18 @@ pub fn start_install(id: &str) -> Result<(), String> {
                     }
                 }
             }
-        });
-    match spawn {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            let message = format!("could not start model installer: {e}");
-            finish_operation(
-                spec.id,
-                InstallPhase::Failed(message.clone()),
-                0,
-                spec.download_bytes,
-            );
-            Err(message)
-        }
-    }
+        },
+    )
 }
 
 pub fn start_remove(id: &str) -> Result<(), String> {
     let spec = *model(id).ok_or_else(|| format!("unknown local model '{id}'"))?;
     let _cancel = claim_operation(spec.id, InstallPhase::Removing, spec.download_bytes)?;
-    let spawn = std::thread::Builder::new()
-        .name(format!("qd-model-remove-{}", spec.id))
-        .spawn(move || {
+    spawn_operation(
+        &spec,
+        format!("qd-model-remove-{}", spec.id),
+        "model removal",
+        move || {
             let result = model_dir(&spec).and_then(|dir| {
                 if dir.exists() {
                     fs::remove_dir_all(&dir)
@@ -252,11 +244,23 @@ pub fn start_remove(id: &str) -> Result<(), String> {
                     finish_operation(spec.id, InstallPhase::Failed(e), 0, spec.download_bytes)
                 }
             }
-        });
-    match spawn {
+        },
+    )
+}
+
+/// Run a claimed install/remove on its own named thread. If the thread cannot
+/// be spawned the operation is finished as failed right away, so Settings
+/// does not poll a busy state that nothing will ever clear.
+fn spawn_operation(
+    spec: &ModelSpec,
+    thread_name: String,
+    what: &str,
+    work: impl FnOnce() + Send + 'static,
+) -> Result<(), String> {
+    match std::thread::Builder::new().name(thread_name).spawn(work) {
         Ok(_) => Ok(()),
         Err(e) => {
-            let message = format!("could not start model removal: {e}");
+            let message = format!("could not start {what}: {e}");
             finish_operation(
                 spec.id,
                 InstallPhase::Failed(message.clone()),

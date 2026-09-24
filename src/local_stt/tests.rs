@@ -16,7 +16,7 @@ use super::download::{
     download_client, download_parallel, download_verified, range_segments, verify_model_hash_once,
 };
 use super::install::{finish_operation, install, InstallPhase};
-use super::native::{ModelLoadParams, NativeEngine, RunParams};
+use super::native::{join_and_clean, language_cstring, ModelLoadParams, NativeEngine, RunParams};
 use super::postprocess::{
     cohere_chunk_ranges, collapse_pathological_repetitions, collapse_pathological_sentence_runs,
     COHERE_CLIP_MAX_SECONDS, COHERE_MIN_TAIL_SECONDS,
@@ -510,28 +510,7 @@ fn live_whisper_pack_download_load_and_transcribe() {
     let old = std::env::var_os("LOCALAPPDATA");
     std::env::set_var("LOCALAPPDATA", &root);
 
-    let result = (|| {
-        let spec = model("whisper-turbo-q5").unwrap();
-        if !is_installed(spec.id) {
-            install(spec, &AtomicBool::new(false))?;
-        }
-        let mut reader =
-            hound::WavReader::open("test-audio/speech_16k.wav").map_err(|e| e.to_string())?;
-        assert_eq!(reader.spec().sample_rate, 16_000);
-        assert_eq!(reader.spec().channels, 1);
-        let pcm = reader
-            .samples::<i16>()
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        let cancel = Arc::new(AtomicBool::new(false));
-        let mut engine = unsafe { NativeEngine::load()? };
-        let transcript = unsafe { engine.run(spec.id, "en", &pcm, &cancel)? }.unwrap_or_default();
-        if transcript.trim().is_empty() {
-            return Err("real local inference returned an empty transcript".into());
-        }
-        tracing::info!("local E2E transcript: {transcript}");
-        Ok::<(), String>(())
-    })();
+    let result = install_and_transcribe_whisper_fixture();
 
     if let Some(old) = old {
         std::env::set_var("LOCALAPPDATA", old);
@@ -544,6 +523,67 @@ fn live_whisper_pack_download_load_and_transcribe() {
     result.unwrap();
 }
 
+/// The body of `live_whisper_pack_download_load_and_transcribe`, run while
+/// `LOCALAPPDATA` points at a scratch folder so the caller can always restore
+/// it, whatever this returns.
+fn install_and_transcribe_whisper_fixture() -> Result<(), String> {
+    let spec = model("whisper-turbo-q5").unwrap();
+    if !is_installed(spec.id) {
+        install(spec, &AtomicBool::new(false))?;
+    }
+    let pcm = read_speech_fixture()?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut engine = unsafe { NativeEngine::load()? };
+    let transcript = unsafe { engine.run(spec.id, "en", &pcm, &cancel)? }.unwrap_or_default();
+    if transcript.trim().is_empty() {
+        return Err("real local inference returned an empty transcript".into());
+    }
+    tracing::info!("local E2E transcript: {transcript}");
+    Ok(())
+}
+
+/// `test-audio/speech_16k.wav` as the 16 kHz mono PCM the engine takes.
+fn read_speech_fixture() -> Result<Vec<i16>, String> {
+    let mut reader =
+        hound::WavReader::open("test-audio/speech_16k.wav").map_err(|e| e.to_string())?;
+    assert_eq!(reader.spec().sample_rate, 16_000);
+    assert_eq!(reader.spec().channels, 1);
+    reader
+        .samples::<i16>()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
+}
+
+#[test]
+fn language_cstring_lets_the_model_detect_blank_or_auto() {
+    assert_eq!(language_cstring("").unwrap(), None);
+    assert_eq!(language_cstring("  ").unwrap(), None);
+    assert_eq!(language_cstring("auto").unwrap(), None);
+    assert_eq!(language_cstring("AUTO").unwrap(), None);
+    assert_eq!(language_cstring("en").unwrap().as_deref(), Some(c"en"));
+    assert!(language_cstring("e\0n").is_err());
+}
+
+#[test]
+fn join_and_clean_joins_parts_and_drops_empty_results() {
+    assert_eq!(
+        join_and_clean(vec![" hello ".into(), String::new(), "world".into()]),
+        Some("hello world".to_string())
+    );
+    assert_eq!(join_and_clean(vec![String::new(), "  ".into()]), None);
+    assert_eq!(join_and_clean(Vec::new()), None);
+}
+
+#[test]
+fn join_and_clean_collapses_a_decoder_loop_that_spans_clips() {
+    let parts = vec![
+        "We ship it today. ".repeat(3),
+        "We ship it today. ".repeat(3),
+    ];
+    let cleaned = join_and_clean(parts).unwrap();
+    assert_eq!(cleaned.matches("We ship it today.").count(), 2);
+}
+
 #[test]
 #[ignore = "loads the user's installed 1.65 GiB Cohere model and runs real native inference"]
 fn live_installed_cohere_prewarm_and_transcribe() {
@@ -554,13 +594,7 @@ fn live_installed_cohere_prewarm_and_transcribe() {
         spec.label
     );
 
-    let mut reader = hound::WavReader::open("test-audio/speech_16k.wav").unwrap();
-    assert_eq!(reader.spec().sample_rate, 16_000);
-    assert_eq!(reader.spec().channels, 1);
-    let pcm = reader
-        .samples::<i16>()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+    let pcm = read_speech_fixture().unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
     let mut engine = unsafe { NativeEngine::load().unwrap() };
 

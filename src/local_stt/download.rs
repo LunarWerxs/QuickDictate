@@ -88,13 +88,7 @@ pub(super) fn download_verified(
     display_total: u64,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
-    let parent = dest
-        .parent()
-        .ok_or_else(|| "download destination has no parent".to_string())?;
-    fs::create_dir_all(parent)
-        .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
-    let part = dest.with_extension("part");
-    let _ = fs::remove_file(&part);
+    let part = fresh_part_path(dest)?;
     let result = (|| {
         check_cancelled(cancel)?;
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -113,22 +107,44 @@ pub(super) fn download_verified(
             display_total,
             cancel,
         )?;
-        check_cancelled(cancel)?;
-        if actual != expected_sha256 {
-            return Err("download failed SHA-256 verification".into());
-        }
-        if dest.exists() {
-            fs::remove_file(dest)
-                .map_err(|e| format!("could not replace {}: {e}", dest.display()))?;
-        }
-        fs::rename(&part, dest)
-            .map_err(|e| format!("could not activate {}: {e}", dest.display()))?;
-        Ok(())
+        activate_verified(&actual, expected_sha256, &part, dest, cancel)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&part);
     }
     result
+}
+
+/// Create `dest`'s folder and return its `.part` sibling, with any stale
+/// partial from an earlier attempt already removed.
+fn fresh_part_path(dest: &Path) -> Result<std::path::PathBuf, String> {
+    let parent = dest
+        .parent()
+        .ok_or_else(|| "download destination has no parent".to_string())?;
+    fs::create_dir_all(parent)
+        .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
+    let part = dest.with_extension("part");
+    let _ = fs::remove_file(&part);
+    Ok(part)
+}
+
+/// Move a fully downloaded `part` over `dest`, but only once its hash matches
+/// the pinned one: a partial or tampered file is never activated.
+fn activate_verified(
+    actual_sha256: &str,
+    expected_sha256: &str,
+    part: &Path,
+    dest: &Path,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    check_cancelled(cancel)?;
+    if actual_sha256 != expected_sha256 {
+        return Err("download failed SHA-256 verification".into());
+    }
+    if dest.exists() {
+        fs::remove_file(dest).map_err(|e| format!("could not replace {}: {e}", dest.display()))?;
+    }
+    fs::rename(part, dest).map_err(|e| format!("could not activate {}: {e}", dest.display()))
 }
 
 pub(super) fn check_cancelled(cancel: &AtomicBool) -> Result<(), String> {
@@ -148,16 +164,29 @@ pub(super) fn download_client() -> Result<reqwest::Client, String> {
         .map_err(|e| format!("could not create download client: {e}"))
 }
 
-async fn send_with_cancel(
-    request: reqwest::RequestBuilder,
+/// Also fails the download once a sibling range has failed, so the other
+/// ranges stop instead of finishing a file that will be thrown away.
+fn check_aborted(cancel: &AtomicBool, failed: &AtomicBool) -> Result<(), String> {
+    check_cancelled(cancel)?;
+    if failed.load(Ordering::Acquire) {
+        return Err("parallel download stopped after another range failed".into());
+    }
+    Ok(())
+}
+
+/// Await one network step, polling `cancel` every 100 ms so a stalled
+/// connection cannot hold a cancelled install open. `what` prefixes the
+/// network error.
+async fn until_cancelled<T>(
+    step: impl std::future::Future<Output = reqwest::Result<T>>,
     cancel: &AtomicBool,
-) -> Result<reqwest::Response, String> {
-    let request = request.send();
-    tokio::pin!(request);
+    what: &str,
+) -> Result<T, String> {
+    tokio::pin!(step);
     loop {
         tokio::select! {
-            result = &mut request => {
-                return result.map_err(|e| format!("download request failed: {e}"));
+            result = &mut step => {
+                return result.map_err(|e| format!("{what}: {e}"));
             }
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
                 check_cancelled(cancel)?;
@@ -166,22 +195,18 @@ async fn send_with_cancel(
     }
 }
 
+async fn send_with_cancel(
+    request: reqwest::RequestBuilder,
+    cancel: &AtomicBool,
+) -> Result<reqwest::Response, String> {
+    until_cancelled(request.send(), cancel, "download request failed").await
+}
+
 async fn next_chunk_with_cancel(
     response: &mut reqwest::Response,
     cancel: &AtomicBool,
 ) -> Result<Option<bytes::Bytes>, String> {
-    let chunk = response.chunk();
-    tokio::pin!(chunk);
-    loop {
-        tokio::select! {
-            result = &mut chunk => {
-                return result.map_err(|e| format!("download read failed: {e}"));
-            }
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                check_cancelled(cancel)?;
-            }
-        }
-    }
+    until_cancelled(response.chunk(), cancel, "download read failed").await
 }
 
 async fn server_supports_ranges(
@@ -232,16 +257,7 @@ async fn download_single(
     let mut response = send_with_cancel(client.get(url), cancel)
         .await
         .map_err(|e| format!("download failed: {e}"))?;
-    if !response.status().is_success() {
-        return Err(format!("download failed: HTTP {}", response.status()));
-    }
-    if let Some(len) = response.content_length() {
-        if len != expected_bytes {
-            return Err(format!(
-                "download size changed upstream (expected {expected_bytes}, got {len})"
-            ));
-        }
-    }
+    check_single_response(&response, expected_bytes)?;
     let mut file =
         File::create(part).map_err(|e| format!("could not create {}: {e}", part.display()))?;
     let mut hasher = Sha256::new();
@@ -268,11 +284,31 @@ async fn download_single(
             "download was incomplete (expected {expected_bytes} bytes, got {downloaded})"
         ));
     }
-    Ok(hasher
+    Ok(hex_digest(hasher))
+}
+
+/// Reject a single-stream response that failed, or whose announced size is
+/// not the pinned one, before anything is written.
+fn check_single_response(response: &reqwest::Response, expected_bytes: u64) -> Result<(), String> {
+    if !response.status().is_success() {
+        return Err(format!("download failed: HTTP {}", response.status()));
+    }
+    match response.content_length() {
+        Some(len) if len != expected_bytes => Err(format!(
+            "download size changed upstream (expected {expected_bytes}, got {len})"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Lowercase hex SHA-256, the form the pinned hashes are written in. One
+/// helper so the streamed and the re-read hash cannot drift apart.
+fn hex_digest(hasher: Sha256) -> String {
+    hasher
         .finalize()
         .iter()
         .map(|b| format!("{b:02x}"))
-        .collect::<String>())
+        .collect::<String>()
 }
 
 pub(super) fn range_segments(total: u64, workers: usize) -> Vec<(u64, u64)> {
@@ -301,12 +337,7 @@ pub(super) async fn download_parallel(
     cancel: &AtomicBool,
     workers: usize,
 ) -> Result<(), String> {
-    let file =
-        File::create(part).map_err(|e| format!("could not create {}: {e}", part.display()))?;
-    file.set_len(expected_bytes)
-        .map_err(|e| format!("could not size {}: {e}", part.display()))?;
-    drop(file);
-
+    presize_part(part, expected_bytes)?;
     let progress = AtomicU64::new(0);
     let failed = AtomicBool::new(false);
     let first_error = Mutex::new(None::<String>);
@@ -335,14 +366,7 @@ pub(super) async fn download_parallel(
                 )
                 .await;
                 if let Err(error) = result {
-                    if failed
-                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                    {
-                        if let Ok(mut first) = first_error.lock() {
-                            *first = Some(error);
-                        }
-                    }
+                    record_first_error(failed, first_error, error);
                 }
             }
         });
@@ -363,6 +387,28 @@ pub(super) async fn download_parallel(
         .map_err(|e| format!("could not open {} for flushing: {e}", part.display()))?;
     file.sync_all()
         .map_err(|e| format!("could not flush download: {e}"))
+}
+
+/// Create `part` at its full pinned size up front, so every range writer can
+/// seek straight to its own offset.
+fn presize_part(part: &Path, expected_bytes: u64) -> Result<(), String> {
+    let file =
+        File::create(part).map_err(|e| format!("could not create {}: {e}", part.display()))?;
+    file.set_len(expected_bytes)
+        .map_err(|e| format!("could not size {}: {e}", part.display()))
+}
+
+/// Keep only the first range's error: it is the cause, the others are the
+/// ranges it stopped. Setting `failed` is also what stops them.
+fn record_first_error(failed: &AtomicBool, first_error: &Mutex<Option<String>>, error: String) {
+    if failed
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        if let Ok(mut first) = first_error.lock() {
+            *first = Some(error);
+        }
+    }
 }
 
 /// Reads one attempt's response body into `file`, chunk by chunk, advancing
@@ -388,10 +434,7 @@ async fn write_range_chunks(
 ) -> Result<(u64, Option<String>), String> {
     let mut last_error = Some(format!("response ended before byte {end}"));
     while next <= end {
-        check_cancelled(cancel)?;
-        if failed.load(Ordering::Acquire) {
-            return Err("parallel download stopped after another range failed".into());
-        }
+        check_aborted(cancel, failed)?;
         let limit = (end - next + 1).min(DOWNLOAD_BUFFER_BYTES as u64) as usize;
         let chunk = match next_chunk_with_cancel(response, cancel).await {
             Ok(None) => break,
@@ -434,75 +477,35 @@ async fn download_range(
     cancel: &AtomicBool,
     failed: &AtomicBool,
 ) -> Result<(), String> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .open(part)
-        .map_err(|e| format!("could not open {}: {e}", part.display()))?;
-    file.seek(SeekFrom::Start(start))
-        .map_err(|e| format!("could not seek {}: {e}", part.display()))?;
+    let mut file = open_part_at(part, start)?;
     let mut next = start;
     let mut last_error = None;
     for attempt in 1..=DOWNLOAD_RANGE_ATTEMPTS {
-        check_cancelled(cancel)?;
-        if failed.load(Ordering::Acquire) {
-            return Err("parallel download stopped after another range failed".into());
-        }
-        let mut response = match send_with_cancel(
-            client
-                .get(url)
-                .header(reqwest::header::RANGE, format!("bytes={next}-{end}")),
-            cancel,
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err(e) => {
-                last_error = Some(format!("request failed: {e}"));
-                if attempt < DOWNLOAD_RANGE_ATTEMPTS {
-                    tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;
+        check_aborted(cancel, failed)?;
+        match request_range(client, url, next, end, expected_bytes, cancel).await {
+            Ok(mut response) => {
+                let (updated_next, retry_reason) = write_range_chunks(
+                    &mut response,
+                    &mut file,
+                    start,
+                    end,
+                    next,
+                    id,
+                    phase.clone(),
+                    display_total,
+                    progress,
+                    cancel,
+                    failed,
+                )
+                .await?;
+                next = updated_next;
+                if next > end {
+                    return Ok(());
                 }
-                continue;
+                last_error = retry_reason;
             }
-        };
-        let remaining = end - next + 1;
-        let expected_range = format!("bytes {next}-{end}/{expected_bytes}");
-        let actual_range = response
-            .headers()
-            .get(reqwest::header::CONTENT_RANGE)
-            .and_then(|v| v.to_str().ok());
-        if response.status() != reqwest::StatusCode::PARTIAL_CONTENT
-            || actual_range != Some(expected_range.as_str())
-            || response.content_length() != Some(remaining)
-        {
-            last_error = Some(format!(
-                "server returned unexpected metadata ({})",
-                response.status()
-            ));
-            if attempt < DOWNLOAD_RANGE_ATTEMPTS {
-                tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;
-            }
-            continue;
+            Err(retry_reason) => last_error = Some(retry_reason),
         }
-
-        let (updated_next, retry_reason) = write_range_chunks(
-            &mut response,
-            &mut file,
-            start,
-            end,
-            next,
-            id,
-            phase.clone(),
-            display_total,
-            progress,
-            cancel,
-            failed,
-        )
-        .await?;
-        next = updated_next;
-        if next > end {
-            return Ok(());
-        }
-        last_error = retry_reason;
         if attempt < DOWNLOAD_RANGE_ATTEMPTS {
             tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;
         }
@@ -511,6 +514,54 @@ async fn download_range(
         "range {start}-{end} failed after {DOWNLOAD_RANGE_ATTEMPTS} attempts: {}",
         last_error.unwrap_or_else(|| "range did not start".into())
     ))
+}
+
+/// Request bytes `next..=end` and accept the response only when it is
+/// exactly that range of the pinned file. `Err` is the retry reason the
+/// caller keeps in case every attempt fails.
+async fn request_range(
+    client: &reqwest::Client,
+    url: &str,
+    next: u64,
+    end: u64,
+    expected_bytes: u64,
+    cancel: &AtomicBool,
+) -> Result<reqwest::Response, String> {
+    let response = send_with_cancel(
+        client
+            .get(url)
+            .header(reqwest::header::RANGE, format!("bytes={next}-{end}")),
+        cancel,
+    )
+    .await
+    .map_err(|e| format!("request failed: {e}"))?;
+    let remaining = end - next + 1;
+    let expected_range = format!("bytes {next}-{end}/{expected_bytes}");
+    let actual_range = response
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok());
+    if response.status() != reqwest::StatusCode::PARTIAL_CONTENT
+        || actual_range != Some(expected_range.as_str())
+        || response.content_length() != Some(remaining)
+    {
+        return Err(format!(
+            "server returned unexpected metadata ({})",
+            response.status()
+        ));
+    }
+    Ok(response)
+}
+
+/// The presized `part`, opened for writing at this range's own offset.
+fn open_part_at(part: &Path, start: u64) -> Result<File, String> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(part)
+        .map_err(|e| format!("could not open {}: {e}", part.display()))?;
+    file.seek(SeekFrom::Start(start))
+        .map_err(|e| format!("could not seek {}: {e}", part.display()))?;
+    Ok(file)
 }
 
 fn hash_file(path: &Path, cancel: &AtomicBool) -> Result<String, String> {
@@ -528,11 +579,7 @@ fn hash_file(path: &Path, cancel: &AtomicBool) -> Result<String, String> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>())
+    Ok(hex_digest(hasher))
 }
 
 /// `is_installed` trusts a matching length plus a marker derived only from
