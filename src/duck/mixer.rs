@@ -180,40 +180,59 @@ pub(super) type Move<'a> = (&'a AppSession, Level, Change);
 /// coming back), so a hiccup never strands an app half-quiet.
 pub(super) fn glide(moves: &[Move<'_>], over: Duration) -> Vec<bool> {
     let mut ok = vec![true; moves.len()];
-    let mut ramps = Vec::with_capacity(moves.len());
-    for (i, (app, now, change)) in moves.iter().enumerate() {
-        ramps.push(match change {
-            Change::Mute => (now.volume, 0.0),
-            Change::Unmute => {
-                ok[i] = app.set_volume(0.0) && app.set_muted(false);
-                (0.0, now.volume)
-            }
-            Change::Volume(target) => (now.volume, *target),
-        });
-    }
+    let ramps: Vec<(f32, f32)> = moves
+        .iter()
+        .zip(ok.iter_mut())
+        .map(|(one, ok)| begin_ramp(one, ok))
+        .collect();
     let steps = plan::fade_steps(over);
     for step in 1..=steps {
-        let t = step as f32 / steps as f32;
-        for (i, (app, _, _)) in moves.iter().enumerate() {
-            if ok[i] {
-                let (from, to) = ramps[i];
-                ok[i] = app.set_volume(plan::fade_level(from, to, t));
-            }
-        }
+        step_ramps(moves, &ramps, &mut ok, step as f32 / steps as f32);
         if step < steps {
             std::thread::sleep(plan::FADE_STEP);
         }
     }
-    for (i, (app, now, change)) in moves.iter().enumerate() {
-        if ok[i] && *change == Change::Mute {
-            // Silent now: mute, then put the slider back where it was.
-            ok[i] = app.set_muted(true) && app.set_volume(now.volume);
-        }
-        if !ok[i] {
-            let (from, to) = ramps[i];
-            let _ = app.set_muted(false);
-            let _ = app.set_volume(from.max(to));
-        }
+    for ((one, ramp), ok) in moves.iter().zip(&ramps).zip(ok.iter_mut()) {
+        *ok = end_ramp(one, *ramp, *ok);
     }
     ok
+}
+
+/// Where one move's slider travels from and to. An unmute first drops the
+/// slider to silence and lifts the mute, so it can swell up from nothing.
+fn begin_ramp((app, now, change): &Move<'_>, ok: &mut bool) -> (f32, f32) {
+    match change {
+        Change::Mute => (now.volume, 0.0),
+        Change::Unmute => {
+            *ok = app.set_volume(0.0) && app.set_muted(false);
+            (0.0, now.volume)
+        }
+        Change::Volume(target) => (now.volume, *target),
+    }
+}
+
+/// Move every still-healthy app `t` of the way along its ramp.
+fn step_ramps(moves: &[Move<'_>], ramps: &[(f32, f32)], ok: &mut [bool], t: f32) {
+    for (((app, _, _), (from, to)), ok) in moves.iter().zip(ramps).zip(ok.iter_mut()) {
+        if *ok {
+            *ok = app.set_volume(plan::fade_level(*from, *to, t));
+        }
+    }
+}
+
+/// Finish one move: a fade to mute ends muted with the slider back where it
+/// was; a move that failed anywhere goes to its louder end. Returns whether
+/// the move landed.
+fn end_ramp((app, now, change): &Move<'_>, (from, to): (f32, f32), ok: bool) -> bool {
+    let landed = if ok && *change == Change::Mute {
+        // Silent now: mute, then put the slider back where it was.
+        app.set_muted(true) && app.set_volume(now.volume)
+    } else {
+        ok
+    };
+    if !landed {
+        let _ = app.set_muted(false);
+        let _ = app.set_volume(from.max(to));
+    }
+    landed
 }

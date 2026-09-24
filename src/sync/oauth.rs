@@ -373,12 +373,23 @@ fn wait_for_callback(listener: &TcpListener, timeout: Duration) -> Result<(Strin
         .context("set loopback non-blocking")?;
     let deadline = Instant::now() + timeout;
     loop {
+        let stream = next_connection(listener, deadline, timeout)?;
+        if let Some(code_and_state) = handle_loopback_request(stream)? {
+            return Ok(code_and_state);
+        }
+    }
+}
+
+/// The next connection on the non-blocking `listener`, polling until
+/// `deadline`; `timeout` only names the wait in the error.
+fn next_connection(
+    listener: &TcpListener,
+    deadline: Instant,
+    timeout: Duration,
+) -> Result<TcpStream> {
+    loop {
         match listener.accept() {
-            Ok((stream, _)) => {
-                if let Some(code_and_state) = handle_loopback_request(stream)? {
-                    return Ok(code_and_state);
-                }
-            }
+            Ok((stream, _)) => return Ok(stream),
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if Instant::now() >= deadline {
                     bail!(

@@ -140,47 +140,80 @@ pub fn store_push(access_token: &str, settings: &Value, base_version: u64) -> Re
     let mut conflicts = 0;
     let mut rate_limit_retried = false;
     loop {
-        let resp = client()?
-            .post(&url)
-            .bearer_auth(access_token)
-            .json(&serde_json::json!({
-                "settings": settings,
-                "baseVersion": base,
-                "merge": true,
-            }))
-            .send()
-            .context("store POST")?;
-        let status = resp.status();
-        let body: Value = resp.json().unwrap_or(Value::Null);
-        if status.is_success() {
-            clear_store_cache();
-            return Ok(body
-                .get("version")
-                .and_then(Value::as_u64)
-                .unwrap_or(base + 1));
-        }
-        match status.as_u16() {
-            409 => {
+        let (status, body) = post_patch(access_token, &url, settings, base)?;
+        match push_step(status.as_u16(), &body, base) {
+            PushStep::Saved(version) => {
+                clear_store_cache();
+                return Ok(version);
+            }
+            PushStep::Conflict => {
                 conflicts += 1;
                 if conflicts >= 3 {
                     bail!("push kept conflicting with a newer cloud copy; try again");
                 }
                 base = conflict_current_version(&body)
                     .unwrap_or_else(|| refetch_version(access_token, base));
-                continue;
             }
-            429 if !rate_limit_retried => {
+            PushStep::RateLimited if !rate_limit_retried => {
                 rate_limit_retried = true;
                 std::thread::sleep(rate_limit_wait(&body));
-                continue;
             }
-            429 => bail!(
+            PushStep::RateLimited => bail!(
                 "the settings store is still rate-limiting us after waiting {} seconds",
                 retry_after_seconds(&body).unwrap_or(1)
             ),
-            413 => bail!("settings are too large to sync (over 64 KB)"),
-            _ => bail!("could not save to the cloud (HTTP {status}): {body}"),
+            PushStep::TooLarge => bail!("settings are too large to sync (over 64 KB)"),
+            PushStep::Failed => bail!("could not save to the cloud (HTTP {status}): {body}"),
         }
+    }
+}
+
+/// One merge-mode POST of `settings` against `base`: the status and the body.
+fn post_patch(
+    access_token: &str,
+    url: &str,
+    settings: &Value,
+    base: u64,
+) -> Result<(reqwest::StatusCode, Value)> {
+    let resp = client()?
+        .post(url)
+        .bearer_auth(access_token)
+        .json(&serde_json::json!({
+            "settings": settings,
+            "baseVersion": base,
+            "merge": true,
+        }))
+        .send()
+        .context("store POST")?;
+    let status = resp.status();
+    Ok((status, resp.json().unwrap_or(Value::Null)))
+}
+
+/// What one push attempt's answer means for the loop in [`store_push`].
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum PushStep {
+    /// Saved; the new version (the body's, or `base + 1` if it named none).
+    Saved(u64),
+    /// 409: someone else wrote first; retry against the newer version.
+    Conflict,
+    /// 429: wait as told, once.
+    RateLimited,
+    /// 413: over the store's size cap.
+    TooLarge,
+    Failed,
+}
+
+pub(super) fn push_step(status: u16, body: &Value, base: u64) -> PushStep {
+    match status {
+        200..=299 => PushStep::Saved(
+            body.get("version")
+                .and_then(Value::as_u64)
+                .unwrap_or(base + 1),
+        ),
+        409 => PushStep::Conflict,
+        429 => PushStep::RateLimited,
+        413 => PushStep::TooLarge,
+        _ => PushStep::Failed,
     }
 }
 

@@ -93,6 +93,26 @@ fn verb(percent: u8) -> String {
     }
 }
 
+/// Put `left` back on every running session of its app that still reads as
+/// the duck left it, naming each one restored in `restored`. Returns whether
+/// the app was running at all: one that is not stays a leftover for later.
+fn put_back_leftover(left: &Leftover, sessions: &[AppSession], restored: &mut Vec<String>) -> bool {
+    let mut running = false;
+    for app in sessions
+        .iter()
+        .filter(|s| s.session == left.session && !s.is_gone())
+    {
+        running = true;
+        let change = app
+            .level()
+            .and_then(|now| plan::restore(left.original, left.set, now));
+        if change.is_some_and(|c| app.apply(c)) {
+            restored.push(plan::app_name(&left.session).to_string());
+        }
+    }
+    running
+}
+
 /// Make every move, gliding over `fade` when there is one, and report per
 /// move whether it landed.
 fn make_moves(moves: &[Move<'_>], fade: Option<Duration>) -> Vec<bool> {
@@ -350,24 +370,8 @@ impl Worker {
         let sessions = mixer.sessions();
         let before = self.leftovers.len();
         let mut restored = Vec::new();
-        self.leftovers.retain(|left| {
-            let running: Vec<&AppSession> = sessions
-                .iter()
-                .filter(|s| s.session == left.session && !s.is_gone())
-                .collect();
-            if running.is_empty() {
-                return true;
-            }
-            for app in running {
-                let change = app
-                    .level()
-                    .and_then(|now| plan::restore(left.original, left.set, now));
-                if change.is_some_and(|c| app.apply(c)) {
-                    restored.push(plan::app_name(&left.session).to_string());
-                }
-            }
-            false
-        });
+        self.leftovers
+            .retain(|left| !put_back_leftover(left, &sessions, &mut restored));
         if !restored.is_empty() {
             tracing::info!(
                 "duck: put back {} app(s) an earlier run left quieted ({})",
@@ -388,24 +392,10 @@ impl Worker {
 
     /// [`Self::persist`], plus `pending`: changes about to be made.
     fn persist_with(&mut self, pending: &[Leftover]) {
-        let mut all = self.leftovers.clone();
-        if let Some(ducked) = &self.ducked {
-            for app in &ducked.apps {
-                plan::upsert(&mut all, app.leftover());
-            }
-        }
-        for left in pending {
-            plan::upsert(&mut all, left.clone());
-        }
+        let all = self.records(pending);
         let path = crate::paths::data_file(LEFTOVERS_FILE);
         if all.is_empty() {
-            if self.on_disk {
-                match std::fs::remove_file(&path) {
-                    Ok(()) => self.on_disk = false,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => self.on_disk = false,
-                    Err(e) => tracing::warn!("duck: could not remove {}: {e}", path.display()),
-                }
-            }
+            self.remove_file(&path);
             return;
         }
         // Atomic, so a crash while writing can never leave a torn list that
@@ -416,6 +406,32 @@ impl Worker {
             Err(e) => tracing::warn!(
                 "duck: could not record the quieted apps ({e}); a crash now would leave them quiet"
             ),
+        }
+    }
+
+    /// Every app to put back: the leftovers, everything ducked right now, and
+    /// `pending`, one record per app (the newest wins).
+    fn records(&self, pending: &[Leftover]) -> Vec<Leftover> {
+        let mut all = self.leftovers.clone();
+        let ducked = self
+            .ducked
+            .iter()
+            .flat_map(|d| d.apps.iter().map(DuckedApp::leftover));
+        for left in ducked.chain(pending.iter().cloned()) {
+            plan::upsert(&mut all, left);
+        }
+        all
+    }
+
+    /// Delete the leftovers file if there is one; nothing to put back.
+    fn remove_file(&mut self, path: &std::path::Path) {
+        if !self.on_disk {
+            return;
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => self.on_disk = false,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => self.on_disk = false,
+            Err(e) => tracing::warn!("duck: could not remove {}: {e}", path.display()),
         }
     }
 }
