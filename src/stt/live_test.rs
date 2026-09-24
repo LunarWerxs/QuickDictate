@@ -1,7 +1,7 @@
 //! Live provider round-trip tests.
 //!
 //! These exercise each adapter against the **real** provider API: canned TTS
-//! speech (`tests/fixtures/speech_16k.wav`, known phrase) → `connect` →
+//! speech (`test-audio/speech_16k.wav`, known phrase) → `connect` →
 //! `send_audio` (chunked) → `commit`/`close` → collect `recv_event` → assert
 //! the transcript contains the expected words. This is the automated stand-in
 //! for the old "speak into a mic and watch it paste" manual test.
@@ -22,8 +22,8 @@ use std::time::Duration;
 use super::provider::{ProviderSession, SttEvent, SttProvider, SttSessionOpts};
 
 const KEYS_ENV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/my.keys.env");
-const WAV_16K: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/speech_16k.wav");
-const WAV_24K: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/speech_24k.wav");
+const WAV_16K: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-audio/speech_16k.wav");
+const WAV_24K: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-audio/speech_24k.wav");
 
 /// Read the comma-separated keys for a provider out of `my.keys.env`. Returns
 /// empty if the file or line is missing (test then skips).

@@ -318,7 +318,7 @@ mod tests {
 
     #[test]
     fn deepgram_does_its_own_formatting() {
-        // Verified live against tests/fixtures/speech_16k.wav: without these
+        // Verified live against test-audio/speech_16k.wav: without these
         // Deepgram returns unpunctuated lower-case text and we threw away
         // formatting it was willing to do for free.
         let url = build_url(MODEL_ID, &test_opts(vec![]));

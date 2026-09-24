@@ -61,7 +61,7 @@ settings.json
 
 # Generated test audio (recreate with scripts/gen_test_audio.ps1). The live
 # provider tests are #[ignore] + need real keys, so these aren't needed in CI.
-tests/fixtures/*.wav
+/test-audio/*.wav
 
 # Headless UI screenshots (scripts/ui_shot.ps1), dev-only artifacts. The
 # capture writes `.tmp` first and renames, so a killed run can leave it behind.

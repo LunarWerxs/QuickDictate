@@ -516,7 +516,7 @@ fn live_whisper_pack_download_load_and_transcribe() {
             install(spec, &AtomicBool::new(false))?;
         }
         let mut reader =
-            hound::WavReader::open("tests/fixtures/speech_16k.wav").map_err(|e| e.to_string())?;
+            hound::WavReader::open("test-audio/speech_16k.wav").map_err(|e| e.to_string())?;
         assert_eq!(reader.spec().sample_rate, 16_000);
         assert_eq!(reader.spec().channels, 1);
         let pcm = reader
@@ -554,7 +554,7 @@ fn live_installed_cohere_prewarm_and_transcribe() {
         spec.label
     );
 
-    let mut reader = hound::WavReader::open("tests/fixtures/speech_16k.wav").unwrap();
+    let mut reader = hound::WavReader::open("test-audio/speech_16k.wav").unwrap();
     assert_eq!(reader.spec().sample_rate, 16_000);
     assert_eq!(reader.spec().channels, 1);
     let pcm = reader

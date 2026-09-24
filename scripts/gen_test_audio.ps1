@@ -1,10 +1,10 @@
 # Regenerates the speech fixtures used by the live provider tests
 # (src/stt/live_test.rs). Uses Windows SAPI TTS so the audio is deterministic
-# and the transcript is known. Output: tests/fixtures/speech_{16,24}k.wav
+# and the transcript is known. Output: test-audio/speech_{16,24}k.wav
 # (16 kHz for streaming providers, 24 kHz for OpenAI Realtime). These are
 # gitignored — run this once locally before `cargo test -- --ignored`.
 $ErrorActionPreference = "Stop"
-$dir = Join-Path $PSScriptRoot "..\tests\fixtures"
+$dir = Join-Path $PSScriptRoot "..\test-audio"
 New-Item -ItemType Directory -Force $dir | Out-Null
 Add-Type -AssemblyName System.Speech
 # Distinctive content words so tests can assert on the transcript.
