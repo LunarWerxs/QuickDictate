@@ -80,6 +80,8 @@ SCRIBE_HALLUCINATION_HANDOFF.md
 
 # Local AI memory for this repo. Deliberately NOT published.
 /.claude/memory/
+# Checkouts parallel agents work in; each is merged or removed, never committed.
+/.claude/worktrees/
 
 # Architect (local audit) - profile + reports stay machine-local
 /.arkitect/
