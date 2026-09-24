@@ -15,6 +15,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   what changed in the cloud, so a change saved here while offline is not reverted either.
 - **A text replacement you delete stays deleted.** The cloud merges pushes key by key and only an
   explicit delete removes a key, so a removed replacement used to come back on the next pull.
+- **The pip follows a per-app profile's provider.** With a profile that puts one app on Google,
+  OpenAI or the local model while your default streams, the pip showed a frozen "0" instead of its
+  spinner, and on release skipped the "still working" state the local model needs.
 
 ## [1.2.0] - 2026-09-24
 
