@@ -10,6 +10,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 
 use super::*;
 
+/// Releases every modifier the user is physically holding, so the injected
 /// input is not silently reinterpreted as a shortcut.
 ///
 /// Deliberately does NOT re-press them on drop. The physical key is still
@@ -54,12 +55,19 @@ pub(super) fn send_unicode_text(text: &str) -> Result<()> {
         inputs.push(unicode_key_input(unit, false));
         inputs.push(unicode_key_input(unit, true));
     }
+    send_inputs(&inputs, "text")
+}
+
+/// Hand `inputs` to `SendInput` in chunks, so we never exceed a single call's
+/// practical event count. `what` names the injection in the error.
+fn send_inputs(inputs: &[INPUT], what: &str) -> Result<()> {
     for chunk in inputs.chunks(4096) {
-        unsafe {
-            let sent = SendInput(chunk, std::mem::size_of::<INPUT>() as i32);
-            if sent as usize != chunk.len() {
-                return Err(anyhow!("SendInput sent {sent}/{} events", chunk.len()));
-            }
+        let sent = unsafe { SendInput(chunk, std::mem::size_of::<INPUT>() as i32) };
+        if sent as usize != chunk.len() {
+            return Err(anyhow!(
+                "SendInput ({what}) sent {sent}/{} events",
+                chunk.len()
+            ));
         }
     }
     Ok(())
@@ -88,8 +96,7 @@ fn unicode_key_input(unit: u16, keyup: bool) -> INPUT {
     }
 }
 
-/// Sends `count` VK_BACK (backspace) key presses via `SendInput`, in chunks
-/// so we never exceed a single `SendInput` call's practical event count.
+/// Sends `count` VK_BACK (backspace) key presses via `SendInput`.
 /// Used to undo the previous pasted chunk for the "scratch that" voice
 /// command -- works identically whether that chunk landed via the Unicode-
 /// keystroke path or the clipboard path, since both end up as ordinary
@@ -98,23 +105,17 @@ pub(super) fn send_backspaces(count: usize) -> Result<()> {
     if count == 0 {
         return Ok(());
     }
+    // The same release `paste` does, and here it matters more: a held Ctrl
+    // turns each backspace into Ctrl+Backspace (delete a whole word) and a
+    // held Alt into Alt+Backspace (undo), so an undo counted in characters
+    // would reach far past the dictated text into the user's own.
+    let _modifiers = ReleasedModifiers::take();
     let mut inputs: Vec<INPUT> = Vec::with_capacity(count * 2);
     for _ in 0..count {
         inputs.push(keybd_input(VK_BACK, KEYBD_EVENT_FLAGS(0)));
         inputs.push(keybd_input(VK_BACK, KEYEVENTF_KEYUP));
     }
-    for chunk in inputs.chunks(4096) {
-        unsafe {
-            let sent = SendInput(chunk, std::mem::size_of::<INPUT>() as i32);
-            if sent as usize != chunk.len() {
-                return Err(anyhow!(
-                    "SendInput (backspace) sent {sent}/{} events",
-                    chunk.len()
-                ));
-            }
-        }
-    }
-    Ok(())
+    send_inputs(&inputs, "backspace")
 }
 
 pub(super) fn send_ctrl_v() -> Result<()> {
@@ -124,13 +125,7 @@ pub(super) fn send_ctrl_v() -> Result<()> {
         keybd_input(VK_V, KEYEVENTF_KEYUP),
         keybd_input(VK_CONTROL, KEYEVENTF_KEYUP),
     ];
-    unsafe {
-        let sent = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
-        if sent as usize != inputs.len() {
-            return Err(anyhow!("SendInput sent {sent}/{}", inputs.len()));
-        }
-    }
-    Ok(())
+    send_inputs(&inputs, "ctrl+v")
 }
 
 fn keybd_input(vk: VIRTUAL_KEY, flags: KEYBD_EVENT_FLAGS) -> INPUT {

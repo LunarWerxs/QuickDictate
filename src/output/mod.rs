@@ -4,13 +4,13 @@
 mod clipboard;
 mod input;
 mod processor;
+mod target;
 mod worker;
 
 #[cfg(test)]
 mod tests;
 
 use anyhow::Result;
-use parking_lot::Mutex;
 use windows::Win32::UI::Input::KeyboardAndMouse::{KEYBD_EVENT_FLAGS, VIRTUAL_KEY};
 
 use crate::focus;
@@ -21,6 +21,7 @@ pub use worker::spawn;
 use clipboard::*;
 use input::*;
 use processor::*;
+use target::*;
 
 /// KEYEVENTF_UNICODE (0x0004): wScan carries the Unicode character; wVk must
 /// be 0. Defined here rather than imported so we don't depend on a specific
@@ -38,12 +39,6 @@ const MAX_SAVED_CLIPBOARD_BYTES: usize = 16 * 1024 * 1024;
 /// four encodings adds up fast, and we would rather decline to snapshot than
 /// balloon a tray app's RSS.
 const MAX_SNAPSHOT_TOTAL_BYTES: usize = 48 * 1024 * 1024;
-
-/// Where the most recent paste actually landed: (foreground HWND, exe name).
-/// "Scratch that" refuses to fire backspaces unless focus is still there, so
-/// an alt-tab between dictating and undoing cannot delete somebody else's
-/// text. Set by [`paste_processed`](worker::paste_processed), read by [`handle_scratch_that`](worker::handle_scratch_that).
-static LAST_PASTE_TARGET: Mutex<Option<(isize, Option<String>)>> = Mutex::new(None);
 
 /// Put `text` on the Windows clipboard (CF_UNICODETEXT) and leave it there.
 /// Used by the tray's "Recent transcriptions": clicking an entry copies it so

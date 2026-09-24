@@ -98,12 +98,15 @@ pub(super) fn apply_edits(original: &str, edits: &[Edit]) -> Option<String> {
             continue;
         }
         // Exactly once, or we cannot know which occurrence was meant.
-        let mut hits = original.match_indices(&edit.before);
-        let Some((at, _)) = hits.next() else {
+        let Some(at) = original.find(edit.before.as_str()) else {
             tracing::debug!("polish: dropping an edit whose `before` is not in the transcript");
             return None;
         };
-        if hits.next().is_some() {
+        // Search again from one char past the hit, not from its end:
+        // `match_indices` skips overlapping matches, so "no no" in
+        // "no no no" used to count as unique.
+        let next = at + original[at..].chars().next().map_or(1, char::len_utf8);
+        if original[next..].contains(edit.before.as_str()) {
             tracing::debug!("polish: dropping an edit whose `before` is ambiguous");
             return None;
         }

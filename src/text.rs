@@ -234,34 +234,7 @@ impl TextProcessor {
     }
 
     fn cleanup_punctuation(&self, t: &str) -> String {
-        // Collapse ".." (exactly two) -> "." but leave "..." (and longer runs) alone.
-        // `regex` doesn't support look-around so we scan codepoints manually.
-        let mut out = String::with_capacity(t.len());
-        let mut iter = t.chars().peekable();
-        while let Some(c) = iter.next() {
-            if c == '.' {
-                let mut run = 1usize;
-                while iter.peek() == Some(&'.') {
-                    iter.next();
-                    run += 1;
-                }
-                if run == 2 {
-                    out.push('.');
-                } else {
-                    for _ in 0..run {
-                        out.push('.');
-                    }
-                }
-            } else if c == ',' {
-                // Collapse runs of ',' into a single ','.
-                out.push(',');
-                while iter.peek() == Some(&',') {
-                    iter.next();
-                }
-            } else {
-                out.push(c);
-            }
-        }
+        let out = collapse_punct_runs(t);
         // Insert a space between sentence-ending punct and an immediately-following capital.
         SENTENCE_GLUE.replace_all(&out, "$1 $2").into_owned()
     }
@@ -296,8 +269,11 @@ impl TextProcessor {
             })
             .into_owned();
         // Append a period if the sentence looks finished but has no closer.
+        // A pause mark is not "finished": closing "have a-" or "fascinated…"
+        // with a period hid the pause from `ends_mid_sentence`, so the next
+        // chunk opened a new sentence.
         if let Some(last) = s.chars().last() {
-            if !matches!(last, '.' | '?' | '!' | ',' | ';' | ':') {
+            if !matches!(last, '.' | '?' | '!') && !is_pause_mark(last) {
                 let word_count = s.split_whitespace().count();
                 if word_count > 3 || s.len() > 15 {
                     s.push('.');
@@ -324,13 +300,45 @@ impl TextProcessor {
 pub fn ends_mid_sentence(processed: &str) -> bool {
     // `auto_space` / `auto_newline` append a trailer, so compare on the text.
     let t = processed.trim_end();
-    if t.ends_with("...") || t.ends_with('\u{2026}') {
-        return true;
+    t.ends_with("...") || t.chars().last().is_some_and(is_pause_mark)
+}
+
+/// A single character that ends a chunk mid-thought: an ellipsis glyph, or a
+/// dangling comma, semicolon, colon or hyphen. Shared by [`ends_mid_sentence`]
+/// and the auto-period, which must never close what this one calls open.
+fn is_pause_mark(c: char) -> bool {
+    matches!(c, '\u{2026}' | ',' | ';' | ':' | '-')
+}
+
+/// Collapse ".." (exactly two) -> "." but leave "..." (and longer runs)
+/// alone, and collapse any run of ',' into one. `regex` doesn't support
+/// look-around so we scan codepoints manually.
+fn collapse_punct_runs(t: &str) -> String {
+    let mut out = String::with_capacity(t.len());
+    let mut iter = t.chars().peekable();
+    while let Some(c) = iter.next() {
+        match c {
+            '.' => {
+                let run = 1 + skip_run(&mut iter, '.');
+                out.extend(std::iter::repeat_n('.', if run == 2 { 1 } else { run }));
+            }
+            ',' => {
+                skip_run(&mut iter, ',');
+                out.push(',');
+            }
+            _ => out.push(c),
+        }
     }
-    matches!(
-        t.chars().last(),
-        Some(',') | Some(';') | Some(':') | Some('-')
-    )
+    out
+}
+
+/// Consume every `c` immediately ahead in `iter`, returning how many.
+fn skip_run(iter: &mut std::iter::Peekable<std::str::Chars<'_>>, c: char) -> usize {
+    let mut n = 0;
+    while iter.next_if_eq(&c).is_some() {
+        n += 1;
+    }
+    n
 }
 
 #[cfg(test)]
@@ -553,6 +561,33 @@ mod tests {
         assert!(!ends_mid_sentence("That is the whole point."));
         assert!(!ends_mid_sentence("Is that right?"));
         assert!(!ends_mid_sentence(""));
+    }
+
+    #[test]
+    fn the_auto_period_never_closes_a_pause() {
+        // Both used to gain a period, which hid the pause from
+        // ends_mid_sentence and capitalized the next chunk.
+        let p = processor();
+        let dash = p.process("the pause didn't intend to have a-");
+        assert_eq!(dash, "The pause didn't intend to have a-");
+        assert!(ends_mid_sentence(&dash));
+        let ellipsis = p.process("and I also was just fascinated\u{2026}");
+        assert_eq!(ellipsis, "And I also was just fascinated\u{2026}");
+        assert!(ends_mid_sentence(&ellipsis));
+        // A bare word still gets closed.
+        assert_eq!(
+            p.process("and that is the whole point"),
+            "And that is the whole point."
+        );
+    }
+
+    #[test]
+    fn dot_and_comma_runs_collapse_but_ellipses_survive() {
+        assert_eq!(collapse_punct_runs("end.. next"), "end. next");
+        assert_eq!(collapse_punct_runs("wait... and...."), "wait... and....");
+        assert_eq!(collapse_punct_runs("a,,, b, c"), "a, b, c");
+        assert_eq!(collapse_punct_runs(".."), ".");
+        assert_eq!(collapse_punct_runs("plain"), "plain");
     }
 
     #[test]

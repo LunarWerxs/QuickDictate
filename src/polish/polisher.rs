@@ -168,46 +168,13 @@ impl Polisher {
         };
         let key = Self::take_key(&settings, &self.next_key);
         self.rt.spawn(async move {
-            let started = Instant::now();
-            let outcome = match key {
-                Some(key) => request_edits(&inner.client, &settings, &key, &text).await,
-                None => Err("no key configured".to_string()),
-            };
-            let polished = match outcome {
-                Ok(edits) => apply_edits(&text, &edits),
-                Err(e) => {
-                    tracing::debug!("polish: request failed ({e}); leaving the text alone");
-                    None
-                }
-            };
-            tracing::debug!(
-                "polish: pass over {} char(s) took {:?} and {} the text",
-                text.chars().count(),
-                started.elapsed(),
-                if polished.is_some() {
-                    "changed"
-                } else {
-                    "left"
-                }
-            );
+            let polished = polish_once(&inner.client, &settings, key, &text).await;
 
             // Whatever came back, this input is answered: publish it (even
             // unchanged, stored as the text itself) so a later `resolve` for
             // the same text is instant instead of a second round trip.
             let settled = polished.unwrap_or_else(|| text.clone());
-            let (waiters, next) = {
-                let mut st = inner.state.lock();
-                st.ready = Some((text.clone(), settled.clone()));
-                if st.inflight.as_deref() == Some(text.as_str()) {
-                    st.inflight = None;
-                    (std::mem::take(&mut st.waiters), st.queued.take())
-                } else {
-                    // A newer pass superseded us and owns the waiters now.
-                    // Our answer still goes in `ready`; it just isn't the one
-                    // anybody is holding the paste for.
-                    (Vec::new(), None)
-                }
-            };
+            let (waiters, next) = settle(&inner.state, &text, &settled);
             for tx in waiters {
                 // The receiver may already have hit its deadline and gone;
                 // that is the expected loss case, not an error.
@@ -217,5 +184,59 @@ impl Polisher {
                 inner.speculate(&settings, &next);
             }
         });
+    }
+}
+
+/// One request and apply round trip over `text`. `None` means leave the text
+/// alone: no key, a failed request, or an edit set that did not pass.
+async fn polish_once(
+    client: &reqwest::Client,
+    settings: &PolishSettings,
+    key: Option<String>,
+    text: &str,
+) -> Option<String> {
+    let started = Instant::now();
+    let outcome = match key {
+        Some(key) => request_edits(client, settings, &key, text).await,
+        None => Err("no key configured".to_string()),
+    };
+    let polished = match outcome {
+        Ok(edits) => apply_edits(text, &edits),
+        Err(e) => {
+            tracing::debug!("polish: request failed ({e}); leaving the text alone");
+            None
+        }
+    };
+    tracing::debug!(
+        "polish: pass over {} char(s) took {:?} and {} the text",
+        text.chars().count(),
+        started.elapsed(),
+        if polished.is_some() {
+            "changed"
+        } else {
+            "left"
+        }
+    );
+    polished
+}
+
+/// Publish a finished pass's answer for `text`, and hand back the paste
+/// threads to wake with it plus whatever was queued behind it. Both are empty
+/// when a newer pass has superseded this one.
+fn settle(
+    state: &Mutex<State>,
+    text: &str,
+    settled: &str,
+) -> (Vec<std::sync::mpsc::SyncSender<String>>, Option<String>) {
+    let mut st = state.lock();
+    st.ready = Some((text.to_string(), settled.to_string()));
+    if st.inflight.as_deref() == Some(text) {
+        st.inflight = None;
+        (std::mem::take(&mut st.waiters), st.queued.take())
+    } else {
+        // A newer pass superseded us and owns the waiters now. Our answer
+        // still goes in `ready`; it just isn't the one anybody is holding
+        // the paste for.
+        (Vec::new(), None)
     }
 }
