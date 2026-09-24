@@ -364,8 +364,13 @@ pub(super) fn compute_tick_snapshot(app: &App) -> TickSnapshot {
     // word count to show, so the pip spins instead of displaying a "0" that
     // never moves. Asked of the provider rather than hardcoded here: this
     // read `== "local"`, which left Google and OpenAI users watching a frozen
-    // zero for the whole dictation.
-    let show_spinner = !crate::stt::provider_streams_interim_text(&cfg)
+    // zero for the whole dictation. It is the provider the press actually
+    // runs on, which a Per-App Profile may have switched.
+    let streams = match app.press_provider.load().as_deref() {
+        Some(id) => crate::stt::provider_id_streams_interim_text(id, &cfg),
+        None => crate::stt::provider_streams_interim_text(&cfg),
+    };
+    let show_spinner = !streams
         && matches!(
             status,
             Status::Starting | Status::Listening | Status::Processing | Status::Finalizing

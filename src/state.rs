@@ -283,6 +283,11 @@ pub struct App {
     /// on the held transcript while the user is still talking and the paste
     /// path can collect the answer. Inert unless configured.
     pub polish: Arc<crate::polish::Polisher>,
+    /// The provider the latest press runs on, as it resolved it (a Per-App
+    /// Profile may pick another than `Config::stt_provider`); `None` before
+    /// the first press. The pip reads it to decide between a live word count
+    /// and a spinner. Lock-free, because the UI loop reads it every frame.
+    pub press_provider: arc_swap::ArcSwapOption<String>,
 }
 
 impl App {
@@ -310,6 +315,7 @@ impl App {
             stats: Arc::new(StatsStore::load()),
             audio,
             polish: Arc::new(crate::polish::Polisher::new(rt_for_polish)),
+            press_provider: arc_swap::ArcSwapOption::empty(),
         })
     }
 

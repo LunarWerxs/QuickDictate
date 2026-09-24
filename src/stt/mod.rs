@@ -257,6 +257,7 @@ async fn run_session_with_retries(
         let id = cfg
             .provider_for_exe(press.exe_at_start.as_deref())
             .unwrap_or_else(|| cfg.stt_provider.clone());
+        app2.press_provider.store(Some(Arc::new(id.clone())));
         let _ = provider.set(id);
     }
     let user_aborted = || stop.load(Ordering::Acquire) || app2.current_session_epoch() != epoch;
