@@ -7,17 +7,24 @@
 //! server flushes finals and closes on its own.
 
 use async_trait::async_trait;
-use futures_util::StreamExt;
 use serde::Deserialize;
 
 use super::provider::{
     classify_by_substring, server_error_event, AudioFormat, ConnectError, ProviderSession,
-    ProviderSink, ProviderStream, RecvError, SendError, SttEvent, SttProvider, SttSessionOpts,
+    SttEvent, SttProvider, SttSessionOpts,
 };
-use super::ws::{self, WsReader, WsSink};
+use super::ws;
 
 const WS_URL: &str = "wss://api.deepgram.com/v1/listen";
 const MODEL_ID: &str = "nova-3";
+/// Tells Deepgram to flush interim → final and close. The server then sends
+/// any remaining finals and closes the socket itself; a client Close would
+/// race that final-results flush.
+const CLOSE_STREAM: &str = "{\"type\":\"CloseStream\"}";
+/// Deepgram closes a stream after ~10 s with no audio (NET-0001). This is its
+/// documented keepalive: resets that timer without adding any audio. A
+/// transport ping does NOT prevent that close, so it must be this JSON.
+const KEEP_ALIVE: &str = "{\"type\":\"KeepAlive\"}";
 /// Deepgram caps keyterm prompting at 500 tokens combined across all terms,
 /// not a term count; we don't tokenize client-side, so this bounds the term
 /// *count* as a conservative stand-in for that limit.
@@ -57,13 +64,14 @@ impl SttProvider for DeepgramProvider {
             &format!("Token {key}"),
         )
         .await?;
-        let (sink, stream) = conn.split();
-        Ok(ProviderSession {
-            sink: Box::new(DeepgramSink { sink }),
-            stream: Box::new(DeepgramStream {
-                ws: WsReader::new(stream),
-            }),
-        })
+        // Metadata / SpeechStarted / UtteranceEnd / empty transcript map to
+        // nothing, so the reader keeps going past them.
+        Ok(ws::pcm_session(
+            conn,
+            CLOSE_STREAM,
+            Some(KEEP_ALIVE),
+            map_frame,
+        ))
     }
 }
 
@@ -90,57 +98,10 @@ fn build_url(model: &str, opts: &SttSessionOpts) -> String {
     );
     if !opts.custom_vocabulary.is_empty() && (model.contains("nova-3") || model.contains("flux")) {
         for term in opts.custom_vocabulary.iter().take(MAX_KEYTERMS) {
-            url.push_str("&keyterm=");
-            url.push_str(
-                &url::form_urlencoded::byte_serialize(term.as_bytes()).collect::<String>(),
-            );
+            ws::push_query(&mut url, "keyterm", term);
         }
     }
     url
-}
-
-struct DeepgramSink {
-    sink: WsSink,
-}
-
-#[async_trait]
-impl ProviderSink for DeepgramSink {
-    async fn send_audio(&mut self, pcm: &[i16]) -> Result<(), SendError> {
-        // Raw little-endian PCM16 binary frame — no envelope.
-        ws::send_pcm(&mut self.sink, pcm).await
-    }
-
-    async fn commit(&mut self) -> Result<(), SendError> {
-        // Tell Deepgram to flush interim → final and close. The server then
-        // sends any remaining finals and closes the socket itself.
-        ws::send_text(&mut self.sink, "{\"type\":\"CloseStream\"}").await
-    }
-
-    async fn keepalive(&mut self) -> Result<(), SendError> {
-        // Deepgram closes a stream after ~10 s with no audio (NET-0001). This is
-        // its documented keepalive: resets that timer without adding any audio.
-        // A transport ping does NOT prevent that close, so it must be this JSON.
-        ws::send_text(&mut self.sink, "{\"type\":\"KeepAlive\"}").await
-    }
-
-    async fn close(&mut self) -> Result<(), SendError> {
-        // No-op: CloseStream already initiates the server-side close. Sending a
-        // client Close here would race Deepgram's final-results flush.
-        Ok(())
-    }
-}
-
-struct DeepgramStream {
-    ws: WsReader,
-}
-
-#[async_trait]
-impl ProviderStream for DeepgramStream {
-    async fn recv_event(&mut self) -> Result<Option<SttEvent>, RecvError> {
-        // Metadata / SpeechStarted / UtteranceEnd / empty transcript map to
-        // nothing, so the reader keeps going past them.
-        self.ws.recv(map_frame).await
-    }
 }
 
 #[derive(Deserialize)]

@@ -12,16 +12,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 use tokio_tungstenite::tungstenite::Message;
 
 use super::provider::{
     classify_by_substring, server_error_event, AudioFormat, ConnectError, ProviderSession,
-    ProviderSink, ProviderStream, RecvError, SendError, SttEvent, SttProvider, SttSessionOpts,
+    SttEvent, SttProvider, SttSessionOpts,
 };
-use super::ws::{self, WsConn, WsReader, WsSink};
+use super::ws::{self, WsConn};
 use crate::keys::FailKind;
 
 // Host is chosen by the `dashscope_intl` config flag: mainland-China (default)
@@ -116,9 +116,7 @@ impl SttProvider for DashScopeProvider {
 
         // 1) send run-task
         let run_task = build_run_task(&task_id, model, opts);
-        conn.send(Message::Text(run_task.into()))
-            .await
-            .map_err(|e| ConnectError(format!("run-task send: {e}")))?;
+        ws::send_setup(&mut conn, "run-task", run_task).await?;
 
         // 2) await task-started (or task-failed) before letting audio flow,
         //    bounded so a silent-but-open connection can't hang the session.
@@ -131,13 +129,15 @@ impl SttProvider for DashScopeProvider {
             }
         }
 
-        let (sink, stream) = conn.split();
-        Ok(ProviderSession {
-            sink: Box::new(DashScopeSink { sink, task_id }),
-            stream: Box::new(DashScopeStream {
-                ws: WsReader::new(stream),
-            }),
-        })
+        // finish-task drives the server-side close after task-finished. No
+        // documented no-audio keepalive, so an idle socket gets a transport
+        // ping.
+        Ok(ws::pcm_session(
+            conn,
+            build_finish_task(&task_id),
+            None,
+            map_frame,
+        ))
     }
 }
 
@@ -238,46 +238,15 @@ fn build_run_task(task_id: &str, model: &str, opts: &SttSessionOpts) -> String {
     .to_string()
 }
 
-struct DashScopeSink {
-    sink: WsSink,
-    task_id: String,
-}
-
-#[async_trait]
-impl ProviderSink for DashScopeSink {
-    async fn send_audio(&mut self, pcm: &[i16]) -> Result<(), SendError> {
-        ws::send_pcm(&mut self.sink, pcm).await
-    }
-
-    async fn commit(&mut self) -> Result<(), SendError> {
-        let finish = json!({
-            "header": { "action": "finish-task", "task_id": self.task_id, "streaming": "duplex" },
-            "payload": { "input": {} }
-        })
-        .to_string();
-        ws::send_text(&mut self.sink, finish).await
-    }
-
-    async fn keepalive(&mut self) -> Result<(), SendError> {
-        // No documented no-audio keepalive, so use a transport-level WS ping.
-        ws::ping(&mut self.sink).await
-    }
-
-    async fn close(&mut self) -> Result<(), SendError> {
-        // No-op: finish-task drives the server-side close after task-finished.
-        Ok(())
-    }
-}
-
-struct DashScopeStream {
-    ws: WsReader,
-}
-
-#[async_trait]
-impl ProviderStream for DashScopeStream {
-    async fn recv_event(&mut self) -> Result<Option<SttEvent>, RecvError> {
-        self.ws.recv(map_frame).await
-    }
+/// Build the `finish-task` frame that ends the utterance, carrying the same
+/// `task_id` as the session's `run-task`. Pure (fixture-tested); built once
+/// per session at connect.
+fn build_finish_task(task_id: &str) -> String {
+    json!({
+        "header": { "action": "finish-task", "task_id": task_id, "streaming": "duplex" },
+        "payload": { "input": {} }
+    })
+    .to_string()
 }
 
 /// The `header` of a DashScope frame (used during the handshake).
@@ -481,6 +450,15 @@ mod tests {
             .unwrap()
             .get("language_hints")
             .is_none());
+    }
+
+    #[test]
+    fn finish_task_names_the_session_task() {
+        let v: serde_json::Value = serde_json::from_str(&build_finish_task("0123abcd")).unwrap();
+        assert_eq!(v["header"]["action"], "finish-task");
+        assert_eq!(v["header"]["task_id"], "0123abcd");
+        assert_eq!(v["header"]["streaming"], "duplex");
+        assert_eq!(v["payload"]["input"], json!({}));
     }
 
     #[test]

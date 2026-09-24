@@ -7,16 +7,19 @@
 //! with `{"type":"Terminate"}`, after which the server flushes and closes.
 
 use async_trait::async_trait;
-use futures_util::StreamExt;
 use serde::Deserialize;
 
 use super::provider::{
     classify_by_substring, server_error_event, AudioFormat, ConnectError, ProviderSession,
-    ProviderSink, ProviderStream, RecvError, SendError, SttEvent, SttProvider, SttSessionOpts,
+    SttEvent, SttProvider, SttSessionOpts,
 };
-use super::ws::{self, WsReader, WsSink};
+use super::ws;
 
 const WS_URL: &str = "wss://streaming.assemblyai.com/v3/ws";
+/// Ends the session: the server flushes the final turn(s) and closes the
+/// socket itself. The streaming API documents no no-audio keepalive, so the
+/// sink keeps an idle socket open with a transport ping.
+const TERMINATE: &str = "{\"type\":\"Terminate\"}";
 /// v3 streaming hard-errors above 100 keyterms per session.
 const MAX_KEYTERMS: usize = 100;
 
@@ -49,13 +52,7 @@ impl SttProvider for AssemblyAiProvider {
     ) -> Result<ProviderSession, ConnectError> {
         // v3 streaming is English-only and takes no language param.
         let conn = ws::connect(&build_url(opts), "Authorization", key).await?;
-        let (sink, stream) = conn.split();
-        Ok(ProviderSession {
-            sink: Box::new(AssemblyAiSink { sink }),
-            stream: Box::new(AssemblyAiStream {
-                ws: WsReader::new(stream),
-            }),
-        })
+        Ok(ws::pcm_session(conn, TERMINATE, None, map_frame))
     }
 }
 
@@ -69,56 +66,13 @@ fn build_url(opts: &SttSessionOpts) -> String {
         "{WS_URL}?sample_rate={rate}&encoding=pcm_s16le",
         rate = opts.sample_rate,
     );
-    if !opts.custom_vocabulary.is_empty() {
-        let terms: Vec<&str> = opts
-            .custom_vocabulary
-            .iter()
-            .take(MAX_KEYTERMS)
-            .map(String::as_str)
-            .collect();
-        let json = serde_json::to_string(&terms).unwrap_or_default();
-        url.push_str("&keyterms_prompt=");
-        url.push_str(&url::form_urlencoded::byte_serialize(json.as_bytes()).collect::<String>());
-    }
+    ws::push_json_terms(
+        &mut url,
+        "keyterms_prompt",
+        &opts.custom_vocabulary,
+        MAX_KEYTERMS,
+    );
     url
-}
-
-struct AssemblyAiSink {
-    sink: WsSink,
-}
-
-#[async_trait]
-impl ProviderSink for AssemblyAiSink {
-    async fn send_audio(&mut self, pcm: &[i16]) -> Result<(), SendError> {
-        ws::send_pcm(&mut self.sink, pcm).await
-    }
-
-    async fn commit(&mut self) -> Result<(), SendError> {
-        // Terminate flushes the final turn(s) and closes the socket server-side.
-        ws::send_text(&mut self.sink, "{\"type\":\"Terminate\"}").await
-    }
-
-    async fn keepalive(&mut self) -> Result<(), SendError> {
-        // No documented no-audio keepalive for the streaming API, so use a
-        // transport-level WS ping.
-        ws::ping(&mut self.sink).await
-    }
-
-    async fn close(&mut self) -> Result<(), SendError> {
-        // No-op: Terminate already initiates the server-side close.
-        Ok(())
-    }
-}
-
-struct AssemblyAiStream {
-    ws: WsReader,
-}
-
-#[async_trait]
-impl ProviderStream for AssemblyAiStream {
-    async fn recv_event(&mut self) -> Result<Option<SttEvent>, RecvError> {
-        self.ws.recv(map_frame).await
-    }
 }
 
 #[derive(Deserialize)]
