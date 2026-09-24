@@ -18,17 +18,20 @@ pub struct ProviderStats {
     pub dictations: u64,
 }
 
+/// How two copies of a counter combine: summed across devices, or the
+/// larger kept when merging two replicas of the same device's monotonic
+/// counters.
+type Combine = fn(u64, u64) -> u64;
+
 impl ProviderStats {
     pub(super) fn add_assign(&mut self, other: &Self) {
-        self.words = self.words.saturating_add(other.words);
-        self.audio_ms = self.audio_ms.saturating_add(other.audio_ms);
-        self.dictations = self.dictations.saturating_add(other.dictations);
+        self.combine(other, u64::saturating_add);
     }
 
-    pub(super) fn merge_monotonic(&mut self, other: &Self) {
-        self.words = self.words.max(other.words);
-        self.audio_ms = self.audio_ms.max(other.audio_ms);
-        self.dictations = self.dictations.max(other.dictations);
+    fn combine(&mut self, other: &Self, op: Combine) {
+        self.words = op(self.words, other.words);
+        self.audio_ms = op(self.audio_ms, other.audio_ms);
+        self.dictations = op(self.dictations, other.dictations);
     }
 }
 
@@ -56,34 +59,31 @@ impl PeriodStats {
         self.dictations = self.dictations.saturating_add(1);
         self.longest_dictation_words = self.longest_dictation_words.max(words);
         self.longest_dictation_audio_ms = self.longest_dictation_audio_ms.max(audio_ms);
-        let totals = self.providers.entry(provider.to_string()).or_default();
-        totals.words = totals.words.saturating_add(words);
-        totals.audio_ms = totals.audio_ms.saturating_add(audio_ms);
-        totals.dictations = totals.dictations.saturating_add(1);
+        self.providers
+            .entry(provider.to_string())
+            .or_default()
+            .add_assign(&ProviderStats {
+                words,
+                audio_ms,
+                dictations: 1,
+            });
     }
 
     pub(super) fn add_assign(&mut self, other: &Self) {
-        self.words = self.words.saturating_add(other.words);
-        self.audio_ms = self.audio_ms.saturating_add(other.audio_ms);
-        self.dictations = self.dictations.saturating_add(other.dictations);
-        self.longest_dictation_words = self
-            .longest_dictation_words
-            .max(other.longest_dictation_words);
-        self.longest_dictation_audio_ms = self
-            .longest_dictation_audio_ms
-            .max(other.longest_dictation_audio_ms);
-        for (provider, totals) in &other.providers {
-            self.providers
-                .entry(provider.clone())
-                .or_default()
-                .add_assign(totals);
-        }
+        self.combine(other, u64::saturating_add);
     }
 
     pub(super) fn merge_monotonic(&mut self, other: &Self) {
-        self.words = self.words.max(other.words);
-        self.audio_ms = self.audio_ms.max(other.audio_ms);
-        self.dictations = self.dictations.max(other.dictations);
+        self.combine(other, u64::max);
+    }
+
+    /// The one field walk both merges share, so a counter added later is
+    /// never summed by one and forgotten by the other. The longest-dictation
+    /// records are maxima under either merge.
+    fn combine(&mut self, other: &Self, op: Combine) {
+        self.words = op(self.words, other.words);
+        self.audio_ms = op(self.audio_ms, other.audio_ms);
+        self.dictations = op(self.dictations, other.dictations);
         self.longest_dictation_words = self
             .longest_dictation_words
             .max(other.longest_dictation_words);
@@ -94,7 +94,7 @@ impl PeriodStats {
             self.providers
                 .entry(provider.clone())
                 .or_default()
-                .merge_monotonic(totals);
+                .combine(totals, op);
         }
     }
 }

@@ -392,3 +392,37 @@ fn a_reappearing_raw_row_for_an_already_archived_device_is_not_folded_again() {
     assert_eq!(synced.devices[ARCHIVED_DEVICE_ID].totals.words, 30);
     assert_eq!(synced.devices[ARCHIVED_DEVICE_ID].totals.dictations, 3);
 }
+
+#[test]
+fn period_add_sums_counts_while_merge_keeps_the_larger_and_both_keep_longest() {
+    let mut left = PeriodStats::default();
+    left.record("deepgram", 10, 1_000);
+    left.record("deepgram", 4, 400);
+    let mut right = PeriodStats::default();
+    right.record("deepgram", 7, 700);
+    right.record("openai", 3, 300);
+
+    let mut summed = left.clone();
+    summed.add_assign(&right);
+    assert_eq!(
+        (summed.words, summed.audio_ms, summed.dictations),
+        (24, 2_400, 4)
+    );
+    assert_eq!(summed.providers["deepgram"].words, 21);
+    assert_eq!(summed.providers["deepgram"].dictations, 3);
+    assert_eq!(summed.providers["openai"].words, 3);
+
+    let mut merged = left.clone();
+    merged.merge_monotonic(&right);
+    assert_eq!(
+        (merged.words, merged.audio_ms, merged.dictations),
+        (14, 1_400, 2)
+    );
+    assert_eq!(merged.providers["deepgram"].words, 14);
+    assert_eq!(merged.providers["openai"].dictations, 1);
+
+    for combined in [&summed, &merged] {
+        assert_eq!(combined.longest_dictation_words, 10);
+        assert_eq!(combined.longest_dictation_audio_ms, 1_000);
+    }
+}

@@ -123,18 +123,25 @@ fn handle_hide_tray_menu_click(app: &Arc<App>) {
 pub(super) fn drain_menu_events(app: &Arc<App>) {
     let menu_rx = MenuEvent::receiver();
     while let Ok(ev) = menu_rx.try_recv() {
-        let id = ev.id().as_ref();
-        if ev.id() == &MenuId::new("settings") {
-            crate::settings_ui::show_settings(Arc::clone(app));
-        } else if ev.id() == &MenuId::new("hide_tray") {
-            handle_hide_tray_menu_click(app);
-        } else if ev.id() == &MenuId::new("quit") {
+        dispatch_menu_click(app, ev.id().as_ref());
+    }
+}
+
+/// Route one clicked item, by the id [`build_tray`] /
+/// [`TrayState::rebuild_history_menu`] gave it, to its handler.
+fn dispatch_menu_click(app: &Arc<App>, id: &str) {
+    match id {
+        "settings" => crate::settings_ui::show_settings(Arc::clone(app)),
+        "hide_tray" => handle_hide_tray_menu_click(app),
+        "quit" => {
             tracing::info!("Quit selected from tray menu");
             app.shutdown.store(true, Ordering::Release);
-        } else if ev.id() == &MenuId::new("history:copyall") {
-            handle_history_copy_all(app);
-        } else if let Some(idx) = id.strip_prefix("history:") {
-            handle_history_click(app, id, idx);
+        }
+        "history:copyall" => handle_history_copy_all(app),
+        _ => {
+            if let Some(idx) = id.strip_prefix("history:") {
+                handle_history_click(app, id, idx);
+            }
         }
     }
 }

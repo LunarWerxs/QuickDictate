@@ -162,9 +162,18 @@ impl UiLoopState {
                 self.error_tooltip_kind = Some(tick.error_kind);
             }
         } else if self.error_tooltip_kind.is_some() && tick.status == Status::Listening {
-            let _ = self.tray.tray.set_tooltip(Some(&self.default_tooltip));
+            self.restore_default_tooltip();
             self.error_tooltip_kind = None;
         }
+    }
+
+    /// Put the plain version text back once an error or blocked-hotkey
+    /// tooltip clears, and forget which update the tooltip last advertised:
+    /// that text is gone now, so [`Self::sync_update_tooltip`] must write it
+    /// again for a still-pending update rather than think it is still up.
+    fn restore_default_tooltip(&mut self) {
+        let _ = self.tray.tray.set_tooltip(Some(&self.default_tooltip));
+        self.update_tooltip_tag = None;
     }
 
     /// A blocked hotkey isn't a dictation error, so it doesn't share the
@@ -178,7 +187,7 @@ impl UiLoopState {
                 self.hotkey_tooltip_active = true;
             }
         } else if self.hotkey_tooltip_active {
-            let _ = self.tray.tray.set_tooltip(Some(&self.default_tooltip));
+            self.restore_default_tooltip();
             self.hotkey_tooltip_active = false;
         }
     }
@@ -234,51 +243,58 @@ impl UiLoopState {
 
     /// Move the pip to the cursor and repaint it (or hide it) for this tick.
     pub(super) fn render_pip_or_hide(&mut self, tick: &TickSnapshot) {
-        let smooth_count = self.display_count.round() as u32;
-        unsafe {
-            if tick.want_visible {
-                let mut p = POINT::default();
-                if GetCursorPos(&mut p).is_ok() {
-                    let pos_changed =
-                        !matches!(self.last_pos, Some(prev) if prev.x == p.x && prev.y == p.y);
-                    let status_changed = tick.render_status != self.last_status;
-                    let count_changed = smooth_count != self.last_word_count;
-                    let spinner_changed = tick.show_spinner != self.last_spinner;
-                    // The error glyph depends on the kind, so a kind flip while
-                    // the status stays Error must still repaint (two back-to-back
-                    // errors of different kinds within the 2s pip window).
-                    let kind_changed = tick.render_kind != self.last_error_kind;
-                    // Render whenever anything changes — the smoothed counter
-                    // changes most frames during active dictation, giving a
-                    // fluid animation.
-                    if pos_changed
-                        || status_changed
-                        || count_changed
-                        || kind_changed
-                        || spinner_changed
-                        || tick.show_spinner
-                    {
-                        self.overlay.render(
-                            tick.render_status,
-                            tick.render_kind,
-                            smooth_count,
-                            tick.show_spinner.then_some(self.spinner_angle),
-                            p.x + PIP_OFFSET_X,
-                            p.y + PIP_OFFSET_Y,
-                        );
-                        self.last_pos = Some(p);
-                        self.last_word_count = smooth_count;
-                        self.last_error_kind = tick.render_kind;
-                    }
-                }
-            } else if self.last_status != Status::Idle || self.last_pos.is_some() {
-                self.overlay.hide();
-                self.last_pos = None;
-                self.last_word_count = u32::MAX;
-            }
+        if tick.want_visible {
+            self.render_pip_at_cursor(tick);
+        } else if self.last_status != Status::Idle || self.last_pos.is_some() {
+            unsafe { self.overlay.hide() };
+            self.last_pos = None;
+            self.last_word_count = u32::MAX;
         }
         self.last_status = tick.render_status;
         self.last_spinner = tick.show_spinner;
+    }
+
+    /// Repaint the pip beside the cursor if anything it shows has changed.
+    /// A failed cursor read skips this tick.
+    fn render_pip_at_cursor(&mut self, tick: &TickSnapshot) {
+        let smooth_count = self.display_count.round() as u32;
+        let mut p = POINT::default();
+        if unsafe { GetCursorPos(&mut p) }.is_err() || !self.pip_is_stale(tick, p, smooth_count) {
+            return;
+        }
+        unsafe {
+            self.overlay.render(
+                tick.render_status,
+                tick.render_kind,
+                smooth_count,
+                tick.show_spinner.then_some(self.spinner_angle),
+                p.x + PIP_OFFSET_X,
+                p.y + PIP_OFFSET_Y,
+            );
+        }
+        self.last_pos = Some(p);
+        self.last_word_count = smooth_count;
+        self.last_error_kind = tick.render_kind;
+    }
+
+    /// Render whenever anything changes — the smoothed counter changes most
+    /// frames during active dictation, giving a fluid animation — and on
+    /// every tick while the spinner turns.
+    fn pip_is_stale(&self, tick: &TickSnapshot, p: POINT, smooth_count: u32) -> bool {
+        let pos_changed = !matches!(self.last_pos, Some(prev) if prev.x == p.x && prev.y == p.y);
+        let status_changed = tick.render_status != self.last_status;
+        let count_changed = smooth_count != self.last_word_count;
+        let spinner_changed = tick.show_spinner != self.last_spinner;
+        // The error glyph depends on the kind, so a kind flip while the
+        // status stays Error must still repaint (two back-to-back errors of
+        // different kinds within the 2s pip window).
+        let kind_changed = tick.render_kind != self.last_error_kind;
+        pos_changed
+            || status_changed
+            || count_changed
+            || kind_changed
+            || spinner_changed
+            || tick.show_spinner
     }
 
     /// Fast cadence only while a real dictation needs the pip to track the

@@ -188,7 +188,9 @@ impl Stored {
 
 // ===== the live state =====
 
-fn now_ms() -> u64 {
+/// Wall-clock milliseconds, the unit both prompt schedules (this one and `feedback_survey`'s)
+/// persist their timestamps in.
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -235,28 +237,55 @@ fn parse_or_fresh(raw: &str, now: u64) -> NudgeState {
 }
 
 fn load() -> NudgeState {
-    let path = crate::paths::data_file(STATE_FILE);
-    let Ok(raw) = std::fs::read_to_string(&path) else {
-        return NudgeState::new(now_ms());
-    };
-    parse_or_fresh(&raw, now_ms())
+    load_state_file(STATE_FILE, parse_or_fresh, NudgeState::new)
 }
 
 fn persist(state: &NudgeState) {
-    let path = crate::paths::data_file(STATE_FILE);
-    let Ok(json) = serde_json::to_string_pretty(&Stored::from(state)) else {
+    save_state_file(STATE_FILE, &Stored::from(state), "nudge");
+}
+
+/// Run `f` against the live state, persisting whatever it changed.
+fn with_state<T>(f: impl FnOnce(&mut NudgeState) -> T) -> T {
+    with_persisted_state(&STATE, load, persist, f)
+}
+
+// ===== persistence shared with `feedback_survey` =====
+//
+// Both prompt schedules keep one process-wide state in a small JSON file under the same rules:
+// never fail, never block a dictation. One copy of those rules, so the two cannot drift apart.
+
+/// Read `file` from the data folder and turn it into a state with `parse`. A missing or unreadable
+/// file is `fresh`, never an error.
+pub(crate) fn load_state_file<S>(file: &str, parse: fn(&str, u64) -> S, fresh: fn(u64) -> S) -> S {
+    let path = crate::paths::data_file(file);
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return fresh(now_ms());
+    };
+    parse(&raw, now_ms())
+}
+
+/// Write `value` to `file` in the data folder as pretty JSON. `label` names the prompt in the log.
+pub(crate) fn save_state_file(file: &str, value: &impl Serialize, label: &str) {
+    let path = crate::paths::data_file(file);
+    let Ok(json) = serde_json::to_string_pretty(value) else {
         return;
     };
     if let Err(e) = std::fs::write(&path, json) {
         // Best-effort by design: see the module doc. A read-only data folder means the user gets
         // asked again another day, which is a far better outcome than a failed dictation.
-        tracing::debug!("nudge: could not save state to {}: {e}", path.display());
+        tracing::debug!("{label}: could not save state to {}: {e}", path.display());
     }
 }
 
-/// Run `f` against the live state, persisting whatever it changed.
-fn with_state<T>(f: impl FnOnce(&mut NudgeState) -> T) -> T {
-    let mut guard = match STATE.lock() {
+/// Run `f` against the state in `slot`, loading it on first touch and persisting whatever `f`
+/// changed.
+pub(crate) fn with_persisted_state<S, T>(
+    slot: &Mutex<Option<S>>,
+    load: fn() -> S,
+    persist: fn(&S),
+    f: impl FnOnce(&mut S) -> T,
+) -> T {
+    let mut guard = match slot.lock() {
         Ok(guard) => guard,
         // A poisoned lock means another thread panicked mid-update. The state is a prompt
         // schedule, not user data: recovering the value is the right call, and the alternative

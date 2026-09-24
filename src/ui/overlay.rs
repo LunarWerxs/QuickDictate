@@ -172,102 +172,75 @@ impl Overlay {
             *p = 0;
         }
 
-        // Disc color picked by status. Values are (R, G, B).
-        let (r, g, b) = match status {
-            Status::Idle => return, // window will be hidden; nothing to draw
-            Status::Starting => (0xFA, 0xB0, 0x05), // amber
-            Status::Listening => (0x22, 0xC5, 0x5E), // green
-            Status::Processing | Status::Finalizing => (0x4A, 0x90, 0xF5), // blue
-            Status::Error => (0xEF, 0x44, 0x44), // red
+        let Some(rgb) = disc_color(status) else {
+            return; // window will be hidden; nothing to draw
         };
         let cx = (self.size as f32 - 1.0) / 2.0;
         let cy = (self.size as f32 - 1.0) / 2.0;
-        // Leave 1 px gutter so the soft edge doesn't get cropped by the window.
-        let radius_outer = (self.size as f32 / 2.0) - 1.0;
-        // 1 px feather for the anti-aliased edge.
-        let edge = 1.0_f32;
-
-        for y in 0..self.size {
-            for x in 0..self.size {
-                let dx = x as f32 - cx;
-                let dy = y as f32 - cy;
-                let dist = (dx * dx + dy * dy).sqrt();
-                // Smooth alpha: 1.0 inside, ramps to 0 across `edge` pixels at the rim.
-                let a = ((radius_outer - dist) / edge).clamp(0.0, 1.0);
-                if a == 0.0 {
-                    continue;
-                }
-                let alpha = (a * 255.0 + 0.5) as u32;
-                // Premultiplied BGRA: BB GG RR AA stored as 0xAARRGGBB on
-                // little-endian (which Windows expects).
-                let pr = ((r as f32) * a + 0.5) as u32;
-                let pg = ((g as f32) * a + 0.5) as u32;
-                let pb = ((b as f32) * a + 0.5) as u32;
-                let idx = (y * self.size + x) as usize;
-                pixels[idx] = (alpha << 24) | (pr << 16) | (pg << 8) | pb;
-            }
-        }
+        fill_disc(pixels, self.size, cx, cy, rgb);
 
         if let Some(start_angle) = spinner_angle {
             // Local providers are batch-only, so a word count sits at zero
             // until the final transcript. Draw a rotating 270° ring instead.
             draw_spinner_ring(pixels, self.size, cx, cy, start_angle);
         } else {
-            // Draw the label on top. GDI doesn't touch the alpha channel, but
-            // the disc interior already has alpha=255, so text stays opaque.
-            let (label, use_icon_font): (String, bool) = match status {
-                Status::Error => {
-                    let (glyph, icon) = error_glyph(error_kind);
-                    (glyph.to_string(), icon)
-                }
-                _ => (format!("{word_count}"), false),
-            };
-            let mut label_utf16: Vec<u16> = label.encode_utf16().collect();
-            let font = if use_icon_font {
-                self.font_icon
-            } else {
-                self.font_ui
-            };
-            let old_font = SelectObject(self.mem_dc, font);
-            let _ = SetBkMode(self.mem_dc, TRANSPARENT);
-
-            // Drop shadow: 1 px down-right, black.
-            let _ = SetTextColor(self.mem_dc, COLORREF(0x00000000));
-            let mut shadow_rect = RECT {
-                left: 1,
-                top: 1,
-                right: self.size + 1,
-                bottom: self.size + 1,
-            };
-            DrawTextW(
-                self.mem_dc,
-                &mut label_utf16,
-                &mut shadow_rect,
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-            );
-            // Main text: white.
-            let _ = SetTextColor(self.mem_dc, COLORREF(0x00FFFFFF));
-            let mut text_rect = RECT {
-                left: 0,
-                top: 0,
-                right: self.size,
-                bottom: self.size,
-            };
-            DrawTextW(
-                self.mem_dc,
-                &mut label_utf16,
-                &mut text_rect,
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-            );
-            // No DeleteObject here: `font` is one of the cached
-            // `font_ui`/`font_icon` handles, freed once in `Drop` rather than
-            // every repaint.
-            SelectObject(self.mem_dc, old_font);
+            self.draw_label(status, error_kind, word_count);
         }
+        self.present(screen_x, screen_y);
+    }
 
-        // Ship the bitmap to the screen, also moving the window.
-        // UpdateLayeredWindow won't reveal a hidden window -- it only updates
-        // an already-visible one. So show it on first use.
+    /// Draw the label on top of the disc. GDI doesn't touch the alpha
+    /// channel, but the disc interior already has alpha=255, so text stays
+    /// opaque.
+    unsafe fn draw_label(&self, status: Status, error_kind: ErrorKind, word_count: u32) {
+        let (label, use_icon_font) = pip_label(status, error_kind, word_count);
+        let mut label_utf16: Vec<u16> = label.encode_utf16().collect();
+        let font = if use_icon_font {
+            self.font_icon
+        } else {
+            self.font_ui
+        };
+        let old_font = SelectObject(self.mem_dc, font);
+        let _ = SetBkMode(self.mem_dc, TRANSPARENT);
+
+        // Drop shadow: 1 px down-right, black.
+        let _ = SetTextColor(self.mem_dc, COLORREF(0x00000000));
+        let mut shadow_rect = RECT {
+            left: 1,
+            top: 1,
+            right: self.size + 1,
+            bottom: self.size + 1,
+        };
+        DrawTextW(
+            self.mem_dc,
+            &mut label_utf16,
+            &mut shadow_rect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
+        // Main text: white.
+        let _ = SetTextColor(self.mem_dc, COLORREF(0x00FFFFFF));
+        let mut text_rect = RECT {
+            left: 0,
+            top: 0,
+            right: self.size,
+            bottom: self.size,
+        };
+        DrawTextW(
+            self.mem_dc,
+            &mut label_utf16,
+            &mut text_rect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
+        // No DeleteObject here: `font` is one of the cached
+        // `font_ui`/`font_icon` handles, freed once in `Drop` rather than
+        // every repaint.
+        SelectObject(self.mem_dc, old_font);
+    }
+
+    /// Ship the bitmap to the screen, also moving the window.
+    /// UpdateLayeredWindow won't reveal a hidden window -- it only updates
+    /// an already-visible one. So show it on first use.
+    unsafe fn present(&self, screen_x: i32, screen_y: i32) {
         let pt_dst = POINT {
             x: screen_x,
             y: screen_y,
@@ -301,6 +274,61 @@ impl Overlay {
             let _ = ShowWindow(self.hwnd, SW_SHOWNA);
             self.visible.set(true);
         }
+    }
+}
+
+/// Disc color picked by status, as (R, G, B). `None` for Idle: the window
+/// will be hidden, so there is nothing to draw.
+pub(super) fn disc_color(status: Status) -> Option<(u8, u8, u8)> {
+    match status {
+        Status::Idle => None,
+        Status::Starting => Some((0xFA, 0xB0, 0x05)), // amber
+        Status::Listening => Some((0x22, 0xC5, 0x5E)), // green
+        Status::Processing | Status::Finalizing => Some((0x4A, 0x90, 0xF5)), // blue
+        Status::Error => Some((0xEF, 0x44, 0x44)),    // red
+    }
+}
+
+/// Paint the anti-aliased disc of `(r, g, b)` centered on `(cx, cy)` into
+/// the `size`x`size` premultiplied BGRA buffer, leaving the pixels outside
+/// it as they were.
+pub(super) fn fill_disc(pixels: &mut [u32], size: i32, cx: f32, cy: f32, (r, g, b): (u8, u8, u8)) {
+    // Leave 1 px gutter so the soft edge doesn't get cropped by the window.
+    let radius_outer = (size as f32 / 2.0) - 1.0;
+    // 1 px feather for the anti-aliased edge.
+    let edge = 1.0_f32;
+
+    for y in 0..size {
+        for x in 0..size {
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            let dist = (dx * dx + dy * dy).sqrt();
+            // Smooth alpha: 1.0 inside, ramps to 0 across `edge` pixels at the rim.
+            let a = ((radius_outer - dist) / edge).clamp(0.0, 1.0);
+            if a == 0.0 {
+                continue;
+            }
+            let alpha = (a * 255.0 + 0.5) as u32;
+            // Premultiplied BGRA: BB GG RR AA stored as 0xAARRGGBB on
+            // little-endian (which Windows expects).
+            let pr = ((r as f32) * a + 0.5) as u32;
+            let pg = ((g as f32) * a + 0.5) as u32;
+            let pb = ((b as f32) * a + 0.5) as u32;
+            let idx = (y * size + x) as usize;
+            pixels[idx] = (alpha << 24) | (pr << 16) | (pg << 8) | pb;
+        }
+    }
+}
+
+/// The text drawn on the disc and whether it needs the icon font: the
+/// error glyph while in Error, the live word count otherwise.
+pub(super) fn pip_label(status: Status, error_kind: ErrorKind, word_count: u32) -> (String, bool) {
+    match status {
+        Status::Error => {
+            let (glyph, icon) = error_glyph(error_kind);
+            (glyph.to_string(), icon)
+        }
+        _ => (format!("{word_count}"), false),
     }
 }
 

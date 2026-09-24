@@ -136,6 +136,10 @@ struct About {
     checking: bool,
     /// The GitHub mark, pre-composited on the pill fill so the blit is seamless.
     gh_icon: Option<HBITMAP>,
+    /// The logo and wordmark bitmaps, each with its SS_BITMAP static (raw
+    /// HWND). STM_SETIMAGE leaves them owned by us, so `WM_DESTROY` detaches
+    /// and frees them; otherwise every open/close cycle leaks both.
+    static_bitmaps: Vec<(isize, HBITMAP)>,
     /// Child HWNDs (as raw values) for hit-testing WM_SETCURSOR / invalidation.
     ver_pill: isize,
     status_pill: isize,
@@ -304,6 +308,7 @@ unsafe fn on_wm_create(hwnd: HWND) -> LRESULT {
         status: Status::Checking,
         checking: true,
         gh_icon: None,
+        static_bitmaps: Vec::new(),
         ver_pill: 0,
         status_pill: 0,
         lw_logo: 0,
@@ -472,6 +477,20 @@ unsafe fn on_wm_dpichanged(hwnd: HWND, lparam: LPARAM) -> LRESULT {
     LRESULT(0)
 }
 
+/// Free the logo and wordmark bitmaps here rather than in `WM_NCDESTROY`:
+/// the statics holding them still exist during the parent's `WM_DESTROY`
+/// and are gone by its `WM_NCDESTROY`, and only a live static can hand back
+/// the alpha copy comctl32 v6 made of each one.
+unsafe fn on_wm_destroy(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let st = about_state(hwnd);
+    if !st.is_null() {
+        for (ctl, hbmp) in (*st).static_bitmaps.drain(..) {
+            release_static_bitmap(HWND(ctl as *mut c_void), hbmp);
+        }
+    }
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
 unsafe fn on_wm_ncdestroy(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let _ = KillTimer(hwnd, SPINNER_TIMER);
     ABOUT_HWND.store(0, Ordering::Release);
@@ -487,37 +506,59 @@ unsafe fn on_wm_ncdestroy(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) 
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
+/// Every colour message the box answers. `None` for anything else, so the
+/// wndproc carries on to its own dispatch.
+unsafe fn on_ctlcolor(msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+    // Muted on-surface colours for the subtitle / license / copyright —
+    // handled BEFORE the generic static colouring.
+    if msg == WM_CTLCOLORSTATIC {
+        if let Some(r) = on_ctlcolorstatic(wparam, lparam) {
+            return Some(r);
+        }
+    }
+    dark_ctlcolor(msg, wparam)
+}
+
+/// The messages the box's own worker threads (and [`show_about_and_install`])
+/// post back to it. `None` for anything else.
+unsafe fn on_about_message(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> Option<LRESULT> {
+    match msg {
+        WM_ABOUT_CHECKED => Some(on_wm_about_checked(hwnd, wparam, lparam)),
+        WM_ABOUT_UPDATE_FAILED => Some(on_wm_about_update_failed(hwnd, lparam)),
+        WM_ABOUT_INSTALL => Some(begin_pending_install(hwnd)),
+        _ => None,
+    }
+}
+
+unsafe fn close_about(hwnd: HWND) -> LRESULT {
+    let _ = DestroyWindow(hwnd);
+    LRESULT(0)
+}
+
 extern "system" fn about_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
-        // Muted on-surface colours for the subtitle / license / copyright —
-        // handled BEFORE the generic static colouring.
-        if msg == WM_CTLCOLORSTATIC {
-            if let Some(r) = on_ctlcolorstatic(wparam, lparam) {
-                return r;
-            }
+        if let Some(r) = on_ctlcolor(msg, wparam, lparam) {
+            return r;
         }
-        if let Some(r) = dark_ctlcolor(msg, wparam) {
+        if let Some(r) = on_about_message(hwnd, msg, wparam, lparam) {
             return r;
         }
         match msg {
             WM_CREATE => on_wm_create(hwnd),
             WM_DRAWITEM => on_wm_drawitem(hwnd, lparam),
             WM_TIMER if wparam.0 == SPINNER_TIMER => on_wm_timer(hwnd),
-            WM_ABOUT_CHECKED => on_wm_about_checked(hwnd, wparam, lparam),
-            WM_ABOUT_UPDATE_FAILED => on_wm_about_update_failed(hwnd, lparam),
-            WM_ABOUT_INSTALL => begin_pending_install(hwnd),
             WM_COMMAND => on_wm_command(hwnd, wparam),
             WM_SETCURSOR => on_wm_setcursor(hwnd, msg, wparam, lparam),
-            WM_KEYDOWN if wparam.0 == 0x1B => {
-                // Esc closes (plain window — no dialog manager to send IDCANCEL).
-                let _ = DestroyWindow(hwnd);
-                LRESULT(0)
-            }
+            // Esc closes (plain window — no dialog manager to send IDCANCEL).
+            WM_KEYDOWN if wparam.0 == 0x1B => close_about(hwnd),
             WM_DPICHANGED => on_wm_dpichanged(hwnd, lparam),
-            WM_CLOSE => {
-                let _ = DestroyWindow(hwnd);
-                LRESULT(0)
-            }
+            WM_CLOSE => close_about(hwnd),
+            WM_DESTROY => on_wm_destroy(hwnd, msg, wparam, lparam),
             WM_NCDESTROY => on_wm_ncdestroy(hwnd, msg, wparam, lparam),
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }

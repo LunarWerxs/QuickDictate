@@ -31,45 +31,8 @@ impl StatsStore {
     }
 
     pub(super) fn load_from(path: PathBuf) -> Self {
-        let backup = path.with_extension("json.bak");
-        let source = if path.exists() || !backup.exists() {
-            path.clone()
-        } else {
-            tracing::warn!(
-                "{} was missing after an interrupted save; recovering stats from {}",
-                path.display(),
-                backup.display()
-            );
-            backup
-        };
-        let (mut stats, writable) = match fs::read_to_string(&source) {
-            Ok(json) => match serde_json::from_str(&json) {
-                Ok(stats) => (stats, true),
-                Err(e) => {
-                    let bad = path.with_extension("json.bad");
-                    match fs::copy(&source, &bad) {
-                        Ok(_) => tracing::warn!(
-                            "could not parse {}: {e}; backed it up to {} and reset stats",
-                            source.display(),
-                            bad.display()
-                        ),
-                        Err(copy_err) => tracing::warn!(
-                            "could not parse {}: {e}; reset stats (backup failed: {copy_err})",
-                            source.display()
-                        ),
-                    }
-                    (UsageStats::default(), true)
-                }
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (UsageStats::default(), true),
-            Err(e) => {
-                tracing::warn!(
-                    "could not read {}: {e}; keeping stats read-only so existing history cannot be overwritten",
-                    source.display()
-                );
-                (UsageStats::default(), false)
-            }
-        };
+        let source = recovery_source(&path);
+        let (mut stats, writable) = read_stats(&path, &source);
         let before_normalize = stats.clone();
         stats.normalize(unix_now());
         if writable && stats != before_normalize {
@@ -289,6 +252,62 @@ fn stats_path() -> PathBuf {
     crate::paths::data_file(STATS_FILE)
 }
 
+/// The file to load: `path`, unless a save was interrupted between staging
+/// the old file as `.bak` and moving the new one in, which leaves only the
+/// backup behind.
+fn recovery_source(path: &Path) -> PathBuf {
+    let backup = path.with_extension("json.bak");
+    if path.exists() || !backup.exists() {
+        return path.to_path_buf();
+    }
+    tracing::warn!(
+        "{} was missing after an interrupted save; recovering stats from {}",
+        path.display(),
+        backup.display()
+    );
+    backup
+}
+
+/// Read and parse `source`, and whether the store may write `path` later.
+/// Missing or unparseable (set aside as `.bad`) starts over writable; any
+/// other read error starts over read-only, so history that exists but could
+/// not be read is never overwritten.
+fn read_stats(path: &Path, source: &Path) -> (UsageStats, bool) {
+    match fs::read_to_string(source) {
+        Ok(json) => match serde_json::from_str(&json) {
+            Ok(stats) => (stats, true),
+            Err(e) => {
+                quarantine_unparseable(path, source, &e);
+                (UsageStats::default(), true)
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (UsageStats::default(), true),
+        Err(e) => {
+            tracing::warn!(
+                "could not read {}: {e}; keeping stats read-only so existing history cannot be overwritten",
+                source.display()
+            );
+            (UsageStats::default(), false)
+        }
+    }
+}
+
+/// Copy an unparseable stats file aside as `.bad` before it is reset.
+fn quarantine_unparseable(path: &Path, source: &Path, e: &serde_json::Error) {
+    let bad = path.with_extension("json.bad");
+    match fs::copy(source, &bad) {
+        Ok(_) => tracing::warn!(
+            "could not parse {}: {e}; backed it up to {} and reset stats",
+            source.display(),
+            bad.display()
+        ),
+        Err(copy_err) => tracing::warn!(
+            "could not parse {}: {e}; reset stats (backup failed: {copy_err})",
+            source.display()
+        ),
+    }
+}
+
 fn save_atomic(path: &Path, stats: &UsageStats) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -298,31 +317,9 @@ fn save_atomic(path: &Path, stats: &UsageStats) -> Result<(), String> {
         .map_err(|e| format!("could not serialize {}: {e}", path.display()))?;
     let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
     let backup = path.with_extension("json.bak");
-    let mut file =
-        fs::File::create(&tmp).map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
-    file.write_all(&json)
-        .and_then(|()| file.sync_all())
-        .map_err(|e| format!("could not flush {}: {e}", tmp.display()))?;
-    drop(file);
-
+    write_synced(&tmp, &json)?;
     if path.exists() {
-        match fs::remove_file(&backup) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(format!(
-                    "could not clear old stats backup {}: {e}",
-                    backup.display()
-                ))
-            }
-        }
-        fs::rename(path, &backup).map_err(|e| {
-            format!(
-                "could not stage {} for replacement at {}: {e}",
-                path.display(),
-                backup.display()
-            )
-        })?;
+        stage_backup(path, &backup)?;
     }
     if let Err(e) = fs::rename(&tmp, path) {
         if backup.exists() && !path.exists() {
@@ -332,4 +329,36 @@ fn save_atomic(path: &Path, stats: &UsageStats) -> Result<(), String> {
     }
     let _ = fs::remove_file(backup);
     Ok(())
+}
+
+/// Write `bytes` to `tmp` and flush them to disk before it is renamed into
+/// place, so a crash can never leave a half-written stats file behind.
+fn write_synced(tmp: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut file =
+        fs::File::create(tmp).map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|e| format!("could not flush {}: {e}", tmp.display()))
+}
+
+/// Move the current file aside to `backup` (clearing a stale one first), so
+/// the rename that follows never replaces the only good copy.
+fn stage_backup(path: &Path, backup: &Path) -> Result<(), String> {
+    match fs::remove_file(backup) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "could not clear old stats backup {}: {e}",
+                backup.display()
+            ))
+        }
+    }
+    fs::rename(path, backup).map_err(|e| {
+        format!(
+            "could not stage {} for replacement at {}: {e}",
+            path.display(),
+            backup.display()
+        )
+    })
 }
