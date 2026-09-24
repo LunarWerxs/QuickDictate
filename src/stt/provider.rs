@@ -194,6 +194,15 @@ pub trait SttProvider: Send + Sync {
         None
     }
 
+    /// Whether the account check must commit its audio before the provider
+    /// will say anything about the account. OpenAI Realtime reports a key with
+    /// no credit only when it transcribes a committed buffer (a
+    /// `transcription.failed` carrying `insufficient_quota`, measured
+    /// 2026-09-11), so a check that only streams would pass every such key.
+    fn account_check_commits(&self) -> bool {
+        false
+    }
+
     /// Whether this provider sends interim transcripts WHILE the user is
     /// still talking. The pip's live word count is built out of those, so a
     /// provider that answers only after the audio is committed leaves it

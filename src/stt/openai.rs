@@ -49,6 +49,19 @@ impl SttProvider for OpenAiProvider {
         false
     }
 
+    /// A key with no credit left connects and accepts audio; OpenAI says so
+    /// only once it transcribes a committed buffer. One second of faint noise,
+    /// committed, surfaces it at startup (once per key, recorded in
+    /// `key_checks`) instead of on the user's first dictation, for a
+    /// fraction of a cent.
+    fn account_check_audio(&self) -> Option<std::time::Duration> {
+        Some(std::time::Duration::from_secs(1))
+    }
+
+    fn account_check_commits(&self) -> bool {
+        true
+    }
+
     fn final_transcript_timeout(&self) -> std::time::Duration {
         // Realtime `.completed` has taken a little over two seconds in field
         // logs. The socket intentionally remains open after commit, so give

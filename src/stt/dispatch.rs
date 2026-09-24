@@ -205,6 +205,7 @@ pub(super) async fn check_account(
     };
     let chunk = account_chunk(opts.sample_rate);
     let chunks = audio.as_millis() / 100;
+    let commit = provider.account_check_commits();
     // `Some(outcome)` if the stream settled it first; `None` if the whole
     // stream went out and the listening window passed without a word.
     let heard = tokio::select! {
@@ -217,6 +218,9 @@ pub(super) async fn check_account(
                     break;
                 }
                 tokio::time::sleep(ACCOUNT_CHECK_PACE).await;
+            }
+            if commit {
+                let _ = sink.commit().await;
             }
             tokio::time::sleep(ACCOUNT_CHECK_LISTEN).await;
         } => None,
@@ -486,26 +490,36 @@ mod tests {
     }
 
     #[test]
-    fn only_elevenlabs_needs_an_account_check() {
-        for id in [
-            "deepgram",
-            "assemblyai",
-            "dashscope",
-            "google",
-            "local",
-            "openai",
-        ] {
+    fn only_elevenlabs_and_openai_need_an_account_check() {
+        for id in ["deepgram", "assemblyai", "dashscope", "google", "local"] {
+            let provider = make_provider(&with_provider(id));
             assert!(
-                make_provider(&with_provider(id))
-                    .account_check_audio()
-                    .is_none(),
+                provider.account_check_audio().is_none(),
                 "{id} would spend quota on a check it does not need"
             );
+            assert!(!provider.account_check_commits());
         }
-        let audio = make_provider(&with_provider("elevenlabs")).account_check_audio();
+        let elevenlabs = make_provider(&with_provider("elevenlabs"));
         assert!(
-            audio.is_some_and(|a| a > Duration::from_secs(11)),
+            elevenlabs
+                .account_check_audio()
+                .is_some_and(|a| a > Duration::from_secs(11)),
             "ElevenLabs rejects at about ten seconds of audio"
+        );
+        assert!(
+            !elevenlabs.account_check_commits(),
+            "ElevenLabs rejects mid-stream; a commit would only buy an empty transcript"
+        );
+        let openai = make_provider(&with_provider("openai"));
+        assert!(
+            openai
+                .account_check_audio()
+                .is_some_and(|a| a <= Duration::from_secs(1)),
+            "OpenAI needs only enough audio to commit"
+        );
+        assert!(
+            openai.account_check_commits(),
+            "OpenAI says nothing about credit until a buffer is committed"
         );
     }
 }
