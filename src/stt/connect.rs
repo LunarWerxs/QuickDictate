@@ -4,7 +4,6 @@
 //! subscribes to the audio pipeline, and connects the provider -- rotating
 //! keys on the failures that are the key's fault.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,13 +12,13 @@ use tokio::time::Instant;
 
 use crate::config::Config;
 use crate::keys::KeyPool;
-use crate::state::{App, Status};
+use crate::state::App;
 
 use super::dispatch::make_provider_id;
 use super::provider::{
     AudioFormat, ProviderSession, ProviderSink, ProviderStream, SttProvider, SttSessionOpts,
 };
-use super::{SessionAbort, CONNECT_TIMEOUT, ERROR_PIP_VISIBLE};
+use super::{show_error_pip, Press, SessionAbort, CONNECT_TIMEOUT};
 
 /// How a live session opens a REPLACEMENT connection when its server goes
 /// quiet: the same provider, the same key, the same options. Built only for
@@ -117,61 +116,46 @@ pub(super) fn audio_capture_unhealthy(app: &Arc<App>, epoch: u64) -> bool {
     );
     if app.current_session_epoch() == epoch {
         // A lost mic is a generic error (the "!" pip), not a key problem.
-        app.raise_error(crate::state::ErrorKind::Generic);
-        let app_for_clear = Arc::clone(app);
-        app.rt.spawn(async move {
-            tokio::time::sleep(ERROR_PIP_VISIBLE).await;
-            if app_for_clear.current_session_epoch() == epoch {
-                app_for_clear.clear_status_if(Status::Error, Status::Idle);
-            }
-        });
+        show_error_pip(app, epoch, crate::state::ErrorKind::Generic);
     }
     true
 }
 
 /// Resolve config/per-app-profile overrides, acquire a key, and connect.
-/// `Ok(None)` means the connection succeeded but the press it belongs to is
-/// already superseded (a newer epoch started, or `stop` fired) -- the caller
-/// returns `Ok(())` without spawning anything. A key the provider refuses at
-/// connect is marked failed in the pool and reported as
-/// [`SessionAbort::KeyRejected`] so the retry shell moves to the next key
-/// `tried` does not yet name; a handshake that never answers is
+/// `Ok(None)` means the connection succeeded but the user discarded the press
+/// meanwhile -- the caller returns `Ok(())` without spawning anything. A key
+/// the provider refuses at connect is marked failed in the pool and reported
+/// as [`SessionAbort::KeyRejected`] so the retry shell moves to the next key
+/// `press.tried` does not yet name; a handshake that never answers is
 /// [`SessionAbort::ConnectTimedOut`], which ends the press without blaming
 /// any key. A no-key-required provider's connect error is returned raw.
 pub(super) async fn establish_connected_session(
     app: &Arc<App>,
     keys: Arc<KeyPool>,
-    stop: &Arc<AtomicBool>,
     epoch: u64,
-    tried: &mut Vec<String>,
+    press: &mut Press,
 ) -> Result<Option<ConnectedSession>> {
     let cfg = app.config.load_full();
-    // Resolve Per-App Profile overrides ONCE, at session start. The profile
-    // that matters for provider/language is the one for the window the user
-    // was in when they pressed the hotkey; the text-processing profile is
-    // resolved separately at commit time in output.rs, because by then focus
-    // may legitimately have moved.
-    let exe_at_start = crate::focus::foreground_exe_name();
-    let effective = cfg.effective_settings(exe_at_start.as_deref());
-    let resolved_provider = cfg.provider_for_exe(exe_at_start.as_deref());
-    // A profile that names a DIFFERENT provider needs that provider's keys,
-    // so the session runs on that provider's pool -- the one `App` keeps per
-    // provider, so what this attempt learns about a key survives to the next
-    // attempt and the next press. (Building a fresh pool here, as this once
-    // did, forgot every rejection the moment it was recorded, and a dead key
-    // was tried again on every single attempt.) Everything else keeps using
-    // the shared pool the main loop maintains.
-    let keys = match resolved_provider.as_deref() {
-        Some(want) if want != keys.provider_id() => {
-            tracing::info!(
-                "session[{epoch}] profile for {:?} overrides the provider: {} -> {want}",
-                exe_at_start.as_deref().unwrap_or("<unknown>"),
-                keys.provider_id()
-            );
-            app.pool_for_provider(&cfg, want)
-        }
-        _ => keys,
-    };
+    // The profile that matters for provider/language is the one for the
+    // window the user was in when they pressed the hotkey, which the retry
+    // shell resolved ONCE for the whole press: an attempt after a key
+    // rotation must not re-read it from whatever window is in front by then.
+    // The text-processing profile is resolved separately at commit time in
+    // output.rs, because by then focus may legitimately have moved.
+    let exe_at_start = press.exe_at_start.as_deref();
+    let effective = cfg.effective_settings(exe_at_start);
+    let resolved_provider = cfg.provider_for_exe(exe_at_start);
+    let keys = pool_for_profile(
+        app,
+        &cfg,
+        keys,
+        resolved_provider.as_deref(),
+        exe_at_start,
+        epoch,
+    );
+    // Recorded before anything below can fail, so the retry shell reports a
+    // rejected key against the pool it came from.
+    press.pool = Some(Arc::clone(&keys));
     let provider: Arc<dyn SttProvider> = Arc::from(make_provider_id(
         resolved_provider.as_deref().unwrap_or(&cfg.stt_provider),
         &cfg,
@@ -185,29 +169,7 @@ pub(super) async fn establish_connected_session(
     // end-of-stream). Read once here so the recv task captures a plain bool.
     let suppress_phantom = provider.suppress_phantom_finalization();
 
-    let key = if requires_api_key {
-        match keys.acquire_excluding(tried) {
-            Some(k) => {
-                tried.push(k.clone());
-                k
-            }
-            // Nothing this press has not already tried, or nothing at all.
-            // The retry shell reads "no key acquired" off `tried` and stops.
-            None => return Err(SessionAbort::KeyRejected.into()),
-        }
-    } else {
-        String::new()
-    };
-    // Positional label, never a slice of the credential: log files end up
-    // attached to bug reports.
-    let key_suffix = keys.label(&key);
-    if requires_api_key {
-        tracing::info!("session[{epoch}] provider={provider_id} using key {key_suffix}");
-        *app.current_key.lock() = Some(key.clone());
-    } else {
-        tracing::info!("session[{epoch}] provider={provider_id} (no API key)");
-        *app.current_key.lock() = None;
-    }
+    let (key, key_suffix) = acquire_key(app, &keys, provider.as_ref(), &mut press.tried, epoch)?;
 
     let fmt = provider.required_audio_format();
     let opts = SttSessionOpts {
@@ -223,13 +185,121 @@ pub(super) async fn establish_connected_session(
     // per-session resampler.
     let (samples_rx, flusher) = app.audio.subscribe(fmt.sample_rate);
 
+    let ProviderSession { sink, stream } =
+        connect_provider(provider.as_ref(), &keys, &key, &key_suffix, &opts, epoch).await?;
+
+    // Only a dictation the user threw away ends here. Letting go before the
+    // handshake finished, or pressing again, does not: the audio buffered in
+    // `samples_rx` since the subscribe above is what they said, and the
+    // release phase ships it exactly as it would have had the release come a
+    // moment after the connect. Dropping it made keeping a press depend on
+    // network latency, and a superseded press's words must still land.
+    if app.session_discarded(epoch) {
+        return Ok(None);
+    }
+
+    let recovery = provider
+        .supports_stall_recovery()
+        .then(|| Reconnector::new(Arc::clone(&provider), key.clone(), opts.clone()));
+
+    Ok(Some(ConnectedSession {
+        cfg,
+        keys,
+        key,
+        key_suffix,
+        requires_api_key,
+        finalize_timeout,
+        final_transcript_timeout,
+        suppress_phantom,
+        provider_id,
+        fmt,
+        samples_rx,
+        flusher,
+        sink,
+        stream,
+        recovery,
+    }))
+}
+
+/// The key pool a press on `resolved_provider` runs on. A profile that names
+/// a DIFFERENT provider needs that provider's keys, so the session runs on
+/// that provider's pool -- the one `App` keeps per provider, so what this
+/// attempt learns about a key survives to the next attempt and the next
+/// press. (Building a fresh pool here, as this once did, forgot every
+/// rejection the moment it was recorded, and a dead key was tried again on
+/// every single attempt.) Everything else keeps using the shared pool the
+/// main loop maintains.
+fn pool_for_profile(
+    app: &App,
+    cfg: &Config,
+    keys: Arc<KeyPool>,
+    resolved_provider: Option<&str>,
+    exe_at_start: Option<&str>,
+    epoch: u64,
+) -> Arc<KeyPool> {
+    match resolved_provider {
+        Some(want) if want != keys.provider_id() => {
+            tracing::info!(
+                "session[{epoch}] profile for {:?} overrides the provider: {} -> {want}",
+                exe_at_start.unwrap_or("<unknown>"),
+                keys.provider_id()
+            );
+            app.pool_for_provider(cfg, want)
+        }
+        _ => keys,
+    }
+}
+
+/// Take the next key this press has not tried yet (none at all for a
+/// provider that needs no key), record it in `tried`, and publish it as the
+/// app's current key. Returns the key and its log label. With nothing untried
+/// left (or nothing configured) it is [`SessionAbort::KeyRejected`]; the retry
+/// shell reads "no key acquired" off `tried` and stops.
+fn acquire_key(
+    app: &App,
+    keys: &KeyPool,
+    provider: &dyn SttProvider,
+    tried: &mut Vec<String>,
+    epoch: u64,
+) -> Result<(String, String)> {
+    let provider_id = provider.id();
+    let requires_api_key = provider.requires_api_key();
+    let key = if requires_api_key {
+        let key = keys
+            .acquire_excluding(tried)
+            .ok_or(SessionAbort::KeyRejected)?;
+        tried.push(key.clone());
+        key
+    } else {
+        String::new()
+    };
+    // Positional label, never a slice of the credential: log files end up
+    // attached to bug reports.
+    let key_suffix = keys.label(&key);
+    if requires_api_key {
+        tracing::info!("session[{epoch}] provider={provider_id} using key {key_suffix}");
+        *app.current_key.lock() = Some(key.clone());
+    } else {
+        tracing::info!("session[{epoch}] provider={provider_id} (no API key)");
+        *app.current_key.lock() = None;
+    }
+    Ok((key, key_suffix))
+}
+
+/// Open the provider connection under [`CONNECT_TIMEOUT`], sorting a failure
+/// into what the retry shell does next: rotate keys, or stop the press.
+async fn connect_provider(
+    provider: &dyn SttProvider,
+    keys: &KeyPool,
+    key: &str,
+    key_suffix: &str,
+    opts: &SttSessionOpts,
+    epoch: u64,
+) -> Result<ProviderSession> {
+    let provider_id = provider.id();
+    let requires_api_key = provider.requires_api_key();
     let connect_start = Instant::now();
-    let ProviderSession { sink, stream } = match tokio::time::timeout(
-        CONNECT_TIMEOUT,
-        provider.connect(&key, &opts),
-    )
-    .await
-    {
+    let session = match tokio::time::timeout(CONNECT_TIMEOUT, provider.connect(key, opts)).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             if !requires_api_key {
@@ -240,7 +310,7 @@ pub(super) async fn establish_connected_session(
             // rotate to the next key instead of giving up on the whole press.
             // (This was the DashScope red-"!" bug: its arrears error surfaces
             // at connect, and a plain error here killed the session outright.)
-            keys.mark_failed(&key, provider.classify_connect_error(&e));
+            keys.mark_failed(key, provider.classify_connect_error(&e));
             tracing::warn!(
                 "session[{epoch}] {provider_id} connect failed with key ...{key_suffix}: {e}"
             );
@@ -268,30 +338,5 @@ pub(super) async fn establish_connected_session(
         "session[{epoch}] {provider_id} connected in {:?}",
         connect_start.elapsed()
     );
-
-    if app.current_session_epoch() != epoch || stop.load(Ordering::Acquire) {
-        return Ok(None);
-    }
-
-    let recovery = provider
-        .supports_stall_recovery()
-        .then(|| Reconnector::new(Arc::clone(&provider), key.clone(), opts.clone()));
-
-    Ok(Some(ConnectedSession {
-        cfg,
-        keys,
-        key,
-        key_suffix,
-        requires_api_key,
-        finalize_timeout,
-        final_transcript_timeout,
-        suppress_phantom,
-        provider_id,
-        fmt,
-        samples_rx,
-        flusher,
-        sink,
-        stream,
-        recovery,
-    }))
+    Ok(session)
 }

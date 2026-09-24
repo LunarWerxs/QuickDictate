@@ -1,8 +1,8 @@
 //! Tests for the provider-agnostic session runner.
 
 use super::heuristics::{
-    is_phantom_finalization, looks_like_short_answer, transcripts_equivalent,
-    transport_failure_lost_speech,
+    failure_to_surface, is_phantom_finalization, looks_like_short_answer, transcripts_equivalent,
+    transport_failure_lost_speech, CUT_OFF_MID_PRESS,
 };
 use super::send_task::TailSilenceGate;
 use super::{audio_duration_ms, SentAudio, SessionUsage};
@@ -100,6 +100,56 @@ fn a_reset_after_the_words_landed_is_teardown_not_failure() {
     // get typed, so how the socket closed afterwards is not their problem.
     assert!(!transport_failure_lost_speech(27, false));
     assert!(!transport_failure_lost_speech(27, true));
+}
+
+#[test]
+fn a_provider_failure_on_a_press_that_typed_nothing_raises_the_pip() {
+    // A local model that would not load, or a Google upload whose every
+    // retry failed: the socket never died, but nothing was typed and the
+    // adapter said why. This used to end the press quietly as "empty".
+    assert_eq!(
+        failure_to_surface(0, false, Some("model not installed"), None),
+        Some("model not installed")
+    );
+    // It names the cause even when the transport also had something to say.
+    assert_eq!(
+        failure_to_surface(0, true, Some("model not installed"), Some("reset")),
+        Some("model not installed")
+    );
+}
+
+#[test]
+fn a_provider_failure_after_words_landed_is_logged_not_a_pip() {
+    assert_eq!(
+        failure_to_surface(12, false, Some("one segment"), None),
+        None
+    );
+    assert_eq!(
+        failure_to_surface(12, true, Some("one segment"), None),
+        None
+    );
+}
+
+#[test]
+fn a_server_that_closed_cleanly_mid_press_still_raises_the_pip() {
+    // A Close frame ends the recv task without recording a read error, but
+    // the send half watched the socket die before any word came back.
+    assert_eq!(
+        failure_to_surface(0, true, None, None),
+        Some(CUT_OFF_MID_PRESS)
+    );
+    assert_eq!(
+        failure_to_surface(0, true, None, Some("reset")),
+        Some("reset")
+    );
+}
+
+#[test]
+fn a_transport_teardown_that_cost_nothing_stays_quiet() {
+    // The empty press and the reset after the words landed, as before.
+    assert_eq!(failure_to_surface(0, false, None, Some("reset")), None);
+    assert_eq!(failure_to_surface(27, true, None, Some("reset")), None);
+    assert_eq!(failure_to_surface(0, false, None, None), None);
 }
 
 #[test]

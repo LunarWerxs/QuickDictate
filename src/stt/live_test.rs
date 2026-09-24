@@ -19,7 +19,7 @@
 
 use std::time::Duration;
 
-use super::provider::{ProviderSession, SttEvent, SttProvider, SttSessionOpts};
+use super::provider::{ProviderSession, ProviderStream, SttEvent, SttProvider, SttSessionOpts};
 
 const KEYS_ENV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/my.keys.env");
 const WAV_16K: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-audio/speech_16k.wav");
@@ -105,10 +105,74 @@ async fn probe(provider: &dyn SttProvider, key: &str, samples: Vec<i16>) -> anyh
         let _ = sink.close().await;
     });
 
-    let mut committed = String::new();
-    let mut last_partial = String::new();
-    let mut first_partial_at: Option<Duration> = None;
-    let mut partials: usize = 0;
+    let heard = collect_events(stream.as_mut(), started, audio_ends).await?;
+    let _ = send.await;
+    eprintln!(
+        "  [{:6.2}s] stream ended: {} partial(s), first partial at {}",
+        started.elapsed().as_secs_f64(),
+        heard.partials,
+        heard
+            .first_partial_at
+            .map(|d| format!("{:.2}s", d.as_secs_f64()))
+            .unwrap_or_else(|| "never".into())
+    );
+    Ok(heard.transcript())
+}
+
+/// What one live session said back, and the timeline numbers that decide
+/// whether its provider may opt into stall recovery.
+#[derive(Default)]
+struct Heard {
+    committed: String,
+    last_partial: String,
+    first_partial_at: Option<Duration>,
+    partials: usize,
+}
+
+impl Heard {
+    fn on_committed(&mut self, t: &str, started: tokio::time::Instant) {
+        eprintln!(
+            "  [{:6.2}s] committed ({} words)",
+            started.elapsed().as_secs_f64(),
+            t.split_whitespace().count()
+        );
+        if !self.committed.is_empty() {
+            self.committed.push(' ');
+        }
+        self.committed.push_str(t);
+    }
+
+    fn on_partial(&mut self, t: String, started: tokio::time::Instant) {
+        self.partials += 1;
+        if self.first_partial_at.is_none() {
+            self.first_partial_at = Some(started.elapsed());
+        }
+        eprintln!(
+            "  [{:6.2}s] partial ({} words)",
+            started.elapsed().as_secs_f64(),
+            t.split_whitespace().count()
+        );
+        self.last_partial = t;
+    }
+
+    /// The committed text, or the last partial if nothing ever committed.
+    fn transcript(self) -> String {
+        if self.committed.trim().is_empty() {
+            self.last_partial
+        } else {
+            self.committed
+        }
+    }
+}
+
+/// Read the session's events until it ends or goes quiet past its deadline.
+/// A key or provider failure is the error the caller rotates keys on.
+async fn collect_events(
+    stream: &mut dyn ProviderStream,
+    started: tokio::time::Instant,
+    audio_ends: tokio::time::Instant,
+) -> anyhow::Result<Heard> {
+    let mut heard = Heard::default();
     let hard_deadline = tokio::time::Instant::now() + Duration::from_secs(25);
     // Once a final chunk lands we only linger briefly for more (multi-segment),
     // rather than waiting out the hard deadline — OpenAI keeps the socket open.
@@ -120,31 +184,12 @@ async fn probe(provider: &dyn SttProvider, key: &str, samples: Vec<i16>) -> anyh
         };
         match ev {
             Ok(Some(SttEvent::Committed(t))) => {
-                eprintln!(
-                    "  [{:6.2}s] committed ({} words)",
-                    started.elapsed().as_secs_f64(),
-                    t.split_whitespace().count()
-                );
-                if !committed.is_empty() {
-                    committed.push(' ');
-                }
-                committed.push_str(&t);
+                heard.on_committed(&t, started);
                 deadline = (tokio::time::Instant::now() + Duration::from_millis(1500))
                     .max(audio_ends + Duration::from_millis(2500))
                     .min(hard_deadline);
             }
-            Ok(Some(SttEvent::Partial(t))) => {
-                partials += 1;
-                if first_partial_at.is_none() {
-                    first_partial_at = Some(started.elapsed());
-                }
-                eprintln!(
-                    "  [{:6.2}s] partial ({} words)",
-                    started.elapsed().as_secs_f64(),
-                    t.split_whitespace().count()
-                );
-                last_partial = t;
-            }
+            Ok(Some(SttEvent::Partial(t))) => heard.on_partial(t, started),
             Ok(Some(SttEvent::KeyFailure(k))) => {
                 return Err(anyhow::anyhow!("provider signaled key failure: {k:?}"))
             }
@@ -164,19 +209,7 @@ async fn probe(provider: &dyn SttProvider, key: &str, samples: Vec<i16>) -> anyh
             }
         }
     }
-    let _ = send.await;
-    eprintln!(
-        "  [{:6.2}s] stream ended: {partials} partial(s), first partial at {}",
-        started.elapsed().as_secs_f64(),
-        first_partial_at
-            .map(|d| format!("{:.2}s", d.as_secs_f64()))
-            .unwrap_or_else(|| "never".into())
-    );
-    Ok(if committed.trim().is_empty() {
-        last_partial
-    } else {
-        committed
-    })
+    Ok(heard)
 }
 
 /// Assert the transcript looks like our known phrase (robust to STT variation).
