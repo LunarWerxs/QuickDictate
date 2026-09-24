@@ -32,32 +32,44 @@ pub(super) struct ModalOutcome {
     pub(super) do_overwrite: bool,
 }
 
+/// The hairline between a modal's body and its closing button row.
+pub(super) fn modal_footer_rule(ui: &mut egui::Ui) {
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(6.0);
+}
+
+/// The right-aligned Done / Cancel pair that closes an editor modal: Done
+/// commits its rows into the draft, Cancel throws them away. Shared so the
+/// two editors cannot come to disagree on which button does which.
+pub(super) fn done_cancel_buttons(ui: &mut egui::Ui, out: &mut ModalOutcome) {
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if accent_button(ui, "Done").clicked() {
+            out.action = ModalAction::Commit;
+        }
+        if ui.button("Cancel").clicked() {
+            out.action = ModalAction::Cancel;
+        }
+    });
+}
+
 /// The "Default settings" confirm-before-destroy modal.
 fn render_default_reset_modal(ctx: &egui::Context, out: &mut ModalOutcome) {
     let backdrop = SettingsApp::modal_frame(ctx, "Reset all settings?", 380.0, |ui| {
-        egui::Frame::new()
-            .fill(bad().gamma_multiply(0.09))
-            .stroke(Stroke::new(1.0, bad().gamma_multiply(0.45)))
-            .corner_radius(CornerRadius::same(8))
-            .inner_margin(Margin::symmetric(10, 8))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(
-                    RichText::new(
-                        "This resets every setting back to its default \u{2014} \
-                         provider, hotkeys, replacements, and profiles. Your API \
-                         keys are kept. This cannot be undone.",
-                    )
-                    .size(11.5)
-                    .color(text()),
-                );
-            });
+        danger_box(ui, |ui| {
+            ui.label(
+                RichText::new(
+                    "This resets every setting back to its default \u{2014} \
+                     provider, hotkeys, replacements, and profiles. Your API \
+                     keys are kept. This cannot be undone.",
+                )
+                .size(11.5)
+                .color(text()),
+            );
+        });
         ui.add_space(12.0);
         ui.horizontal(|ui| {
-            if ui
-                .button(RichText::new("Reset").font(semibold(11.5)).color(bad()))
-                .clicked()
-            {
+            if danger_button(ui, "Reset").clicked() {
                 out.do_default_reset = true;
                 out.action = ModalAction::Cancel;
             }
@@ -71,24 +83,41 @@ fn render_default_reset_modal(ctx: &egui::Context, out: &mut ModalOutcome) {
     }
 }
 
-/// The "you have unsaved changes" close-confirm modal.
-fn render_unsaved_changes_modal(ctx: &egui::Context, out: &mut ModalOutcome) {
-    let backdrop = SettingsApp::modal_frame(ctx, "Unsaved changes", 380.0, |ui| {
-        ui.label(
-            RichText::new(
-                "You have unsaved changes. Save them before closing, or discard \
-                 them?",
-            )
-            .size(12.5)
-            .color(text()),
-        );
+/// Which way a [`render_two_way_prompt`] was answered this frame.
+enum Choice {
+    None,
+    /// The accent button.
+    Primary,
+    /// The red button, whichever of the two ways discards something.
+    Destructive,
+}
+
+/// A prompt with two ways forward plus Cancel: the question, an accent
+/// primary button, a red destructive one, and Cancel on the right. Shared by
+/// the close and on-disk-change prompts so they keep one layout and one rule
+/// for what a dismiss means.
+///
+/// Escape/backdrop = Cancel (keep editing), never either answer — an
+/// accidental dismiss must never be the thing that throws away edits.
+fn render_two_way_prompt(
+    ctx: &egui::Context,
+    title: &str,
+    width: f32,
+    question: &str,
+    primary: &str,
+    destructive: &str,
+    out: &mut ModalOutcome,
+) -> Choice {
+    let mut choice = Choice::None;
+    let backdrop = SettingsApp::modal_frame(ctx, title, width, |ui| {
+        ui.label(RichText::new(question).size(12.5).color(text()));
         ui.add_space(12.0);
         ui.horizontal(|ui| {
-            if accent_button(ui, "Save").clicked() {
-                out.do_close_save = true;
+            if accent_button(ui, primary).clicked() {
+                choice = Choice::Primary;
             }
-            if ui.button(RichText::new("Discard").color(bad())).clicked() {
-                out.do_close_discard = true;
+            if ui.button(RichText::new(destructive).color(bad())).clicked() {
+                choice = Choice::Destructive;
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Cancel").clicked() {
@@ -97,43 +126,47 @@ fn render_unsaved_changes_modal(ctx: &egui::Context, out: &mut ModalOutcome) {
             });
         });
     });
-    // Escape/backdrop = Cancel (keep editing), never Discard — an
-    // accidental dismiss must never be the thing that throws away edits.
     if backdrop || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         out.action = ModalAction::Cancel;
+    }
+    choice
+}
+
+/// The "you have unsaved changes" close-confirm modal.
+fn render_unsaved_changes_modal(ctx: &egui::Context, out: &mut ModalOutcome) {
+    match render_two_way_prompt(
+        ctx,
+        "Unsaved changes",
+        380.0,
+        "You have unsaved changes. Save them before closing, or discard \
+         them?",
+        "Save",
+        "Discard",
+        out,
+    ) {
+        Choice::Primary => out.do_close_save = true,
+        Choice::Destructive => out.do_close_discard = true,
+        Choice::None => {}
     }
 }
 
 /// The "settings.json changed on disk" reload-vs-overwrite modal.
 fn render_external_change_modal(ctx: &egui::Context, out: &mut ModalOutcome) {
-    let backdrop = SettingsApp::modal_frame(ctx, "settings.json changed on disk", 420.0, |ui| {
-        ui.label(
-            RichText::new(
-                "settings.json changed on disk since you opened \u{201c}Edit \
-                 settings.json\u{2026}\u{201d} \u{2014} probably your own hand-edit. \
-                 Reload it here (discarding the edits you've made in this window), \
-                 or overwrite it with what's in this window?",
-            )
-            .size(12.5)
-            .color(text()),
-        );
-        ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            if accent_button(ui, "Reload").clicked() {
-                out.do_reload_from_disk = true;
-            }
-            if ui.button(RichText::new("Overwrite").color(bad())).clicked() {
-                out.do_overwrite = true;
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Cancel").clicked() {
-                    out.action = ModalAction::Cancel;
-                }
-            });
-        });
-    });
-    if backdrop || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-        out.action = ModalAction::Cancel;
+    match render_two_way_prompt(
+        ctx,
+        "settings.json changed on disk",
+        420.0,
+        "settings.json changed on disk since you opened \u{201c}Edit \
+         settings.json\u{2026}\u{201d} \u{2014} probably your own hand-edit. \
+         Reload it here (discarding the edits you've made in this window), \
+         or overwrite it with what's in this window?",
+        "Reload",
+        "Overwrite",
+        out,
+    ) {
+        Choice::Primary => out.do_reload_from_disk = true,
+        Choice::Destructive => out.do_overwrite = true,
+        Choice::None => {}
     }
 }
 

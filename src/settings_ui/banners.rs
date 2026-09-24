@@ -3,6 +3,168 @@
 
 use super::*;
 
+/// The tinted, rounded strip every banner sits in, and the gap below it.
+/// `fill` and `stroke` are how strongly `tint` shows in each. One definition,
+/// so the banners stacked above the page cannot drift apart in shape.
+fn banner_strip(
+    ui: &mut egui::Ui,
+    tint: Color32,
+    fill: f32,
+    stroke: f32,
+    margin: i8,
+    add: impl FnOnce(&mut egui::Ui),
+) {
+    egui::Frame::new()
+        .fill(tint.gamma_multiply(fill))
+        .stroke(Stroke::new(1.0, tint.gamma_multiply(stroke)))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::same(margin))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            add(ui);
+        });
+    ui.add_space(10.0);
+}
+
+/// Which control on an [`ask_strip`] was clicked this frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StripClick {
+    /// The corner ×.
+    Close,
+    NotNow,
+    /// The accent button: take the offer.
+    Action,
+    /// "Remind me in a month", on the strips that offer it.
+    Monthly,
+}
+
+/// What an [`ask_strip`] says, and which buttons it offers.
+struct AskStrip<'a> {
+    tint: Color32,
+    headline: &'a str,
+    body: &'a str,
+    action: &'a str,
+    action_hover: Option<&'a str>,
+    /// The hover text for "Remind me in a month"; `None` leaves that button
+    /// out.
+    monthly_hover: Option<&'a str>,
+}
+
+/// A small muted button, for the quiet ways out of an ask.
+fn quiet_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.button(RichText::new(label).size(12.0).color(muted()))
+}
+
+/// The strip the crash-report, sign-in and feedback asks share: headline with
+/// a corner ×, the body copy, then the button row. Returns what was clicked
+/// rather than acting on it: the click is acted on after the frame closes, so
+/// nothing mutates `self` from inside it, and each banner decides for itself
+/// what its answers mean to its engine.
+fn ask_strip(ui: &mut egui::Ui, strip: &AskStrip) -> Option<StripClick> {
+    let mut click = None;
+    banner_strip(ui, strip.tint, 0.12, 0.45, 12, |ui| {
+        // Text on its own rows, buttons on a row of their own beneath.
+        //
+        // The obvious layout — text left, buttons right, one row — does not survive
+        // contact: four controls need roughly 300pt, the copy is a full sentence, and
+        // egui's horizontal layout does not reserve space for what comes after, so the
+        // body simply runs underneath the buttons. Reserving a fixed width for them only
+        // moves the failure to whichever window size the guess is wrong at. Stacking is
+        // correct at every width, which matters here because this window is resizable and
+        // auto-fits its content.
+        ui.vertical(|ui| {
+            if ask_strip_header(ui, strip.headline) {
+                click = Some(StripClick::Close);
+            }
+            ui.add_space(2.0);
+            ui.label(RichText::new(strip.body).size(12.0).color(muted()));
+            ui.add_space(8.0);
+            if let Some(button) = ask_strip_buttons(ui, strip) {
+                click = Some(button);
+            }
+        });
+    });
+    click
+}
+
+/// An ask strip's headline, with the dismiss × in its corner. Returns whether
+/// the × was clicked.
+fn ask_strip_header(ui: &mut egui::Ui, headline: &str) -> bool {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(headline).font(semibold(14.0)).color(text()));
+        // The × belongs in the corner, not in the button row. Beside "Not now" it
+        // reads as a fourth choice, when it is really the same "no" the whole
+        // strip can be closed with — and the two can mean different things to an
+        // engine (see `nudge_outcome`).
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.button(RichText::new("\u{00D7}").size(14.0).color(muted()))
+                .on_hover_text("Dismiss")
+                .clicked()
+        })
+        .inner
+    })
+    .inner
+}
+
+/// An ask strip's right-aligned button row: the accent action, "Not now",
+/// and "Remind me in a month" when the strip offers it.
+fn ask_strip_buttons(ui: &mut egui::Ui, strip: &AskStrip) -> Option<StripClick> {
+    button_row_right(ui, |ui| {
+        let mut click = None;
+        let mut action = accent_button(ui, strip.action);
+        if let Some(tip) = strip.action_hover {
+            action = action.on_hover_text(tip);
+        }
+        if action.clicked() {
+            click = Some(StripClick::Action);
+        }
+        if quiet_button(ui, "Not now").clicked() {
+            click = Some(StripClick::NotNow);
+        }
+        if strip.monthly_hover.is_some_and(|tip| {
+            quiet_button(ui, "Remind me in a month")
+                .on_hover_text(tip)
+                .clicked()
+        }) {
+            click = Some(StripClick::Monthly);
+        }
+        click
+    })
+}
+
+/// Whether the first-run banner applies: a cloud provider is selected and no
+/// provider has a key yet. Local needs no key, so it is never nagged about.
+fn needs_onboarding(draft: &Config) -> bool {
+    !draft.stt_provider.eq_ignore_ascii_case("local") && draft.providers_with_keys().is_empty()
+}
+
+/// The sign-in engine's answer for a click on its strip.
+///
+/// Same answers, same words, as the web banner every other LunarWerx app
+/// shows (`nudge-banner.ts`). "Not now" and the × are the same thing - a
+/// dismissal worth one interval - and there is deliberately no permanent
+/// opt-out: the engine has no state that could express one. See
+/// `nudge_engine.rs`'s header for the decision and what it costs.
+fn nudge_outcome(click: StripClick) -> crate::nudge_engine::Outcome {
+    use crate::nudge_engine::{Cadence, Outcome};
+    match click {
+        StripClick::Close => Outcome::Declined,
+        StripClick::NotNow => Outcome::Snoozed,
+        StripClick::Action => Outcome::Accepted,
+        StripClick::Monthly => Outcome::SetCadence(Cadence::Monthly),
+    }
+}
+
+/// The feedback engine's answer for a click on its strip: only the action
+/// counts as sharing; every other way out is the same dismissal.
+fn survey_outcome(click: StripClick) -> crate::feedback_survey::Outcome {
+    use crate::feedback_survey::Outcome;
+    match click {
+        StripClick::Action => Outcome::Shared,
+        StripClick::Close | StripClick::NotNow | StripClick::Monthly => Outcome::Dismissed,
+    }
+}
+
 impl super::SettingsApp {
     /// First-run onboarding banner, pinned above the provider card while *no*
     /// provider has any key. QuickDictate is unusable until a key is added, so
@@ -10,42 +172,32 @@ impl super::SettingsApp {
     /// first action obvious instead of leaving the user to guess. It reads the
     /// live draft, so it vanishes the instant a key is saved into any provider.
     pub(crate) fn onboarding_banner(&mut self, ui: &mut egui::Ui) {
-        if self.draft.stt_provider.eq_ignore_ascii_case("local")
-            || !self.draft.providers_with_keys().is_empty()
-        {
+        if !needs_onboarding(&self.draft) {
             return;
         }
-        let acc = accent();
-        egui::Frame::new()
-            .fill(acc.gamma_multiply(0.16))
-            .stroke(Stroke::new(1.0, acc.gamma_multiply(0.55)))
-            .corner_radius(CornerRadius::same(10))
-            .inner_margin(Margin::same(14))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(
-                    RichText::new("Add an API key to get started")
-                        .font(semibold(15.0))
-                        .color(text()),
-                );
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new(
-                        "QuickDictate is bring-your-own-key. Pick a provider below, then \
-                         \"Manage keys\u{2026}\" to paste a key from any one of them \
-                         (ElevenLabs, Deepgram, OpenAI, AssemblyAI, DashScope, or Google). \
-                         Hit Save & Restart when you're done. Free tiers/trials exist for \
-                         several providers — signup links are in the README.",
-                    )
-                    .size(12.5)
-                    .color(muted()),
-                );
-                ui.add_space(8.0);
-                if accent_button(ui, "Manage keys\u{2026}").clicked() {
-                    self.open_keys_modal(KEYS_TARGET_PROVIDER);
-                }
-            });
-        ui.add_space(10.0);
+        banner_strip(ui, accent(), 0.16, 0.55, 14, |ui| {
+            ui.label(
+                RichText::new("Add an API key to get started")
+                    .font(semibold(15.0))
+                    .color(text()),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(
+                    "QuickDictate is bring-your-own-key. Pick a provider below, then \
+                     \"Manage keys\u{2026}\" to paste a key from any one of them \
+                     (ElevenLabs, Deepgram, OpenAI, AssemblyAI, DashScope, or Google). \
+                     Hit Save & Restart when you're done. Free tiers/trials exist for \
+                     several providers — signup links are in the README.",
+                )
+                .size(12.5)
+                .color(muted()),
+            );
+            ui.add_space(8.0);
+            if accent_button(ui, "Manage keys\u{2026}").clicked() {
+                self.open_keys_modal(KEYS_TARGET_PROVIDER);
+            }
+        });
     }
     /// A newer release the daily auto-check found but hasn't installed (see
     /// `update::pending_update`) — surfaced here too, not just the tray
@@ -59,33 +211,26 @@ impl super::SettingsApp {
         let Some(tag) = crate::update::pending_update() else {
             return;
         };
-        egui::Frame::new()
-            .fill(good().gamma_multiply(0.14))
-            .stroke(Stroke::new(1.0, good().gamma_multiply(0.5)))
-            .corner_radius(CornerRadius::same(10))
-            .inner_margin(Margin::same(12))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(format!("Update available: v{tag}"))
-                            .font(semibold(14.0))
-                            .color(text()),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if accent_button(ui, "Update")
-                            .on_hover_text(
-                                "Download and install it now. QuickDictate restarts itself \
-                                 when it's done and brings this window back.",
-                            )
-                            .clicked()
-                        {
-                            crate::about::show_about_and_install(tag.clone());
-                        }
-                    });
+        banner_strip(ui, good(), 0.14, 0.5, 12, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("Update available: v{tag}"))
+                        .font(semibold(14.0))
+                        .color(text()),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if accent_button(ui, "Update")
+                        .on_hover_text(
+                            "Download and install it now. QuickDictate restarts itself \
+                             when it's done and brings this window back.",
+                        )
+                        .clicked()
+                    {
+                        crate::about::show_about_and_install(tag.clone());
+                    }
                 });
             });
-        ui.add_space(10.0);
+        });
     }
     /// A fresh `quickdictate-panic.log` entry the previous run left behind (see
     /// `crash_banner::note_launch`, called once at startup) — offers to open the same redacted
@@ -100,54 +245,21 @@ impl super::SettingsApp {
         let Some(ask) = crate::crash_banner::pending_ask() else {
             return;
         };
-        let mut open_report = false;
-        let mut dismissed = false;
-
-        egui::Frame::new()
-            .fill(bad().gamma_multiply(0.12))
-            .stroke(Stroke::new(1.0, bad().gamma_multiply(0.45)))
-            .corner_radius(CornerRadius::same(10))
-            .inner_margin(Margin::same(12))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.vertical(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(ask.headline)
-                                .font(semibold(14.0))
-                                .color(text()),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .button(RichText::new("\u{00D7}").size(14.0).color(muted()))
-                                .on_hover_text("Dismiss")
-                                .clicked()
-                            {
-                                dismissed = true;
-                            }
-                        });
-                    });
-                    ui.add_space(2.0);
-                    ui.label(RichText::new(ask.body).size(12.0).color(muted()));
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if accent_button(ui, "Open report\u{2026}").clicked() {
-                                open_report = true;
-                            }
-                            if ui
-                                .button(RichText::new("Not now").size(12.0).color(muted()))
-                                .clicked()
-                            {
-                                dismissed = true;
-                            }
-                        });
-                    });
-                });
-            });
-        ui.add_space(10.0);
-
-        if open_report {
+        let click = ask_strip(
+            ui,
+            &AskStrip {
+                tint: bad(),
+                headline: ask.headline,
+                body: ask.body,
+                action: "Open report\u{2026}",
+                action_hover: None,
+                monthly_hover: None,
+            },
+        );
+        let Some(click) = click else {
+            return;
+        };
+        if click == StripClick::Action {
             // WHY force this true: `error_report_section` early-returns (and so never renders
             // the preview we're about to set) whenever `self.draft.error_reporting_enabled` is
             // false. That draft field is this window's *unsaved* copy, so a user who unchecked
@@ -162,9 +274,8 @@ impl super::SettingsApp {
             self.tab = nav::Tab::Advanced;
             self.status.clear();
         }
-        if open_report || dismissed {
-            crate::crash_banner::dismiss();
-        }
+        // Opening the report and dismissing both answer the offer for this launch.
+        crate::crash_banner::dismiss();
     }
     /// The "you could be signed in" banner.
     ///
@@ -186,118 +297,39 @@ impl super::SettingsApp {
         let Some(ask) = self.nudge_ask.clone() else {
             return;
         };
-        // Answer collected inside the closure and acted on after it, so the borrow of `self` that
-        // the frame holds is already released when we mutate `nudge_ask` and touch the engine.
-        let mut answer: Option<crate::nudge_engine::Outcome> = None;
-        let mut connect = false;
-
-        egui::Frame::new()
-            .fill(accent().gamma_multiply(0.12))
-            .stroke(Stroke::new(1.0, accent().gamma_multiply(0.45)))
-            .corner_radius(CornerRadius::same(10))
-            .inner_margin(Margin::same(12))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                // Text on its own rows, buttons on a row of their own beneath.
-                //
-                // The obvious layout — text left, buttons right, one row — does not survive
-                // contact: four controls need roughly 300pt, the copy is a full sentence, and
-                // egui's horizontal layout does not reserve space for what comes after, so the
-                // body simply runs underneath the buttons. Reserving a fixed width for them only
-                // moves the failure to whichever window size the guess is wrong at. Stacking is
-                // correct at every width, which matters here because this window is resizable and
-                // auto-fits its content.
-                ui.vertical(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(&ask.headline)
-                                .font(semibold(14.0))
-                                .color(text()),
-                        );
-                        // The × belongs in the corner, not in the button row. Beside "Not now" it
-                        // reads as a fourth choice, when it is really the same "no" the whole
-                        // strip can be closed with — and the two mean different things to the
-                        // engine (see the comment on the buttons below).
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .button(RichText::new("\u{00D7}").size(14.0).color(muted()))
-                                .on_hover_text("Dismiss")
-                                .clicked()
-                            {
-                                answer = Some(crate::nudge_engine::Outcome::Declined);
-                            }
-                        });
-                    });
-                    ui.add_space(2.0);
-                    ui.label(RichText::new(&ask.body).size(12.0).color(muted()));
-                    ui.add_space(8.0);
-                    // The `horizontal` wrapper is load-bearing, not decoration. A bare
-                    // `with_layout(right_to_left)` inside a vertical claims ALL the remaining
-                    // height, which made this banner swallow the entire settings page and pinned
-                    // its buttons to the bottom of the window. `horizontal` constrains it to one
-                    // row's height, which is what a button row is.
-                    ui.horizontal(|ui| {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if accent_button(ui, &ask.action_label)
-                                .on_hover_text(
-                                    "Opens your browser to sign in, then syncs these settings to \
-                                 your Connections account.",
-                                )
-                                .clicked()
-                            {
-                                answer = Some(crate::nudge_engine::Outcome::Accepted);
-                                connect = true;
-                            }
-                            // Same answers, same words, as the web banner every other LunarWerx app
-                            // shows (`nudge-banner.ts`). "Not now" and the × are the same thing -
-                            // a dismissal worth one interval - and there is deliberately no
-                            // permanent opt-out: the engine has no state that could express one.
-                            // See `nudge_engine.rs`'s header for the decision and what it costs.
-                            if ui
-                                .button(RichText::new("Not now").size(12.0).color(muted()))
-                                .clicked()
-                            {
-                                answer = Some(crate::nudge_engine::Outcome::Snoozed);
-                            }
-                            // The month-long dismissal only exists from the fourth ask on, and the
-                            // ENGINE decides that, never a count re-derived here.
-                            if ask.can_snooze_month
-                                && ui
-                                    .button(
-                                        RichText::new("Remind me in a month")
-                                            .size(12.0)
-                                            .color(muted()),
-                                    )
-                                    .on_hover_text(
-                                        "Hides this for a month. Settings sync stays available on \
-                                 this page in the meantime.",
-                                    )
-                                    .clicked()
-                            {
-                                answer = Some(crate::nudge_engine::Outcome::SetCadence(
-                                    crate::nudge_engine::Cadence::Monthly,
-                                ));
-                            }
-                        });
-                    });
-                });
-            });
-        ui.add_space(10.0);
-
-        if let Some(outcome) = answer {
-            crate::nudge::record(outcome);
-            self.nudge_ask = None;
-            if connect {
-                // Start the app's OWN sign-in rather than sending them to a web page and hoping
-                // they come back and find the sync card. The offer is already built; the prompt's
-                // only job was to say so. `begin_sign_in` is the exact path the Settings sync
-                // button runs, so this app has one sign-in flow, not two that can drift.
-                let ctx = ui.ctx().clone();
-                self.begin_sign_in(&ctx);
-                self.tab = super::nav::Tab::Application;
-                self.status =
-                    "Finish signing in with Connections in your browser\u{2026}".to_string();
-            }
+        let click = ask_strip(
+            ui,
+            &AskStrip {
+                tint: accent(),
+                headline: &ask.headline,
+                body: &ask.body,
+                action: &ask.action_label,
+                action_hover: Some(
+                    "Opens your browser to sign in, then syncs these settings to \
+                     your Connections account.",
+                ),
+                // The month-long dismissal only exists from the fourth ask on, and the
+                // ENGINE decides that, never a count re-derived here.
+                monthly_hover: ask.can_snooze_month.then_some(
+                    "Hides this for a month. Settings sync stays available on \
+                     this page in the meantime.",
+                ),
+            },
+        );
+        let Some(click) = click else {
+            return;
+        };
+        crate::nudge::record(nudge_outcome(click));
+        self.nudge_ask = None;
+        if click == StripClick::Action {
+            // Start the app's OWN sign-in rather than sending them to a web page and hoping
+            // they come back and find the sync card. The offer is already built; the prompt's
+            // only job was to say so. `begin_sign_in` is the exact path the Settings sync
+            // button runs, so this app has one sign-in flow, not two that can drift.
+            let ctx = ui.ctx().clone();
+            self.begin_sign_in(&ctx);
+            self.tab = super::nav::Tab::Application;
+            self.status = "Finish signing in with Connections in your browser\u{2026}".to_string();
         }
     }
 
@@ -310,64 +342,70 @@ impl super::SettingsApp {
         let Some(ask) = self.feedback_ask.clone() else {
             return;
         };
-        let mut answer: Option<crate::feedback_survey::Outcome> = None;
-        let mut open_url: Option<String> = None;
+        let click = ask_strip(
+            ui,
+            &AskStrip {
+                tint: good(),
+                headline: ask.headline,
+                body: ask.body,
+                action: ask.action_label,
+                action_hover: Some("Opens a new issue on GitHub, pre-filled"),
+                monthly_hover: None,
+            },
+        );
+        let Some(click) = click else {
+            return;
+        };
+        crate::feedback_survey::record(survey_outcome(click));
+        self.feedback_ask = None;
+        if click == StripClick::Action {
+            crate::about::open_url(&ask.url);
+            self.status = "Thanks \u{2014} opening GitHub in your browser\u{2026}".to_string();
+        }
+    }
+}
 
-        egui::Frame::new()
-            .fill(good().gamma_multiply(0.12))
-            .stroke(Stroke::new(1.0, good().gamma_multiply(0.45)))
-            .corner_radius(CornerRadius::same(10))
-            .inner_margin(Margin::same(12))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.vertical(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(ask.headline)
-                                .font(semibold(14.0))
-                                .color(text()),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .button(RichText::new("\u{00D7}").size(14.0).color(muted()))
-                                .on_hover_text("Dismiss")
-                                .clicked()
-                            {
-                                answer = Some(crate::feedback_survey::Outcome::Dismissed);
-                            }
-                        });
-                    });
-                    ui.add_space(2.0);
-                    ui.label(RichText::new(ask.body).size(12.0).color(muted()));
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if accent_button(ui, ask.action_label)
-                                .on_hover_text("Opens a new issue on GitHub, pre-filled")
-                                .clicked()
-                            {
-                                answer = Some(crate::feedback_survey::Outcome::Shared);
-                                open_url = Some(ask.url.clone());
-                            }
-                            if ui
-                                .button(RichText::new("Not now").size(12.0).color(muted()))
-                                .clicked()
-                            {
-                                answer = Some(crate::feedback_survey::Outcome::Dismissed);
-                            }
-                        });
-                    });
-                });
-            });
-        ui.add_space(10.0);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nudge_engine::{Cadence, Outcome};
 
-        if let Some(outcome) = answer {
-            crate::feedback_survey::record(outcome);
-            self.feedback_ask = None;
-            if let Some(url) = open_url {
-                crate::about::open_url(&url);
-                self.status = "Thanks \u{2014} opening GitHub in your browser\u{2026}".to_string();
-            }
+    #[test]
+    fn onboarding_shows_until_any_cloud_provider_has_a_key() {
+        let mut draft = Config::default();
+        assert!(needs_onboarding(&draft), "a fresh install has no keys");
+        draft.deepgram_keys.push("dg-key".into());
+        // Any provider's key will do, not only the selected one's: it can be
+        // switched to in the same dropdown.
+        assert!(!needs_onboarding(&draft));
+    }
+
+    #[test]
+    fn onboarding_never_nags_the_keyless_local_provider() {
+        let mut draft = Config::default();
+        draft.stt_provider = "local".into();
+        assert!(!needs_onboarding(&draft));
+        draft.stt_provider = "Local".into();
+        assert!(!needs_onboarding(&draft));
+    }
+
+    #[test]
+    fn sign_in_clicks_map_to_the_engine_answers() {
+        assert_eq!(nudge_outcome(StripClick::Action), Outcome::Accepted);
+        assert_eq!(nudge_outcome(StripClick::NotNow), Outcome::Snoozed);
+        assert_eq!(nudge_outcome(StripClick::Close), Outcome::Declined);
+        assert_eq!(
+            nudge_outcome(StripClick::Monthly),
+            Outcome::SetCadence(Cadence::Monthly)
+        );
+    }
+
+    #[test]
+    fn only_the_feedback_action_counts_as_shared() {
+        use crate::feedback_survey::Outcome as Survey;
+        assert_eq!(survey_outcome(StripClick::Action), Survey::Shared);
+        for click in [StripClick::Close, StripClick::NotNow, StripClick::Monthly] {
+            assert_eq!(survey_outcome(click), Survey::Dismissed, "{click:?}");
         }
     }
 }

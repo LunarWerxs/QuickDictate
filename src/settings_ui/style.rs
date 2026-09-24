@@ -61,8 +61,38 @@ pub(crate) fn icon_data() -> egui::IconData {
 /// native Windows instead of egui's bundled font. Silently keeps the default
 /// if the font files are missing.
 pub(crate) fn apply_fonts(ctx: &egui::Context) {
+    // Native Windows icon font for the section-header glyphs. Prefer Segoe
+    // Fluent Icons (Win 11); fall back to Segoe MDL2 Assets (Win 10). Both share
+    // the same PUA codepoints for the classic glyphs we use (E7xx/E8xx), so the
+    // icons render identically whichever one is present.
+    let icons = std::fs::read(r"C:\Windows\Fonts\SegoeIcons.ttf")
+        .or_else(|_| std::fs::read(r"C:\Windows\Fonts\segmdl2.ttf"))
+        .ok();
+    if icons.is_some() {
+        ICONS_OK.store(true, Ordering::Relaxed);
+    }
+    ctx.set_fonts(font_definitions(
+        std::fs::read(r"C:\Windows\Fonts\segoeui.ttf").ok(),
+        std::fs::read(r"C:\Windows\Fonts\seguisb.ttf").ok(),
+        icons,
+    ));
+}
+/// The font set [`apply_fonts`] installs, from whichever system font files
+/// could be read.
+///
+/// The "semibold" family is bound even when seguisb.ttf is missing, falling
+/// back to the body fonts: headings name it on every frame, and epaint panics
+/// on a family with no fonts, which would kill the Settings thread for good.
+/// "icons" stays unbound without its font, since `icon_font` is only ever used
+/// behind [`icons_available`]; it is isolated in its own family so its
+/// private-use glyphs never leak into body text.
+fn font_definitions(
+    segoe: Option<Vec<u8>>,
+    semibold: Option<Vec<u8>>,
+    icons: Option<Vec<u8>>,
+) -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
-    if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\segoeui.ttf") {
+    if let Some(bytes) = segoe {
         fonts
             .font_data
             .insert("segoe".into(), egui::FontData::from_owned(bytes).into());
@@ -72,33 +102,32 @@ pub(crate) fn apply_fonts(ctx: &egui::Context) {
             .or_default()
             .insert(0, "segoe".into());
     }
-    if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\seguisb.ttf") {
-        fonts.font_data.insert(
-            "segoe-semibold".into(),
-            egui::FontData::from_owned(bytes).into(),
-        );
-        fonts.families.insert(
-            egui::FontFamily::Name("semibold".into()),
-            vec!["segoe-semibold".into()],
-        );
-    }
-    // Native Windows icon font for the section-header glyphs. Prefer Segoe
-    // Fluent Icons (Win 11); fall back to Segoe MDL2 Assets (Win 10). Both share
-    // the same PUA codepoints for the classic glyphs we use (E7xx/E8xx), so the
-    // icons render identically whichever one is present. Isolated in its own
-    // "icons" family so its private-use glyphs never leak into body text.
-    let icon_font = std::fs::read(r"C:\Windows\Fonts\SegoeIcons.ttf")
-        .or_else(|_| std::fs::read(r"C:\Windows\Fonts\segmdl2.ttf"));
-    if let Ok(bytes) = icon_font {
+    let semibold_family = match semibold {
+        Some(bytes) => {
+            fonts.font_data.insert(
+                "segoe-semibold".into(),
+                egui::FontData::from_owned(bytes).into(),
+            );
+            vec!["segoe-semibold".into()]
+        }
+        None => fonts
+            .families
+            .get(&egui::FontFamily::Proportional)
+            .cloned()
+            .unwrap_or_default(),
+    };
+    fonts
+        .families
+        .insert(egui::FontFamily::Name("semibold".into()), semibold_family);
+    if let Some(bytes) = icons {
         fonts
             .font_data
             .insert("icons".into(), egui::FontData::from_owned(bytes).into());
         fonts
             .families
             .insert(egui::FontFamily::Name("icons".into()), vec!["icons".into()]);
-        ICONS_OK.store(true, Ordering::Relaxed);
     }
-    ctx.set_fonts(fonts);
+    fonts
 }
 pub(crate) fn semibold(size: f32) -> egui::FontId {
     egui::FontId::new(size, egui::FontFamily::Name("semibold".into()))
@@ -199,4 +228,44 @@ pub(crate) fn apply_style(ctx: &egui::Context) {
         s.spacing.button_padding = egui::vec2(12.0, 6.0);
         s.spacing.interact_size.y = 26.0;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn semibold_headings_render_without_the_semibold_font_file() {
+        // The regression: with seguisb.ttf unreadable, "semibold" was never
+        // bound and the first heading panicked inside epaint. Lay one out
+        // through a real context so the fallback is proven, not just present.
+        let ctx = egui::Context::default();
+        ctx.set_fonts(font_definitions(None, None, None));
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.label(RichText::new("Settings").font(semibold(15.0)));
+        });
+    }
+
+    #[test]
+    fn semibold_prefers_its_own_font_file_when_present() {
+        let fonts = font_definitions(None, Some(vec![0]), None);
+        let family = fonts
+            .families
+            .get(&egui::FontFamily::Name("semibold".into()));
+        assert_eq!(
+            family.map(Vec::as_slice),
+            Some(["segoe-semibold".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn semibold_falls_back_to_the_body_fonts() {
+        let fonts = font_definitions(Some(vec![0]), None, None);
+        let body = fonts.families.get(&egui::FontFamily::Proportional);
+        let semibold = fonts
+            .families
+            .get(&egui::FontFamily::Name("semibold".into()));
+        assert!(body.is_some_and(|b| b.first().is_some_and(|f| f == "segoe")));
+        assert_eq!(semibold, body);
+    }
 }
