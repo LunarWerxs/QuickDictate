@@ -102,19 +102,12 @@ fn activate_message_id() -> u32 {
     id
 }
 
-#[allow(
-    clippy::expect_used,
-    reason = "a thread that cannot be spawned at startup is unrecoverable; the panic message is the only diagnostic there is"
-)]
 pub fn spawn(app: Arc<App>) -> std::thread::JoinHandle<()> {
-    std::thread::Builder::new()
-        .name("qd-ui".into())
-        .spawn(move || {
-            if let Err(e) = run(app) {
-                tracing::error!("ui thread: {e:#}");
-            }
-        })
-        .expect("spawn ui thread")
+    crate::threads::spawn_named("qd-ui", move || {
+        if let Err(e) = run(app) {
+            tracing::error!("ui thread: {e:#}");
+        }
+    })
 }
 
 fn run(app: Arc<App>) -> Result<()> {

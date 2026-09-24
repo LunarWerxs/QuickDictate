@@ -64,6 +64,7 @@ mod stt;
 mod sync;
 mod text;
 mod theme;
+mod threads;
 mod ui;
 mod update;
 mod voice_commands;
