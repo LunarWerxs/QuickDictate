@@ -42,6 +42,31 @@ fn duck_combo(ui: &mut egui::Ui, on: &mut bool, percent: &mut u8) -> egui::Respo
         .response
 }
 
+/// One half of the card's two-column layout: a [label | control] grid. All
+/// four halves share this so the left and right columns keep identical
+/// spacing and their rows line up.
+fn label_grid(id: &str) -> egui::Grid {
+    egui::Grid::new(id).num_columns(2).spacing([10.0, 10.0])
+}
+
+/// Paint a hotkey field's record dot: a solid accent dot with a soft halo
+/// while armed, otherwise a ring with a centre dot that lights up on hover.
+fn paint_record_dot(ui: &egui::Ui, center: egui::Pos2, r: f32, recording: bool, hovered: bool) {
+    let p = ui.painter();
+    if recording {
+        p.circle_filled(center, r, accent());
+        p.circle_stroke(
+            center,
+            r + 2.5,
+            Stroke::new(1.5, accent().gamma_multiply(0.45)),
+        );
+    } else {
+        let col = if hovered { accent() } else { muted() };
+        p.circle_stroke(center, r, Stroke::new(1.6, col));
+        p.circle_filled(center, r * 0.5, col);
+    }
+}
+
 impl super::SettingsApp {
     /// A hotkey text field with a small, subtle "record" dot tucked into its
     /// right edge (instead of a separate wide button). Click the dot to arm
@@ -88,23 +113,7 @@ impl super::SettingsApp {
         // Sense the click on the dot's rect. Added AFTER the text field, so it
         // sits on top and wins the click over the well beneath it.
         let hit = ui.interact(dot_rect, id, egui::Sense::click());
-        let center = dot_rect.center();
-        let r = side * 0.26;
-        {
-            let p = ui.painter();
-            if recording {
-                p.circle_filled(center, r, accent());
-                p.circle_stroke(
-                    center,
-                    r + 2.5,
-                    Stroke::new(1.5, accent().gamma_multiply(0.45)),
-                );
-            } else {
-                let col = if hit.hovered() { accent() } else { muted() };
-                p.circle_stroke(center, r, Stroke::new(1.6, col));
-                p.circle_filled(center, r * 0.5, col);
-            }
-        }
+        paint_record_dot(ui, dot_rect.center(), side * 0.26, recording, hit.hovered());
         let hit = hit
             .on_hover_cursor(egui::CursorIcon::PointingHand)
             .on_hover_text(if recording {
@@ -124,41 +133,31 @@ impl super::SettingsApp {
             // 4-column grid let the wide Mode/Hold side squeeze the Language/
             // Toggle side). Visually: Language / Mode on top, hotkeys below.
             ui.columns(2, |cols| {
-                egui::Grid::new("dict_left")
-                    .num_columns(2)
-                    .spacing([10.0, 10.0])
-                    .show(&mut cols[0], |ui| {
-                        ui.label("Language (BCP-47)").on_hover_text(TIP_LANGUAGE);
-                        ui.add(styled_input(&mut self.draft.language).desired_width(130.0))
-                            .on_hover_text(TIP_LANGUAGE);
-                        ui.end_row();
-                        ui.label("Toggle hotkey").on_hover_text(TIP_TOGGLE_HOTKEY);
-                        self.hotkey_field_ui(ui, HotkeyField::Toggle, 130.0);
-                        ui.end_row();
-                    });
-                egui::Grid::new("dict_right")
-                    .num_columns(2)
-                    .spacing([10.0, 10.0])
-                    .show(&mut cols[1], |ui| {
-                        ui.label("Mode").on_hover_text(TIP_MODE);
-                        egui::ComboBox::from_id_salt("mode")
-                            .width(120.0)
-                            .selected_text(self.draft.mode.clone())
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut self.draft.mode,
-                                    "toggle".into(),
-                                    "toggle",
-                                );
-                                ui.selectable_value(&mut self.draft.mode, "hold".into(), "hold");
-                            })
-                            .response
-                            .on_hover_text(TIP_MODE);
-                        ui.end_row();
-                        ui.label("Hold hotkey").on_hover_text(TIP_HOLD_HOTKEY);
-                        self.hotkey_field_ui(ui, HotkeyField::Hold, 120.0);
-                        ui.end_row();
-                    });
+                label_grid("dict_left").show(&mut cols[0], |ui| {
+                    ui.label("Language (BCP-47)").on_hover_text(TIP_LANGUAGE);
+                    ui.add(styled_input(&mut self.draft.language).desired_width(130.0))
+                        .on_hover_text(TIP_LANGUAGE);
+                    ui.end_row();
+                    ui.label("Toggle hotkey").on_hover_text(TIP_TOGGLE_HOTKEY);
+                    self.hotkey_field_ui(ui, HotkeyField::Toggle, 130.0);
+                    ui.end_row();
+                });
+                label_grid("dict_right").show(&mut cols[1], |ui| {
+                    ui.label("Mode").on_hover_text(TIP_MODE);
+                    egui::ComboBox::from_id_salt("mode")
+                        .width(120.0)
+                        .selected_text(self.draft.mode.clone())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.draft.mode, "toggle".into(), "toggle");
+                            ui.selectable_value(&mut self.draft.mode, "hold".into(), "hold");
+                        })
+                        .response
+                        .on_hover_text(TIP_MODE);
+                    ui.end_row();
+                    ui.label("Hold hotkey").on_hover_text(TIP_HOLD_HOTKEY);
+                    self.hotkey_field_ui(ui, HotkeyField::Hold, 120.0);
+                    ui.end_row();
+                });
             });
 
             // Windows only grants a hotkey to the first process that asks for
@@ -192,56 +191,50 @@ impl super::SettingsApp {
             //    after you stop talking before finalizing. Read per session,
             //    so it applies on your next dictation — no restart needed.
             ui.columns(2, |cols| {
-                egui::Grid::new("dict_timing_left")
-                    .num_columns(2)
-                    .spacing([10.0, 10.0])
-                    .show(&mut cols[0], |ui| {
-                        ui.label("Hold to re-paste").on_hover_text(TIP_REPASTE);
+                label_grid("dict_timing_left").show(&mut cols[0], |ui| {
+                    ui.label("Hold to re-paste").on_hover_text(TIP_REPASTE);
+                    secs_input(
+                        ui,
+                        &mut self.draft.reinsert_hold_ms,
+                        0.5..=4.0,
+                        "reinsert_hold",
+                    )
+                    .on_hover_text(TIP_REPASTE);
+                    ui.end_row();
+
+                    ui.label("Other audio").on_hover_text(TIP_DUCK);
+                    duck_combo(
+                        ui,
+                        &mut self.draft.duck_other_audio,
+                        &mut self.draft.duck_volume_percent,
+                    )
+                    .on_hover_text(TIP_DUCK);
+                    ui.end_row();
+                });
+                label_grid("dict_timing_right").show(&mut cols[1], |ui| {
+                    ui.label("Keep listening after")
+                        .on_hover_text(TIP_LISTEN_TAIL);
+                    secs_input(ui, &mut self.draft.listen_tail_ms, 0.3..=3.0, "listen_tail")
+                        .on_hover_text(TIP_LISTEN_TAIL);
+                    ui.end_row();
+
+                    // Meaningless with the cleanup pass off, so gray it
+                    // out rather than letting it read as a live budget.
+                    let polish_on = self.draft.polish_enabled;
+                    ui.add_enabled_ui(polish_on, |ui| {
+                        ui.label("AI cleanup waits").on_hover_text(TIP_POLISH_WAIT);
+                    });
+                    ui.add_enabled_ui(polish_on, |ui| {
                         secs_input(
                             ui,
-                            &mut self.draft.reinsert_hold_ms,
-                            0.5..=4.0,
-                            "reinsert_hold",
+                            &mut self.draft.polish_deadline_ms,
+                            0.1..=2.0,
+                            "polish_deadline",
                         )
-                        .on_hover_text(TIP_REPASTE);
-                        ui.end_row();
-
-                        ui.label("Other audio").on_hover_text(TIP_DUCK);
-                        duck_combo(
-                            ui,
-                            &mut self.draft.duck_other_audio,
-                            &mut self.draft.duck_volume_percent,
-                        )
-                        .on_hover_text(TIP_DUCK);
-                        ui.end_row();
+                        .on_hover_text(TIP_POLISH_WAIT);
                     });
-                egui::Grid::new("dict_timing_right")
-                    .num_columns(2)
-                    .spacing([10.0, 10.0])
-                    .show(&mut cols[1], |ui| {
-                        ui.label("Keep listening after")
-                            .on_hover_text(TIP_LISTEN_TAIL);
-                        secs_input(ui, &mut self.draft.listen_tail_ms, 0.3..=3.0, "listen_tail")
-                            .on_hover_text(TIP_LISTEN_TAIL);
-                        ui.end_row();
-
-                        // Meaningless with the cleanup pass off, so gray it
-                        // out rather than letting it read as a live budget.
-                        let polish_on = self.draft.polish_enabled;
-                        ui.add_enabled_ui(polish_on, |ui| {
-                            ui.label("AI cleanup waits").on_hover_text(TIP_POLISH_WAIT);
-                        });
-                        ui.add_enabled_ui(polish_on, |ui| {
-                            secs_input(
-                                ui,
-                                &mut self.draft.polish_deadline_ms,
-                                0.1..=2.0,
-                                "polish_deadline",
-                            )
-                            .on_hover_text(TIP_POLISH_WAIT);
-                        });
-                        ui.end_row();
-                    });
+                    ui.end_row();
+                });
             });
 
             ui.add_space(10.0);

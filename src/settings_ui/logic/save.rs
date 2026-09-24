@@ -10,30 +10,8 @@ impl SettingsApp {
             self.status = format!("Not saved — {e}");
             return false;
         }
-        let previous = self.app.config.load_full();
-        let leaving_local = previous.stt_provider.eq_ignore_ascii_case("local")
-            && !self.draft.stt_provider.eq_ignore_ascii_case("local");
-        let path = Config::settings_path();
-        match self.draft.save(&path) {
-            Ok(()) => {
-                // Hot-store so per-session settings (paste policy, provider,
-                // keys, replacements) apply immediately; hotkeys and logging
-                // initialization still need a restart.
-                self.app.config.store(Arc::new(self.draft.clone()));
-                // The running capture re-resolves its device every couple of
-                // seconds, so a microphone change takes effect on its own
-                // rather than waiting for a restart.
-                crate::audio::set_preferred_input(&self.draft.input_device);
-                if leaving_local {
-                    crate::local_stt::request_unload();
-                } else if self.draft.stt_provider.eq_ignore_ascii_case("local") {
-                    crate::local_stt::request_prewarm(&self.draft.local_model);
-                }
-                crate::autostart::reconcile(self.draft.run_at_startup);
-                // Make the history file agree with the (possibly just
-                // flipped) `persist_history` toggle: written now if on,
-                // deleted now if off.
-                self.app.sync_history_file();
+        match self.persist(self.draft.clone()) {
+            Ok(path) => {
                 self.status = "Saved. Hotkey and logging changes apply after restart.".into();
                 tracing::info!("settings saved via UI to {}", path.display());
                 true
@@ -43,6 +21,51 @@ impl SettingsApp {
                 false
             }
         }
+    }
+    /// Write `cfg` to settings.json and make it the running config, returning
+    /// the path written. The one write path for this window: Save and a sync
+    /// pull that changed settings both come through here, so a pulled
+    /// microphone or provider takes effect exactly like a saved one instead of
+    /// waiting for a restart.
+    pub(crate) fn persist(&mut self, cfg: Config) -> anyhow::Result<std::path::PathBuf> {
+        let previous = self.app.config.load_full();
+        let leaving_local = previous.stt_provider.eq_ignore_ascii_case("local")
+            && !cfg.stt_provider.eq_ignore_ascii_case("local");
+        let path = Config::settings_path();
+        cfg.save(&path)?;
+        self.refresh_editor_snapshot();
+        // Hot-store so per-session settings (paste policy, provider, keys,
+        // replacements) apply immediately; hotkeys and logging initialization
+        // still need a restart.
+        let cfg = Arc::new(cfg);
+        self.app.config.store(Arc::clone(&cfg));
+        // The running capture re-resolves its device every couple of seconds,
+        // so a microphone change takes effect on its own rather than waiting
+        // for a restart.
+        crate::audio::set_preferred_input(&cfg.input_device);
+        if leaving_local {
+            crate::local_stt::request_unload();
+        } else if cfg.stt_provider.eq_ignore_ascii_case("local") {
+            crate::local_stt::request_prewarm(&cfg.local_model);
+        }
+        crate::autostart::reconcile(cfg.run_at_startup);
+        // Make the history file agree with the (possibly just flipped)
+        // `persist_history` toggle: written now if on, deleted now if off.
+        self.app.sync_history_file();
+        Ok(path)
+    }
+    /// Push the just-saved draft to Connections on a background thread; the
+    /// result lands later as `SyncEvent::Pushed`. Returns whether the push
+    /// started (`false` when another sync operation holds the one slot).
+    fn spawn_push(&mut self, ctx: &egui::Context) -> bool {
+        let snapshot = crate::sync::snapshot_to_synced(&self.draft, &self.app.stats.snapshot());
+        self.spawn_sync(ctx, move || {
+            SyncEvent::Pushed(
+                crate::sync::push_now(snapshot)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string()),
+            )
+        })
     }
     /// Plain "Save" (bottom bar / dialogs): save locally — fast, so this stays
     /// synchronous and callers can rely on the file being written when it
@@ -57,15 +80,7 @@ impl SettingsApp {
             return false;
         }
         if self.sync.phase == SyncPhase::SignedIn {
-            let snapshot = crate::sync::snapshot_to_synced(&self.draft, &self.app.stats.snapshot());
-            let spawned = self.spawn_sync(ctx, move || {
-                SyncEvent::Pushed(
-                    crate::sync::push_now(snapshot)
-                        .map(|_| ())
-                        .map_err(|e| e.to_string()),
-                )
-            });
-            self.status = if spawned {
+            self.status = if self.spawn_push(ctx) {
                 "Saved. Syncing to your Connections account\u{2026}".into()
             } else {
                 // Another sync operation (sign-in/resume/disconnect) is
@@ -102,18 +117,31 @@ impl SettingsApp {
     /// back to [`Config::default`] and persist immediately, refreshing the UI
     /// on the spot.
     ///
-    /// Deliberately carries a few fields *forward* rather than blanking them,
-    /// because they aren't really "settings" a user means to reset:
-    ///   * API keys (`*_keys` / `local_keys`) — QuickDictate is
-    ///     bring-your-own-key; wiping these would break dictation entirely
-    ///     and force re-onboarding, which isn't what "reset to defaults" implies.
+    /// The fields it keeps are listed on [`SettingsApp::defaults_keeping_keys`].
+    pub(crate) fn reset_to_defaults(&mut self) {
+        self.draft = Self::defaults_keeping_keys(&self.draft);
+        self.recording = None;
+        self.resync_vocabulary_scratch();
+        if self.save() {
+            self.status = "Settings reset to defaults.".into();
+        }
+    }
+    /// [`Config::default`] with a few of `keep`'s fields carried *forward*
+    /// rather than blanked, because they aren't really "settings" a user
+    /// means to reset:
+    ///   * API keys (every `*_keys` list, the AI cleanup's `polish_keys` and
+    ///     the legacy `local_keys`) and `protect_keys_at_rest` —
+    ///     QuickDictate is bring-your-own-key; wiping these would break
+    ///     dictation entirely and force re-onboarding, and the confirm dialog
+    ///     promises "Your API keys are kept". The reset is written to disk at
+    ///     once, so dropping the protect flag would re-write every kept key
+    ///     in plaintext.
     ///   * `install_id` — a machine identity for update checks, not a
     ///     preference (see `Config::install_id`'s doc comment).
     ///   * `window_width/height/x/y` — machine-local window geometry, same
     ///     category `sync.rs` already excludes from portable settings.
-    pub(crate) fn reset_to_defaults(&mut self) {
-        let keep = &self.draft;
-        self.draft = Config {
+    pub(crate) fn defaults_keeping_keys(keep: &Config) -> Config {
+        Config {
             elevenlabs_keys: keep.elevenlabs_keys.clone(),
             deepgram_keys: keep.deepgram_keys.clone(),
             openai_keys: keep.openai_keys.clone(),
@@ -121,17 +149,14 @@ impl SettingsApp {
             dashscope_keys: keep.dashscope_keys.clone(),
             google_keys: keep.google_keys.clone(),
             local_keys: keep.local_keys.clone(),
+            polish_keys: keep.polish_keys.clone(),
+            protect_keys_at_rest: keep.protect_keys_at_rest,
             install_id: keep.install_id.clone(),
             window_width: keep.window_width,
             window_height: keep.window_height,
             window_x: keep.window_x,
             window_y: keep.window_y,
             ..Config::default()
-        };
-        self.recording = None;
-        self.resync_vocabulary_scratch();
-        if self.save() {
-            self.status = "Settings reset to defaults.".into();
         }
     }
     /// "Save and restart" (bottom bar): save locally, then — if signed in —
@@ -148,38 +173,29 @@ impl SettingsApp {
         if !self.save() {
             return;
         }
-        if crate::sync::is_signed_in() {
-            let snapshot = crate::sync::snapshot_to_synced(&self.draft, &self.app.stats.snapshot());
-            let spawned = self.spawn_sync(ctx, move || {
-                SyncEvent::Pushed(
-                    crate::sync::push_now(snapshot)
-                        .map(|_| ())
-                        .map_err(|e| e.to_string()),
-                )
+        // Not signed in, or another sync operation was already in flight: don't
+        // hold the restart hostage waiting for it (best-effort, same as before).
+        if crate::sync::is_signed_in() && self.spawn_push(ctx) {
+            self.status = "Syncing before restart\u{2026}".into();
+            let timeout = std::time::Duration::from_secs(6);
+            self.pending_restart = Some(PendingRestart {
+                deadline: std::time::Instant::now() + timeout,
             });
-            if spawned {
-                self.status = "Syncing before restart\u{2026}".into();
-                let timeout = std::time::Duration::from_secs(6);
-                self.pending_restart = Some(PendingRestart {
-                    deadline: std::time::Instant::now() + timeout,
-                });
-                // egui frames are event-driven: with no mouse/keyboard input, nothing
-                // would otherwise re-render `ui()` and `poll_pending_restart` would
-                // never get to notice the deadline passed. Force a frame right at the
-                // deadline so the restart still fires even if the user walks away.
-                ctx.request_repaint_after(timeout);
-                return; // do_relaunch runs from poll_pending_restart once it lands
-            }
-            // Another sync operation was already in flight; don't hold the
-            // restart hostage waiting for it (best-effort, same as before).
+            // egui frames are event-driven: with no mouse/keyboard input, nothing
+            // would otherwise run `logic()` and `poll_pending_restart` would
+            // never get to notice the deadline passed. Force a frame right at the
+            // deadline so the restart still fires even if the user walks away.
+            ctx.request_repaint_after(timeout);
+            return; // do_relaunch runs from poll_pending_restart once it lands
         }
         self.do_relaunch();
     }
     /// Poll a pending "Save and restart" once per frame (see
     /// `save_and_restart`): once the background push has been drained by
     /// `drain_sync` (`sync.rx` back to `None`, whether it succeeded or
-    /// failed) or the deadline passes, actually relaunch. Called from `ui`
-    /// right after `drain_sync` so it sees a push that just landed this frame.
+    /// failed) or the deadline passes, actually relaunch. Called from `logic`
+    /// (which runs even while the window is hidden) right after `drain_sync`,
+    /// so it sees a push that just landed this frame.
     pub(crate) fn poll_pending_restart(&mut self, ctx: &egui::Context) {
         let Some(pending) = self.pending_restart.as_ref() else {
             return;

@@ -3,6 +3,9 @@
 use crate::settings_ui::*;
 
 impl SettingsApp {
+    // Which auto-opened modal (if any) a headless shot should land on, keyed by
+    // `QUICKDICTATE_UI_OPEN`. Split out of `screenshot_hook` so the frame-timing
+    // logic there isn't buried under this dispatch's own branching.
     fn apply_shot_mode(&mut self, mode: &str) {
         match mode {
             "keys" | "keys-test" => self.open_keys_modal(KEYS_TARGET_PROVIDER),
@@ -42,18 +45,7 @@ impl SettingsApp {
         };
         self.frames += 1;
         let mode = std::env::var("QUICKDICTATE_UI_OPEN").unwrap_or_default();
-        // Which nav page to capture. Without this every shot would show the
-        // page the rail opens on, so a change to any other page could not be
-        // verified headlessly at all.
-        if let Ok(want) = std::env::var("QUICKDICTATE_UI_TAB") {
-            if let Some(tab) = nav::TABS.iter().find(|t| {
-                t.label()
-                    .to_ascii_lowercase()
-                    .starts_with(&want.to_ascii_lowercase())
-            }) {
-                self.tab = *tab;
-            }
-        }
+        self.apply_shot_tab();
         // Let fonts/layout settle, optionally auto-open a modal for the shot.
         if self.frames == 5 {
             self.apply_shot_mode(&mode);
@@ -64,12 +56,7 @@ impl SettingsApp {
             let keys = self.active_keys();
             self.start_key_test(ctx, keys);
         }
-        let ready = if mode.ends_with("-test") {
-            self.frames > 25 && self.test_rx.is_none() && !self.verdicts.is_empty()
-        } else {
-            self.frames == 14
-        };
-        if ready && !self.shot_requested {
+        if self.shot_ready(&mode) && !self.shot_requested {
             self.shot_requested = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
         }
@@ -80,22 +67,54 @@ impl SettingsApp {
             })
         });
         if let Some(img) = image {
-            let (w, h) = (img.size[0] as u32, img.size[1] as u32);
-            let bytes: Vec<u8> = img.pixels.iter().flat_map(|p| p.to_array()).collect();
-            if let Some(buf) = image::RgbaImage::from_raw(w, h, bytes) {
-                // Write atomically (tmp + rename) so a watcher never observes a
-                // half-written / zero-byte file mid-encode. Force PNG — the
-                // ".tmp" extension would otherwise defeat format-from-extension.
-                let tmp = format!("{path}.tmp");
-                match buf.save_with_format(&tmp, image::ImageFormat::Png) {
-                    Ok(()) => {
-                        let _ = std::fs::rename(&tmp, &path);
-                        tracing::info!("settings ui screenshot -> {path}");
-                    }
-                    Err(e) => tracing::error!("screenshot save failed: {e}"),
-                }
-            }
+            save_shot(&img, &path);
         }
         ctx.request_repaint(); // keep frames flowing while the hook is armed
+    }
+    /// Which nav page to capture, from `QUICKDICTATE_UI_TAB` (a label prefix,
+    /// any case). Without this every shot would show the page the rail opens
+    /// on, so a change to any other page could not be verified headlessly at
+    /// all.
+    fn apply_shot_tab(&mut self) {
+        let Ok(want) = std::env::var("QUICKDICTATE_UI_TAB") else {
+            return;
+        };
+        let want = want.to_ascii_lowercase();
+        if let Some(tab) = nav::TABS
+            .iter()
+            .find(|t| t.label().to_ascii_lowercase().starts_with(&want))
+        {
+            self.tab = *tab;
+        }
+    }
+    /// Whether this frame is the one to capture: a fixed settle time for a
+    /// plain shot, or for a `-test` mode, once the probe run has finished and
+    /// reported at least one verdict.
+    fn shot_ready(&self, mode: &str) -> bool {
+        if mode.ends_with("-test") {
+            self.frames > 25 && self.test_rx.is_none() && !self.verdicts.is_empty()
+        } else {
+            self.frames == 14
+        }
+    }
+}
+
+/// Encode a captured frame to `path` as PNG. Written atomically (tmp +
+/// rename) so a watcher never observes a half-written / zero-byte file
+/// mid-encode; PNG is forced because the ".tmp" extension would otherwise
+/// defeat format-from-extension.
+fn save_shot(img: &egui::ColorImage, path: &str) {
+    let (w, h) = (img.size[0] as u32, img.size[1] as u32);
+    let bytes: Vec<u8> = img.pixels.iter().flat_map(|p| p.to_array()).collect();
+    let Some(buf) = image::RgbaImage::from_raw(w, h, bytes) else {
+        return;
+    };
+    let tmp = format!("{path}.tmp");
+    match buf.save_with_format(&tmp, image::ImageFormat::Png) {
+        Ok(()) => {
+            let _ = std::fs::rename(&tmp, path);
+            tracing::info!("settings ui screenshot -> {path}");
+        }
+        Err(e) => tracing::error!("screenshot save failed: {e}"),
     }
 }

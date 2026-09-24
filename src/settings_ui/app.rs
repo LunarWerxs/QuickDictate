@@ -43,6 +43,22 @@ pub(super) struct ReplacementsModalState {
     pub(super) bulk_text: String,
 }
 
+impl ReplacementsModalState {
+    /// The replacements this editor holds, as its Done button commits them:
+    /// the bulk text if it was left in text-editor mode, otherwise the rows,
+    /// with any rule whose "from" is blank dropped.
+    pub(super) fn into_committed(self) -> std::collections::BTreeMap<String, String> {
+        let rows = if self.bulk {
+            text_to_replacements(&self.bulk_text)
+        } else {
+            self.rows
+        };
+        rows.into_iter()
+            .filter(|(from, _)| !from.trim().is_empty())
+            .collect()
+    }
+}
+
 pub(super) enum Modal {
     Keys(KeysModalState),
     Replacements(ReplacementsModalState),
@@ -250,6 +266,14 @@ impl eframe::App for SettingsApp {
             return;
         }
 
+        // Sync results and a pending "Save and restart" are handled here, not
+        // in `ui`: eframe skips `ui` while the window is hidden, so closing the
+        // window during the restart's sync push left the relaunch the user
+        // asked for waiting forever. The worker's own `request_repaint` and the
+        // restart deadline's `request_repaint_after` both still reach this hook.
+        self.drain_sync(ctx);
+        self.poll_pending_restart(ctx);
+
         // A "Settings" click arrived while we were already running: reveal the
         // window. If it had been hidden, re-seed to a clean slate first so a
         // re-open looks exactly like a fresh open (not the leftover state from
@@ -268,9 +292,11 @@ impl eframe::App for SettingsApp {
         // close (we manage "closing" ourselves as hide-and-reveal-later; see
         // OPEN's doc comment) and either hide right away, or — if the draft
         // has edits that were never saved — ask first instead of silently
-        // throwing them away (see `Modal::UnsavedChanges`).
+        // throwing them away (see `Modal::UnsavedChanges`). An open key or
+        // replacements editor counts: its rows are folded into the draft first.
         if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.commit_open_editor();
             if self.draft_is_dirty() {
                 self.modal = Some(Modal::UnsavedChanges);
             } else {
@@ -285,25 +311,9 @@ impl eframe::App for SettingsApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.drain_verdicts();
-        self.drain_sync(&ctx);
-        self.poll_pending_restart(&ctx);
         self.capture_hotkey(&ctx);
         self.screenshot_hook(&ctx);
-
-        // On the first frame, if we opened already signed in, silently resume
-        // and pull so this machine picks up settings changed on another device.
-        if !self.sync.resume_kicked {
-            self.sync.resume_kicked = true;
-            if crate::sync::is_signed_in() {
-                let snapshot =
-                    crate::sync::snapshot_to_synced(&self.draft, &self.app.stats.snapshot());
-                self.spawn_sync(&ctx, move || {
-                    SyncEvent::Connected(
-                        crate::sync::resume_and_pull(snapshot).map_err(|e| e.to_string()),
-                    )
-                });
-            }
-        }
+        self.kick_resume_once(&ctx);
 
         let testing = self.test_rx.is_some();
 
@@ -378,26 +388,51 @@ impl eframe::App for SettingsApp {
         if do_about {
             crate::about::show_about();
         }
-        // A hand-edit via "Edit settings.json…" may have landed on disk since
-        // it was opened; ask Reload/Overwrite first rather than silently
-        // clobbering it (see `external_change_pending`, `Modal::ExternalChange`).
         if do_save_restart {
-            if self.external_change_pending() {
-                self.pending_save_kind = Some(PendingSaveKind::Restart);
-                self.modal = Some(Modal::ExternalChange);
-            } else {
-                self.save_and_restart(&ctx);
-            }
+            self.request_save(&ctx, PendingSaveKind::Restart);
         }
         if do_save {
-            if self.external_change_pending() {
-                self.pending_save_kind = Some(PendingSaveKind::Plain);
-                self.modal = Some(Modal::ExternalChange);
-            } else {
-                self.save_and_sync(&ctx);
-            }
+            self.request_save(&ctx, PendingSaveKind::Plain);
         }
 
         self.render_modal(&ctx);
+    }
+}
+
+impl SettingsApp {
+    /// On the first frame, if we opened already signed in, silently resume
+    /// and pull so this machine picks up settings changed on another device.
+    fn kick_resume_once(&mut self, ctx: &egui::Context) {
+        if self.sync.resume_kicked {
+            return;
+        }
+        self.sync.resume_kicked = true;
+        if crate::sync::is_signed_in() {
+            let snapshot = crate::sync::snapshot_to_synced(&self.draft, &self.app.stats.snapshot());
+            self.spawn_sync(ctx, move || {
+                SyncEvent::Connected(
+                    crate::sync::resume_and_pull(snapshot).map_err(|e| e.to_string()),
+                )
+            });
+        }
+    }
+
+    /// Act on a pinned-bar Save or Save and restart click. A hand-edit via
+    /// "Edit settings.json…" may have landed on disk since it was opened; ask
+    /// Reload/Overwrite first rather than silently clobbering it (see
+    /// `external_change_pending`, `Modal::ExternalChange`), remembering which
+    /// save to resume.
+    fn request_save(&mut self, ctx: &egui::Context, kind: PendingSaveKind) {
+        if self.external_change_pending() {
+            self.pending_save_kind = Some(kind);
+            self.modal = Some(Modal::ExternalChange);
+            return;
+        }
+        match kind {
+            PendingSaveKind::Restart => self.save_and_restart(ctx),
+            PendingSaveKind::Plain => {
+                self.save_and_sync(ctx);
+            }
+        }
     }
 }

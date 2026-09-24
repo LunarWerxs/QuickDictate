@@ -48,60 +48,68 @@ impl super::SettingsApp {
     /// inline status note, avatar + name, and the Stop syncing button.
     /// Returns whether the user clicked Stop syncing.
     fn render_sync_signed_in(&self, ui: &mut egui::Ui, working: bool) -> bool {
-        let mut do_disconnect = false;
         ui.horizontal(|ui| {
             chip(ui, "Synced", good());
             // Status note sits inline next to the chip (it used to
             // read "as <account>"; the note is more useful here).
-            // The chip already says "Synced", so drop that redundant
-            // prefix from the note ("Synced \u{2014} already up to
-            // date." -> "already up to date."; bare "Synced." -> "").
-            if !self.sync.note.is_empty() {
-                let note = self.sync.note.clone();
-                let inline = note
-                    .strip_prefix("Synced \u{2014} ")
-                    .or_else(|| note.strip_prefix("Synced."))
-                    .unwrap_or(note.as_str())
-                    .trim();
-                if !inline.is_empty() {
-                    let col = if self.sync.is_error { bad() } else { text() };
-                    ui.label(RichText::new(inline.to_string()).color(col));
-                }
+            let inline = inline_sync_note(&self.sync.note);
+            if !inline.is_empty() {
+                let col = if self.sync.is_error { bad() } else { text() };
+                ui.label(RichText::new(inline.to_string()).color(col));
             }
-            // The signed-in account avatar + name, to the right of the status note. The
-            // avatar (circular) is uploaded once userinfo resolves the profile picture;
-            // the name is muted secondary context. Older creds saved before we fetched
-            // them have neither until the next silent resume.
-            if let Some(tex) = &self.sync.avatar {
-                ui.add(
-                    egui::Image::from_texture(egui::load::SizedTexture::new(
-                        tex.id(),
-                        egui::vec2(18.0, 18.0),
-                    ))
-                    .corner_radius(9),
-                );
-            }
-            if !self.sync.name.is_empty() {
-                ui.label(RichText::new(format!("\u{00b7} {}", self.sync.name)).color(muted()));
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add_enabled(!working, egui::Button::new("Stop syncing"))
-                    .on_hover_text(
-                        "Disconnect this device and delete your synced settings \
-                             from the cloud.",
-                    )
-                    .clicked()
-                {
-                    do_disconnect = true;
-                }
-                if working {
-                    ui.add(egui::Spinner::new().size(14.0));
-                }
-            });
-        });
-        do_disconnect
+            self.render_sync_account(ui);
+            render_stop_syncing(ui, working)
+        })
+        .inner
     }
+
+    /// The signed-in account avatar + name, to the right of the status note.
+    /// The avatar (circular) is uploaded once userinfo resolves the profile
+    /// picture; the name is muted secondary context. Older creds saved before
+    /// we fetched them have neither until the next silent resume.
+    fn render_sync_account(&self, ui: &mut egui::Ui) {
+        if let Some(tex) = &self.sync.avatar {
+            ui.add(
+                egui::Image::from_texture(egui::load::SizedTexture::new(
+                    tex.id(),
+                    egui::vec2(18.0, 18.0),
+                ))
+                .corner_radius(9),
+            );
+        }
+        if !self.sync.name.is_empty() {
+            ui.label(RichText::new(format!("\u{00b7} {}", self.sync.name)).color(muted()));
+        }
+    }
+}
+
+/// The sync note as shown inline next to the "Synced" chip. The chip already
+/// says "Synced", so the note's redundant prefix is dropped ("Synced \u{2014}
+/// already up to date." -> "already up to date."; bare "Synced." -> "").
+pub(super) fn inline_sync_note(note: &str) -> &str {
+    note.strip_prefix("Synced \u{2014} ")
+        .or_else(|| note.strip_prefix("Synced."))
+        .unwrap_or(note)
+        .trim()
+}
+
+/// The right-aligned "Stop syncing" button (disabled, with a spinner, while a
+/// sync operation runs). Returns whether it was clicked.
+fn render_stop_syncing(ui: &mut egui::Ui, working: bool) -> bool {
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        let clicked = ui
+            .add_enabled(!working, egui::Button::new("Stop syncing"))
+            .on_hover_text(
+                "Disconnect this device and delete your synced settings \
+                     from the cloud.",
+            )
+            .clicked();
+        if working {
+            ui.add(egui::Spinner::new().size(14.0));
+        }
+        clicked
+    })
+    .inner
 }
 
 /// The `SignedOut` arm of `sync_card`'s status match. Returns whether the

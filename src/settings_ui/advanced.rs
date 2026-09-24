@@ -24,71 +24,93 @@ fn profile_editor_row(
         });
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.label("Language").on_hover_text(
-                "Recognition language for this app. Leave blank to use the \
-                     global language.",
-            );
-            let mut lang_buf = p.language.clone().unwrap_or_default();
-            if ui
-                .add(
-                    styled_input(&mut lang_buf)
-                        .hint_text("Use global")
-                        .desired_width(90.0),
-                )
-                .changed()
-            {
-                p.language = (!lang_buf.trim().is_empty()).then_some(lang_buf);
-            }
+            profile_language_field(ui, p);
             ui.add_space(8.0);
-            ui.label("Provider");
-            egui::ComboBox::from_id_salt(("profile_provider", idx))
-                .width(150.0)
-                .selected_text(
-                    p.stt_provider
-                        .as_deref()
-                        .map(provider_label)
-                        .unwrap_or("Use global"),
-                )
-                .show_ui(ui, |ui| {
-                    if ui
-                        .selectable_label(p.stt_provider.is_none(), "Use global")
-                        .clicked()
-                    {
-                        p.stt_provider = None;
-                    }
-                    for (id, label) in providers() {
-                        let selected = p.stt_provider.as_deref() == Some(id);
-                        if ui.selectable_label(selected, label).clicked() {
-                            p.stt_provider = Some(id.to_string());
-                        }
-                    }
-                });
+            profile_provider_combo(ui, idx, p);
         });
         ui.add_space(4.0);
-        let mut override_vocab = p.custom_vocabulary.is_some();
-        if blue_check(ui, &mut override_vocab, "Override vocabulary for this app")
-            .on_hover_text(
-                "Unchecked: use the global custom vocabulary (Vocabulary page). Checked \
-                     with an empty list: no vocabulary biasing at all in this app.",
-            )
-            .changed()
-        {
-            p.custom_vocabulary = if override_vocab {
-                Some(parse_vocabulary(vocab_buf))
-            } else {
-                None
-            };
-        }
-        if p.custom_vocabulary.is_some() {
-            ui.add(
-                egui::TextEdit::multiline(vocab_buf)
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(2)
-                    .margin(Margin::symmetric(6, CTRL_PAD))
-                    .hint_text("One term per line"),
-            );
-        }
+        profile_vocabulary_override(ui, p, vocab_buf);
     });
+}
+
+/// A profile's Language override: blank means "use the global language", so
+/// an emptied field clears the override instead of storing "".
+fn profile_language_field(ui: &mut egui::Ui, p: &mut crate::config::Profile) {
+    ui.label("Language").on_hover_text(
+        "Recognition language for this app. Leave blank to use the \
+             global language.",
+    );
+    let mut lang_buf = p.language.clone().unwrap_or_default();
+    if ui
+        .add(
+            styled_input(&mut lang_buf)
+                .hint_text("Use global")
+                .desired_width(90.0),
+        )
+        .changed()
+    {
+        p.language = (!lang_buf.trim().is_empty()).then_some(lang_buf);
+    }
+}
+
+/// A profile's Provider override dropdown: "Use global" (no override) or one
+/// of the providers. `idx` keeps each row's combo id distinct.
+fn profile_provider_combo(ui: &mut egui::Ui, idx: usize, p: &mut crate::config::Profile) {
+    ui.label("Provider");
+    egui::ComboBox::from_id_salt(("profile_provider", idx))
+        .width(150.0)
+        .selected_text(
+            p.stt_provider
+                .as_deref()
+                .map(provider_label)
+                .unwrap_or("Use global"),
+        )
+        .show_ui(ui, |ui| {
+            if ui
+                .selectable_label(p.stt_provider.is_none(), "Use global")
+                .clicked()
+            {
+                p.stt_provider = None;
+            }
+            for (id, label) in providers() {
+                let selected = p.stt_provider.as_deref() == Some(id);
+                if ui.selectable_label(selected, label).clicked() {
+                    p.stt_provider = Some(id.to_string());
+                }
+            }
+        });
+}
+
+/// The "Override vocabulary for this app" check and, while it is on, the
+/// profile's own term list, edited through its scratch buffer.
+fn profile_vocabulary_override(
+    ui: &mut egui::Ui,
+    p: &mut crate::config::Profile,
+    vocab_buf: &mut String,
+) {
+    let mut override_vocab = p.custom_vocabulary.is_some();
+    if blue_check(ui, &mut override_vocab, "Override vocabulary for this app")
+        .on_hover_text(
+            "Unchecked: use the global custom vocabulary (Vocabulary page). Checked \
+                 with an empty list: no vocabulary biasing at all in this app.",
+        )
+        .changed()
+    {
+        p.custom_vocabulary = if override_vocab {
+            Some(parse_vocabulary(vocab_buf))
+        } else {
+            None
+        };
+    }
+    if p.custom_vocabulary.is_some() {
+        ui.add(
+            egui::TextEdit::multiline(vocab_buf)
+                .desired_width(f32::INFINITY)
+                .desired_rows(2)
+                .margin(Margin::symmetric(6, CTRL_PAD))
+                .hint_text("One term per line"),
+        );
+    }
 }
 
 impl super::SettingsApp {
@@ -307,31 +329,10 @@ impl super::SettingsApp {
         );
 
         if browse {
-            let start = crate::paths::expand(&self.draft.data_dir).unwrap_or(live_dir.clone());
-            if let Some(dir) = crate::paths::pick_folder(Some(&start)) {
-                match crate::paths::check_writable(&dir) {
-                    Ok(()) => {
-                        self.draft.data_dir = dir.to_string_lossy().into_owned();
-                        // Accept the choice either way, but say so if the folder
-                        // is already somebody else's.
-                        self.status = crate::paths::folder_caution(&dir).unwrap_or_default();
-                    }
-                    Err(e) => self.status = format!("Can't use that folder: {e}"),
-                }
-            }
+            self.browse_for_data_folder(&live_dir);
         }
         if use_app_data {
-            match crate::paths::app_data_dir() {
-                Some(dir) => {
-                    self.draft.data_dir = dir.to_string_lossy().into_owned();
-                    // Clear any "can't use that folder" left by an earlier
-                    // Browse: it describes a choice that is no longer selected.
-                    self.status.clear();
-                }
-                None => {
-                    self.status = "Windows did not report a LOCALAPPDATA folder.".to_string();
-                }
-            }
+            self.use_app_data_folder();
         }
         if use_default {
             self.draft.data_dir.clear();
@@ -342,6 +343,41 @@ impl super::SettingsApp {
             let _ = std::process::Command::new("explorer.exe")
                 .arg(&live_dir)
                 .spawn();
+        }
+    }
+
+    /// The Files row's "Browse…": pick a folder, starting from the typed one
+    /// (or the folder in use), and take it only if it is writable.
+    fn browse_for_data_folder(&mut self, live_dir: &std::path::Path) {
+        let start =
+            crate::paths::expand(&self.draft.data_dir).unwrap_or_else(|| live_dir.to_path_buf());
+        let Some(dir) = crate::paths::pick_folder(Some(&start)) else {
+            return;
+        };
+        match crate::paths::check_writable(&dir) {
+            Ok(()) => {
+                self.draft.data_dir = dir.to_string_lossy().into_owned();
+                // Accept the choice either way, but say so if the folder
+                // is already somebody else's.
+                self.status = crate::paths::folder_caution(&dir).unwrap_or_default();
+            }
+            Err(e) => self.status = format!("Can't use that folder: {e}"),
+        }
+    }
+
+    /// The Files row's "Use AppData": point the draft at
+    /// %LOCALAPPDATA%\QuickDictate.
+    fn use_app_data_folder(&mut self) {
+        match crate::paths::app_data_dir() {
+            Some(dir) => {
+                self.draft.data_dir = dir.to_string_lossy().into_owned();
+                // Clear any "can't use that folder" left by an earlier
+                // Browse: it describes a choice that is no longer selected.
+                self.status.clear();
+            }
+            None => {
+                self.status = "Windows did not report a LOCALAPPDATA folder.".to_string();
+            }
         }
     }
 

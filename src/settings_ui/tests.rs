@@ -74,6 +74,79 @@ fn left_and_right_click_are_never_captured() {
     }
 }
 
+fn key_event(
+    key: egui::Key,
+    pressed: bool,
+    repeat: bool,
+    modifiers: egui::Modifiers,
+) -> egui::Event {
+    egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed,
+        repeat,
+        modifiers,
+    }
+}
+
+fn pointer_event(button: egui::PointerButton, pressed: bool) -> egui::Event {
+    egui::Event::PointerButton {
+        pos: egui::Pos2::ZERO,
+        button,
+        pressed,
+        modifiers: egui::Modifiers::default(),
+    }
+}
+
+#[test]
+fn a_recording_field_takes_the_first_bindable_press_and_escape_cancels() {
+    let none = egui::Modifiers::default();
+    let ctrl = egui::Modifiers {
+        ctrl: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        capture_from_event(&key_event(egui::Key::Escape, true, false, none)),
+        Some(None),
+        "Escape cancels recording"
+    );
+    assert_eq!(
+        capture_from_event(&key_event(egui::Key::D, true, false, ctrl)),
+        Some(Some("ctrl+d".to_string()))
+    );
+    assert_eq!(
+        capture_from_event(&pointer_event(egui::PointerButton::Middle, true)),
+        Some(Some("mouse3".to_string()))
+    );
+    // Everything else leaves the field listening: releases, key repeats,
+    // keys the parser can't use, the unbindable buttons, and non-input events.
+    for ev in [
+        key_event(egui::Key::D, false, false, ctrl),
+        key_event(egui::Key::D, true, true, ctrl),
+        key_event(egui::Key::F35, true, false, none),
+        key_event(egui::Key::Escape, false, false, none),
+        pointer_event(egui::PointerButton::Middle, false),
+        pointer_event(egui::PointerButton::Primary, true),
+        egui::Event::PointerMoved(egui::Pos2::ZERO),
+    ] {
+        assert_eq!(
+            capture_from_event(&ev),
+            None,
+            "{ev:?} must not end recording"
+        );
+    }
+    // The first event that decides wins, the way `capture_hotkey` scans.
+    let events = [
+        key_event(egui::Key::F35, true, false, none),
+        pointer_event(egui::PointerButton::Extra1, true),
+        key_event(egui::Key::Escape, true, false, none),
+    ];
+    assert_eq!(
+        events.iter().find_map(capture_from_event),
+        Some(Some("mouse4".to_string()))
+    );
+}
+
 #[test]
 fn a_mouse_bound_toggle_and_hold_are_a_reported_conflict() {
     // Two identical mouse bindings are as unusable as two identical
@@ -271,4 +344,109 @@ fn history_cache_stale_detects_a_filter_edit_with_the_version_unchanged() {
 #[test]
 fn history_cache_stale_detects_both_moving_at_once() {
     assert!(history_cache_stale(3, 5, "hello", "world"));
+}
+
+// ---- "Default settings" keeps the keys (review fix F4) --------------------
+
+#[test]
+fn default_reset_keeps_every_api_key_list_and_the_key_protection() {
+    // Every `*_keys` list is found through the serialized shape, so a key
+    // list added later is covered without touching this test.
+    let mut shape = match serde_json::to_value(Config::default()) {
+        Ok(serde_json::Value::Object(map)) => map,
+        other => panic!("Config must serialize to an object, got {other:?}"),
+    };
+    let key_fields: Vec<String> = shape
+        .iter()
+        .filter(|(name, value)| name.ends_with("_keys") && value.is_array())
+        .map(|(name, _)| name.clone())
+        .collect();
+    assert!(
+        key_fields.iter().any(|f| f == "polish_keys"),
+        "the AI cleanup's keys are API keys too: {key_fields:?}"
+    );
+    for field in &key_fields {
+        shape.insert(
+            field.clone(),
+            serde_json::json!([format!("key-for-{field}")]),
+        );
+    }
+    shape.insert("protect_keys_at_rest".into(), serde_json::Value::Bool(true));
+    shape.insert("language".into(), serde_json::json!("fr-FR"));
+    let edited: Config = serde_json::from_value(serde_json::Value::Object(shape)).unwrap();
+
+    let reset = SettingsApp::defaults_keeping_keys(&edited);
+
+    let reset_shape = serde_json::to_value(&reset).unwrap();
+    for field in &key_fields {
+        assert_eq!(
+            reset_shape[field.as_str()],
+            serde_json::json!([format!("key-for-{field}")]),
+            "{field} was wiped by the reset"
+        );
+    }
+    assert!(
+        reset.protect_keys_at_rest,
+        "dropping the flag re-writes every kept key in plaintext"
+    );
+    assert_eq!(
+        reset.language,
+        Config::default().language,
+        "everything else does reset"
+    );
+}
+
+// ---- Closing with an editor open (review fix F2) --------------------------
+
+#[test]
+fn an_open_replacements_editor_commits_exactly_what_done_would() {
+    let rows_mode = ReplacementsModalState {
+        rows: vec![
+            ("Github".into(), "GitHub".into()),
+            ("   ".into(), "blank from is dropped".into()),
+        ],
+        add_from: String::new(),
+        add_to: String::new(),
+        bulk: false,
+        bulk_text: "ignored => outside text mode".into(),
+    };
+    assert_eq!(
+        rows_mode.into_committed().into_iter().collect::<Vec<_>>(),
+        vec![("Github".to_string(), "GitHub".to_string())]
+    );
+
+    // Left in text-editor mode: the text is what gets committed, not the rows.
+    let bulk_mode = ReplacementsModalState {
+        rows: vec![("stale".into(), "row".into())],
+        add_from: String::new(),
+        add_to: String::new(),
+        bulk: true,
+        bulk_text: "Chat GPT => ChatGPT\n\nno separator".into(),
+    };
+    assert_eq!(
+        bulk_mode.into_committed().into_iter().collect::<Vec<_>>(),
+        vec![("Chat GPT".to_string(), "ChatGPT".to_string())]
+    );
+}
+
+// ---- Sync card ------------------------------------------------------------
+
+#[test]
+fn the_inline_sync_note_drops_what_the_synced_chip_already_says() {
+    use super::sync::inline_sync_note;
+    assert_eq!(
+        inline_sync_note("Synced \u{2014} already up to date."),
+        "already up to date."
+    );
+    assert_eq!(inline_sync_note("Synced."), "");
+    assert_eq!(inline_sync_note(""), "");
+    // Notes that don't open with the chip's word are shown whole.
+    assert_eq!(
+        inline_sync_note("Updated from your Connections account."),
+        "Updated from your Connections account."
+    );
+    assert_eq!(
+        inline_sync_note("Sync problem: offline"),
+        "Sync problem: offline"
+    );
 }

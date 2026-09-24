@@ -28,38 +28,7 @@ impl SettingsApp {
         // recorded. Renewed every frame, and self-expiring if this window goes
         // away mid-record.
         crate::mouse_hook::capture_lease();
-        let captured = ctx.input(|i| {
-            for ev in &i.events {
-                match ev {
-                    egui::Event::Key {
-                        key,
-                        pressed: true,
-                        repeat: false,
-                        modifiers,
-                        ..
-                    } => {
-                        if *key == egui::Key::Escape {
-                            return Some(None);
-                        }
-                        if let Some(combo) = combo_from_event(*key, *modifiers) {
-                            return Some(Some(combo));
-                        }
-                    }
-                    egui::Event::PointerButton {
-                        button,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } => {
-                        if let Some(combo) = combo_from_pointer(*button, *modifiers) {
-                            return Some(Some(combo));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            None
-        });
+        let captured = ctx.input(|i| i.events.iter().find_map(capture_from_event));
         match captured {
             Some(Some(combo)) => {
                 match field {
