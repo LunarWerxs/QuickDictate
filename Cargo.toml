@@ -1,6 +1,6 @@
 [package]
 name = "quickdictate"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2021"
 description = "Fast Windows dictation with cloud and optional local speech recognition"
 # Source available, free for noncommercial use; see LICENSE. Releases through

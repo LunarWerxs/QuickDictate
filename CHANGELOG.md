@@ -6,7 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-09-24
+
 ### Fixed
+
+- **An OpenAI key with no credit left is caught before you dictate on it.** OpenAI accepts such a
+  key's connection and says nothing until it has transcribed audio, so the startup key check passed
+  it and your first dictation failed. The one-time check now sends a second of faint noise and
+  commits it, which surfaces "no credit" right away; a key that passes is remembered and never
+  checked again.
 
 - **Settings sync no longer lets one PC overwrite another's newer settings.** A Save pushed every
   synced setting, so a PC that had not pulled recently wrote its stale copy over a change made on
