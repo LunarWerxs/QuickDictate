@@ -80,10 +80,6 @@ pub const RELEASES_URL: &str = "https://github.com/LunarWerxs/QuickDictate/relea
 pub const GITHUB_LATEST_API: &str =
     "https://api.github.com/repos/LunarWerxs/QuickDictate/releases/latest";
 
-/// GitHub rejects requests without a User-Agent (the release download still
-/// goes there directly); the Studio proxy sees the same header.
-const USER_AGENT: &str = concat!("QuickDictate/", env!("CARGO_PKG_VERSION"));
-
 /// At most one real network check per this interval (auto path only).
 const CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
 
@@ -174,12 +170,9 @@ fn set_pending_update(tag: Option<String>) {
 }
 
 fn client() -> Option<reqwest::blocking::Client> {
-    reqwest::blocking::Client::builder()
-        .user_agent(USER_AGENT)
-        .timeout(Duration::from_secs(120))
-        .connect_timeout(Duration::from_secs(15))
-        .build()
-        .ok()
+    // GitHub rejects requests without a User-Agent (the release download still
+    // goes there directly); `http` sets the shared one.
+    crate::http::blocking_client(Duration::from_secs(120), Duration::from_secs(15)).ok()
 }
 
 /// The last successful `fetch_latest_json` payload, held so the install step

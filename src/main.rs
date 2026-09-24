@@ -31,6 +31,7 @@ mod focus;
 mod fuzz;
 mod history_store;
 mod hotkeys;
+mod http;
 mod icon;
 mod key_checks;
 mod keys;
@@ -117,6 +118,9 @@ fn main() -> Result<()> {
     // runtime alive until every physical dictation has finalized and its stats
     // write is durable, then let process exit hand the mutex to the child.
     started.app.stats.finish_sessions_and_flush();
+    // Every session has finalized, so every transcript is queued: the output
+    // worker, which kept running for exactly this, pastes them and exits.
+    output::request_stop();
     // Every press has finished listening by now, so put back any app still
     // quieted before the process (and the worker thread that knows which
     // apps they are) goes away.

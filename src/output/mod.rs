@@ -16,6 +16,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{KEYBD_EVENT_FLAGS, VIRTUAL_KEY
 use crate::focus;
 
 pub use processor::PasteOutcome;
+pub(crate) use worker::request_stop;
 pub use worker::spawn;
 
 use clipboard::*;

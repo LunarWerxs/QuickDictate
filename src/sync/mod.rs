@@ -66,7 +66,6 @@ const STORE_BASE: &str = "https://studio.connectionsapi.com/v1/app-data";
 const SCOPES: &str = "openid profile email photo";
 const REDIRECT_PATH: &str = "/oauth/callback";
 const CREDS_FILE: &str = "quickdictate-connections.dat";
-const USER_AGENT: &str = concat!("QuickDictate/", env!("CARGO_PKG_VERSION"));
 const STATS_KEY: &str = "usage_stats";
 
 /// How long we wait for the user to complete sign-in in their browser.

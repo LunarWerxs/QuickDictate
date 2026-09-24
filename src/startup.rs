@@ -356,7 +356,8 @@ impl Started {
     /// already running when shutdown began puts the user's clipboard back
     /// only after `clipboard_restore_delay_ms`, on that thread; exiting first
     /// leaves the transcript on their clipboard for good. An idle worker
-    /// quits within 50 ms of `app.shutdown`, so this normally returns at once.
+    /// quits within 50 ms of `output::request_stop`, so this normally returns
+    /// at once.
     pub(crate) fn wait_for_output(self, limit: Duration) {
         if !join_within(self.output_join, limit) {
             tracing::warn!("shutdown: output worker still busy after {limit:?}; exiting anyway");

@@ -16,7 +16,6 @@ use sha2::{Digest, Sha256};
 use super::install::{set_state, InstallPhase};
 use super::ModelSpec;
 
-const USER_AGENT: &str = concat!("QuickDictate/", env!("CARGO_PKG_VERSION"));
 const PARALLEL_DOWNLOAD_MIN_BYTES: u64 = 32 * 1024 * 1024;
 const PARALLEL_DOWNLOAD_WORKERS: usize = 8;
 const DOWNLOAD_BUFFER_BYTES: usize = 1024 * 1024;
@@ -157,7 +156,7 @@ pub(super) fn check_cancelled(cancel: &AtomicBool) -> Result<(), String> {
 
 pub(super) fn download_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
-        .user_agent(USER_AGENT)
+        .user_agent(crate::http::USER_AGENT)
         .connect_timeout(Duration::from_secs(20))
         .timeout(Duration::from_secs(4 * 60 * 60))
         .build()

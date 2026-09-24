@@ -1,7 +1,7 @@
 //! The paste worker thread: it takes a finished transcript off the channel,
 //! applies the per-app text processing, and decides how it reaches the screen.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,6 +15,18 @@ use crate::text::{self, TextProcessor};
 use crate::voice_commands::{self, ScratchThat};
 
 use super::*;
+
+/// Set by `main` once every session has finished finalizing (see
+/// [`request_stop`]). The worker deliberately runs on past `App::shutdown`
+/// until then: a press still live when the app is told to quit delivers its
+/// transcript DURING that finalize, and a worker that had already left would
+/// drop those words unpasted and out of history.
+static STOP: AtomicBool = AtomicBool::new(false);
+
+/// Every session has finalized: paste whatever is still queued, then exit.
+pub(crate) fn request_stop() {
+    STOP.store(true, Ordering::Release);
+}
 
 #[allow(
     clippy::expect_used,
@@ -50,7 +62,7 @@ fn run(app: Arc<App>) {
     // simply doesn't apply, which is the pre-existing behavior.
     let mut continue_within: Option<u64> = None;
 
-    while !app.shutdown.load(Ordering::Acquire) {
+    while !STOP.load(Ordering::Acquire) {
         crossbeam_channel::select! {
             recv(app.transcript_rx) -> raw => {
                 let raw = match raw {
@@ -83,6 +95,11 @@ fn run(app: Arc<App>) {
             }
             default(Duration::from_millis(50)) => {}
         }
+    }
+    // The last words of a press that was live at shutdown can land between the
+    // final select and the stop request: paste them too, then leave.
+    while let Ok(raw) = app.transcript_rx.try_recv() {
+        process_transcript(&app, raw, &mut cache, &current_cfg, &mut continue_within);
     }
 }
 

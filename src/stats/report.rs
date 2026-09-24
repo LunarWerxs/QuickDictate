@@ -42,7 +42,6 @@ mod tests;
 /// forward, so no data is lost by the endpoint not existing yet.
 pub const USAGE_REPORT_API: &str = "https://studio.connectionsapi.com/v1/app/quickdictate/usage";
 
-const USER_AGENT: &str = concat!("QuickDictate/", env!("CARGO_PKG_VERSION"));
 const CACHE_FILE: &str = "quickdictate-usage-report.txt";
 
 /// At most one real network send per this interval, same cadence as the
@@ -122,12 +121,7 @@ pub(super) fn anonymized_payload(install_id: &str, stats: &UsageStats) -> Value 
 }
 
 fn client() -> Option<reqwest::blocking::Client> {
-    reqwest::blocking::Client::builder()
-        .user_agent(USER_AGENT)
-        .timeout(Duration::from_secs(30))
-        .connect_timeout(Duration::from_secs(10))
-        .build()
-        .ok()
+    crate::http::blocking_client(Duration::from_secs(30), Duration::from_secs(10)).ok()
 }
 
 /// POST the rollup now, unconditionally -- throttling is [`spawn_daily_report`]'s

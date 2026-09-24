@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use super::{
     AUTH_URL, CALLBACK_TIMEOUT, CLIENT_ID, MAX_AVATAR_BYTES, MAX_AVATAR_DIMENSION, REDIRECT_PATH,
-    SCOPES, TOKEN_URL, USERINFO_URL, USER_AGENT,
+    SCOPES, TOKEN_URL, USERINFO_URL,
 };
 
 /// CSPRNG bytes via CNG's system-preferred RNG. **Fallible on purpose:** the
@@ -107,11 +107,7 @@ fn open_browser(url: &str) {
 // ---- HTTP + token flows ----------------------------------------------------
 
 pub(super) fn client() -> Result<reqwest::blocking::Client> {
-    reqwest::blocking::Client::builder()
-        .user_agent(USER_AGENT)
-        .timeout(Duration::from_secs(30))
-        .connect_timeout(Duration::from_secs(15))
-        .build()
+    crate::http::blocking_client(Duration::from_secs(30), Duration::from_secs(15))
         .context("http client init")
 }
 
