@@ -16,7 +16,7 @@
 //!     simply asks the user to sign in again there.
 //!   * **Only portable preferences and numeric usage totals sync**
 //!     ([`SYNCED_KEYS`](schema::SYNCED_KEYS)). API keys, transcript text, window geometry,
-//!     `run_at_startup`, and logging flags never leave the machine.
+//!     `run_at_startup`, and the transcript-logging flag never leave the machine.
 //!
 //! The access token lives only in a worker's stack for the duration of one call;
 //! it is never persisted. Only the refresh token (+ a display email/name) is
@@ -48,7 +48,7 @@ pub use schema::{apply_synced_to_config, snapshot_to_synced, synced_stats};
 pub use store::{store_delete, store_pull, store_push};
 
 use oauth::fetch_userinfo;
-use schema::merge_stats;
+use schema::{merge_stats, stats_to_synced};
 use store::{clear_store_cache, CachedRemoteDoc};
 
 // ---- Public constants ------------------------------------------------------
@@ -163,29 +163,7 @@ pub fn resume_and_pull(local_snapshot: Value) -> Result<Connected> {
     let mut creds = load_creds().ok_or_else(|| anyhow!("not signed in"))?;
     let tokens = refresh(&creds.refresh_token)?;
     persist_rotated(&creds, &tokens);
-    // Backfill the display name/email for creds saved before we fetched userinfo (older builds
-    // decoded identity from the id_token, which carries neither). One-time re-seal on next resume.
-    if creds.name.is_empty() || creds.email.is_empty() || creds.picture.is_empty() {
-        let (email, name, picture) = fetch_userinfo(&tokens.access_token);
-        let changed = (!name.is_empty() && name != creds.name)
-            || (!email.is_empty() && email != creds.email)
-            || (!picture.is_empty() && picture != creds.picture);
-        if changed {
-            if !name.is_empty() {
-                creds.name = name;
-            }
-            if !email.is_empty() {
-                creds.email = email;
-            }
-            if !picture.is_empty() {
-                creds.picture = picture;
-            }
-            let _ = save_creds(&Creds {
-                refresh_token: tokens.refresh_token.clone(),
-                ..creds.clone()
-            });
-        }
-    }
+    backfill_identity(&mut creds, &tokens);
     let avatar = fetch_avatar(&creds.picture);
     let doc = store_pull(&tokens.access_token)?;
     let mut merged = doc.settings;
@@ -201,7 +179,41 @@ pub fn resume_and_pull(local_snapshot: Value) -> Result<Connected> {
     })
 }
 
-/// Push the current local snapshot to the cloud (used on Save). Refresh-aware.
+/// Backfill the display name/email for creds saved before we fetched userinfo (older builds
+/// decoded identity from the id_token, which carries neither). One-time re-seal on next resume.
+fn backfill_identity(creds: &mut Creds, tokens: &Tokens) {
+    if !(creds.name.is_empty() || creds.email.is_empty() || creds.picture.is_empty()) {
+        return;
+    }
+    let (email, name, picture) = fetch_userinfo(&tokens.access_token);
+    if fill_identity(creds, email, name, picture) {
+        let _ = save_creds(&Creds {
+            refresh_token: tokens.refresh_token.clone(),
+            ..creds.clone()
+        });
+    }
+}
+
+/// Take each non-empty userinfo field that differs from what `creds` holds.
+/// An empty one is a userinfo blip, never a reason to erase a known value.
+/// Returns whether anything changed.
+fn fill_identity(creds: &mut Creds, email: String, name: String, picture: String) -> bool {
+    let mut changed = false;
+    for (slot, fresh) in [
+        (&mut creds.name, name),
+        (&mut creds.email, email),
+        (&mut creds.picture, picture),
+    ] {
+        if !fresh.is_empty() && *slot != fresh {
+            *slot = fresh;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Push `local_snapshot` to the cloud: the full synced snapshot on Save, or
+/// just the usage stats from the background and exit pushes. Refresh-aware.
 pub fn push_now(mut local_snapshot: Value) -> Result<u64> {
     let _guard = sync_guard();
     let creds = load_creds().ok_or_else(|| anyhow!("not signed in"))?;
@@ -224,8 +236,10 @@ pub fn schedule_stats_push(app: Arc<App>) {
             // A short debounce captures quick successive dictations in one
             // request and keeps network work away from the transcription path.
             std::thread::sleep(Duration::from_secs(3));
-            let config = app.config.load();
-            let snapshot = snapshot_to_synced(&config, &app.stats.snapshot());
+            // Stats only: this machine's settings may be older than the cloud's
+            // (it pulls only when Settings opens), and merge mode would let
+            // them overwrite a newer change made elsewhere.
+            let snapshot = stats_to_synced(&app.stats.snapshot());
             if let Err(error) = push_now(snapshot) {
                 tracing::warn!("connections: background stats sync failed: {error}");
             }
@@ -255,8 +269,8 @@ pub fn flush_before_exit(app: &Arc<App>, timeout: Duration) {
     if !is_signed_in() {
         return;
     }
-    let config = app.config.load();
-    let snapshot = snapshot_to_synced(&config, &app.stats.snapshot());
+    // Stats only, for the same reason as `schedule_stats_push`.
+    let snapshot = stats_to_synced(&app.stats.snapshot());
     let (tx, rx) = std::sync::mpsc::channel();
     if std::thread::Builder::new()
         .name("qd-sync-flush".into())
@@ -283,13 +297,13 @@ pub fn flush_before_exit(app: &Arc<App>, timeout: Duration) {
 /// issued, so a failed write here is not a safe no-op: the in-memory session
 /// keeps working for the rest of this run, but the NEXT launch would load the
 /// now-dead old token off disk and get an opaque "token refresh failed" with
-/// no clue why. Rather than leave that trap, a save failure on a genuine
-/// rotation logs the real cause and clears the local creds, so the next
-/// launch presents a clean signed-out state the user can act on (sign in
-/// again) instead of a confusing refresh error. This is distinct from the
-/// benign identity-backfill re-seal in `resume_and_pull` (same `save_creds`,
-/// but backfilling a display name/email, not persisting a rotated token) —
-/// that path is left as best-effort, unchanged.
+/// no clue why. So the write is retried once, and if both attempts fail the
+/// real cause is logged as an error. The old creds are deliberately KEPT
+/// rather than cleared (see the note in the body): the next launch then shows
+/// a refresh error that the log explains, instead of a silent sign-out. This
+/// is distinct from the benign identity-backfill re-seal in
+/// `backfill_identity` (same `save_creds`, but backfilling a display
+/// name/email, not persisting a rotated token), which stays best-effort.
 fn persist_rotated(old: &Creds, fresh: &Tokens) {
     if fresh.refresh_token.is_empty() || fresh.refresh_token == old.refresh_token {
         return;

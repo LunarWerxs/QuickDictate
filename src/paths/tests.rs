@@ -1,6 +1,6 @@
 //! Tests for folder resolution, the writability check, and migration.
 
-use super::resolve::{env_dir, migration_sources, resolve};
+use super::resolve::{env_dir, migration_sources, resolve, wide};
 use super::*;
 
 /// `expand` and `resolve` read process-wide environment state, so the tests
@@ -210,6 +210,39 @@ fn migration_moves_files_and_the_logs_folder() {
     assert!(dest.join("quickdictate-stats.json").exists());
     assert!(!source_dir.join("logs").exists());
     assert!(!source_dir.join("quickdictate-stats.json").exists());
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// An exe on the Desktop or in C:\Tools can sit beside another tool's
+/// `logs\`. Moving the data folder must not carry that off with it.
+#[test]
+fn migration_leaves_somebody_elses_logs_folder_alone() {
+    let root = temp_dir("foreignlogs");
+    let dest = root.join("dest");
+    let source_dir = root.join("source");
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::create_dir_all(source_dir.join("logs")).unwrap();
+    std::fs::write(source_dir.join("logs\\othertool.log"), b"not ours").unwrap();
+    std::fs::write(source_dir.join("quickdictate-stats.json"), b"{}").unwrap();
+
+    let diags = migrate_into(&source_dir, &dest);
+
+    assert!(source_dir.join("logs\\othertool.log").exists());
+    assert!(!dest.join("logs").exists());
+    assert!(dest.join("quickdictate-stats.json").exists(), "{diags:?}");
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn only_a_logs_folder_with_quickdictate_files_counts_as_ours() {
+    let root = temp_dir("ourlogs");
+    std::fs::create_dir_all(&root).unwrap();
+    assert!(!holds_our_logs(&root), "an empty folder proves nothing");
+    std::fs::write(root.join("server.log"), b"").unwrap();
+    assert!(!holds_our_logs(&root));
+    std::fs::write(root.join("QuickDictate-panic.log"), b"").unwrap();
+    assert!(holds_our_logs(&root), "matched case-insensitively");
+    assert!(!holds_our_logs(&root.join("missing")));
     std::fs::remove_dir_all(&root).unwrap();
 }
 

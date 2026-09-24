@@ -11,17 +11,13 @@ use crate::stats::UsageStats;
 use super::STATS_KEY;
 
 /// The **allowlist** of settings.json keys that sync to the cloud. Deliberately
-/// excludes:
+/// excludes (the full list, with reasons, is [`NEVER_SYNCED`]):
 ///
 ///   * every `*_keys` / `local_keys` array — **secrets, never synced**;
 ///   * `window_width/height/x/y` — machine-local window geometry;
 ///   * `run_at_startup` — per-machine registry (Run key) behavior;
-///   * `hide_tray_icon` — per-machine, like `run_at_startup`: whether the
-///     notification-area icon is shown is a property of this install, not a
-///     portable preference, so it never travels with the synced settings;
-///   * `enable_logging` / `log_transcripts` — local diagnostics toggles;
-///   * `max_log_mb` — a per-install log-size cap, machine-local like
-///     `enable_logging`, not a portable preference;
+///   * `log_transcripts` — writes your dictated text to disk, so turning it on
+///     from another machine would be a privacy change made for you;
 ///   * `data_dir` — an absolute path on *this* PC. Syncing it would point a
 ///     second machine at a folder that may not exist there (or, worse, at
 ///     somebody else's folder that does);
@@ -29,10 +25,10 @@ use super::STATS_KEY;
 ///     would merge two machines' identities into one;
 ///   * `update_auto_install` — a machine-local policy choice (whether *this*
 ///     machine applies updates unattended); syncing it would silently opt a
-///     second machine into unattended installs;
-///   * `protect_keys_at_rest` — whether *this* machine's settings.json seals
-///     its keys with DPAPI bound to this Windows account; meaningless (and
-///     misleading) if carried to another account or machine.
+///     second machine into unattended installs.
+///
+/// `hide_tray_icon`, `enable_logging`, `max_log_mb` and `protect_keys_at_rest`
+/// were once on that list and now sync; the note at their entries says why.
 ///
 /// Only portable preferences travel. Names match `Config`'s serde field names
 /// exactly, so the transforms below stay in lock-step with the struct. See
@@ -170,6 +166,16 @@ pub fn snapshot_to_synced(cfg: &Config, stats: &UsageStats) -> Value {
         object.insert(STATS_KEY.to_string(), stats.synced_value());
     }
     snapshot
+}
+
+/// The usage statistics alone, as a document of their own: what the
+/// background and exit pushes send. Merge mode leaves every other cloud key as
+/// it is, so a machine that has not pulled lately cannot write its stale
+/// settings over a change made on another machine since.
+pub(super) fn stats_to_synced(stats: &UsageStats) -> Value {
+    let mut out = serde_json::Map::new();
+    out.insert(STATS_KEY.to_string(), stats.synced_value());
+    Value::Object(out)
 }
 
 pub fn synced_stats(remote: &Value) -> Option<&Value> {

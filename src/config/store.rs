@@ -52,50 +52,25 @@ impl Config {
         // settings.json sitting next to the exe IS the portable install's
         // config, and an upgrade must never silently move such a user onto a
         // different file.
-        if let Some(path) = Self::env_settings_path() {
-            if path.exists() {
-                return path;
-            }
+        if let Some(path) = Self::env_settings_path().filter(|p| p.exists()) {
+            return path;
         }
 
-        let exe = std::env::current_exe().ok();
-        let exe_dir = exe
-            .as_ref()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf));
 
-        if let Some(dir) = exe_dir.as_ref() {
-            let direct = dir.join("settings.json");
-            if direct.exists() {
-                return direct;
-            }
-            // Walk up looking for a settings.json. This exists purely so a dev
-            // run from target/{profile}/ (or .../deps/) picks up the project
-            // root's settings.json. It must NOT happen in a shipped build: a
-            // portable exe dropped in, say, Downloads\QuickDictate\ would
-            // otherwise adopt an unrelated settings.json sitting in the user's
-            // profile folder and then overwrite it wholesale on the next Save.
-            // Debug builds walk freely; release builds only accept an ancestor
-            // that is explicitly marked as a QuickDictate working tree.
-            let mut cur = dir.clone();
-            for _ in 0..5 {
-                if let Some(parent) = cur.parent() {
-                    let candidate = parent.join("settings.json");
-                    if candidate.exists() && Self::ancestor_settings_allowed(parent) {
-                        return candidate;
-                    }
-                    cur = parent.to_path_buf();
-                } else {
-                    break;
-                }
-            }
+        if let Some(path) = exe_dir.as_deref().and_then(Self::exe_or_ancestor_settings) {
+            return path;
         }
 
         // The well-known off-exe location. Only adopted when the file is really
         // there, so this can never redirect an install that has its own copy.
-        if let Some(path) = crate::paths::app_data_dir().map(|d| d.join("settings.json")) {
-            if path.exists() {
-                return path;
-            }
+        if let Some(path) = crate::paths::app_data_dir()
+            .map(|d| d.join("settings.json"))
+            .filter(|p| p.exists())
+        {
+            return path;
         }
 
         let cwd = PathBuf::from("settings.json");
@@ -112,61 +87,86 @@ impl Config {
         exe_dir.map(|p| p.join("settings.json")).unwrap_or(cwd)
     }
 
+    /// An existing settings.json next to the exe, or in one of the five
+    /// folders above it that [`Config::ancestor_settings_allowed`] accepts.
+    fn exe_or_ancestor_settings(dir: &Path) -> Option<PathBuf> {
+        let direct = dir.join("settings.json");
+        if direct.exists() {
+            return Some(direct);
+        }
+        // Walk up looking for a settings.json. This exists purely so a dev
+        // run from target/{profile}/ (or .../deps/) picks up the project
+        // root's settings.json. It must NOT happen in a shipped build: a
+        // portable exe dropped in, say, Downloads\QuickDictate\ would
+        // otherwise adopt an unrelated settings.json sitting in the user's
+        // profile folder and then overwrite it wholesale on the next Save.
+        // Debug builds walk freely; release builds only accept an ancestor
+        // that is explicitly marked as a QuickDictate working tree.
+        dir.ancestors()
+            .skip(1)
+            .take(5)
+            .find(|parent| {
+                parent.join("settings.json").exists() && Self::ancestor_settings_allowed(parent)
+            })
+            .map(|parent| parent.join("settings.json"))
+    }
+
     /// Load settings.json, generating one with defaults if no file is found.
     /// We don't use `tracing` here because logging may not be initialized yet
     /// (logging is now configured *from* the loaded settings). Instead we
     /// return a list of diagnostic messages the caller replays via tracing
     /// after init_logging has run.
     pub fn load_or_create() -> (Self, Vec<String>) {
-        let mut diags: Vec<String> = Vec::new();
         let path = Self::settings_path();
-
         if path.exists() {
-            return match fs::read_to_string(&path) {
-                Ok(data) => match serde_json::from_str::<Config>(&data) {
-                    Ok(mut c) => {
-                        diags.push(format!("INFO: Loaded settings from {}", path.display()));
-                        diags.extend(c.unseal_keys());
-                        let configured_model = c.local_model.clone();
-                        if c.normalize_local_model() {
-                            diags.push(format!(
-                                "WARN: local model '{configured_model}' is no longer available; \
-                                 using '{}' instead",
-                                c.local_model
-                            ));
-                        }
-                        (c, diags)
-                    }
-                    Err(e) => {
-                        // Preserve the unparseable file instead of silently
-                        // discarding the user's keys/prefs on a hand-edit typo or
-                        // truncated write: copy it aside so it can be recovered or
-                        // hand-fixed, and report it loudly.
-                        let bad = path.with_extension("json.bad");
-                        match fs::copy(&path, &bad) {
-                            Ok(_) => diags.push(format!(
-                                "ALERT: failed to parse {}: {e}. Backed up the original to {} and started from defaults — restore or fix it to recover your settings.",
-                                path.display(),
-                                bad.display()
-                            )),
-                            Err(copy_err) => diags.push(format!(
-                                "ALERT: failed to parse {}: {e}. Using defaults. (Could not back up the original: {copy_err})",
-                                path.display()
-                            )),
-                        }
-                        (Config::default(), diags)
-                    }
-                },
-                Err(e) => {
-                    diags.push(format!(
-                        "ERROR: failed to read {}: {e}. Using defaults.",
-                        path.display()
-                    ));
-                    (Config::default(), diags)
-                }
-            };
+            Self::load_existing(&path)
+        } else {
+            Self::create_from_template(path)
         }
+    }
 
+    /// The load half of [`Config::load_or_create`]: `path` exists.
+    fn load_existing(path: &Path) -> (Self, Vec<String>) {
+        let data = match fs::read_to_string(path) {
+            Ok(data) => data,
+            // Not valid UTF-8 (Notepad's "UTF-16 LE" or "ANSI" with an accented
+            // character) or held by another process. Same treatment as a parse
+            // failure: the file is the user's only copy of their keys, and the
+            // defaults about to be used must not be mistaken for it.
+            Err(e) => {
+                let alert =
+                    back_up_unloadable(path, &format!("failed to read {}: {e}", path.display()));
+                return (Config::default(), vec![alert]);
+            }
+        };
+        match parse_settings(&data) {
+            Ok(mut c) => {
+                let mut diags = vec![format!("INFO: Loaded settings from {}", path.display())];
+                diags.extend(c.unseal_keys());
+                let configured_model = c.local_model.clone();
+                if c.normalize_local_model() {
+                    diags.push(format!(
+                        "WARN: local model '{configured_model}' is no longer available; \
+                         using '{}' instead",
+                        c.local_model
+                    ));
+                }
+                (c, diags)
+            }
+            // Preserve the unparseable file instead of silently discarding the
+            // user's keys/prefs on a hand-edit typo or truncated write: copy it
+            // aside so it can be recovered or hand-fixed, and report it loudly.
+            Err(e) => {
+                let alert =
+                    back_up_unloadable(path, &format!("failed to parse {}: {e}", path.display()));
+                (Config::default(), vec![alert])
+            }
+        }
+    }
+
+    /// The create half of [`Config::load_or_create`]: nothing at `path` yet.
+    fn create_from_template(path: PathBuf) -> (Self, Vec<String>) {
+        let mut diags: Vec<String> = Vec::new();
         // File missing: write the embedded template (settings.example.json,
         // baked into the exe) to the canonical location, so the first launch
         // leaves a real, nicely-formatted file to edit. `settings_path` already
@@ -201,8 +201,9 @@ impl Config {
         (cfg, diags)
     }
 
-    /// Every per-provider key array, mutably, in canonical order. One place to
-    /// add a provider so the seal/unseal passes can never miss one.
+    /// Every API-key array, mutably, in canonical order: the per-provider ones
+    /// plus the LLM cleanup endpoint's. One place to add a key array so the
+    /// seal/unseal passes can never miss one.
     fn key_arrays_mut(&mut self) -> Vec<&mut Vec<String>> {
         vec![
             &mut self.elevenlabs_keys,
@@ -212,6 +213,7 @@ impl Config {
             &mut self.dashscope_keys,
             &mut self.google_keys,
             &mut self.local_keys,
+            &mut self.polish_keys,
         ]
     }
 
@@ -312,24 +314,66 @@ impl Config {
     /// ordering, grouping, and hand edits byte-for-byte intact (this write
     /// happens in the background at startup; it must not reformat a file the
     /// user curates). Files without the slot (settings.json from an older
-    /// version) fall back to a normal [`Config::save`] — the same full
-    /// rewrite the Settings window already does on every save.
+    /// version) fall back to a full [`Config::save`] of what is ON DISK plus
+    /// the id, never of `self`: when startup could not load the file, `self`
+    /// is `Config::default()`, and saving it would replace the user's keys
+    /// with defaults. For the same reason a file that cannot be read or
+    /// parsed, or already holds an id, is left alone and reported as an error.
     pub fn save_install_id(&self, path: &Path) -> anyhow::Result<()> {
         const EMPTY_SLOT: &str = "\"install_id\": \"\"";
-        if let Ok(text) = fs::read_to_string(path) {
-            if text.contains(EMPTY_SLOT) {
-                let filled = text.replace(
-                    EMPTY_SLOT,
-                    &format!("\"install_id\": \"{}\"", self.install_id),
-                );
-                // Same write-then-rename idiom as save().
-                let tmp = path.with_extension("json.tmp");
-                fs::write(&tmp, filled.as_bytes())?;
-                fs::rename(&tmp, path)?;
-                return Ok(());
-            }
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            // Nothing on disk to preserve: a plain save creates the file.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return self.save(path),
+            Err(e) => anyhow::bail!("could not read {}: {e}", path.display()),
+        };
+        if text.contains(EMPTY_SLOT) {
+            let filled = text.replace(
+                EMPTY_SLOT,
+                &format!("\"install_id\": \"{}\"", self.install_id),
+            );
+            // Same write-then-rename idiom as save().
+            let tmp = path.with_extension("json.tmp");
+            fs::write(&tmp, filled.as_bytes())?;
+            fs::rename(&tmp, path)?;
+            return Ok(());
         }
-        self.save(path)
+        let mut on_disk = parse_settings(&text).map_err(|e| {
+            anyhow::anyhow!("{} does not parse ({e}); leaving it alone", path.display())
+        })?;
+        if !on_disk.install_id.trim().is_empty() {
+            anyhow::bail!(
+                "{} already has an install id this run did not load; leaving it alone",
+                path.display()
+            );
+        }
+        on_disk.install_id.clone_from(&self.install_id);
+        on_disk.normalize_local_model();
+        on_disk.save(path)
+    }
+}
+
+/// Parse settings.json text. A leading UTF-8 byte-order mark is skipped:
+/// Notepad writes one under "UTF-8 with BOM", and serde_json rejects it, which
+/// would otherwise turn a routine hand edit into "failed to parse".
+fn parse_settings(text: &str) -> serde_json::Result<Config> {
+    serde_json::from_str(text.strip_prefix('\u{feff}').unwrap_or(text))
+}
+
+/// Copy a settings.json that exists but could not be loaded to
+/// `settings.json.bad`, and return the ALERT naming `failure` and the backup.
+/// The copy is what lets the user recover their keys after the defaults the
+/// app falls back to get saved over the original.
+fn back_up_unloadable(path: &Path, failure: &str) -> String {
+    let bad = path.with_extension("json.bad");
+    match fs::copy(path, &bad) {
+        Ok(_) => format!(
+            "ALERT: {failure}. Backed up the original to {} and started from defaults — restore or fix it to recover your settings.",
+            bad.display()
+        ),
+        Err(copy_err) => {
+            format!("ALERT: {failure}. Using defaults. (Could not back up the original: {copy_err})")
+        }
     }
 }
 
@@ -426,6 +470,120 @@ mod tests {
         assert_eq!(reloaded.install_id, "11111111-2222-4333-8444-555555555555");
         assert_eq!(reloaded.mode, "hold");
         let _ = fs::remove_file(&path);
+    }
+
+    fn temp_settings(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "qd-store-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir.join("settings.json")
+    }
+
+    #[test]
+    fn save_install_id_fallback_keeps_the_files_settings_not_the_callers() {
+        // Startup could not load this file, so the caller holds defaults. The
+        // fallback must add the id to what is on disk, keys included.
+        let path = temp_settings("keep-disk");
+        fs::write(
+            &path,
+            r#"{ "mode": "hold", "elevenlabs_keys": ["el-key"] }"#,
+        )
+        .unwrap();
+
+        let defaults = Config {
+            install_id: "11111111-2222-4333-8444-555555555555".into(),
+            ..Config::default()
+        };
+        defaults.save_install_id(&path).unwrap();
+
+        let reloaded: Config = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(reloaded.install_id, defaults.install_id);
+        assert_eq!(reloaded.mode, "hold");
+        assert_eq!(reloaded.elevenlabs_keys, vec!["el-key".to_string()]);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn save_install_id_leaves_an_unparseable_or_already_stamped_file_alone() {
+        let path = temp_settings("leave-alone");
+        let c = Config {
+            install_id: "11111111-2222-4333-8444-555555555555".into(),
+            ..Config::default()
+        };
+
+        let typo = "{ \"mode\": \"hold\", \"elevenlabs_keys\": [\"el-key\"] ";
+        fs::write(&path, typo).unwrap();
+        assert!(c.save_install_id(&path).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), typo);
+
+        // A real id means this run's config did not come from this file.
+        let stamped = r#"{ "install_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" }"#;
+        fs::write(&path, stamped).unwrap();
+        assert!(c.save_install_id(&path).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), stamped);
+
+        // Not UTF-8 at all (UTF-16 LE from Notepad): unreadable, untouched.
+        let utf16: Vec<u8> = "{ \"mode\": \"höld\" }"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        fs::write(&path, &utf16).unwrap();
+        assert!(c.save_install_id(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), utf16);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn an_unreadable_settings_file_is_backed_up_and_alerted() {
+        let path = temp_settings("unreadable");
+        let utf16: Vec<u8> = "{ \"mode\": \"höld\" }"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        fs::write(&path, &utf16).unwrap();
+
+        let (cfg, diags) = Config::load_existing(&path);
+        assert!(cfg.install_id.is_empty(), "fell back to defaults");
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].starts_with("ALERT: failed to read"), "{diags:?}");
+        assert_eq!(fs::read(path.with_extension("json.bad")).unwrap(), utf16);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_utf8_bom_does_not_break_loading() {
+        let path = temp_settings("bom");
+        fs::write(&path, "\u{feff}{ \"mode\": \"hold\" }").unwrap();
+        let (cfg, diags) = Config::load_existing(&path);
+        assert_eq!(cfg.mode, "hold");
+        assert!(diags[0].starts_with("INFO:"), "{diags:?}");
+        assert!(!path.with_extension("json.bad").exists());
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn polish_keys_are_sealed_at_rest_like_the_provider_keys() {
+        let path = temp_settings("polish-seal");
+        let cfg = Config {
+            protect_keys_at_rest: true,
+            polish_keys: vec!["gem-secret".into()],
+            ..Config::default()
+        };
+        cfg.save(&path).unwrap();
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert!(
+            !on_disk.contains("gem-secret"),
+            "polish key written in plaintext"
+        );
+
+        let mut loaded: Config = serde_json::from_str(&on_disk).unwrap();
+        assert!(loaded.unseal_keys().is_empty());
+        assert_eq!(loaded.polish_keys, cfg.polish_keys);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
