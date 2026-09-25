@@ -17,7 +17,10 @@ use super::download::{
     Fetch,
 };
 use super::install::{finish_operation, install, InstallPhase};
-use super::native::{join_and_clean, language_cstring, ModelLoadParams, NativeEngine, RunParams};
+use super::native::{
+    join_and_clean, language_cstring, whisper_history_tokens, whisper_initial_prompt,
+    ModelLoadParams, NativeEngine, RunParams, WhisperRunExt,
+};
 use super::postprocess::{
     cohere_chunk_ranges, collapse_pathological_repetitions, collapse_pathological_sentence_runs,
     COHERE_CLIP_MAX_SECONDS, COHERE_MIN_TAIL_SECONDS,
@@ -417,6 +420,46 @@ fn decoder_loop_guard_is_conservative() {
 fn ffi_layout_matches_transcribe_0_1_3_x64() {
     assert_eq!(std::mem::size_of::<ModelLoadParams>(), 16);
     assert_eq!(std::mem::size_of::<RunParams>(), 64);
+    // transcribe_whisper_run_ext_init writes the library's own sizeof (80 on
+    // x64) into this struct: any smaller and it would write past the end.
+    assert_eq!(std::mem::size_of::<WhisperRunExt>(), 80);
+}
+
+// Contract: the local Whisper run gets the custom vocabulary as its initial
+// prompt, whole terms only, and no other model gets one; prompt plus carried
+// history stays within 223 tokens. Regression: the runtime truncates a long
+// prompt alone, but prompt plus the default 223-token history overflows the
+// 448-token decoder prefix on every later window and fails the dictation; a
+// special-token term is rejected outright; a cut mid-term biases toward a
+// word nobody listed.
+#[test]
+fn whisper_initial_prompt_is_whisper_only_and_keeps_whole_terms() {
+    assert_eq!(
+        whisper_initial_prompt("whisper-turbo-q5", " Anneliese, Kowalczyk ").as_deref(),
+        Some(c"Anneliese, Kowalczyk")
+    );
+    assert_eq!(
+        whisper_initial_prompt("whisper-turbo-q5", "Anneliese, <|en|>, Kowalczyk").as_deref(),
+        Some(c"Anneliese, Kowalczyk")
+    );
+    assert_eq!(whisper_initial_prompt("whisper-turbo-q5", "<|en|>"), None);
+    assert_eq!(whisper_initial_prompt("cohere-q5", "Anneliese"), None);
+    assert_eq!(whisper_initial_prompt("whisper-turbo-q5", "  "), None);
+    assert_eq!(whisper_initial_prompt("whisper-turbo-q5", "a\0b"), None);
+
+    let terms: Vec<String> = (0..200).map(|i| format!("Término{i:03}")).collect();
+    let prompt = whisper_initial_prompt("whisper-turbo-q5", &terms.join(", ")).unwrap();
+    let prompt = prompt.to_str().unwrap();
+    assert!(prompt.len() <= 200, "{} bytes", prompt.len());
+    assert!(prompt.starts_with("Término000, Término001"));
+    let last = prompt.rsplit(", ").next().unwrap();
+    assert!(terms.iter().any(|term| term == last), "cut mid-term: {last}");
+
+    // A token covers at least one byte, so prompt tokens <= bytes + 1.
+    let history = whisper_history_tokens(prompt.len());
+    assert!(history >= 1, "0 or less means the runtime's default of 223");
+    assert!(prompt.len() + 1 + history as usize <= 223, "history {history}");
+    assert_eq!(whisper_history_tokens(10_000), 1);
 }
 
 #[test]
@@ -533,7 +576,7 @@ fn install_and_transcribe_whisper_fixture() -> Result<(), String> {
     let pcm = read_speech_fixture()?;
     let cancel = Arc::new(AtomicBool::new(false));
     let mut engine = unsafe { NativeEngine::load()? };
-    let transcript = unsafe { engine.run(spec.id, "en", &pcm, &cancel)? }.unwrap_or_default();
+    let transcript = unsafe { engine.run(spec.id, "en", "", &pcm, &cancel)? }.unwrap_or_default();
     if transcript.trim().is_empty() {
         return Err("real local inference returned an empty transcript".into());
     }
@@ -606,7 +649,7 @@ fn live_installed_cohere_prewarm_and_transcribe() {
 
     let inference_started = Instant::now();
     let transcript =
-        unsafe { engine.run(spec.id, "en", &pcm, &cancel).unwrap() }.unwrap_or_default();
+        unsafe { engine.run(spec.id, "en", "", &pcm, &cancel).unwrap() }.unwrap_or_default();
     eprintln!(
         "Cohere fixture inference completed in {:.2}s: {transcript}",
         inference_started.elapsed().as_secs_f32()

@@ -42,11 +42,62 @@ pub(super) struct RunParams {
     spec_k_drafts: i32,
 }
 
+/// `transcribe_whisper_run_ext` from transcribe.cpp 0.1.3
+/// `include/transcribe/whisper.h`, reached through [`RunParams::family`].
+/// Mirrored here only to hand Whisper the user's custom vocabulary as its
+/// initial prompt: every other field keeps the value
+/// `transcribe_whisper_run_ext_init` gives it. The library's init writes its
+/// own sizeof into this struct, so the size is pinned by a layout test.
+#[repr(C)]
+pub(super) struct WhisperRunExt {
+    ext_size: u64,
+    ext_kind: u32,
+    initial_prompt: *const c_char,
+    prompt_tokens: *const i32,
+    n_prompt_tokens: usize,
+    prompt_condition: c_int,
+    condition_on_prev_tokens: bool,
+    max_prev_context_tokens: i32,
+    temperature: f32,
+    temperature_inc: f32,
+    compression_ratio_thold: f32,
+    logprob_thold: f32,
+    no_speech_thold: f32,
+    seed: u32,
+    max_initial_timestamp: f32,
+}
+
+/// TRANSCRIBE_WHISPER_PROMPT_ALL_SEGMENTS: the initial prompt heads the
+/// context of every 30-second window, not only the first, so a long
+/// dictation still sees the vocabulary after the first window rolls off.
+const WHISPER_PROMPT_ALL_SEGMENTS: c_int = 1;
+
+/// Tokens Whisper's decoder prefix may spend on prompt plus carried history
+/// together: half its 448-token context, the budget the runtime gives each of
+/// them alone. With ALL_SEGMENTS every later window carries both, so they
+/// must share it or the prefix outgrows the context and the run fails.
+const WHISPER_PROMPT_CONTEXT_TOKENS: usize = 223;
+
+/// Upper bound on the vocabulary prompt handed to Whisper, in bytes. A BPE
+/// token covers at least one byte, so the prompt is at most bytes + 1
+/// tokens; this cap leaves the carried history at least 22 of the shared
+/// [`WHISPER_PROMPT_CONTEXT_TOKENS`].
+const WHISPER_PROMPT_MAX_BYTES: usize = 200;
+
+/// `max_prev_context_tokens` for a prompt of `prompt_bytes`: whatever of the
+/// shared budget the prompt cannot use. Floored at 1 because the runtime
+/// reads 0 or less as its default of 223, which is the overflow itself.
+pub(super) fn whisper_history_tokens(prompt_bytes: usize) -> i32 {
+    let history = WHISPER_PROMPT_CONTEXT_TOKENS.saturating_sub(prompt_bytes + 1);
+    history.max(1) as i32
+}
+
 type VersionFn = unsafe extern "C" fn() -> *const c_char;
 type StatusStringFn = unsafe extern "C" fn(c_int) -> *const c_char;
 type InitBackendsFn = unsafe extern "C" fn(*const c_char) -> Status;
 type LoadParamsInitFn = unsafe extern "C" fn(*mut ModelLoadParams);
 type RunParamsInitFn = unsafe extern "C" fn(*mut RunParams);
+type WhisperRunExtInitFn = unsafe extern "C" fn(*mut WhisperRunExt);
 type OpenFn = unsafe extern "C" fn(
     *const c_char,
     *const ModelLoadParams,
@@ -67,6 +118,7 @@ struct NativeApi {
     init_backends: InitBackendsFn,
     load_params_init: LoadParamsInitFn,
     run_params_init: RunParamsInitFn,
+    whisper_run_ext_init: WhisperRunExtInitFn,
     open: OpenFn,
     free: FreeFn,
     run: RunFn,
@@ -129,6 +181,7 @@ impl NativeEngine {
             init_backends: symbol!("transcribe_init_backends", InitBackendsFn),
             load_params_init: symbol!("transcribe_model_load_params_init", LoadParamsInitFn),
             run_params_init: symbol!("transcribe_run_params_init", RunParamsInitFn),
+            whisper_run_ext_init: symbol!("transcribe_whisper_run_ext_init", WhisperRunExtInitFn),
             open: symbol!("transcribe_open", OpenFn),
             free: symbol!("transcribe_session_free", FreeFn),
             run: symbol!("transcribe_run", RunFn),
@@ -211,18 +264,21 @@ impl NativeEngine {
         }
         let silence = vec![0i16; 16_000];
         let cancel = Arc::new(AtomicBool::new(false));
-        let _ = unsafe { self.run(model_id, "en", &silence, &cancel)? };
+        let _ = unsafe { self.run(model_id, "en", "", &silence, &cancel)? };
         Ok(true)
     }
 
     /// Decode a whole buffer: split it into clips and join what each decodes to.
     /// Its signature and empty-input guard repeat `run_one` (one clip) further
-    /// down native.rs. An argument struct is not worth it for four parameters at
+    /// down native.rs. An argument struct is not worth it for five parameters at
     /// two levels of the same decode; revisit if a third entry point takes them.
+    /// `vocabulary` is the custom vocabulary as one prompt
+    /// (`SttSessionOpts::vocabulary_prompt`); only Whisper takes it.
     pub(super) unsafe fn run(
         &mut self,
         model_id: &str,
         language: &str,
+        vocabulary: &str,
         pcm_i16: &[i16],
         cancel: &Arc<AtomicBool>,
     ) -> Result<Option<String>, String> {
@@ -230,6 +286,7 @@ impl NativeEngine {
             return Ok(None);
         }
         self.ensure_model(model_id, self.gpu_failed)?;
+        let prompt = whisper_initial_prompt(model_id, vocabulary);
         let ranges = clip_ranges(model_id, pcm_i16);
         let mut parts = Vec::with_capacity(ranges.len());
         for (index, range) in ranges.into_iter().enumerate() {
@@ -237,7 +294,10 @@ impl NativeEngine {
                 return Err("local transcription was cancelled".into());
             }
             let clip = &pcm_i16[range];
-            if let Some(text) = unsafe { self.run_clip(model_id, language, clip, index, cancel)? } {
+            let decoded = unsafe {
+                self.run_clip(model_id, language, prompt.as_deref(), clip, index, cancel)?
+            };
+            if let Some(text) = decoded {
                 parts.push(text);
             }
         }
@@ -251,11 +311,12 @@ impl NativeEngine {
         &mut self,
         model_id: &str,
         language: &str,
+        prompt: Option<&CStr>,
         clip: &[i16],
         index: usize,
         cancel: &Arc<AtomicBool>,
     ) -> Result<Option<String>, String> {
-        let text = unsafe { self.run_one(model_id, language, clip, cancel)? };
+        let text = unsafe { self.run_one(model_id, language, prompt, clip, cancel)? };
         let looped = model_id == "cohere-q5"
             && text
                 .as_deref()
@@ -272,9 +333,9 @@ impl NativeEngine {
             index + 1
         );
         Ok(join_transcript_parts([
-            unsafe { self.run_one(model_id, language, &clip[..split], cancel)? }
+            unsafe { self.run_one(model_id, language, prompt, &clip[..split], cancel)? }
                 .unwrap_or_default(),
-            unsafe { self.run_one(model_id, language, &clip[split..], cancel)? }
+            unsafe { self.run_one(model_id, language, prompt, &clip[split..], cancel)? }
                 .unwrap_or_default(),
         ]))
     }
@@ -313,6 +374,7 @@ impl NativeEngine {
         &mut self,
         model_id: &str,
         language: &str,
+        prompt: Option<&CStr>,
         pcm_i16: &[i16],
         cancel: &Arc<AtomicBool>,
     ) -> Result<Option<String>, String> {
@@ -327,6 +389,22 @@ impl NativeEngine {
             .as_ref()
             .map(|s| s.as_ptr())
             .unwrap_or(std::ptr::null());
+        // Bias Whisper toward the user's vocabulary (contact and company
+        // names, jargon) the way the cloud providers already are. The struct
+        // must outlive both decode calls below, including the CPU retry.
+        let mut whisper = std::mem::zeroed::<WhisperRunExt>();
+        if let Some(prompt) = prompt {
+            unsafe { (self.api.whisper_run_ext_init)(&mut whisper) };
+            whisper.initial_prompt = prompt.as_ptr();
+            // ALL_SEGMENTS requires condition_on_prev_tokens (the runtime
+            // rejects the pair otherwise).
+            whisper.prompt_condition = WHISPER_PROMPT_ALL_SEGMENTS;
+            whisper.condition_on_prev_tokens = true;
+            // Prompt and history share one budget (carry_initial_prompt):
+            // left at its default the history alone may take 223 tokens.
+            whisper.max_prev_context_tokens = whisper_history_tokens(prompt.to_bytes().len());
+            params.family = &whisper as *const WhisperRunExt as *const c_void;
+        }
         let session = self.session("no local model is loaded")?;
         let mut status = unsafe { self.decode(session, &pcm, &params, cancel) };
         // A GPU driver can initialize successfully yet fail on its first graph.
@@ -386,6 +464,45 @@ pub(super) fn join_and_clean(parts: Vec<String>) -> Option<String> {
         tracing::warn!("local STT removed {dropped} repeated unit(s) from a decoder loop");
     }
     (!cleaned.is_empty()).then_some(cleaned)
+}
+
+/// The vocabulary prompt for this run: `None` for a model that is not
+/// Whisper (only Whisper's runtime takes an initial prompt) or when there is
+/// no vocabulary. Longer than [`WHISPER_PROMPT_MAX_BYTES`] keeps only the
+/// whole terms that fit: `vocabulary` is joined with ", " by
+/// `SttSessionOpts::vocabulary_prompt`, and half a term would bias toward a
+/// word the user never listed. A term holding special-token text (`<|en|>`)
+/// is dropped: the runtime rejects such a prompt, failing every dictation.
+pub(super) fn whisper_initial_prompt(model_id: &str, vocabulary: &str) -> Option<CString> {
+    if !model_id.starts_with("whisper") {
+        return None;
+    }
+    let terms: Vec<&str> = vocabulary
+        .split(',')
+        .map(str::trim)
+        .filter(|term| !term.is_empty() && !term.contains("<|"))
+        .collect();
+    let joined = terms.join(", ");
+    let mut prompt = joined.as_str();
+    if prompt.len() > WHISPER_PROMPT_MAX_BYTES {
+        let mut end = WHISPER_PROMPT_MAX_BYTES;
+        while !prompt.is_char_boundary(end) {
+            end -= 1;
+        }
+        let head = &prompt[..end];
+        prompt = if prompt[end..].starts_with(',') {
+            head
+        } else {
+            head.rfind(',').map_or(head, |at| &head[..at])
+        }
+        .trim_end();
+    }
+    if prompt.is_empty() {
+        return None;
+    }
+    CString::new(prompt)
+        .map_err(|_| tracing::warn!("custom vocabulary contains a NUL byte; not sent to Whisper"))
+        .ok()
 }
 
 /// The run's language hint: `None` (let the model detect it) for blank or

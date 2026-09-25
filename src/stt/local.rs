@@ -65,6 +65,7 @@ impl SttProvider for LocalProvider {
             sink: Box::new(LocalSink {
                 model_id: self.model_id.clone(),
                 language: opts.language.clone(),
+                vocabulary: opts.vocabulary_prompt(),
                 sample_rate: opts.sample_rate,
                 pcm: Vec::new(),
                 event_tx: Some(event_tx),
@@ -80,6 +81,9 @@ impl SttProvider for LocalProvider {
 struct LocalSink {
     model_id: String,
     language: String,
+    /// Custom vocabulary as one prompt. The Whisper model is biased with it;
+    /// Cohere has no prompt input and ignores it.
+    vocabulary: String,
     sample_rate: u32,
     pcm: Vec<i16>,
     event_tx: Option<mpsc::UnboundedSender<SttEvent>>,
@@ -126,6 +130,7 @@ impl ProviderSink for LocalSink {
         let result = crate::local_stt::transcribe(
             self.model_id.clone(),
             self.language.clone(),
+            self.vocabulary.clone(),
             pcm,
             Arc::clone(&self.cancel),
         )
@@ -172,6 +177,7 @@ mod tests {
         LocalSink {
             model_id: "test".into(),
             language: "en".into(),
+            vocabulary: String::new(),
             sample_rate,
             pcm: Vec::new(),
             event_tx: Some(event_tx),

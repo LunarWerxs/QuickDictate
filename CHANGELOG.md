@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Custom vocabulary now reaches the offline Whisper model.** Names and jargon on the Vocabulary
+  page used to bias only the cloud providers; the local Whisper Large v3 Turbo run now gets them as
+  its initial prompt, re-applied to every 30-second window of a long dictation, so a contact's or
+  company's exact spelling survives offline too. Cohere Transcribe has no prompt input and is
+  unchanged.
+
 ## [1.2.2] - 2026-09-24
 
 A maintenance release with no change to how the app behaves.
