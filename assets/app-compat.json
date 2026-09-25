@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "revision": 1,
+  "entries": [
+    {
+      "name": "Windows Console (legacy mode)",
+      "window_class": "ConsoleWindowClass",
+      "delivery": "keystrokes",
+      "message": "A console in legacy mode does not paste on Ctrl+V, so long text is typed instead."
+    },
+    {
+      "name": "mintty (Git Bash, Cygwin, MSYS2)",
+      "window_class": "mintty",
+      "delivery": "keystrokes",
+      "message": "mintty pastes on Shift+Insert, not Ctrl+V, so long text is typed instead."
+    },
+    {
+      "name": "PuTTY",
+      "window_class": "PuTTY",
+      "delivery": "keystrokes",
+      "message": "PuTTY pastes on right-click or Shift+Insert, not Ctrl+V, so long text is typed instead."
+    },
+    {
+      "name": "Remote Desktop Connection",
+      "exe": "mstsc.exe",
+      "delivery": "keystrokes",
+      "message": "The remote session only sees this PC's clipboard when clipboard redirection is on, so long text is typed instead."
+    }
+  ]
+}

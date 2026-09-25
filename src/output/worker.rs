@@ -8,6 +8,7 @@ use std::time::Duration;
 use anyhow::Result;
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::app_compat;
 use crate::focus;
 use crate::polish;
 use crate::state::{App, ErrorKind};
@@ -325,8 +326,18 @@ pub(super) fn paste_processed(
     // actually got typed, so an undo can never chase a paste that failed.
     let target = PasteTarget::current();
 
+    // The app-compatibility list: windows that ignore Ctrl+V, see another
+    // clipboard or drop injected keys get the delivery that works there.
+    let compat = app_compat::lookup(&app_compat::WindowFacts::current());
+    if let Some(entry) = &compat {
+        app_compat::announce(entry);
+    }
+    let delivery = compat
+        .as_ref()
+        .map_or(app_compat::Delivery::Auto, |entry| entry.delivery);
+
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        paste(processed, restore_delay_ms)
+        paste(processed, restore_delay_ms, delivery)
     }));
     // The transcript goes into history on EVERY outcome, not just success.
     // A failed paste used to be lost three ways at once (not typed, not on the
@@ -345,6 +356,22 @@ pub(super) fn paste_processed(
                  the transcription is on the clipboard, press Ctrl+V to paste it"
             );
             app.raise_error(ErrorKind::Elevated);
+        }
+        Ok(Ok(PasteOutcome::LeftForApp)) => {
+            let entry = compat.as_ref();
+            tracing::error!(
+                "{} does not accept dictated text ({}); the transcription is on the clipboard, \
+                 paste it yourself{}",
+                entry.map_or("the focused window", |e| e.name.as_str()),
+                entry
+                    .and_then(|e| e.message.as_deref())
+                    .unwrap_or("app-compatibility list"),
+                entry
+                    .and_then(|e| e.url.as_deref())
+                    .map(|url| format!(" (more: {url})"))
+                    .unwrap_or_default()
+            );
+            app.raise_error(ErrorKind::AppBlocked);
         }
         Ok(Err(e)) => {
             tracing::error!("paste failed: {e:#}");

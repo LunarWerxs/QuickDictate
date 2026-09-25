@@ -13,6 +13,7 @@ mod tests;
 use anyhow::Result;
 use windows::Win32::UI::Input::KeyboardAndMouse::{KEYBD_EVENT_FLAGS, VIRTUAL_KEY};
 
+use crate::app_compat::Delivery;
 use crate::focus;
 
 pub use processor::PasteOutcome;
@@ -50,7 +51,7 @@ pub fn copy_to_clipboard(text: &str) -> Result<()> {
     set_clipboard_unicode(text)
 }
 
-pub fn paste(text: &str, restore_delay_ms: u64) -> Result<PasteOutcome> {
+pub fn paste(text: &str, restore_delay_ms: u64, delivery: Delivery) -> Result<PasteOutcome> {
     if text.is_empty() {
         return Ok(PasteOutcome::Typed);
     }
@@ -64,6 +65,13 @@ pub fn paste(text: &str, restore_delay_ms: u64) -> Result<PasteOutcome> {
         return Ok(PasteOutcome::LeftOnClipboard);
     }
 
+    // The app-compatibility list says this window drops every kind of
+    // injected input, so typing would be lost without a trace.
+    if delivery == Delivery::Manual {
+        set_clipboard_unicode(text)?;
+        return Ok(PasteOutcome::LeftForApp);
+    }
+
     // Any modifier the user is physically holding (very much including the
     // modifier half of their own hold-to-talk hotkey) combines with whatever
     // we inject: Ctrl+V becomes Ctrl+Alt+V, and typed characters become menu
@@ -71,7 +79,7 @@ pub fn paste(text: &str, restore_delay_ms: u64) -> Result<PasteOutcome> {
     let _modifiers = ReleasedModifiers::take();
 
     let n = text.chars().count();
-    if n < CLIPBOARD_THRESHOLD {
+    if !uses_clipboard(delivery, n) {
         tracing::debug!("paste: sending {} chars via Unicode keystrokes", n);
         return send_unicode_text(text).map(|()| PasteOutcome::Typed);
     }
@@ -79,6 +87,16 @@ pub fn paste(text: &str, restore_delay_ms: u64) -> Result<PasteOutcome> {
     tracing::debug!("paste: {} chars via clipboard (instant)", n);
     match paste_via_clipboard(text, restore_delay_ms) {
         Ok(()) => Ok(PasteOutcome::Typed),
+        Err(e) if delivery == Delivery::Clipboard => {
+            // Listed as dropping synthetic keystrokes, so the keystroke
+            // fallback below would lose the text silently: leave it on the
+            // clipboard for the user instead.
+            tracing::warn!(
+                "paste: clipboard path failed ({e:#}); leaving the text on the clipboard"
+            );
+            set_clipboard_unicode(text)?;
+            Ok(PasteOutcome::LeftForApp)
+        }
         Err(e) => {
             // The clipboard path can fail entirely when another process is
             // holding the clipboard open (clipboard managers do this). Falling
@@ -87,5 +105,15 @@ pub fn paste(text: &str, restore_delay_ms: u64) -> Result<PasteOutcome> {
             tracing::warn!("paste: clipboard path failed ({e:#}); falling back to keystrokes");
             send_unicode_text(text).map(|()| PasteOutcome::Typed)
         }
+    }
+}
+
+/// Whether `n` characters go through the clipboard rather than keystrokes. A
+/// forced delivery from the app-compatibility list overrides the length rule.
+fn uses_clipboard(delivery: Delivery, n: usize) -> bool {
+    match delivery {
+        Delivery::Keystrokes => false,
+        Delivery::Clipboard => true,
+        Delivery::Auto | Delivery::Manual => n >= CLIPBOARD_THRESHOLD,
     }
 }

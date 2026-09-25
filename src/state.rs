@@ -193,6 +193,9 @@ pub enum ErrorKind {
     /// A global hotkey is registered by another process and QuickDictate has
     /// been unable to claim it (see `hotkeys::hotkeys_blocked`).
     HotkeyBlocked = 6,
+    /// The app-compatibility list says the focused window drops injected
+    /// input, so the text was left on the clipboard (see `app_compat`).
+    AppBlocked = 7,
 }
 
 impl ErrorKind {
@@ -204,6 +207,7 @@ impl ErrorKind {
             4 => ErrorKind::Network,
             5 => ErrorKind::Elevated,
             6 => ErrorKind::HotkeyBlocked,
+            7 => ErrorKind::AppBlocked,
             _ => ErrorKind::Generic,
         }
     }
@@ -219,6 +223,7 @@ impl ErrorKind {
             ErrorKind::Network => "Could not reach the provider",
             ErrorKind::Elevated => "Cannot type into an elevated window; text is on the clipboard",
             ErrorKind::HotkeyBlocked => "A hotkey is claimed by another app",
+            ErrorKind::AppBlocked => "This app refuses dictated text; it is on the clipboard",
         }
     }
 }

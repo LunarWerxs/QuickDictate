@@ -141,3 +141,16 @@ fn the_undo_stack_is_capped_oldest_first() {
     }
     assert_eq!(reachable, 50);
 }
+
+/// An app-compatibility entry that forces a delivery must beat the length
+/// rule both ways: a console ignores Ctrl+V however long the text is, and a
+/// window that drops keystrokes drops short text too.
+#[test]
+fn forced_delivery_overrides_the_length_threshold() {
+    use crate::app_compat::Delivery;
+    let long = CLIPBOARD_THRESHOLD + 10;
+    assert!(!uses_clipboard(Delivery::Keystrokes, long));
+    assert!(uses_clipboard(Delivery::Clipboard, 1));
+    assert!(!uses_clipboard(Delivery::Auto, 1));
+    assert!(uses_clipboard(Delivery::Auto, long));
+}
