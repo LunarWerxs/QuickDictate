@@ -15,6 +15,8 @@ use super::native::NativeEngine;
 struct Job {
     model_id: String,
     language: String,
+    /// The custom vocabulary as one prompt; empty for none.
+    vocabulary: String,
     pcm: Vec<i16>,
     cancel: Arc<AtomicBool>,
     result: oneshot::Sender<Result<Option<String>, String>>,
@@ -64,6 +66,7 @@ fn worker() -> Result<&'static mpsc::SyncSender<WorkerCommand>, String> {
 pub async fn transcribe(
     model_id: String,
     language: String,
+    vocabulary: String,
     pcm: Vec<i16>,
     cancel: Arc<AtomicBool>,
 ) -> Result<Option<String>, String> {
@@ -71,6 +74,7 @@ pub async fn transcribe(
     let job = Job {
         model_id,
         language,
+        vocabulary,
         pcm,
         cancel,
         result: result_tx,
@@ -186,7 +190,15 @@ fn worker_handle_transcribe(engine: &mut Option<NativeEngine>, job: Job) {
             Some(e) => e,
             None => engine.insert(unsafe { NativeEngine::load()? }),
         };
-        unsafe { loaded.run(&job.model_id, &job.language, &job.pcm, &job.cancel) }
+        unsafe {
+            loaded.run(
+                &job.model_id,
+                &job.language,
+                &job.vocabulary,
+                &job.pcm,
+                &job.cancel,
+            )
+        }
     })();
     tracing::info!(
         "local STT processed {audio_seconds:.1}s of audio in {:.2}s",

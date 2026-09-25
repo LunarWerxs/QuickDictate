@@ -254,7 +254,7 @@ nothing else changes.
 | OpenAI | transcription `prompt` | Terms are joined into one prompt string |
 | Google | `speechContexts[].phrases` | 5000 phrases |
 | DashScope | not supported | Paraformer needs a vocabulary registered up front through a separate API, so there is no inline term list to send |
-| Local (offline) | not supported yet | The bundled runtime entry point takes no prompt parameter |
+| Local (offline) | Whisper `initial_prompt` | Whisper Large v3 Turbo only: terms are joined into one prompt, kept to whole terms within about 600 bytes (Whisper reads at most 223 prompt tokens), and re-applied to every 30-second window of a long dictation. Cohere Transcribe has no prompt input and ignores the list |
 
 If a term never sticks no matter what, fall back to `text_replacements`: that
 runs locally on the recognised text and always wins.
