@@ -18,8 +18,8 @@ use super::download::{
 };
 use super::install::{finish_operation, install, InstallPhase};
 use super::native::{
-    join_and_clean, language_cstring, whisper_initial_prompt, ModelLoadParams, NativeEngine,
-    RunParams, WhisperRunExt,
+    join_and_clean, language_cstring, whisper_history_tokens, whisper_initial_prompt,
+    ModelLoadParams, NativeEngine, RunParams, WhisperRunExt,
 };
 use super::postprocess::{
     cohere_chunk_ranges, collapse_pathological_repetitions, collapse_pathological_sentence_runs,
@@ -426,16 +426,23 @@ fn ffi_layout_matches_transcribe_0_1_3_x64() {
 }
 
 // Contract: the local Whisper run gets the custom vocabulary as its initial
-// prompt, whole terms only, and no other model gets one. Regression: a
-// prompt past Whisper's 223-token window overflows the decoder prefix and
-// fails the whole dictation; a cut mid-term biases toward a word nobody
-// listed.
+// prompt, whole terms only, and no other model gets one; prompt plus carried
+// history stays within 223 tokens. Regression: the runtime truncates a long
+// prompt alone, but prompt plus the default 223-token history overflows the
+// 448-token decoder prefix on every later window and fails the dictation; a
+// special-token term is rejected outright; a cut mid-term biases toward a
+// word nobody listed.
 #[test]
 fn whisper_initial_prompt_is_whisper_only_and_keeps_whole_terms() {
     assert_eq!(
         whisper_initial_prompt("whisper-turbo-q5", " Anneliese, Kowalczyk ").as_deref(),
         Some(c"Anneliese, Kowalczyk")
     );
+    assert_eq!(
+        whisper_initial_prompt("whisper-turbo-q5", "Anneliese, <|en|>, Kowalczyk").as_deref(),
+        Some(c"Anneliese, Kowalczyk")
+    );
+    assert_eq!(whisper_initial_prompt("whisper-turbo-q5", "<|en|>"), None);
     assert_eq!(whisper_initial_prompt("cohere-q5", "Anneliese"), None);
     assert_eq!(whisper_initial_prompt("whisper-turbo-q5", "  "), None);
     assert_eq!(whisper_initial_prompt("whisper-turbo-q5", "a\0b"), None);
@@ -443,10 +450,16 @@ fn whisper_initial_prompt_is_whisper_only_and_keeps_whole_terms() {
     let terms: Vec<String> = (0..200).map(|i| format!("Término{i:03}")).collect();
     let prompt = whisper_initial_prompt("whisper-turbo-q5", &terms.join(", ")).unwrap();
     let prompt = prompt.to_str().unwrap();
-    assert!(prompt.len() <= 600, "{} bytes", prompt.len());
+    assert!(prompt.len() <= 200, "{} bytes", prompt.len());
     assert!(prompt.starts_with("Término000, Término001"));
     let last = prompt.rsplit(", ").next().unwrap();
     assert!(terms.iter().any(|term| term == last), "cut mid-term: {last}");
+
+    // A token covers at least one byte, so prompt tokens <= bytes + 1.
+    let history = whisper_history_tokens(prompt.len());
+    assert!(history >= 1, "0 or less means the runtime's default of 223");
+    assert!(prompt.len() + 1 + history as usize <= 223, "history {history}");
+    assert_eq!(whisper_history_tokens(10_000), 1);
 }
 
 #[test]

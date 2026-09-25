@@ -72,11 +72,25 @@ pub(super) struct WhisperRunExt {
 /// dictation still sees the vocabulary after the first window rolls off.
 const WHISPER_PROMPT_ALL_SEGMENTS: c_int = 1;
 
-/// Upper bound on the vocabulary prompt handed to Whisper, in bytes. Whisper
-/// keeps at most 223 prompt tokens (half its 448-token decoder context); a
-/// comma-separated term list averages well under three bytes per token, so
-/// this stays inside that window instead of overflowing the decoder prefix.
-const WHISPER_PROMPT_MAX_BYTES: usize = 600;
+/// Tokens Whisper's decoder prefix may spend on prompt plus carried history
+/// together: half its 448-token context, the budget the runtime gives each of
+/// them alone. With ALL_SEGMENTS every later window carries both, so they
+/// must share it or the prefix outgrows the context and the run fails.
+const WHISPER_PROMPT_CONTEXT_TOKENS: usize = 223;
+
+/// Upper bound on the vocabulary prompt handed to Whisper, in bytes. A BPE
+/// token covers at least one byte, so the prompt is at most bytes + 1
+/// tokens; this cap leaves the carried history at least 22 of the shared
+/// [`WHISPER_PROMPT_CONTEXT_TOKENS`].
+const WHISPER_PROMPT_MAX_BYTES: usize = 200;
+
+/// `max_prev_context_tokens` for a prompt of `prompt_bytes`: whatever of the
+/// shared budget the prompt cannot use. Floored at 1 because the runtime
+/// reads 0 or less as its default of 223, which is the overflow itself.
+pub(super) fn whisper_history_tokens(prompt_bytes: usize) -> i32 {
+    let history = WHISPER_PROMPT_CONTEXT_TOKENS.saturating_sub(prompt_bytes + 1);
+    history.max(1) as i32
+}
 
 type VersionFn = unsafe extern "C" fn() -> *const c_char;
 type StatusStringFn = unsafe extern "C" fn(c_int) -> *const c_char;
@@ -386,6 +400,9 @@ impl NativeEngine {
             // rejects the pair otherwise).
             whisper.prompt_condition = WHISPER_PROMPT_ALL_SEGMENTS;
             whisper.condition_on_prev_tokens = true;
+            // Prompt and history share one budget (carry_initial_prompt):
+            // left at its default the history alone may take 223 tokens.
+            whisper.max_prev_context_tokens = whisper_history_tokens(prompt.to_bytes().len());
             params.family = &whisper as *const WhisperRunExt as *const c_void;
         }
         let session = self.session("no local model is loaded")?;
@@ -454,12 +471,19 @@ pub(super) fn join_and_clean(parts: Vec<String>) -> Option<String> {
 /// no vocabulary. Longer than [`WHISPER_PROMPT_MAX_BYTES`] keeps only the
 /// whole terms that fit: `vocabulary` is joined with ", " by
 /// `SttSessionOpts::vocabulary_prompt`, and half a term would bias toward a
-/// word the user never listed.
+/// word the user never listed. A term holding special-token text (`<|en|>`)
+/// is dropped: the runtime rejects such a prompt, failing every dictation.
 pub(super) fn whisper_initial_prompt(model_id: &str, vocabulary: &str) -> Option<CString> {
     if !model_id.starts_with("whisper") {
         return None;
     }
-    let mut prompt = vocabulary.trim();
+    let terms: Vec<&str> = vocabulary
+        .split(',')
+        .map(str::trim)
+        .filter(|term| !term.is_empty() && !term.contains("<|"))
+        .collect();
+    let joined = terms.join(", ");
+    let mut prompt = joined.as_str();
     if prompt.len() > WHISPER_PROMPT_MAX_BYTES {
         let mut end = WHISPER_PROMPT_MAX_BYTES;
         while !prompt.is_char_boundary(end) {
