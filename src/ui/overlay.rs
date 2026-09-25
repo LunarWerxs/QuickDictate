@@ -386,6 +386,7 @@ pub(super) fn error_glyph(kind: ErrorKind) -> (&'static str, bool) {
         ErrorKind::Network => ("net", false),
         ErrorKind::Elevated => ("UAC", false),
         ErrorKind::HotkeyBlocked => ("hk", false),
+        ErrorKind::AppBlocked => ("app", false),
     }
 }
 

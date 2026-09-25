@@ -15,6 +15,10 @@ pub enum PasteOutcome {
     /// deliberately NOT restoring the previous contents, so the user can paste
     /// it themselves.
     LeftOnClipboard,
+    /// The app-compatibility list says the focused window drops injected
+    /// input (or its clipboard paste failed where keystrokes would be lost),
+    /// so the text was left on the clipboard for the user to paste.
+    LeftForApp,
 }
 
 /// Per-config-snapshot cache of built [`TextProcessor`]s, keyed by which

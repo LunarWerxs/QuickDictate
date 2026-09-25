@@ -160,6 +160,35 @@ Override punctuation/spacing/replacement behavior per foreground application, re
 - No `profiles` array (or an empty one) is byte-identical to today's behavior.
 - **`profiles_enabled`** (bool, default `true`) is the master on/off switch, with a matching "Enable per-app profiles" checkbox on the Advanced page in Settings -- flip it off to disable profile matching entirely (falling back to global settings) without deleting your `profiles` array.
 
+## Apps that need a different paste (app-compatibility list)
+
+QuickDictate normally types short text as keystrokes and pastes long text with Ctrl+V. Some windows take only one of the two: a legacy-mode console, mintty (Git Bash) and PuTTY ignore Ctrl+V, a Remote Desktop session sees the remote clipboard unless clipboard redirection is on, and some games drop injected keystrokes altogether. Windows reports every injected key as delivered either way, so without help the text just never appears.
+
+A versioned list, checked against the focused window just before each paste, picks the delivery that works there. It ships inside the app (`assets/app-compat.json` in the source) and you can extend or override it without waiting for a release: put a `quickdictate-app-compat.json` in the data folder (next to the exe unless you moved it on the Advanced page, alongside `quickdictate-history.json`). It is re-read whenever it changes, its entries are checked before the built-in ones, and a file that does not parse is ignored (logged) in favour of the built-in list.
+
+```json
+{
+  "version": 1,
+  "revision": 1,
+  "entries": [
+    {
+      "name": "My game",
+      "exe": "game.exe",
+      "window_title": "ranked",
+      "delivery": "manual",
+      "message": "The anti-cheat driver drops injected input.",
+      "url": "https://example.com/why"
+    }
+  ]
+}
+```
+
+- **Matching:** `exe` (exe basename), `window_class` (the top-level window's class) and `window_title` (a substring of its title) are all case-insensitive. Every key an entry sets must match, and it must set at least one; an entry with none is ignored. The first matching entry wins.
+- **`delivery`:** `"keystrokes"` always types, `"clipboard"` always pastes with Ctrl+V (and, if the clipboard is busy, leaves the text there rather than typing into a window that drops keys), `"manual"` injects nothing and leaves the text on the clipboard for you to paste, and `"auto"` keeps the normal behaviour (useful for an entry that only explains).
+- **`message`** and **`url`** are written to the log the first time an entry matches in a run. When the text is left on the clipboard, the status pip shows `app` and the tray tooltip says so.
+- **`version`** is the file format (only `1` is read); **`revision`** is the list's own number, logged when a local file is loaded.
+- An elevated (administrator) window is handled before the list: Windows blocks all injected input into it, so the text always goes to the clipboard there.
+
 ## Voice Commands
 
 A precision, deliberately tiny subset -- currently just **"scratch that"**. Off by default (`"voice_commands": false` in `settings.json`, with a matching checkbox in Settings → Application).

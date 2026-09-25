@@ -75,7 +75,7 @@ const ACTIVE_DIR_MARKER: &str = "active-data-dir.txt";
 /// behind in the old folder when the user relocates.
 ///
 /// `logs` is a directory and is handled as one; the rest are plain files.
-pub(crate) const RELOCATABLE: [&str; 9] = [
+pub(crate) const RELOCATABLE: [&str; 10] = [
     "logs",
     "quickdictate-stats.json",
     "quickdictate-connections.dat",
@@ -89,6 +89,9 @@ pub(crate) const RELOCATABLE: [&str; 9] = [
     // Left behind, the next pull would lose track of what this PC has seen
     // and could revert a change it had not pushed yet.
     crate::sync::BASELINE_FILE,
+    // Left behind, the user's own app-compatibility entries would silently
+    // stop applying after a move.
+    crate::app_compat::APP_COMPAT_FILE,
 ];
 
 static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();

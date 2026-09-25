@@ -16,6 +16,7 @@ fn error_glyph_covers_every_named_variant() {
     assert_eq!(error_glyph(ErrorKind::Network), ("net", false));
     assert_eq!(error_glyph(ErrorKind::Elevated), ("UAC", false));
     assert_eq!(error_glyph(ErrorKind::HotkeyBlocked), ("hk", false));
+    assert_eq!(error_glyph(ErrorKind::AppBlocked), ("app", false));
 }
 
 #[test]
@@ -31,6 +32,7 @@ fn error_glyph_labels_are_all_distinguishable() {
         ErrorKind::Network,
         ErrorKind::Elevated,
         ErrorKind::HotkeyBlocked,
+        ErrorKind::AppBlocked,
     ];
     let mut labels: Vec<&str> = kinds.iter().map(|k| error_glyph(*k).0).collect();
     let before = labels.len();

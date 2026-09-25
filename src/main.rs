@@ -9,6 +9,9 @@
 #![warn(clippy::unwrap_used, clippy::expect_used)]
 
 mod about;
+/// Versioned app-compatibility list: which delivery (keystrokes, clipboard, or
+/// leave it on the clipboard) reaches a window the default hybrid paste does not.
+mod app_compat;
 mod audio;
 mod autostart;
 mod config;

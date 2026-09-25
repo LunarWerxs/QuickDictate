@@ -13,6 +13,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   its initial prompt, re-applied to every 30-second window of a long dictation, so a contact's or
   company's exact spelling survives offline too. Cohere Transcribe has no prompt input and is
   unchanged.
+- **App-compatibility list for pasting.** Before each paste, the focused window's exe, window class
+  and title are checked against a versioned list that picks the delivery that works there: always
+  keystrokes (legacy consoles, mintty, PuTTY and Remote Desktop, which ignore Ctrl+V or see another
+  clipboard), always the clipboard, or leave the text on the clipboard for a window that drops
+  injected input (the pip then shows `app`). The list ships with the app and a
+  `quickdictate-app-compat.json` in the data folder extends or overrides it without a new release.
+  See "Apps that need a different paste" in docs/GUIDE.md.
 
 ## [1.2.2] - 2026-09-24
 

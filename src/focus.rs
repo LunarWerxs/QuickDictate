@@ -19,7 +19,8 @@ use windows::Win32::System::Threading::{
     PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
+    GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetWindowTextW,
+    GetWindowThreadProcessId, GUITHREADINFO,
 };
 
 /// The foreground window and the ids of the thread and process that own it,
@@ -61,6 +62,36 @@ pub fn foreground_exe_name() -> Option<String> {
         let path = String::from_utf16_lossy(&buf[..len as usize]);
         basename_lower(&path)
     }
+}
+
+/// The foreground window's class name (e.g. `"ConsoleWindowClass"`), for the
+/// app-compatibility list: a class names a toolkit or terminal regardless of
+/// which exe hosts it. `None` when there is no foreground window or the query
+/// fails.
+pub fn foreground_window_class() -> Option<String> {
+    let (hwnd, _, _) = foreground_owner()?;
+    // 256 is the documented maximum length of a window class name.
+    let mut buf = [0u16; 256];
+    let len = unsafe { GetClassNameW(hwnd, &mut buf) };
+    non_empty_utf16(&buf, len)
+}
+
+/// The foreground window's title, for the app-compatibility list's title
+/// matching. `None` when there is no foreground window or it has no title.
+pub fn foreground_window_title() -> Option<String> {
+    let (hwnd, _, _) = foreground_owner()?;
+    // Titles longer than this are cut, which only matters to a pattern that
+    // targets their tail.
+    let mut buf = [0u16; 512];
+    let len = unsafe { GetWindowTextW(hwnd, &mut buf) };
+    non_empty_utf16(&buf, len)
+}
+
+/// The first `len` units of `buf` as a string, or `None` for a failed (0 or
+/// negative) or out-of-range length.
+fn non_empty_utf16(buf: &[u16], len: i32) -> Option<String> {
+    let len = usize::try_from(len).ok().filter(|&n| n > 0 && n <= buf.len())?;
+    Some(String::from_utf16_lossy(&buf[..len]))
 }
 
 /// Where keyboard input is going right now, as `(foreground window, focused
