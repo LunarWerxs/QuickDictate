@@ -453,12 +453,18 @@ fn whisper_initial_prompt_is_whisper_only_and_keeps_whole_terms() {
     assert!(prompt.len() <= 200, "{} bytes", prompt.len());
     assert!(prompt.starts_with("Término000, Término001"));
     let last = prompt.rsplit(", ").next().unwrap();
-    assert!(terms.iter().any(|term| term == last), "cut mid-term: {last}");
+    assert!(
+        terms.iter().any(|term| term == last),
+        "cut mid-term: {last}"
+    );
 
     // A token covers at least one byte, so prompt tokens <= bytes + 1.
     let history = whisper_history_tokens(prompt.len());
     assert!(history >= 1, "0 or less means the runtime's default of 223");
-    assert!(prompt.len() + 1 + history as usize <= 223, "history {history}");
+    assert!(
+        prompt.len() + 1 + history as usize <= 223,
+        "history {history}"
+    );
     assert_eq!(whisper_history_tokens(10_000), 1);
 }
 

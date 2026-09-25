@@ -19,8 +19,8 @@ use windows::Win32::System::Threading::{
     PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetWindowTextW,
-    GetWindowThreadProcessId, GUITHREADINFO,
+    GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetWindowTextW, GetWindowThreadProcessId,
+    GUITHREADINFO,
 };
 
 /// The foreground window and the ids of the thread and process that own it,
@@ -90,7 +90,9 @@ pub fn foreground_window_title() -> Option<String> {
 /// The first `len` units of `buf` as a string, or `None` for a failed (0 or
 /// negative) or out-of-range length.
 fn non_empty_utf16(buf: &[u16], len: i32) -> Option<String> {
-    let len = usize::try_from(len).ok().filter(|&n| n > 0 && n <= buf.len())?;
+    let len = usize::try_from(len)
+        .ok()
+        .filter(|&n| n > 0 && n <= buf.len())?;
     Some(String::from_utf16_lossy(&buf[..len]))
 }
 

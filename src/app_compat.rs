@@ -302,8 +302,12 @@ mod tests {
         assert_eq!(list.entries.len(), 1, "the keyless entry must be dropped");
         let hit = list.find(&window("game.exe", "UnityWndClass", "Game - RANKED match"));
         assert_eq!(hit.map(|e| e.delivery), Some(Delivery::Manual));
-        assert!(list.find(&window("game.exe", "UnityWndClass", "Game - menu")).is_none());
-        assert!(list.find(&window("other.exe", "UnityWndClass", "ranked")).is_none());
+        assert!(list
+            .find(&window("game.exe", "UnityWndClass", "Game - menu"))
+            .is_none());
+        assert!(list
+            .find(&window("other.exe", "UnityWndClass", "ranked"))
+            .is_none());
     }
 
     #[test]
