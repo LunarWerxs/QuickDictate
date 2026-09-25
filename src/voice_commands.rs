@@ -80,39 +80,21 @@ mod tests {
     }
 
     #[test]
-    fn bare_phrase_triggers_with_empty_remainder() {
-        assert_eq!(
-            detect("scratch that", true),
-            ScratchThat::Triggered {
-                remaining_raw: String::new()
-            }
-        );
-    }
-
-    #[test]
-    fn case_insensitive_variants_trigger() {
-        assert_eq!(
-            detect("Scratch that", true),
-            ScratchThat::Triggered {
-                remaining_raw: String::new()
-            }
-        );
-        assert_eq!(
-            detect("SCRATCH THAT", true),
-            ScratchThat::Triggered {
-                remaining_raw: String::new()
-            }
-        );
-    }
-
-    #[test]
-    fn trailing_period_variant_triggers() {
-        assert_eq!(
-            detect("scratch that.", true),
-            ScratchThat::Triggered {
-                remaining_raw: String::new()
-            }
-        );
+    fn bare_phrase_in_any_case_or_with_a_period_triggers_with_empty_remainder() {
+        for phrase in [
+            "scratch that",
+            "Scratch that",
+            "SCRATCH THAT",
+            "scratch that.",
+        ] {
+            assert_eq!(
+                detect(phrase, true),
+                ScratchThat::Triggered {
+                    remaining_raw: String::new()
+                },
+                "phrase {phrase:?}"
+            );
+        }
     }
 
     #[test]

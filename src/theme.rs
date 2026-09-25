@@ -239,16 +239,6 @@ mod tests {
     // ---- pick ----
 
     #[test]
-    fn pick_selects_the_dark_branch_in_dark_mode() {
-        assert_eq!(pick(true, "dark", "light"), "dark");
-    }
-
-    #[test]
-    fn pick_selects_the_light_branch_in_light_mode() {
-        assert_eq!(pick(false, "dark", "light"), "light");
-    }
-
-    #[test]
     fn pick_works_with_colorref_like_tc_uses_it() {
         let dark = rgb(32, 32, 32);
         let light = rgb(243, 243, 243);

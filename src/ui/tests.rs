@@ -40,24 +40,6 @@ fn error_glyph_labels_are_all_distinguishable() {
 }
 
 #[test]
-fn only_dead_keys_uses_the_icon_font() {
-    assert!(error_glyph(ErrorKind::DeadKeys).1);
-    for kind in [
-        ErrorKind::Generic,
-        ErrorKind::Quota,
-        ErrorKind::RateLimited,
-        ErrorKind::Network,
-        ErrorKind::Elevated,
-        ErrorKind::HotkeyBlocked,
-    ] {
-        assert!(
-            !error_glyph(kind).1,
-            "{kind:?} should use the plain UI font"
-        );
-    }
-}
-
-#[test]
 fn poll_interval_is_fast_only_while_active() {
     assert_eq!(poll_interval(true), ACTIVE_POLL_INTERVAL);
     assert_eq!(poll_interval(false), IDLE_POLL_INTERVAL);

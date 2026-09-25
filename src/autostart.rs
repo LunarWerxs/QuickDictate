@@ -71,18 +71,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn run_command_quotes_a_path_with_spaces() {
-        let exe = Path::new("C:\\Program Files\\QuickDictate\\QuickDictate.exe");
-        assert_eq!(
-            run_command(exe),
-            "\"C:\\Program Files\\QuickDictate\\QuickDictate.exe\""
-        );
-    }
-
-    #[test]
-    fn run_command_quotes_a_path_without_spaces_too() {
-        let exe = Path::new("C:\\QuickDictate.exe");
-        assert_eq!(run_command(exe), "\"C:\\QuickDictate.exe\"");
+    fn run_command_quotes_the_path_with_or_without_spaces() {
+        for (exe, expected) in [
+            (
+                "C:\\Program Files\\QuickDictate\\QuickDictate.exe",
+                "\"C:\\Program Files\\QuickDictate\\QuickDictate.exe\"",
+            ),
+            ("C:\\QuickDictate.exe", "\"C:\\QuickDictate.exe\""),
+        ] {
+            assert_eq!(run_command(Path::new(exe)), expected, "exe {exe:?}");
+        }
     }
 
     #[test]

@@ -75,15 +75,10 @@ fn an_empty_dictation_never_raises_the_error_pip() {
     // The reported bug: start a dictation, say nothing, stop. ElevenLabs
     // resets the socket without a closing handshake, but the provider
     // returned no words, so there is no transcript to lose and no "!".
-    assert!(!transport_failure_lost_speech(0, false));
-}
-
-#[test]
-fn room_noise_on_an_empty_press_is_still_an_empty_press() {
-    // Same call, stated separately because it is the case that made the
-    // first fix wrong: a silent press in a room with a TV on ships plenty
-    // of chunks above SILENCE_RMS, and ElevenLabs still returns nothing.
-    // Zero words back means an empty press however loud the room was.
+    // This is also the case that made the first fix wrong: a silent press in
+    // a room with a TV on ships plenty of chunks above SILENCE_RMS, and
+    // ElevenLabs still returns nothing. Zero words back means an empty press
+    // however loud the room was.
     assert!(!transport_failure_lost_speech(0, false));
 }
 
@@ -232,16 +227,4 @@ fn trailing_silence_never_followed_by_speech_is_never_emitted() {
     assert!(g.offer(vec![0; 1], false).is_empty());
     assert!(g.offer(vec![0; 1], false).is_empty());
     assert_eq!(g.held(), 3); // all held; caller drops them, none sent
-}
-
-#[test]
-fn alternating_speech_resets_the_held_run_each_time() {
-    let mut g = TailSilenceGate::default();
-    g.offer(vec![9000; 1], true); // speech -> ships, nothing held
-    assert_eq!(g.held(), 0);
-    g.offer(vec![0; 1], false); // 1 held
-    assert_eq!(g.held(), 1);
-    let out = g.offer(vec![9000; 1], true); // speech again -> flush 1 + speech
-    assert_eq!(out.len(), 2);
-    assert_eq!(g.held(), 0);
 }

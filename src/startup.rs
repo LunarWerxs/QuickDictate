@@ -527,25 +527,20 @@ mod tests {
     }
 
     #[test]
-    fn error_reporting_alone_starts_the_panic_log_without_enable_logging() {
+    fn any_one_switch_alone_starts_the_panic_log_and_none_never_does() {
         // The crash banner and "Create an error report..." both read the panic log the moment
         // `error_reporting_enabled` is on, so that setting must be enough on its own -- a user
         // who never turns on "Write quickdictate.log" must still get a panic log to report on.
-        assert!(should_record_panics(false, true, false));
-    }
-
-    #[test]
-    fn enable_logging_alone_still_starts_the_panic_log() {
-        assert!(should_record_panics(true, false, false));
-    }
-
-    #[test]
-    fn env_override_alone_still_starts_the_panic_log() {
-        assert!(should_record_panics(false, false, true));
-    }
-
-    #[test]
-    fn nothing_on_never_starts_the_panic_log() {
+        for (enable_logging, error_reporting, env_override) in [
+            (false, true, false),
+            (true, false, false),
+            (false, false, true),
+        ] {
+            assert!(
+                should_record_panics(enable_logging, error_reporting, env_override),
+                "logging={enable_logging} reporting={error_reporting} env={env_override}"
+            );
+        }
         assert!(!should_record_panics(false, false, false));
     }
 

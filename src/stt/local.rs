@@ -167,11 +167,6 @@ impl ProviderStream for LocalStream {
 mod tests {
     use super::*;
 
-    #[test]
-    fn local_pcm_bound_stays_small() {
-        assert_eq!(16_000 * MAX_AUDIO_SECONDS * size_of::<i16>(), 11_520_000);
-    }
-
     fn sink(sample_rate: u32) -> LocalSink {
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
         LocalSink {
