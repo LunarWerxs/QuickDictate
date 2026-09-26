@@ -13,8 +13,13 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release:
+    timeout-minutes: 60
     name: validate · build · smoke · publish
     runs-on: windows-latest
     steps:

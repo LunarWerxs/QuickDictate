@@ -17,8 +17,13 @@ env:
 # The local mirror of this file is `scripts\check.ps1`. Keep them in step: a
 # gate that only exists in one of the two is a gate somebody will discover the
 # slow way, after a push.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check:
+    timeout-minutes: 60
     name: fmt · clippy · build · test
     # Push/PR/manual only. The weekly `schedule` trigger exists solely to drive
     # the `deny` job below; it must not re-run the full build+test pipeline
@@ -83,6 +88,7 @@ jobs:
             -ExpectedVersion $version
 
   deny:
+    timeout-minutes: 60
     name: cargo-deny (advisories · licenses · sources)
     # Always: unlike every other gate, this one's verdict changes without a code
     # change, because the advisory database moves under a lockfile that did not.
@@ -107,6 +113,7 @@ jobs:
         run: cargo deny check
 
   msrv:
+    timeout-minutes: 60
     name: MSRV (Rust 1.95)
     if: github.event_name != 'schedule'
     runs-on: windows-latest
@@ -126,6 +133,7 @@ jobs:
         run: cargo +1.95-x86_64-pc-windows-msvc check --locked --all-targets
 
   unused-deps:
+    timeout-minutes: 60
     name: cargo-machete (unused dependencies)
     if: github.event_name != 'schedule'
     runs-on: windows-latest
