@@ -21,6 +21,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `quickdictate-app-compat.json` in the data folder extends or overrides it without a new release.
   See "Apps that need a different paste" in docs/GUIDE.md.
 
+### Changed
+
+- **Less CPU between dictations.** The microphone stays open so a press starts instantly, but
+  while nobody is dictating its audio is no longer converted sample by sample only to be thrown
+  away.
+
 ## [1.2.2] - 2026-09-24
 
 A maintenance release with no change to how the app behaves.

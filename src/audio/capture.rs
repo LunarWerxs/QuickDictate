@@ -291,6 +291,13 @@ impl FeedTargets {
     fn feed(&self, data: &[i16]) {
         feed_sessions(&self.sessions, &self.device_rate, &self.channels, data);
     }
+
+    /// True when no session is subscribed. The stream stays open between
+    /// presses, so this is the common case: about a hundred callbacks a
+    /// second whose samples nobody will read.
+    fn idle(&self) -> bool {
+        self.sessions.read().is_empty()
+    }
 }
 
 /// Open the device's input stream in its native sample format, with every
@@ -329,7 +336,8 @@ fn build_stream(
 /// The scratch buffer lives in the callback and keeps its capacity, so after
 /// the first callback the conversion allocates nothing. Generic over
 /// `convert` (not a fn pointer) so each format's loop still compiles to an
-/// inlined per-sample conversion.
+/// inlined per-sample conversion. With no session subscribed the callback
+/// returns before converting: `feed_sessions` would drop the result unread.
 fn build_converting_stream<T>(
     device: &cpal::Device,
     config: cpal::StreamConfig,
@@ -344,6 +352,9 @@ where
     Ok(device.build_input_stream(
         config,
         move |data: &[T], _| {
+            if feed.idle() {
+                return;
+            }
             scratch.clear();
             scratch.reserve(data.len());
             for s in data {
