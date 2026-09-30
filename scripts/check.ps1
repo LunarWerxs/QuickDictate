@@ -15,7 +15,7 @@
 # gate somebody discovers the slow way, after pushing.
 [CmdletBinding()]
 param(
-    # Add the release build + exe validation (the `check` job's tail).
+    # Add the release build + exe validation (ci.yml's `release` job).
     [switch] $Full,
     # Skip the supply-chain gates (cargo-deny, cargo-machete) for a tight loop.
     [switch] $Fast
