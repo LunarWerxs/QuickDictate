@@ -89,11 +89,12 @@ jobs:
         run: rustup show
 
       - name: Cache cargo + target
+        id: rust
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-on-failure: true
 
-      # The whole crates.io index (see the release job): offline on an exact lock-file match.
+      # The whole crates.io index (see the release job): offline only when both caches matched exactly.
       - name: crates.io index
         id: index
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
@@ -119,7 +120,7 @@ jobs:
       # `#[allow(..., reason = "...")]`.
       - name: Clippy
         env:
-          CARGO_NET_OFFLINE: ${{ steps.index.outputs.cache-hit == 'true' }}
+          CARGO_NET_OFFLINE: ${{ steps.index.outputs.cache-hit == 'true' && steps.rust.outputs.cache-hit == 'true' }}
         run: cargo clippy --locked --all-targets -- -D warnings
 
       # Unit tests only. The live provider tests are #[ignore] — they need real
@@ -134,7 +135,7 @@ jobs:
           # The runner wraps each test binary (only those under \deps\) to add libtest's
           # --report-time; the build itself is untouched.
           CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER: pwsh -NoProfile -File ${{ github.workspace }}\scripts\test-timed.ps1
-          CARGO_NET_OFFLINE: ${{ steps.index.outputs.cache-hit == 'true' }}
+          CARGO_NET_OFFLINE: ${{ steps.index.outputs.cache-hit == 'true' && steps.rust.outputs.cache-hit == 'true' }}
         run: cargo test --locked --no-fail-fast
 
       - name: The 30 slowest tests
@@ -168,12 +169,14 @@ jobs:
         run: rustup show
 
       - name: Cache cargo + release target
+        id: rust
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-on-failure: true
 
       # The whole crates.io index, keyed on the lock file: rust-cache keeps only part of it, so cargo
-      # re-read it for 17-48 s before compiling anything. On an exact match the build runs offline.
+      # re-read it for 17-48 s before compiling anything. Offline only when this AND rust-cache (which holds
+      # the .crate files) matched exactly; either one missing, cargo reads the network as before.
       - name: crates.io index
         id: index
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
@@ -183,7 +186,7 @@ jobs:
 
       - name: Build release
         env:
-          CARGO_NET_OFFLINE: ${{ steps.index.outputs.cache-hit == 'true' }}
+          CARGO_NET_OFFLINE: ${{ steps.index.outputs.cache-hit == 'true' && steps.rust.outputs.cache-hit == 'true' }}
         run: cargo build --release --locked
 
       - name: Validate release executable
