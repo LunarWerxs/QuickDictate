@@ -93,6 +93,14 @@ jobs:
         with:
           cache-on-failure: true
 
+      # The whole crates.io index (see the release job): offline on an exact lock-file match.
+      - name: crates.io index
+        id: index
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.cargo/registry/index
+          key: crates-index-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
       # `mod X;` with no tracked file. This is the one class CI genuinely discovers FIRST,
       # because every local gate compiles the working tree where the untracked file still
       # exists - which is exactly how 393c38c pushed a `main` that did not compile. Running it
@@ -110,6 +118,8 @@ jobs:
       # stderr, so an unwrap is a SILENT failure. Exceptions carry a local
       # `#[allow(..., reason = "...")]`.
       - name: Clippy
+        env:
+          CARGO_NET_OFFLINE: ${{ steps.index.outputs.cache-hit == 'true' }}
         run: cargo clippy --locked --all-targets -- -D warnings
 
       # Unit tests only. The live provider tests are #[ignore] — they need real
@@ -124,6 +134,7 @@ jobs:
           # The runner wraps each test binary (only those under \deps\) to add libtest's
           # --report-time; the build itself is untouched.
           CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER: pwsh -NoProfile -File ${{ github.workspace }}\scripts\test-timed.ps1
+          CARGO_NET_OFFLINE: ${{ steps.index.outputs.cache-hit == 'true' }}
         run: cargo test --locked --no-fail-fast
 
       - name: The 30 slowest tests
@@ -161,7 +172,18 @@ jobs:
         with:
           cache-on-failure: true
 
+      # The whole crates.io index, keyed on the lock file: rust-cache keeps only part of it, so cargo
+      # re-read it for 17-48 s before compiling anything. On an exact match the build runs offline.
+      - name: crates.io index
+        id: index
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.cargo/registry/index
+          key: crates-index-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
       - name: Build release
+        env:
+          CARGO_NET_OFFLINE: ${{ steps.index.outputs.cache-hit == 'true' }}
         run: cargo build --release --locked
 
       - name: Validate release executable
