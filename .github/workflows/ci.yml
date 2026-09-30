@@ -161,7 +161,12 @@ jobs:
         with:
           cache-on-failure: true
 
+      # MEASUREMENT ONLY, never landed: how long the release build takes with thin LTO and 16
+      # codegen units instead of what ships (fat LTO, one unit).
       - name: Build release
+        env:
+          CARGO_PROFILE_RELEASE_LTO: thin
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
         run: cargo build --release --locked
 
       - name: Validate release executable
