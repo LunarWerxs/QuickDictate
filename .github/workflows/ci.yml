@@ -2,9 +2,6 @@ name: CI
 
 # rust-ci-speed: windows-per-change not applied: QuickDictate ships only as a Windows executable, so
 # Windows is its one real platform and every leg here stays per change.
-# rust-ci-speed: test-sleeps not applied: the flagged 3 s sleep (src/sync/mod.rs:270) is the production
-# stats-push debounce in `schedule_stats_push`, not a wait inside a test (the audit counts the whole file
-# after its first `#[cfg(test)]`); no test runs it.
 
 on:
   push:
@@ -70,7 +67,7 @@ jobs:
 
   check:
     timeout-minutes: 60
-    name: fmt · clippy · build · test
+    name: fmt · clippy · test
     needs: already
     # Push/PR/manual only. The weekly `schedule` trigger exists solely to drive
     # the `deny` job below; it must not re-run the full build+test pipeline
@@ -115,8 +112,6 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
-      # Tests run BEFORE the fat-LTO release build (2026-09-22): the build is the slowest step in
-      # this job, and a failing test used to be reported only after paying for it.
       # Unit tests only. The live provider tests are #[ignore] — they need real
       # API keys + network and are run locally, never in CI.
       #
@@ -144,6 +139,27 @@ jobs:
           }
           $rows | Sort-Object Seconds -Descending | Select-Object -First 30 |
             ForEach-Object { '{0,8:N3}s  {1}' -f $_.Seconds, $_.Test }
+
+  # The fat-LTO release build is the slowest step of the whole workflow (216-259 s warm) and reads nothing the
+  # tests build, so it runs beside `check` instead of after it: the run costs the slower of the two, not their
+  # sum (7.0 min warm with both in one job, 2026-09-30). Its own cache holds only release artifacts, so neither
+  # job restores and re-saves the other's profile.
+  release:
+    timeout-minutes: 60
+    name: release build · executable check
+    needs: already
+    if: ${{ !cancelled() && github.event_name != 'schedule' && needs.already.outputs.verified != '1' }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Toolchain
+        run: rustup show
+
+      - name: Cache cargo + release target
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          cache-on-failure: true
 
       - name: Build release
         run: cargo build --release --locked
