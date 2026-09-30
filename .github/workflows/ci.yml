@@ -93,6 +93,8 @@ jobs:
 
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          cache-on-failure: true
 
       # `mod X;` with no tracked file. This is the one class CI genuinely discovers FIRST,
       # because every local gate compiles the working tree where the untracked file still
@@ -166,6 +168,8 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          cache-on-failure: true
 
       # Replaces the old `cargo audit` job. cargo-audit answered only "is
       # anything in the lockfile vulnerable"; cargo-deny answers that plus
@@ -190,6 +194,8 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          cache-on-failure: true
       # `cargo +1.95` overrides rust-toolchain.toml's `stable` pin for these
       # commands only; installing it as the default would defeat the pin for
       # everything else in the job.
@@ -211,6 +217,8 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          cache-on-failure: true
       - name: Install cargo-machete
         run: cargo install cargo-machete --locked
       # A dependency nobody uses is still compiled, still shipped, still
