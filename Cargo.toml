@@ -55,6 +55,9 @@ opt-level = 3
 
 [profile.dev]
 opt-level = 1
+# Line tables only: a panic (and the panic hook's backtrace) still names file:line, and
+# every test binary links about 2x faster than with full debug info. `test` inherits dev.
+debug = "line-tables-only"
 
 [dependencies]
 tokio = { version = "1", features = [

@@ -86,7 +86,7 @@ try {
     # Includes the mutation-fuzz suite in src/fuzz.rs (thousands of mutated and
     # truncated inputs through every parser that reads a network response) and
     # the archive-traversal red-team test in src/local_stt.rs.
-    Step 'test'         { cargo test --locked }
+    Step 'test'         { cargo test --locked --no-fail-fast }
 
     if (-not $Fast) {
         # Mirrors ci.yml -> `deny` job. Advisories, licenses, bans, sources.

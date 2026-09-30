@@ -1,9 +1,22 @@
 name: CI
 
+# rust-ci-speed: windows-per-change not applied: QuickDictate ships only as a Windows executable, so
+# Windows is its one real platform and every leg here stays per change.
+# rust-ci-speed: test-sleeps not applied: the flagged 3 s sleep (src/sync/mod.rs:270) is the production
+# stats-push debounce in `schedule_stats_push`, not a wait inside a test (the audit counts the whole file
+# after its first `#[cfg(test)]`); no test runs it.
+
 on:
   push:
     branches: [main]
+    # A docs-only change cannot break the gate. No branch protection requires these checks.
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
   pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
   schedule:
     # Weekly supply-chain sweep (see the `deny` job). Cron is UTC. This is the
     # one gate whose verdict changes with NO code change: a crate the lockfile
@@ -22,14 +35,51 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # A push whose exact commit already passed this workflow (a PR or dispatch run before it
+  # landed) re-proves nothing. This job asks the API; if a green run exists the gates below
+  # are skipped and the run reads success. The gates use `!cancelled()` so that this job
+  # being skipped (PR, dispatch, schedule) or failing leaves them running: it can only ever
+  # save work, never hide a gate. `deny` does not depend on it: its verdict changes with no
+  # code change.
+  already:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    outputs:
+      verified: ${{ steps.check.outputs.verified }}
+    steps:
+      - name: Has this workflow already passed on this exact commit?
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          wf="${GITHUB_WORKFLOW_REF%%@*}"; wf="${wf##*/}"
+          earlier="$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/$wf/runs?head_sha=$GITHUB_SHA&status=success&per_page=10" \
+            | jq -r --arg me "$GITHUB_RUN_ID" '[.workflow_runs[] | select((.id | tostring) != $me)][0].html_url // empty')" || earlier=""
+          if [ -n "$earlier" ]; then
+            echo "::notice::$GITHUB_SHA already passed this workflow: $earlier. The gates are skipped."
+            echo "verified=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "no earlier green run of this workflow on $GITHUB_SHA: the gates run."
+            echo "verified=0" >> "$GITHUB_OUTPUT"
+          fi
+
   check:
     timeout-minutes: 60
     name: fmt · clippy · build · test
+    needs: already
     # Push/PR/manual only. The weekly `schedule` trigger exists solely to drive
     # the `deny` job below; it must not re-run the full build+test pipeline
     # every week for no code change.
-    if: github.event_name != 'schedule'
+    if: ${{ !cancelled() && github.event_name != 'schedule' && needs.already.outputs.verified != '1' }}
     runs-on: windows-latest
+    env:
+      # Per-test wall times for the "30 slowest tests" step (scripts/test-timed.ps1).
+      RT_TEST_TIMES: ${{ github.workspace }}\test-times.log
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
@@ -73,7 +123,25 @@ jobs:
       # skipped: every parser that reads a network response gets thousands of
       # mutated and truncated inputs on every push, for about a second.
       - name: Test
-        run: cargo test --locked
+        env:
+          # The runner wraps each test binary (only those under \deps\) to add libtest's
+          # --report-time; the build itself is untouched.
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER: pwsh -NoProfile -File ${{ github.workspace }}\scripts\test-timed.ps1
+        run: cargo test --locked --no-fail-fast
+
+      - name: The 30 slowest tests
+        if: always()
+        shell: pwsh
+        run: |
+          if (-not (Test-Path $env:RT_TEST_TIMES)) { return }
+          $rows = foreach ($line in Get-Content $env:RT_TEST_TIMES) {
+            $line = $line -replace '\x1b\[[0-9;]*m', ''
+            if ($line -match '^test (.*) \.\.\. ok <([0-9.]+)s>\s*$') {
+              [pscustomobject]@{ Seconds = [double]$Matches[2]; Test = $Matches[1] }
+            }
+          }
+          $rows | Sort-Object Seconds -Descending | Select-Object -First 30 |
+            ForEach-Object { '{0,8:N3}s  {1}' -f $_.Seconds, $_.Test }
 
       - name: Build release
         run: cargo build --release --locked
@@ -115,7 +183,8 @@ jobs:
   msrv:
     timeout-minutes: 60
     name: MSRV (Rust 1.95)
-    if: github.event_name != 'schedule'
+    needs: already
+    if: ${{ !cancelled() && github.event_name != 'schedule' && needs.already.outputs.verified != '1' }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -135,7 +204,8 @@ jobs:
   unused-deps:
     timeout-minutes: 60
     name: cargo-machete (unused dependencies)
-    if: github.event_name != 'schedule'
+    needs: already
+    if: ${{ !cancelled() && github.event_name != 'schedule' && needs.already.outputs.verified != '1' }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
