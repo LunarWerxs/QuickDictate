@@ -165,7 +165,8 @@ jobs:
         run: rustup show
 
       # Its own key: 16 codegen units rebuild every dependency, so the one-unit cache is useless here (a probe
-      # without a key of its own restored it and rebuilt all 264 dependencies).
+      # without one restored it and rebuilt all 264). rust-cache also hashes the job's CARGO_* variables into its
+      # key; the explicit key keeps the caches apart even if those variables move to a step.
       - name: Cache cargo + release target
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
