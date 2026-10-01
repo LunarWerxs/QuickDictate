@@ -35,7 +35,10 @@ Cargo.toml: this list exists so none of them drift (SECURITY.md sat on
       Clippy with `-D warnings`, the whole test suite (including the
       mutation-fuzz pass over every parser that reads a network response, and
       the archive-traversal red-team test), `cargo deny`, `cargo machete`, the
-      release build, and the exe validation.
+      release build, and the exe validation. One difference, on purpose: CI's
+      per-push release build uses thin LTO and 16 codegen units to finish
+      sooner, while this one builds the shipped profile (fat LTO, one codegen
+      unit), the same binary `release.yml` builds from the tag.
 - [ ] `pwsh -File scripts\smoke_test.ps1`: the only check that exercises the real
       pipeline end to end (hotkey capture, audio routing, provider connect, paste).
       CI cannot run it: it needs a microphone, a focused window, and a live API key.
