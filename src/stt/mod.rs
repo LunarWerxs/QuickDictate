@@ -13,6 +13,7 @@ mod deepgram;
 mod elevenlabs;
 mod google;
 mod local;
+mod local_early;
 mod openai;
 pub mod provider;
 mod ws;

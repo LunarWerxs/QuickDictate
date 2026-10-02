@@ -32,6 +32,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   did. In one pass, a 178 s dictation took 20 s on an RTX 3090 and a 177 s test
   clip 8.7 s the first time; clipped, the same clip takes 3.0 s, with no words
   lost at the cuts (9.1% vs 10.4% word errors on a 199 s read-aloud test).
+- **Local dictations are no longer cut at six minutes, and a long one is
+  ready about a second after you let go.** Everything said after minute six
+  used to be dropped, because the whole recording was decoded in one pass after
+  release. A long dictation is now transcribed while you speak: each finished
+  35 s stretch goes to the model in the background, so release only waits for
+  the last few seconds. Through the real dictation path with Parakeet, a 199 s
+  recording finished 0.34 s after release, word for word the same as decoding
+  it whole. A four-hour safety stop remains for a dictation nobody ended.
 
 ## [1.3.0] - 2026-10-02
 

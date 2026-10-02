@@ -26,6 +26,21 @@ pub use worker::{
     DEFAULT_IDLE_UNLOAD_MINUTES,
 };
 
+/// Where the first quiet-boundary clip of `pcm` ends, when `pcm` is long
+/// enough to need more than one clip (the same <=35 s cut the decoder makes).
+/// `None` while it would still be a single clip. A long dictation uses this to
+/// hand finished stretches to the model while the speaker is still talking.
+pub fn first_clip_end(pcm: &[i16], sample_rate: usize) -> Option<usize> {
+    let ranges = postprocess::cohere_chunk_ranges(pcm, sample_rate);
+    (ranges.len() > 1).then(|| ranges[0].end)
+}
+
+/// Join the transcripts of consecutive stretches of one dictation, with the
+/// same seam handling and decoder-loop guard a single decode gets.
+pub fn join_transcripts(parts: Vec<String>) -> Option<String> {
+    native::join_and_clean(parts)
+}
+
 const RUNTIME_VERSION: &str = "0.2.4";
 const RUNTIME_SHA256: &str = "09705f54218817c065602ada8fd0f4d13b3f7fbb9d94929eeb3789c6c2b1f34a";
 

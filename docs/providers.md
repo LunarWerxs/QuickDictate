@@ -255,8 +255,12 @@ when you come back, which is exactly when it is least welcome. Across 1,340
 measured dictations, ones arriving within 25 seconds of a reload took a median
 of 2.41s against 0.50s warm, and 73% of every dictation slower than 3 seconds
 had just followed a reload. The cursor indicator uses a spinner instead of
-a live word count because local transcription runs as one batch after release;
-a hotkey press during that final batch queues the next dictation so the valid
+a live word count because local transcription finishes after release. A long
+dictation (over 40 s) is transcribed while you speak, in clips of at most
+35 s cut at quiet moments, so release only waits for the last stretch however
+long you talked (a 199 s recording finished 0.34 s after release with
+Parakeet); there is no six-minute limit, only a four-hour safety stop.
+A hotkey press during that final step queues the next dictation so the valid
 pending result cannot be superseded and discarded. A queued hold-to-talk start
 is cancelled if you release the key before processing finishes. Vulkan is
 preferred when available; CPU is the automatic fallback. Raw audio passes
