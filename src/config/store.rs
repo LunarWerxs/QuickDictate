@@ -1,8 +1,9 @@
 //! Finding, reading and writing settings.json.
 //!
 //! The search order for the file, the load path (including the parse-failure
-//! backup and the key unsealing), the atomic write, and the two migrations a
-//! load applies: unreadable sealed keys and a local model that no longer ships.
+//! backup and the key unsealing), the atomic write, and the three migrations a
+//! load applies: unreadable sealed keys, a local model that no longer ships,
+//! and DashScope keys from before the international host became the default.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -330,6 +331,25 @@ impl Config {
         true
     }
 
+    /// Keep a settings.json from before the international DashScope host became
+    /// the default on the mainland-China host: one with DashScope keys and no
+    /// `dashscope_intl` was dictating through mainland, and a mainland key
+    /// 401s on the international host. The next save writes the value out, so
+    /// this applies once. A file that names a region, or has no DashScope keys,
+    /// gets what it says or the default. `text` is the file `self` came from.
+    fn keep_legacy_dashscope_region(&mut self, text: &str) {
+        #[derive(serde::Deserialize)]
+        struct Region {
+            dashscope_intl: Option<bool>,
+        }
+        let named = serde_json::from_str::<Region>(text)
+            .map(|r| r.dashscope_intl.is_some())
+            .unwrap_or(true);
+        if !named && self.dashscope_keys.iter().any(|k| !k.trim().is_empty()) {
+            self.dashscope_intl = false;
+        }
+    }
+
     /// Persist a freshly generated [`Config::install_id`] with the lightest
     /// possible touch: when the on-disk file still has the template's empty
     /// `"install_id": ""` slot, fill it in place — leaving the user's key
@@ -373,9 +393,14 @@ impl Config {
 
 /// Parse settings.json text. A leading UTF-8 byte-order mark is skipped:
 /// Notepad writes one under "UTF-8 with BOM", and serde_json rejects it, which
-/// would otherwise turn a routine hand edit into "failed to parse".
+/// would otherwise turn a routine hand edit into "failed to parse". Resolves a
+/// missing DashScope region here, so every path that rewrites the file from
+/// what it parsed writes the region the user was really on.
 fn parse_settings(text: &str) -> serde_json::Result<Config> {
-    serde_json::from_str(text.strip_prefix('\u{feff}').unwrap_or(text))
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut cfg: Config = serde_json::from_str(text)?;
+    cfg.keep_legacy_dashscope_region(text);
+    Ok(cfg)
 }
 
 /// Copy a settings.json that exists but could not be loaded to
@@ -581,6 +606,59 @@ mod tests {
         assert!(diags[0].starts_with("INFO:"), "{diags:?}");
         assert!(!path.with_extension("json.bad").exists());
         let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // ---- DashScope region ---------------------------------------------------
+
+    #[test]
+    fn a_fresh_config_uses_the_international_dashscope_host() {
+        assert!(Config::default().dashscope_intl);
+        let path = temp_settings("dashscope-fresh");
+        let (cfg, _) = Config::create_from_template(path.clone());
+        assert!(cfg.dashscope_intl, "the template must default to Singapore");
+        // A file with no DashScope keys is a new setup too.
+        assert!(
+            parse_settings(r#"{ "mode": "hold" }"#)
+                .unwrap()
+                .dashscope_intl
+        );
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn existing_dashscope_keys_without_a_region_keep_the_mainland_host() {
+        let path = temp_settings("dashscope-legacy");
+        fs::write(&path, r#"{ "dashscope_keys": ["sk-mainland"] }"#).unwrap();
+        let (cfg, _) = Config::load_existing(&path);
+        assert!(!cfg.dashscope_intl, "a mainland key would 401 on -intl");
+
+        // The next save writes the region out, so the file stops relying on
+        // the migration.
+        cfg.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"dashscope_intl\": false"), "{text}");
+
+        // Blank entries are not keys.
+        assert!(
+            parse_settings(r#"{ "dashscope_keys": [" "] }"#)
+                .unwrap()
+                .dashscope_intl
+        );
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn an_explicit_dashscope_region_always_wins() {
+        for intl in [true, false] {
+            for keys in [r#"[]"#, r#"["sk-key"]"#] {
+                let text = format!(r#"{{ "dashscope_keys": {keys}, "dashscope_intl": {intl} }}"#);
+                assert_eq!(
+                    parse_settings(&text).unwrap().dashscope_intl,
+                    intl,
+                    "{text}"
+                );
+            }
+        }
     }
 
     #[test]

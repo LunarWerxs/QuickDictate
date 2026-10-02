@@ -271,10 +271,13 @@ pub struct Config {
     #[serde(default = "default_local_idle_unload_minutes")]
     pub local_idle_unload_minutes: u64,
 
-    /// DashScope region: `false` = mainland-China host (default),
-    /// `true` = the `-intl` host for International accounts. A key from the
-    /// wrong region 401s at the WebSocket upgrade, so match this to your key.
-    #[serde(default = "default_false")]
+    /// DashScope region: `true` = the `-intl` (Singapore) host for
+    /// International accounts (default), `false` = the mainland-China host. A
+    /// key from the wrong region 401s at the WebSocket upgrade, so match this
+    /// to your key. A settings.json with DashScope keys and no value here
+    /// predates the international default and loads as `false` (see
+    /// `Config::keep_legacy_dashscope_region`).
+    #[serde(default = "default_true")]
     pub dashscope_intl: bool,
 
     /// Automatically check for a newer release at startup (throttled to once
@@ -575,7 +578,7 @@ impl Default for Config {
             stt_model: None,
             local_model: default_local_model(),
             local_idle_unload_minutes: default_local_idle_unload_minutes(),
-            dashscope_intl: false,
+            dashscope_intl: true,
             update_auto_check: true,
             install_id: String::new(),
             run_at_startup: false,

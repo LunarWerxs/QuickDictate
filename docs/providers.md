@@ -136,10 +136,11 @@ model back.
 4. Paste it into `dashscope_keys` in `settings.json`.
 
 **Notes, region matters:** DashScope keys are region-locked.
-- By default QuickDictate connects to the **mainland-China** host
-  (`"dashscope_intl": false`).
-- If your key was issued for the **International** region, set
-  `"dashscope_intl": true` in `settings.json`.
+- By default QuickDictate connects to the **International** (Singapore)
+  host (`"dashscope_intl": true`).
+- If your key was issued for the **mainland-China** region, set
+  `"dashscope_intl": false` in `settings.json`, or untick
+  **International account** on the DashScope card in Settings.
 - A key from the wrong region will simply fail to connect, if DashScope
   doesn't work, this mismatch is the first thing to check.
 

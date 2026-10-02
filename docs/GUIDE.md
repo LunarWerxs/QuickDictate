@@ -70,7 +70,7 @@ That replacement table, since it's the fiddly-but-lovely part:
 A couple of gotchas:
 - **Google** is the only non-streaming one: long dictations upload in bounded ~55-second batches, but all results are held until release, so there is no live word count.
 - **Local** is also non-streaming, but uploads nothing. It buffers bounded 16 kHz PCM in memory and transcribes when you release the hotkey.
-- **DashScope is region-sensitive.** It defaults to the mainland-China host; set `"dashscope_intl": true` for the International host. A key from the wrong region just won't connect.
+- **DashScope is region-sensitive.** It defaults to the International (Singapore) host; set `"dashscope_intl": false` for the mainland-China host. A key from the wrong region just won't connect.
 
 Full per-provider setup notes live in [docs/providers.md](providers.md).
 
@@ -85,7 +85,7 @@ Everything lives in `settings.json` (copied from `settings.example.json`). The f
 | `stt_model` | Optional model-override string (`null` = provider default) |
 | `local_model` | Local model id: `"cohere-q5"` (default), `"whisper-turbo-q5"` or `"parakeet-v3-q5"` |
 | `local_idle_unload_minutes` | Minutes of no dictation before the local model is released from memory (default `10`). `0` keeps it loaded for as long as QuickDictate runs, so no dictation ever waits for a reload (Settings › Behavior › Never go to sleep) |
-| `dashscope_intl` | `false` = mainland-China host (default), `true` = International host |
+| `dashscope_intl` | `true` = International (Singapore) host (default), `false` = mainland-China host |
 | `language` | BCP-47 language tag, e.g. `"en-US"` |
 | `mode` | `"toggle"` or `"hold"` |
 | `toggle_hotkey` / `hold_hotkey` | Default `"f14"` / `"f13"`. Can be a key (`"f14"`, `"ctrl+shift+d"`) **or a mouse button**, see [Mouse buttons as hotkeys](#mouse-buttons-as-hotkeys) |

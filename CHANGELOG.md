@@ -36,6 +36,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the guides say what it sends in those terms. What the report sends and the
   `share_usage_stats` key are unchanged.
 
+- **DashScope now defaults to its international (Singapore) host.** It used to
+  default to the mainland-China host, so a new setup sent your voice to
+  Alibaba's servers in mainland China unless you ticked **International
+  account**. That tick is now on by default. Existing setups keep the host they
+  were on: a settings.json with DashScope keys and no `dashscope_intl` stays on
+  mainland China, because a mainland key does not work on the international
+  host, and the next save writes that choice out. Untick **International
+  account** on the DashScope card if your key is a mainland-China one.
+
 ## [1.4.0] - 2026-10-02
 
 Local dictation that keeps up with you: text appears a quarter second after you stop, dictations

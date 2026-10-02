@@ -157,7 +157,8 @@ impl super::SettingsApp {
                 ui.add_space(6.0);
                 blue_check(ui, &mut self.draft.dashscope_intl, "International account")
                     .on_hover_text(
-                        "Use DashScope's international endpoint instead of the mainland-China one.",
+                        "Use DashScope's international (Singapore) endpoint. Untick for a \
+                         mainland-China account: a key only works in its own region.",
                     );
             }
 
