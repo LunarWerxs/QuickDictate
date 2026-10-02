@@ -39,8 +39,7 @@ impl Plan {
 
 const DAY: u64 = 24 * 60 * 60;
 
-/// How long a Business copy that never held a licence may evaluate with
-/// everything working.
+/// The quiet part of the business trial: everything works, with no notice.
 pub(crate) const EVALUATION_SECS: u64 = 7 * DAY;
 
 /// The notice period after the evaluation ends (or a licence is refused)
@@ -48,6 +47,14 @@ pub(crate) const EVALUATION_SECS: u64 = 7 * DAY;
 /// Friday evening: whoever raises the purchase order is back at their desk
 /// before anything stops.
 pub(crate) const NOTICE_SECS: u64 = 3 * DAY;
+
+/// The whole business trial LICENSE grants: the quiet days, then the notice
+/// days. Everything works until it ends; every date and count the user reads
+/// is measured to its end.
+pub(crate) const TRIAL_SECS: u64 = EVALUATION_SECS + NOTICE_SECS;
+
+/// [`TRIAL_SECS`] in days, for the words.
+pub(crate) const TRIAL_DAYS: u64 = TRIAL_SECS / DAY;
 
 /// 2026-10-01T00:00:00Z, before any copy that asks the question existed. An
 /// evaluation start or a refusal stamped earlier than this was stamped by a
@@ -107,10 +114,11 @@ pub(crate) enum Posture {
     /// Connections has not refused the key: keeps working while renewal
     /// retries. Never leads to the lock.
     LicensedRenewing { plan: Option<Plan> },
-    /// Business, never licensed, inside the 7-day evaluation.
+    /// Business, never licensed, in the quiet part of the trial. `ends_unix`
+    /// is when the whole trial ends and dictation stops.
     Evaluation { ends_unix: u64 },
-    /// The evaluation is over; dictation still works until `stops_unix`, with a
-    /// notice at every start.
+    /// The trial's last days: dictation still works until `stops_unix` (the
+    /// same moment), with a notice at every start.
     EvaluationEnded { stops_unix: u64 },
     /// Connections refused the stored key. A Business copy gets the notice
     /// period from that moment (`stops_unix`); a Personal one just hears it in
@@ -185,14 +193,13 @@ fn refused_posture(now: u64, mode: Mode, refused_unix: u64) -> Posture {
 fn evaluation_posture(now: u64, started: u64) -> Posture {
     if !stamp_is_set(started) {
         return Posture::Evaluation {
-            ends_unix: now.saturating_add(EVALUATION_SECS),
+            ends_unix: now.saturating_add(TRIAL_SECS),
         };
     }
-    let ends = started.saturating_add(EVALUATION_SECS);
-    if now < ends {
-        return Posture::Evaluation { ends_unix: ends };
+    let stops = started.saturating_add(TRIAL_SECS);
+    if now < started.saturating_add(EVALUATION_SECS) {
+        return Posture::Evaluation { ends_unix: stops };
     }
-    let stops = ends.saturating_add(NOTICE_SECS);
     if now < stops {
         Posture::EvaluationEnded { stops_unix: stops }
     } else {
@@ -227,13 +234,13 @@ pub(crate) fn gate(p: Posture) -> Gate {
 
 /// Whole days from `now` until `until`, rounded UP and never below 1 while
 /// `until` is still ahead ("1 day left" is what a person expects to read four
-/// hours before the end), capped at the evaluation's own length so a clock set
+/// hours before the end), capped at the trial's own length so a clock set
 /// backwards cannot promise more. `0` once `until` has passed.
 pub(crate) fn days_until(now: u64, until: u64) -> u64 {
     if until <= now {
         return 0;
     }
-    (until - now).div_ceil(DAY).clamp(1, EVALUATION_SECS / DAY)
+    (until - now).div_ceil(DAY).clamp(1, TRIAL_DAYS)
 }
 
 /// Replay the stored key when its certificate expires within this window.

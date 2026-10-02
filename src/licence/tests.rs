@@ -299,29 +299,31 @@ fn only_an_exact_business_answer_is_business() {
     assert_eq!(parse_mode(Some(" Business ")), Some(Mode::Business));
 }
 
-/// Days 1-7 work quietly, days 8-10 work with a notice, day 11 on is locked.
+/// The 10-day trial: days 1-7 work quietly, days 8-10 work with a notice, day
+/// 11 on is locked. Every count the user reads runs to the trial's end.
 #[test]
-fn the_business_evaluation_runs_seven_days_then_three_of_notice_then_locks() {
+fn the_business_trial_runs_ten_days_the_last_three_with_a_notice_then_locks() {
     let f = business(T0);
-    let ends = T0 + 7 * DAY;
+    let quiet_ends = T0 + 7 * DAY;
     let stops = T0 + 10 * DAY;
 
-    // Day 0: the moment it starts.
-    assert_eq!(posture(T0, &f), Posture::Evaluation { ends_unix: ends });
-    assert_eq!(days_until(T0, ends), 7);
+    // Day 0: the moment it starts, with the whole trial ahead.
+    assert_eq!(posture(T0, &f), Posture::Evaluation { ends_unix: stops });
+    assert_eq!(days_until(T0, stops), 10);
     assert_eq!(gate(posture(T0, &f)), Gate::Allow);
 
-    // Day 7: its last second is still the evaluation, with a day left.
-    let day7 = ends - 1;
-    assert_eq!(posture(day7, &f), Posture::Evaluation { ends_unix: ends });
-    assert_eq!(days_until(day7, ends), 1);
+    // Day 7: its last second is still quiet, with three days left.
+    let day7 = quiet_ends - 1;
+    assert_eq!(posture(day7, &f), Posture::Evaluation { ends_unix: stops });
+    assert_eq!(days_until(day7, stops), 4);
 
-    // Day 8: the notice period, dictation still starts.
+    // Day 8: the notice days, dictation still starts.
     assert_eq!(
-        posture(ends, &f),
+        posture(quiet_ends, &f),
         Posture::EvaluationEnded { stops_unix: stops }
     );
-    assert_eq!(gate(posture(ends, &f)), Gate::AllowWithNotice);
+    assert_eq!(gate(posture(quiet_ends, &f)), Gate::AllowWithNotice);
+    assert_eq!(days_until(quiet_ends, stops), 3);
 
     // Day 10: its last second is still the notice.
     assert_eq!(
@@ -349,13 +351,13 @@ fn an_unstarted_or_backdated_evaluation_fails_open() {
     assert_eq!(
         p,
         Posture::Evaluation {
-            ends_unix: T0 + 7 * DAY
+            ends_unix: T0 + 10 * DAY
         }
     );
     assert_eq!(
-        days_until(before, T0 + 7 * DAY),
-        7,
-        "never more than 7 days"
+        days_until(before, T0 + 10 * DAY),
+        10,
+        "never more than the 10-day trial"
     );
 }
 
@@ -576,14 +578,14 @@ fn a_pending_key_is_mentioned_without_claiming_a_licence() {
     let s = Snapshot {
         now_unix: T0,
         posture: Posture::Evaluation {
-            ends_unix: T0 + 7 * DAY,
+            ends_unix: T0 + 10 * DAY,
         },
         key_last4: None,
         pending_reason: Some("signing_key_unavailable".into()),
         pending_key_last4: Some("WWW1".into()),
     };
     let (head, detail) = format::status_lines(&s);
-    assert_eq!(head, "Business evaluation, 7 days left");
+    assert_eq!(head, "Business trial, 10 days left");
     assert!(detail.contains("key ending WWW1"), "{detail}");
     assert!(detail.contains("signing_key_unavailable"), "{detail}");
     let (line, _) = format::report_line(&RedeemReport::AcceptedNoCertificate {
@@ -1086,7 +1088,7 @@ fn a_stamp_from_a_clock_that_was_behind_never_locks() {
     assert_eq!(
         posture(now, &business(behind)),
         Posture::Evaluation {
-            ends_unix: now + 7 * DAY
+            ends_unix: now + 10 * DAY
         }
     );
     let refused = Facts {

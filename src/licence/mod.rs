@@ -1,4 +1,4 @@
-//! Business licensing: Personal or Business, the 7-day business evaluation,
+//! Business licensing: Personal or Business, the 10-day business trial,
 //! redeeming a licence key, and the offline certificate that proves it.
 //!
 //! QuickDictate is PolyForm Noncommercial: free for personal use, and business
@@ -18,10 +18,11 @@
 //!   toward Personal: a missing, corrupt or unreadable value reads as the quiet
 //!   mode. The one thing this module must never do is stop someone the design
 //!   says should be left alone.
-//! * **Business with no licence is an EVALUATION, and an evaluation ends.**
-//!   Seven days with everything working, three days of a clear notice at each
-//!   dictation start, then dictation stops until a key is redeemed. The
-//!   arithmetic is pure, in [`posture`].
+//! * **Business with no licence is a TRIAL, and a trial ends.** Ten days with
+//!   everything working, the last three of them with a clear notice at each
+//!   dictation start, then dictation stops until a key is redeemed. Every date
+//!   and count the user reads runs to the trial's end. The arithmetic is pure,
+//!   in [`posture`].
 //! * **A copy that once held a licence is never locked by silence.** A
 //!   certificate that expires while the machine is offline keeps it working
 //!   while renewal retries. Only an explicit refusal from Connections (a 404

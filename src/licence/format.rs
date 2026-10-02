@@ -2,7 +2,7 @@
 //! posture, and the dates inside them. One place, so three surfaces cannot
 //! drift into three descriptions of one clock.
 
-use super::posture::{days_until, Plan, Posture};
+use super::posture::{days_until, Plan, Posture, TRIAL_DAYS};
 use super::{RedeemReport, Snapshot};
 
 const MONTHS: [&str; 12] = [
@@ -132,27 +132,31 @@ fn posture_lines(s: &Snapshot) -> (String, String) {
         ),
         Posture::Evaluation { ends_unix } => (
             format!(
-                "Business evaluation, {} left",
+                "Business trial, {} left",
                 plural_days(days_until(s.now_unix, ends_unix))
             ),
             format!(
-                "Everything works until {}. After that, business use needs a licence.",
+                "Everything works until {}. After that, dictation needs a licence key.",
                 local_date(ends_unix)
             ),
         ),
         Posture::EvaluationEnded { stops_unix } => (
-            "Licence needed".into(),
             format!(
-                "The 7-day business evaluation has ended. Dictation stops on {} unless a \
-                 licence key is entered.",
+                "Business trial, {} left",
+                plural_days(days_until(s.now_unix, stops_unix))
+            ),
+            format!(
+                "This copy's {TRIAL_DAYS}-day business trial ends on {}. After that, \
+                 dictation stops until a licence key is entered.",
                 local_date(stops_unix)
             ),
         ),
         Posture::Locked { refused: false } => (
             "Licence needed".into(),
-            "The business evaluation has ended. Dictation is paused until a licence key \
-             is entered."
-                .into(),
+            format!(
+                "This copy's {TRIAL_DAYS}-day business trial has ended. Dictation is paused \
+                 until a licence key is entered."
+            ),
         ),
         Posture::Licensed {
             plan: Plan::Perpetual,
@@ -216,10 +220,10 @@ pub(crate) fn notice_text(p: Posture, last4: Option<&str>) -> (String, String) {
     let key = key_suffix(last4);
     match p {
         Posture::EvaluationEnded { stops_unix } => (
-            "A business licence is needed".into(),
+            "Business trial ends soon".into(),
             format!(
-                "The 7-day business evaluation has ended. Dictation stops on {} unless a \
-                 licence key is entered.",
+                "Your {TRIAL_DAYS}-day business trial ends on {}. Buy a licence, or enter \
+                 your key, to keep dictating after that.",
                 local_date(stops_unix)
             ),
         ),
@@ -240,9 +244,10 @@ pub(crate) fn notice_text(p: Posture, last4: Option<&str>) -> (String, String) {
         ),
         _ => (
             "Business licence needed".into(),
-            "Dictation is paused: this copy's 7-day business evaluation has ended. Buy a \
-             licence, or enter your key, to keep dictating."
-                .into(),
+            format!(
+                "Dictation is paused: this copy's {TRIAL_DAYS}-day business trial has ended. \
+                 Buy a licence, or enter your key, to keep dictating."
+            ),
         ),
     }
 }

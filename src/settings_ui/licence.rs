@@ -21,6 +21,9 @@ pub(super) struct LicenceUi {
     pub(super) rx: Option<mpsc::Receiver<RedeemReport>>,
     /// The switch back to free use is asking "are you sure?".
     pub(super) confirm_free: bool,
+    /// The first-run Business answer is showing what business use means,
+    /// before anything is recorded.
+    pub(super) confirm_business: bool,
 }
 
 /// Set by [`super::show_settings_on_licence`]; the frame loop moves to the
@@ -257,6 +260,7 @@ impl super::SettingsApp {
     /// the same answer as closing the window: Personal.
     pub(crate) fn licence_question_banner(&mut self, ui: &mut egui::Ui) {
         if !licence::question_pending() {
+            self.licence.confirm_business = false;
             return;
         }
         let mut answer = None;
@@ -291,14 +295,18 @@ impl super::SettingsApp {
             ui.add_space(8.0);
             button_row_right(ui, |ui| {
                 if ui.button("For-profit business or paid work").clicked() {
-                    answer = Some(licence::Mode::Business);
+                    self.licence.confirm_business = true;
                 }
                 if accent_button(ui, "Personal or nonprofit").clicked() {
                     answer = Some(licence::Mode::Personal);
                 }
             });
         });
+        if self.licence.confirm_business && answer.is_none() {
+            answer = self.business_confirm(ui.ctx());
+        }
         if let Some(mode) = answer {
+            self.licence.confirm_business = false;
             licence::answer_question(mode);
             if mode == licence::Mode::Business {
                 self.tab = nav::Tab::Licence;
@@ -306,9 +314,63 @@ impl super::SettingsApp {
         }
     }
 
+    /// What answering Business means, before it is recorded: business use
+    /// needs a licence, the trial, and what happens when it ends. Back (or
+    /// Escape, or a click outside) returns to the question with nothing
+    /// recorded. Returns `Some(Business)` once the trial is chosen.
+    fn business_confirm(&mut self, ctx: &egui::Context) -> Option<licence::Mode> {
+        let price = licence::product_for(Plan::Perpetual).price;
+        let days = licence::posture::TRIAL_DAYS;
+        let mut answer = None;
+        let mut back = false;
+        let dismissed = Self::modal_frame(ctx, "Business use needs a licence", 430.0, |ui| {
+            ui.label(
+                RichText::new(format!(
+                    "Using QuickDictate for a for-profit business, or for paid work, needs a \
+                     licence: {price}, for this PC."
+                ))
+                .size(13.0)
+                .color(text()),
+            );
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(format!(
+                    "Try it free for {days} days first, with everything working. After {days} \
+                     days, dictation stops until you enter a licence key."
+                ))
+                .size(13.0)
+                .color(text()),
+            );
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(
+                    "Free, with no licence: personal use, and charities, schools, public \
+                     research, public safety, health and environmental organisations and \
+                     government.",
+                )
+                .size(12.0)
+                .color(muted()),
+            );
+            ui.add_space(12.0);
+            button_row_right(ui, |ui| {
+                if accent_button(ui, &format!("Start {days}-day free trial")).clicked() {
+                    answer = Some(licence::Mode::Business);
+                }
+                if ui.button("Back").clicked() {
+                    back = true;
+                }
+            });
+        });
+        if back || (answer.is_none() && dismissed) {
+            self.licence.confirm_business = false;
+        }
+        answer
+    }
+
     /// The window has really closed (see `hide_window`) with the question
     /// still unanswered: that is Personal, and the question is not asked again.
     pub(super) fn close_licence_question(&mut self) {
+        self.licence.confirm_business = false;
         if licence::question_pending() {
             licence::answer_question(licence::Mode::Personal);
         }
@@ -329,7 +391,7 @@ impl super::SettingsApp {
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(format!(
-                            "Evaluation: {days} {} left",
+                            "Business trial: {days} {} left",
                             if days == 1 { "day" } else { "days" }
                         ))
                         .size(12.5)
