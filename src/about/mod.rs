@@ -3,9 +3,11 @@
 //! clickable status *pills* (a GitHub version chip that opens the repo, and a
 //! live "Up to date" update-check chip), the license / copyright in the
 //! bottom-left, and the clickable LunarWerx Studios wordmark in the
-//! bottom-right. The update check runs on a worker thread when the box opens
-//! and again whenever the user clicks the status pill, so the chip is never
-//! stale. When a newer release is waiting, clicking the pill installs it
+//! bottom-right. The update check runs on a worker thread when the box opens,
+//! if update checks are on (or "Check for updates" opened it), and again
+//! whenever the user clicks the status pill. With checks off the pill reads
+//! "Check for updates" and nothing reaches the network until it is clicked.
+//! When a newer release is waiting, clicking the pill installs it
 //! **in-app** (download → verify → swap → relaunch via [`update`](crate::update)) rather than
 //! opening the browser. Theme-aware (dark/light) and per-monitor-DPI scaled.
 
@@ -57,7 +59,7 @@ const LUNARWERX_URL: &str = "https://lunarwerx.com";
 const ID_LW_LOGO: i32 = 1119;
 /// The GitHub version chip → the repo.
 const ID_VER_PILL: i32 = 1201;
-/// The live update-check chip → re-check (or, when an update exists, the releases page).
+/// The live update-check chip → check (or, when an update exists, install it).
 const ID_STATUS_PILL: i32 = 1202;
 const ID_SUBTITLE: i32 = 1203;
 const ID_LICENSE: i32 = 1204;
@@ -118,8 +120,16 @@ static ABOUT_HWND: AtomicIsize = AtomicIsize::new(0);
 /// [`begin_pending_install`].
 static PENDING_INSTALL: Mutex<Option<String>> = Mutex::new(None);
 
+/// Set by [`show_about_and_check`]: the user asked for a check, so the box
+/// checks on open even with update checks off. Consumed in `WM_CREATE`.
+static CHECK_REQUESTED: AtomicBool = AtomicBool::new(false);
+
 /// The latest update-check outcome, shown by the status pill.
+#[derive(Debug, PartialEq)]
 enum Status {
+    /// Update checks are off and nobody has asked yet: the pill reads "Check
+    /// for updates" and a click runs one check.
+    Idle,
     Checking,
     UpToDate,
     Available(String),
@@ -159,6 +169,18 @@ pub fn show_about() {
     if OPEN.swap(true, Ordering::AcqRel) {
         return; // already open
     }
+    spawn_about_thread();
+}
+
+/// Open the About box and check for updates at once, even with update checks
+/// switched off: the Settings window's "Check for updates" item, where the
+/// click is the request. An already-open box is left as it is; its pill
+/// checks on click.
+pub fn show_about_and_check() {
+    if OPEN.swap(true, Ordering::AcqRel) {
+        return; // already open
+    }
+    CHECK_REQUESTED.store(true, Ordering::Release);
     spawn_about_thread();
 }
 
@@ -303,10 +325,24 @@ unsafe fn on_ctlcolorstatic(wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
     muted.map(|c| ctlcolor_text(hdc, c))
 }
 
+/// What the status pill shows when the box opens: `Checking` (and a check
+/// starts) only while update checks are on or the user just asked for one;
+/// otherwise `Idle`, so opening About alone sends nothing.
+fn open_status(auto_check: bool, requested: bool) -> Status {
+    if auto_check || requested {
+        Status::Checking
+    } else {
+        Status::Idle
+    }
+}
+
 unsafe fn on_wm_create(hwnd: HWND) -> LRESULT {
+    let requested = CHECK_REQUESTED.swap(false, Ordering::AcqRel);
+    let status = open_status(crate::update::auto_check_enabled(), requested);
+    let checking = status == Status::Checking;
     let state = Box::new(About {
-        status: Status::Checking,
-        checking: true,
+        status,
+        checking,
         gh_icon: None,
         static_bitmaps: Vec::new(),
         ver_pill: 0,
@@ -322,7 +358,7 @@ unsafe fn on_wm_create(hwnd: HWND) -> LRESULT {
     // -- the tag came from the same check that put the banner up.
     if has_pending_install() {
         begin_pending_install(hwnd);
-    } else {
+    } else if checking {
         start_check(hwnd); // check on open
     }
     LRESULT(0)

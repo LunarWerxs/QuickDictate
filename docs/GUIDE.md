@@ -110,7 +110,7 @@ Everything lives in `settings.json` (copied from `settings.example.json`). The f
 | `protect_keys_at_rest` | Encrypt the API keys in `settings.json` with Windows DPAPI (bool, default `false`). **Costs portability:** a sealed file only decrypts for this Windows account on this machine, so copying the folder elsewhere means pasting the keys in again |
 | `share_usage_stats` | Send LunarWerx one anonymized daily rollup of your lifetime word/audio/dictation totals and provider mix (bool, default `false`). No dictated text, hostname, username, or account info; see SECURITY.md |
 | `custom_vocabulary` | Array of words/phrases sent to the provider to bias recognition (names, jargon, product names). Different from `text_replacements`, which repairs text *after* recognition; this tries to get it right the first time. Providers without a biasing parameter ignore it |
-| `install_id` | Random id sent with update checks (string, generated on first launch; never derived from your machine or identity, clear it for a fresh one) |
+| `install_id` | Random id sent only with the opt-in usage report, never with update checks (string, generated on first launch; never derived from your machine or identity, clear it for a fresh one) |
 | `run_at_startup` | Start QuickDictate at Windows login via the per-user Run key (bool, default `false`) |
 | `prewarm_keys` | Probe the active provider's keys at startup and queue a validated one (bool, default `true`) |
 | `text_replacements` | JSON object mapping misheard phrases to corrections. All rules apply in one pass over the original text (longest match wins); one rule's output is never re-processed by another, so write each rule as a direct source-to-final mapping rather than a chain |

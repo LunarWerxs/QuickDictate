@@ -141,7 +141,7 @@ impl SettingsApp {
     ///     promises "Your API keys are kept". The reset is written to disk at
     ///     once, so dropping the protect flag would re-write every kept key
     ///     in plaintext.
-    ///   * `install_id` — a machine identity for update checks, not a
+    ///   * `install_id` — a machine identity for the usage report, not a
     ///     preference (see `Config::install_id`'s doc comment).
     ///   * `window_width/height/x/y` — machine-local window geometry, same
     ///     category `sync.rs` already excludes from portable settings.

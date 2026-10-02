@@ -21,7 +21,7 @@ use super::STATS_KEY;
 ///   * `data_dir` — an absolute path on *this* PC. Syncing it would point a
 ///     second machine at a folder that may not exist there (or, worse, at
 ///     somebody else's folder that does);
-///   * `install_id` — this install's anonymous update-check id; syncing it
+///   * `install_id` — this install's anonymous usage-report id; syncing it
 ///     would merge two machines' identities into one;
 ///   * `update_auto_install` — a machine-local policy choice (whether *this*
 ///     machine applies updates unattended); syncing it would silently opt a

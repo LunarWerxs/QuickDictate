@@ -280,22 +280,24 @@ pub struct Config {
     /// Automatically check for a newer release at startup (throttled to once
     /// per day). The check goes to LunarWerx's update endpoint (see
     /// `update::RELEASES_API`), which relays GitHub's release info and also
-    /// counts the hit as one anonymous install ping — details in SECURITY.md.
+    /// counts the hit as one anonymous ping — details in SECURITY.md.
     /// Finding a newer release only *reports* it (tray tooltip + the About
     /// pill); installing it is a click, unless you opt into
-    /// `update_auto_install`. Settings → About "Check for updates" works
-    /// regardless of this flag, and there the update installs as soon as you
-    /// click the pill.
+    /// `update_auto_install`. With this off, opening About does not check
+    /// either: its pill reads "Check for updates" and checks once per click
+    /// (Settings' "Check for updates" item counts as that click), and there
+    /// the update installs as soon as you click the pill.
     #[serde(default = "default_true")]
     pub update_auto_check: bool,
 
-    /// Anonymous install id, sent as the `X-Install-Id` header with update
-    /// checks so the update endpoint can count unique installs instead of raw
-    /// hits. A crypto-random UUID generated locally on first launch (see
+    /// Anonymous install id, which keys the opt-in usage report
+    /// (`share_usage_stats`) so the endpoint counts one machine once. A
+    /// crypto-random UUID generated locally on first launch (see
     /// `update::init_install_id`) — **never** derived from hostname, MAC,
     /// username, or any other machine/personal identifier, so it identifies
-    /// nothing but itself. Sent only with update checks (see SECURITY.md);
-    /// clear the value to get a fresh id on the next launch.
+    /// nothing but itself. Sent only with that report, never with update
+    /// checks (see SECURITY.md); clear the value to get a fresh id on the
+    /// next launch.
     #[serde(default)]
     pub install_id: String,
 

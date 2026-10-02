@@ -5,9 +5,10 @@
 //! keeps them strictly local (see `stats::usage::UsageStats`, the existing
 //! Settings-window charts). This lets LunarWerx see aggregate feature
 //! adoption fleet-wide without a new pipeline: it reuses the same
-//! `studio.connectionsapi.com/v1/app/quickdictate/*` endpoint family and
-//! anonymous `install_id` the update checker already established as a
-//! precedent (`update::RELEASES_API`, `update::init_install_id`). Off by
+//! `studio.connectionsapi.com/v1/app/quickdictate/*` endpoint family as the
+//! update checker (`update::RELEASES_API`) and the anonymous `install_id`
+//! made at startup (`update::init_install_id`), which update checks no
+//! longer send, so this opt-in report is its only use. Off by
 //! default; a distinct, new capability from the already-shipped local usage
 //! stats and from `sync::mod` (which syncs a signed-in user's *own* stats
 //! back to their *own* account -- this instead sends one aggregate,
@@ -84,7 +85,7 @@ fn write_cache() {
 /// and a future field added to that struct for the *sync* merge machinery
 /// must not silently start riding along in this *report* payload too.
 /// `install_id` is the one identifier included -- the same crypto-random,
-/// machine-only id already sent with update checks, never derived from
+/// machine-only id made at startup (update checks no longer send it), never derived from
 /// hostname, MAC, username, or account.
 ///
 /// The counts are this install's own device row, not `UsageStats`' top-level

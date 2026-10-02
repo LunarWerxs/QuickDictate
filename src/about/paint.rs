@@ -108,6 +108,7 @@ pub(super) unsafe fn draw_ver_pill(hwnd: HWND, d: &DRAWITEMSTRUCT) {
 /// wndproc-facing wrapper below can stay a thin null check over this.
 pub(super) fn status_label(status: &Status) -> (COLORREF, String) {
     match status {
+        Status::Idle => (rgb(150, 150, 150), "Check for updates".to_string()),
         Status::Checking => (rgb(150, 150, 150), "Checking\u{2026}".to_string()),
         Status::UpToDate => (rgb(63, 185, 80), "Up to date".to_string()),
         Status::Available(tag) => (rgb(210, 153, 34), format!("Update to {tag}")),

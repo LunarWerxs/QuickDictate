@@ -324,8 +324,9 @@ impl SettingsApp {
     fn overflow_menu(&mut self, ui: &mut egui::Ui) {
         ui.set_min_width(170.0);
         if ui.button("Check for updates").clicked() {
-            // The About window runs the check and shows the result.
-            crate::about::show_about();
+            // The About window runs the check and shows the result; this
+            // click is the request, so it checks even with daily checks off.
+            crate::about::show_about_and_check();
         }
         if ui.button("Open log folder").clicked() {
             open_log_folder();

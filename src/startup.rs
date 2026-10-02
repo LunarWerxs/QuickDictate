@@ -397,10 +397,8 @@ pub(crate) fn bring_up_app(
     let keys = KeyPool::new(&app.config.load());
 
     // Resolve (or first-generate + persist) the anonymous install id that
-    // update checks send as X-Install-Id (see SECURITY.md). Must run before
-    // anything else can save settings.json or fire a check — including the
-    // tray/About manual path, which has no App handle and reads the cached
-    // value from update::INSTALL_ID.
+    // keys the opt-in usage report (see SECURITY.md; update checks no longer
+    // send it). Must run before anything else can save settings.json.
     update::init_install_id(&app);
 
     // Publish the App handle so the manual update path (the About window, on its

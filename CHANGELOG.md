@@ -15,6 +15,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   delivered at all. A dictation that landed in the wrong window, or nowhere, is
   one Ctrl+V away. Off by default, because it replaces whatever you had copied.
 
+### Changed
+
+- **Update checks no longer send an install id.** The check now carries only
+  the app version and QuickDictate's User-Agent, so it says which version is
+  asking and nothing about which copy. The random `install_id` stays in
+  settings.json, but only the opt-in usage report sends it.
+
+- **"Check for updates daily" off now means no checks at all.** Opening the
+  About window used to check every time, even with the setting off. Now it
+  checks on open only while the setting is on; with it off, the pill reads
+  **Check for updates** and checks once when you click it. The Settings
+  **Check for updates** item still checks straight away, because that click
+  is the request.
+
 ## [1.4.0] - 2026-10-02
 
 Local dictation that keeps up with you: text appears a quarter second after you stop, dictations
