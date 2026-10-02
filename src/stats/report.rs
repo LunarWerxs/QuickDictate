@@ -43,7 +43,7 @@ mod tests;
 /// forward, so no data is lost by the endpoint not existing yet.
 pub const USAGE_REPORT_API: &str = "https://studio.connectionsapi.com/v1/app/quickdictate/usage";
 
-const CACHE_FILE: &str = "quickdictate-usage-report.txt";
+pub(crate) const CACHE_FILE: &str = "quickdictate-usage-report.txt";
 
 /// At most one real network send per this interval, same cadence as the
 /// update checker (`update::CHECK_INTERVAL_SECS`) -- a daily aggregate is all

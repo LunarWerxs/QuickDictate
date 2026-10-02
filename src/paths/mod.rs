@@ -74,8 +74,9 @@ const ACTIVE_DIR_MARKER: &str = "active-data-dir.txt";
 /// the migration pass; a new runtime file must be added here or it will be left
 /// behind in the old folder when the user relocates.
 ///
-/// `logs` is a directory and is handled as one; the rest are plain files.
-pub(crate) const RELOCATABLE: [&str; 10] = [
+/// `logs` and the error-reports folder are directories and move whole; the rest
+/// are plain files.
+pub(crate) const RELOCATABLE: [&str; 15] = [
     "logs",
     "quickdictate-stats.json",
     "quickdictate-connections.dat",
@@ -92,6 +93,17 @@ pub(crate) const RELOCATABLE: [&str; 10] = [
     // Left behind, the user's own app-compatibility entries would silently
     // stop applying after a move.
     crate::app_compat::APP_COMPAT_FILE,
+    // Left behind, the sign-in prompt, the feedback survey and the crash
+    // banner would forget what the user already answered or dismissed, and
+    // ask again.
+    crate::nudge::STATE_FILE,
+    crate::feedback_survey::STATE_FILE,
+    crate::crash_banner::STATE_FILE,
+    // Left behind, the next start would think today's usage report was never
+    // sent and send it again.
+    crate::stats::USAGE_REPORT_FILE,
+    // Left behind, saved reports would vanish from "Open folder".
+    crate::error_report::REPORTS_DIR_NAME,
 ];
 
 static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();

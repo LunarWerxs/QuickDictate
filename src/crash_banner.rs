@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 /// Beside `quickdictate-nudge.json` and `quickdictate-feedback.json`, for the same reason: a
 /// portable install carries this prompt's memory with it instead of resetting on every machine.
-const STATE_FILE: &str = "quickdictate-crash-banner.json";
+pub(crate) const STATE_FILE: &str = "quickdictate-crash-banner.json";
 const STATE_VERSION: u32 = 1;
 
 /// The on-disk record of the panic log length we last accounted for.

@@ -25,6 +25,7 @@ use sha2::{Digest, Sha256};
 
 pub use aggregate::{DeviceStats, PeriodStats, ProviderStats};
 pub use report::spawn_daily_report;
+pub(crate) use report::CACHE_FILE as USAGE_REPORT_FILE;
 pub use store::StatsStore;
 pub use usage::{StatsRange, StatsView, UsageStats};
 

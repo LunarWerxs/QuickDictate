@@ -50,7 +50,7 @@ const ASK_GAP_MS: u64 = 90 * DAY_MS;
 
 /// Beside `quickdictate-nudge.json` and the other data files, for the same reason: a portable
 /// install should carry the prompt's memory with it instead of resetting on every machine.
-const STATE_FILE: &str = "quickdictate-feedback.json";
+pub(crate) const STATE_FILE: &str = "quickdictate-feedback.json";
 const STATE_VERSION: u32 = 1;
 
 /// What the user did with the on-screen ask.
