@@ -19,7 +19,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   personal use and licensed for business use since v0.9.0, but nothing in the
   app knew the difference. Now the first launch asks once, in Settings, whether
   you use it for a for-profit business. Personal use, and use by charities,
-  schools, public research, public health and government, stays free and is
+  schools, public research, public safety, health and environmental
+  organisations and government, stays free and is
   never nagged or locked. Business use gets a 7-day evaluation
   with everything working, then three days in which each dictation start shows
   a small notice in the corner of the screen (it never takes the focus, so the

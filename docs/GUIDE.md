@@ -275,7 +275,7 @@ The binary lands at `target\release\quickdictate.exe`. Put `settings.example.jso
 
 ## Licence
 
-QuickDictate is free for personal use and for use by charities, schools, public research, public health and government (the PolyForm Noncommercial licence lists them). For-profit business use needs a licence, one per installation: US$19.99 once (perpetual) or US$1.99 a month.
+QuickDictate is free for personal use and for use by charities, schools, public research, public safety, health and environmental organisations and government (the PolyForm Noncommercial licence lists them). For-profit business use needs a licence, one per installation: US$19.99 once (perpetual) or US$1.99 a month.
 
 - **Personal or business.** The first time you open Settings it asks whether you use QuickDictate for a for-profit business. Closing the question without answering counts as personal. Answered business by mistake? **Settings › Licence › Switch to free use** changes it back (it does not restart the evaluation if you switch again later). Personal use never shows a licence notice.
 - **The business evaluation.** A business copy works fully for 7 days, with the days left shown above the Settings pages. For the next 3 days each dictation start shows a small notice in the corner of the screen with **Buy a licence** and **Enter key**; it never takes the focus, so your dictation still pastes where you were typing. After that, the hotkey shows the notice instead of starting a dictation.

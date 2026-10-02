@@ -180,7 +180,10 @@ impl super::SettingsApp {
                 }
                 if ui
                     .link(RichText::new("Manage your licence").size(12.5))
-                    .on_hover_text("Cancel, renew, or move a licence you already hold.")
+                    .on_hover_text(
+                        "Cancel or renew a licence you hold. To cancel or move one to another \
+                         PC by email instead, write to lunawerx@gmail.com.",
+                    )
                     .clicked()
                 {
                     licence::open_manage();
@@ -233,7 +236,8 @@ impl super::SettingsApp {
             RichText::new(
                 "Switch to free use only if no for-profit business or paid work uses \
                  this copy. Personal use, and use by charities, schools, public \
-                 research, public health and government, is free.",
+                 research, public safety, health and environmental organisations \
+                 and government, is free.",
             )
             .size(12.0)
             .color(text()),
@@ -277,9 +281,10 @@ impl super::SettingsApp {
             ui.add_space(4.0);
             ui.label(
                 RichText::new(
-                    "For-profit business use needs a licence after a 7-day free evaluation. \
+                    "For-profit business use is free for 10 days, then needs a licence. \
                      Personal use, and use by charities, schools, public research, public \
-                     health and government, is free, always.",
+                     safety, health and environmental organisations and government, is \
+                     free, always.",
                 )
                 .size(12.5)
                 .color(muted()),
