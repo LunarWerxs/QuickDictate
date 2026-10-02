@@ -283,7 +283,7 @@ More detail in [SECURITY.md](../.github/SECURITY.md).
 
 ## Antivirus / SmartScreen
 
-The released `.exe` is currently **unsigned**, and QuickDictate installs a global hotkey and synthesizes keystrokes to paste text, which, to Windows Defender and SmartScreen, looks a lot like a keylogger. So you may get a "Windows protected your PC" prompt: click **More info** → **Run anyway**. Some antivirus tools may flag the binary too; it's a known false positive tied to the keystroke-injection technique, not anything malicious. Code signing is on the roadmap.
+Releases from v1.4.0 on are **code-signed**; earlier ones are not. QuickDictate installs a global hotkey and synthesizes keystrokes to paste text, which, to Windows Defender and SmartScreen, looks a lot like a keylogger, and a new signature takes a while to build SmartScreen reputation. So you may still get a "Windows protected your PC" prompt: click **More info** → **Run anyway**. Some antivirus tools may flag the binary too; it's a known false positive tied to the keystroke-injection technique, not anything malicious.
 
 ## Contributing
 

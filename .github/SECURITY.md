@@ -55,5 +55,5 @@ QuickDictate is **bring-your-own-key**: you supply your own API key(s) for the S
 QuickDictate installs a global hotkey listener and synthesizes keystrokes to paste transcribed text into the focused window. This is functionally similar to what a keylogger does, so:
 
 - **Windows Defender or other antivirus software may flag the app.** This is a known false positive caused by the keystroke-injection technique itself, not malicious behavior. The source is available in this repository for inspection.
-- **The released `.exe` is currently unsigned**, so Windows SmartScreen will likely show a "Windows protected your PC" warning on first run. To proceed, click **More info**, then **Run anyway**.
-- If you'd rather not trust an unsigned binary, you can build QuickDictate yourself from source (see the README) and verify the code you're running.
+- **Releases from v1.4.0 on are code-signed**; earlier ones are not. A new signature takes a while to build SmartScreen reputation, so Windows may still show a "Windows protected your PC" warning on first run. To proceed, click **More info**, then **Run anyway**.
+- If you'd rather not trust a prebuilt binary, you can build QuickDictate yourself from source (see the README) and verify the code you're running.
