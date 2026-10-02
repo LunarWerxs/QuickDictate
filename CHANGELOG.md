@@ -24,7 +24,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   with everything working, then three days in which each dictation start shows
   a small notice in the corner of the screen (it never takes the focus, so the
   dictation still lands where you were typing), and after that the hotkey shows
-  the notice instead of starting.
+  the notice instead of starting. Answered for-profit by mistake? The Licence
+  page has **Switch to free use**, with an "are you sure?", and switching back
+  and forth never restarts the evaluation.
 
   The new **Settings › Licence** page redeems the key from your purchase email,
   has Buy buttons for both plans (US$19.99 once, or US$1.99 a month) and a link

@@ -214,6 +214,24 @@ pub(crate) fn answer_question(mode: Mode) {
     invalidate();
 }
 
+/// The Licence page's way back from Business: the first-run answer, changed.
+/// Without it, a teacher or a charity worker who clicked the wrong button on
+/// day one was told their use is free and locked out on day eleven with no
+/// exit but paying (Terms Counsel, Legal room, 2026-10-02).
+pub(crate) fn switch_to_free_use() {
+    let _held = STORE_LOCK.lock();
+    switch_store_to_free_use(&store::Store::user());
+    invalidate();
+}
+
+/// The store half of [`switch_to_free_use`]: the mode, and nothing else. The
+/// evaluation stamp stays, so answering Business again later carries on the
+/// clock it started rather than handing out a fresh week.
+fn switch_store_to_free_use(s: &store::Store) {
+    s.set_mode(Mode::Personal);
+    tracing::info!("licence: switched to personal or nonprofit use");
+}
+
 /// What the Settings window shows: the posture plus the display-only details
 /// around it.
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -785,6 +785,29 @@ fn a_different_key_refused_leaves_the_held_licence_alone() {
 const K1: &str = "esk_ABCDE-12345-FGHIJ-6789K";
 const K2: &str = "esk_ZZZZZ-YYYYY-XXXXX-WWWW1";
 
+/// The way back from Business changes the mode and nothing else: answering
+/// Business again later finds the old evaluation stamp, so flipping cannot
+/// buy a fresh week.
+#[test]
+fn switching_to_free_use_keeps_the_evaluation_clock() {
+    let scratch = ScratchKey::new("free-switch");
+    let s = store::Store::at(&scratch.0);
+    s.set_mode(Mode::Business);
+    assert!(s.start_evaluation_if_due(T0));
+    switch_store_to_free_use(&s);
+    assert_eq!(s.mode(), Some(Mode::Personal));
+    let free = s.load_facts(T0 + 30 * DAY);
+    assert_eq!(posture(T0 + 30 * DAY, &free), Posture::Personal);
+    s.set_mode(Mode::Business);
+    assert!(!s.start_evaluation_if_due(T0 + 30 * DAY), "no fresh week");
+    let again = s.load_facts(T0 + 30 * DAY);
+    assert_eq!(again.evaluation_started_unix, T0);
+    assert!(matches!(
+        posture(T0 + 30 * DAY, &again),
+        Posture::Locked { refused: false }
+    ));
+}
+
 /// A store holding nothing but this install's id, the one the test
 /// certificate names.
 fn scratch_store(tag: &str, sub: &str) -> (ScratchKey, store::Store) {

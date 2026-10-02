@@ -19,6 +19,8 @@ pub(super) struct LicenceUi {
     pub(super) is_error: bool,
     /// The redeem in flight, if any.
     pub(super) rx: Option<mpsc::Receiver<RedeemReport>>,
+    /// The switch back to free use is asking "are you sure?".
+    pub(super) confirm_free: bool,
 }
 
 /// Set by [`super::show_settings_on_licence`]; the frame loop moves to the
@@ -193,10 +195,59 @@ impl super::SettingsApp {
                 .size(11.5)
                 .color(muted()),
             );
+            self.free_use_switch(ui, snap.posture);
         });
         if do_redeem {
             self.start_redeem(ctx);
         }
+    }
+
+    /// The way back from Business for a copy with no licence: a link, then a
+    /// plain "are you sure?" naming what free use means, so it stays the same
+    /// self-declaration as the first-run answer.
+    fn free_use_switch(&mut self, ui: &mut egui::Ui, posture: Posture) {
+        let business_unlicensed = matches!(
+            posture,
+            Posture::Evaluation { .. }
+                | Posture::EvaluationEnded { .. }
+                | Posture::Locked { .. }
+                | Posture::NoLongerActive {
+                    stops_unix: Some(_)
+                }
+        );
+        if !business_unlicensed {
+            self.licence.confirm_free = false;
+            return;
+        }
+        ui.add_space(8.0);
+        if !self.licence.confirm_free {
+            if ui
+                .link(RichText::new("Not a for-profit business? Switch to free use").size(12.0))
+                .clicked()
+            {
+                self.licence.confirm_free = true;
+            }
+            return;
+        }
+        ui.label(
+            RichText::new(
+                "Switch to free use only if no for-profit business or paid work uses \
+                 this copy. Personal use, and use by charities, schools, public \
+                 research, public health and government, is free.",
+            )
+            .size(12.0)
+            .color(text()),
+        );
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if accent_button(ui, "Switch to free use").clicked() {
+                licence::switch_to_free_use();
+                self.licence.confirm_free = false;
+            }
+            if ui.button("Cancel").clicked() {
+                self.licence.confirm_free = false;
+            }
+        });
     }
 
     /// The Personal-or-Business question, asked once. Its corner \u{00D7} is
@@ -235,7 +286,7 @@ impl super::SettingsApp {
             );
             ui.add_space(8.0);
             button_row_right(ui, |ui| {
-                if ui.button("For-profit business").clicked() {
+                if ui.button("For-profit business or paid work").clicked() {
                     answer = Some(licence::Mode::Business);
                 }
                 if accent_button(ui, "Personal or nonprofit").clicked() {
