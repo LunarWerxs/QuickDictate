@@ -174,14 +174,16 @@ impl super::SettingsApp {
                     licence::open_buy(Plan::Perpetual);
                 }
                 if ui
-                    .link(RichText::new("Manage your licence").size(12.5))
+                    .link(RichText::new("Move or refund a licence").size(12.5))
                     .on_hover_text(
-                        "Cancel or renew a licence you hold. To cancel or move one to another \
-                         PC by email instead, write to lunawerx@gmail.com.",
+                        "Opens an email to lunawerx@gmail.com. Say which PC the licence \
+                         moves to, or that you want a refund (full, within 14 days of \
+                         paying), and give the key's last four characters. Never send the \
+                         whole key.",
                     )
                     .clicked()
                 {
-                    licence::open_manage();
+                    licence::open_licence_email();
                 }
             });
             ui.add_space(6.0);

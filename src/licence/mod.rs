@@ -107,8 +107,11 @@ pub(crate) const PRODUCTS: [Product; 2] = [
     },
 ];
 
-/// Where a buyer manages (cancels, moves) a licence they already hold.
-pub(crate) const MANAGE_URL: &str = "https://checkout.connections.icu/manage";
+/// How a buyer moves or refunds a licence they already hold: an email, because
+/// the hosted manage page needs a Connections login a guest buyer does not have
+/// (Legal room ruling, issue 1, 2026-10-02).
+pub(crate) const LICENCE_EMAIL_URL: &str =
+    "mailto:lunawerx@gmail.com?subject=QuickDictate%20licence";
 
 /// The public redeem door. No credential: the key is the whole request.
 pub(crate) const REDEEM_URL: &str =
@@ -288,9 +291,10 @@ pub(crate) fn open_buy(plan: Plan) {
     crate::about::open_url(product_for(plan).buy_url);
 }
 
-/// Open the licence-management page in the browser.
-pub(crate) fn open_manage() {
-    crate::about::open_url(MANAGE_URL);
+/// Open a new email to LunarWerx about moving or refunding a licence.
+/// `ShellExecuteW` hands a `mailto:` to the default mail handler.
+pub(crate) fn open_licence_email() {
+    crate::about::open_url(LICENCE_EMAIL_URL);
 }
 
 /// Open Settings on its Licence page (the notice's "Enter key").
