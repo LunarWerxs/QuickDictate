@@ -9,7 +9,7 @@ use crate::mouse_hook::{is_mouse_vk, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2};
 
 use super::combo::vk_for;
 use super::watch::{
-    Dropped, KeyOutcome, Watch, DROPPED_AFTER, LATE_HOTKEY, LOST_UP_GAP, STALE_RELEASE_AFTER,
+    Dropped, KeyOutcome, Watch, DROPPED_AFTER, LATE_HOTKEY, LOST_UP_GAP, REPAIR_FLOOR,
 };
 use super::*;
 
@@ -253,7 +253,7 @@ const TOGGLE: i32 = 1;
 const HOLD: i32 = 2;
 /// Windows had the key up before the press: the normal case.
 const UP: bool = false;
-/// Windows still counted the key as down: the stuck key.
+/// Windows still counted the key as down.
 const STUCK: bool = true;
 
 /// F14 on toggle and F13 on hold, both registered, as on the PC that lost F14.
@@ -281,13 +281,36 @@ fn armed() -> KeyOutcome {
     }
 }
 
-fn dropped(id: i32, vk: u32, hold: bool, handle: bool, still_down: bool) -> Dropped {
+fn cleared(vk: u32) -> KeyOutcome {
+    KeyOutcome {
+        clear: Some(vk),
+        ..KeyOutcome::default()
+    }
+}
+
+/// A stuck key's press: handled and repaired.
+fn handled(id: i32, vk: u32, hold: bool, still_down: bool) -> Dropped {
     Dropped {
         id,
         vk,
         hold,
-        handle,
+        handle: true,
+        repair: true,
         still_down,
+        unlogged: 0,
+    }
+}
+
+/// A press left alone, repaired or only counted.
+fn left_alone(id: i32, vk: u32, hold: bool, repair: bool, still_down: bool) -> Dropped {
+    Dropped {
+        id,
+        vk,
+        hold,
+        handle: false,
+        repair,
+        still_down,
+        unlogged: 0,
     }
 }
 
@@ -312,37 +335,51 @@ fn a_press_dropped_on_a_stuck_key_is_handled_once() {
     w.on_key(F14, false, 0, UP, t + ms(70));
     assert_eq!(
         w.on_timer(t + ms(250)),
-        (vec![dropped(TOGGLE, F14, false, true, false)], false)
+        (vec![handled(TOGGLE, F14, false, false)], false)
     );
     // Windows' own message for that press, arriving late, must not toggle
     // the dictation straight back off.
     assert!(!w.on_hotkey(TOGGLE, t + ms(400)));
-    // The next press is a press again.
+    // The cure took: the next press is an ordinary one again.
     let t2 = t + ms(3000);
     assert_eq!(w.on_key(F14, true, 0, UP, t2), armed());
     assert!(w.on_hotkey(TOGGLE, t2 + ms(1)));
 }
 
 #[test]
-fn a_press_another_program_took_is_left_alone() {
+fn a_press_another_program_took_is_left_alone_and_repaired_rarely() {
     // Remote Desktop, a key remapper or a game swallowed the key, so Windows
     // never counted it as down and sent nothing, on purpose.
     let mut w = watching();
     let t = std::time::Instant::now();
     w.on_key(F14, true, 0, UP, t);
-    let (drops, _) = w.on_timer(t + ms(250));
-    assert_eq!(drops, vec![dropped(TOGGLE, F14, false, false, true)]);
-    // Still cleared once the key is up, and owes no release.
     assert_eq!(
-        w.on_key(F14, false, 0, UP, t + ms(300)),
-        KeyOutcome {
-            clear: Some(F14),
-            ..KeyOutcome::default()
-        }
+        w.on_timer(t + ms(250)).0,
+        vec![left_alone(TOGGLE, F14, false, true, true)]
     );
+    // Repaired once the key is up, and owes no release.
+    assert_eq!(w.on_key(F14, false, 0, UP, t + ms(300)), cleared(F14));
     // A slow hook chain's late WM_HOTKEY is then Windows answering after
     // all, and is acted on.
     assert!(w.on_hotkey(TOGGLE, t + ms(320)));
+    // The next presses the program takes are only counted: no stray key-up
+    // lands in its window a quarter second into each one.
+    let t2 = t + ms(2000);
+    w.on_key(F14, true, 0, UP, t2);
+    assert_eq!(
+        w.on_timer(t2 + ms(250)).0,
+        vec![left_alone(TOGGLE, F14, false, false, true)]
+    );
+    assert_eq!(
+        w.on_key(F14, false, 0, UP, t2 + ms(300)),
+        KeyOutcome::default()
+    );
+    // Ten minutes on, one more repair, carrying the count.
+    let t3 = t + REPAIR_FLOOR + ms(300);
+    w.on_key(F14, true, 0, UP, t3);
+    let mut expected = left_alone(TOGGLE, F14, false, true, true);
+    expected.unlogged = 1;
+    assert_eq!(w.on_timer(t3 + ms(250)).0, vec![expected]);
 }
 
 #[test]
@@ -363,7 +400,7 @@ fn a_handled_hold_press_ends_and_clears_on_its_key_up() {
     w.on_key(F13, true, 0, STUCK, t);
     assert_eq!(
         w.on_timer(t + ms(250)).0,
-        vec![dropped(HOLD, F13, true, true, true)]
+        vec![handled(HOLD, F13, true, true)]
     );
     assert_eq!(
         w.on_key(F13, false, 0, UP, t + ms(4000)),
@@ -386,13 +423,7 @@ fn a_hold_left_alone_never_releases() {
     let t = std::time::Instant::now();
     w.on_key(F13, true, 0, UP, t);
     w.on_timer(t + ms(250));
-    assert_eq!(
-        w.on_key(F13, false, 0, UP, t + ms(900)),
-        KeyOutcome {
-            clear: Some(F13),
-            ..KeyOutcome::default()
-        }
-    );
+    assert_eq!(w.on_key(F13, false, 0, UP, t + ms(900)), cleared(F13));
 }
 
 #[test]
@@ -402,7 +433,10 @@ fn a_lost_key_up_is_settled_by_the_next_press() {
     let mut w = watching();
     let t = std::time::Instant::now();
     w.on_key(F13, true, 0, STUCK, t);
-    assert!(w.on_timer(t + ms(250)).0[0].still_down);
+    assert_eq!(
+        w.on_timer(t + ms(250)).0,
+        vec![handled(HOLD, F13, true, true)]
+    );
     // No key-up. The next press settles the hold dictation and clears the
     // key, rather than leaving both waiting for ever...
     let t2 = t + LOST_UP_GAP + ms(500);
@@ -414,40 +448,47 @@ fn a_lost_key_up_is_settled_by_the_next_press() {
             clear: Some(F13),
         }
     );
-    // ...and is itself a press.
-    assert_eq!(w.on_timer(t2 + ms(250)).0.len(), 1);
+    // ...but is not handled itself: after a key-up the watch missed, a stuck
+    // key and a held one look the same.
+    assert!(!w.on_timer(t2 + ms(250)).0[0].handle);
 }
 
 #[test]
-fn the_rearm_ends_a_hold_whose_key_up_the_hook_missed() {
+fn a_long_hold_is_never_taken_for_a_stuck_key() {
+    // Held for a long press while the hotkey thread stalled, so the hook
+    // missed the auto-repeats in between: the next repeat must not toggle
+    // the dictation off.
     let mut w = watching();
     let t = std::time::Instant::now();
-    w.on_key(F13, true, 0, STUCK, t);
-    w.on_timer(t + ms(250));
-    // Still held as far as Windows knows: nothing to do yet.
-    assert_eq!(
-        w.on_rearm(|_| true, t + STALE_RELEASE_AFTER),
-        KeyOutcome::default()
-    );
-    // Too soon after the press, even if Windows says up.
-    assert_eq!(w.on_rearm(|_| false, t + ms(500)), KeyOutcome::default());
-    assert_eq!(
-        w.on_rearm(|_| false, t + STALE_RELEASE_AFTER),
-        KeyOutcome {
-            arm_timer: false,
-            release: Some(HOLD),
-            clear: Some(F13),
-        }
-    );
-    // Settled once.
-    assert_eq!(
-        w.on_rearm(|_| false, t + STALE_RELEASE_AFTER * 2),
-        KeyOutcome::default()
-    );
-    assert_eq!(
-        w.on_key(F13, false, 0, UP, t + ms(9000)),
-        KeyOutcome::default()
-    );
+    w.on_key(F14, true, 0, UP, t);
+    assert!(w.on_hotkey(TOGGLE, t + ms(1)));
+    let t2 = t + LOST_UP_GAP + ms(100);
+    assert_eq!(w.on_key(F14, true, 0, STUCK, t2), armed());
+    let (drops, _) = w.on_timer(t2 + ms(250));
+    assert!(!drops[0].handle);
+}
+
+#[test]
+fn a_cure_that_does_not_take_stops_the_handling() {
+    // Another program's hook eats the clearing key-up, so Windows keeps the
+    // key down: presses go back to being left alone.
+    let mut w = watching();
+    let t = std::time::Instant::now();
+    w.on_key(F14, true, 0, STUCK, t);
+    w.on_key(F14, false, 0, UP, t + ms(70));
+    assert!(w.on_timer(t + ms(250)).0[0].handle);
+    let t2 = t + ms(2000);
+    w.on_key(F14, true, 0, STUCK, t2);
+    assert!(!w.on_timer(t2 + ms(250)).0[0].handle);
+    w.on_key(F14, false, 0, UP, t2 + ms(300));
+    // Once Windows reports the key up again, a stuck key is a stuck key.
+    let t3 = t + ms(4000);
+    w.on_key(F14, true, 0, UP, t3);
+    assert!(w.on_hotkey(TOGGLE, t3 + ms(1)));
+    w.on_key(F14, false, 0, UP, t3 + ms(70));
+    let t4 = t + ms(6000);
+    w.on_key(F14, true, 0, STUCK, t4);
+    assert!(w.on_timer(t4 + ms(250)).0[0].handle);
 }
 
 #[test]
@@ -456,14 +497,7 @@ fn a_dropped_toggle_held_down_is_cleared_but_not_released() {
     let t = std::time::Instant::now();
     w.on_key(F14, true, 0, STUCK, t);
     assert!(w.on_timer(t + ms(250)).0[0].still_down);
-    assert_eq!(
-        w.on_key(F14, false, 0, UP, t + ms(600)),
-        KeyOutcome {
-            arm_timer: false,
-            release: None,
-            clear: Some(F14),
-        }
-    );
+    assert_eq!(w.on_key(F14, false, 0, UP, t + ms(600)), cleared(F14));
 }
 
 #[test]
@@ -494,9 +528,10 @@ fn auto_repeat_is_not_a_new_press() {
 
 #[test]
 fn a_slow_filterkeys_repeat_is_not_a_new_press() {
-    // FilterKeys set to repeat every 3 s widens the gap to match.
-    let mut w = Watch::new(&[(TOGGLE, MOD_NOREPEAT.0, F14, false)], ms(3500));
-    w.set_registered(TOGGLE, true);
+    // FilterKeys set to repeat every 3 s widens the gap to match, also when
+    // it is turned on while the app runs.
+    let mut w = watching();
+    w.set_lost_up_gap(ms(3500));
     let t = std::time::Instant::now();
     w.on_key(F14, true, 0, UP, t);
     assert!(w.on_hotkey(TOGGLE, t + ms(1)));

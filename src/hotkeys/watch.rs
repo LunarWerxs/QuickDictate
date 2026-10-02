@@ -15,16 +15,18 @@
 //! Windows sent nothing for a press that reached it, and what happens depends
 //! on why:
 //!
-//! - **Windows still counted the key as down** before this press, so
-//!   `MOD_NOREPEAT` took the press for auto-repeat. That is a stuck key, not a
-//!   choice anyone made: the watch handles the press itself.
+//! - **Windows still counted the key as down** before this press, although
+//!   the watch saw it come up, so `MOD_NOREPEAT` took the press for
+//!   auto-repeat. That is a stuck key, not a choice anyone made: the watch
+//!   handles the press itself.
 //! - **Windows did not count it as down.** Then another program may have taken
 //!   the key on purpose (a Remote Desktop window, a key remapper, a game that
 //!   turns hotkeys off), and starting a dictation behind its back would be
 //!   wrong. The press is left alone.
 //!
-//! Either way the watch logs it, registers the hotkey again, and once the key
-//! is up sends one key-up for it, the cure that worked on 2 October. A press
+//! The watch logs it, registers the hotkey again, and once the key is up
+//! sends one key-up for it, the cure that worked on 2 October: always for a
+//! handled press, at most every ten minutes for one left alone. A press
 //! with neither a `WM_HOTKEY received` line nor one of these lines most likely
 //! never reached Windows: the device or its software (a G HUB profile, say)
 //! sent nothing.
@@ -79,10 +81,12 @@ pub(super) const LOST_UP_GAP: Duration = Duration::from_millis(1500);
 /// hook held up the chain), not a second one.
 pub(super) const LATE_HOTKEY: Duration = Duration::from_millis(1500);
 
-/// A handled hold press whose key-up the watch never saw (the hook was gone
-/// for a moment) is ended by the re-arm tick once Windows reports the key up
-/// and it has been at least this long since the press.
-pub(super) const STALE_RELEASE_AFTER: Duration = Duration::from_secs(2);
+/// The fewest minutes between two repairs (re-register, clearing key-up) for
+/// presses left alone. Those are what another program taking the key looks
+/// like, press after press, and a stray key-up a quarter second into its next
+/// press could cut a Remote Desktop or in-game push-to-talk short. Once is
+/// enough to cure a hotkey Windows lost.
+pub(super) const REPAIR_FLOOR: Duration = Duration::from_secs(10 * 60);
 
 /// Marks the key-up the watch sends, so its own hook passes it by.
 const OUR_KEY_UP: usize = 0x5144_4b55; // "QDKU"
@@ -99,8 +103,9 @@ const REPORT_EVERY_TICKS: u32 = 30;
 #[derive(Debug, Clone, Copy)]
 struct Pending {
     at: Instant,
-    /// Windows already counted the key as down when this press arrived.
-    windows_held: bool,
+    /// If Windows sends nothing, the press is a stuck key's and is handled
+    /// here (see [`Watch::on_key`] for when that holds).
+    stuck: bool,
 }
 
 /// One configured keyboard binding, and what the watch knows about its key.
@@ -124,6 +129,12 @@ struct Key {
     release_owed: bool,
     /// Send the clearing key-up once this key is up.
     clear_owed: bool,
+    /// A clearing key-up went out since the last fresh press.
+    cleared: bool,
+    /// Windows still counted the key as down after a clearing key-up: the
+    /// cure did not take (another program's hook ate it, say), so presses are
+    /// left alone until Windows reports the key up again.
+    cure_failed: bool,
 }
 
 /// A press Windows sent no `WM_HOTKEY` for, for the hotkey thread to act on.
@@ -132,14 +143,19 @@ pub(super) struct Dropped {
     pub(super) id: i32,
     pub(super) vk: u32,
     pub(super) hold: bool,
-    /// Windows counted the key as down already, so it took the press for
-    /// auto-repeat: handle the press. Otherwise another program may have taken
-    /// the key on purpose, and the press is left alone.
+    /// A stuck key's press: handle it. Otherwise another program may have
+    /// taken the key on purpose, and the press is left alone.
     pub(super) handle: bool,
+    /// Register the hotkey again and clear the key: always for a handled
+    /// press, at most once per [`REPAIR_FLOOR`] for one left alone. With
+    /// neither, there is nothing to do but count it.
+    pub(super) repair: bool,
     /// The key is still down. When it is not, the clearing key-up goes out
     /// now (and a handled hold press ends at once); when it is, both wait for
     /// its key-up.
     pub(super) still_down: bool,
+    /// Presses left alone without a repair since the last one that had it.
+    pub(super) unlogged: u32,
 }
 
 /// What a key event asks of the hook.
@@ -160,6 +176,10 @@ pub(super) struct KeyOutcome {
 pub(super) struct Watch {
     keys: Vec<Key>,
     lost_up_gap: Duration,
+    /// When a press left alone was last repaired.
+    last_repair: Option<Instant>,
+    /// Presses left alone without a repair since then.
+    unlogged: u32,
     /// Fresh presses of a watched key, and drops met, since the last report.
     presses: u32,
     drops: u32,
@@ -183,11 +203,15 @@ impl Watch {
                 rescued: None,
                 release_owed: false,
                 clear_owed: false,
+                cleared: false,
+                cure_failed: false,
             })
             .collect();
         Self {
             keys,
             lost_up_gap,
+            last_repair: None,
+            unlogged: 0,
             presses: 0,
             drops: 0,
         }
@@ -199,6 +223,10 @@ impl Watch {
         }
     }
 
+    pub(super) fn set_lost_up_gap(&mut self, gap: Duration) {
+        self.lost_up_gap = gap;
+    }
+
     /// Whether `vk` is one of the watched keys.
     pub(super) fn watches(&self, vk: u32) -> bool {
         self.keys.iter().any(|k| k.vk == vk)
@@ -208,6 +236,11 @@ impl Watch {
     /// of the modifiers Windows reports as held and `windows_held` whether
     /// Windows already counted this key as down, both read before Windows
     /// takes this event in.
+    ///
+    /// A press counts as a stuck key's only when Windows held the key down
+    /// although the watch saw it come up: that is a key Windows lost track
+    /// of. After a key-up the watch missed, a held key's auto-repeat looks
+    /// the same as a stuck one, so such a press is never handled here.
     pub(super) fn on_key(
         &mut self,
         vk: u32,
@@ -235,12 +268,20 @@ impl Watch {
                     }
                 }
                 let fresh = !k.down || lost_up;
+                if fresh {
+                    if !windows_held {
+                        k.cure_failed = false;
+                    } else if std::mem::take(&mut k.cleared) {
+                        k.cure_failed = true;
+                    }
+                    k.cleared = out.clear.is_some();
+                }
                 k.down = true;
                 k.last_down = Some(now);
                 if fresh && k.registered && k.mods == mods {
                     k.pending = Some(Pending {
                         at: now,
-                        windows_held,
+                        stuck: windows_held && !lost_up && !k.cure_failed,
                     });
                     k.rescued = None;
                     out.arm_timer = true;
@@ -253,6 +294,7 @@ impl Watch {
                 }
                 if std::mem::take(&mut k.clear_owed) {
                     out.clear = Some(k.vk);
+                    k.cleared = true;
                 }
             }
         }
@@ -292,43 +334,41 @@ impl Watch {
                 continue;
             }
             k.pending = None;
-            let handle = p.windows_held;
+            let handle = p.stuck;
+            let repair = handle
+                || self
+                    .last_repair
+                    .is_none_or(|t| now.duration_since(t) >= REPAIR_FLOOR);
+            let mut unlogged = 0;
+            if !handle {
+                if repair {
+                    self.last_repair = Some(now);
+                    unlogged = std::mem::take(&mut self.unlogged);
+                } else {
+                    self.unlogged += 1;
+                }
+            }
             if handle {
                 k.rescued = Some(now);
                 k.release_owed = k.hold && k.down;
             }
-            k.clear_owed = k.down;
+            k.clear_owed = repair && k.down;
+            if repair && !k.down {
+                // The hotkey thread sends this one straight away.
+                k.cleared = true;
+            }
             dropped.push(Dropped {
                 id: k.id,
                 vk: k.vk,
                 hold: k.hold,
                 handle,
+                repair,
                 still_down: k.down,
+                unlogged,
             });
         }
         self.drops += dropped.len() as u32;
         (dropped, waiting)
-    }
-
-    /// The re-arm tick's sweep: a handled hold press still waiting on a key-up
-    /// the hook never saw ends once Windows reports the key up. `is_down`
-    /// reads Windows' key state.
-    pub(super) fn on_rearm(&mut self, is_down: impl Fn(u32) -> bool, now: Instant) -> KeyOutcome {
-        let mut out = KeyOutcome::default();
-        for k in &mut self.keys {
-            let stale = k
-                .last_down
-                .is_some_and(|t| now.duration_since(t) >= STALE_RELEASE_AFTER);
-            if k.release_owed && stale && !is_down(k.vk) {
-                k.release_owed = false;
-                k.down = false;
-                out.release = Some(k.id);
-                if std::mem::take(&mut k.clear_owed) {
-                    out.clear = Some(k.vk);
-                }
-            }
-        }
-        out
     }
 
     /// Presses seen and drops met since the last call, then zero both.
@@ -503,32 +543,22 @@ pub(super) fn on_timer() -> Vec<Dropped> {
     })
 }
 
-/// One re-arm tick: reinstall the hook, end a handled hold press whose key-up
-/// the hook missed, and every half hour log what the watch saw, so the log
-/// shows it was alive across any stretch the hotkey seemed dead.
+/// One re-arm tick: reinstall the hook, pick up a FilterKeys change, and every
+/// half hour log what the watch saw, so the log shows it was alive across any
+/// stretch the hotkey seemed dead.
 pub(super) fn rearm() {
     install();
-    let (outcome, report) = LIVE.with_borrow_mut(|live| {
-        let Some(live) = live.as_mut() else {
-            return (KeyOutcome::default(), None);
-        };
-        let outcome = live.watch.on_rearm(key_down, Instant::now());
-        if outcome.release.is_some() {
-            let _ = live.tx.send(HotkeyEvent::HoldReleased);
-        }
+    let gap = lost_up_gap();
+    let report = LIVE.with_borrow_mut(|live| {
+        let live = live.as_mut()?;
+        live.watch.set_lost_up_gap(gap);
         live.ticks += 1;
         if live.ticks < REPORT_EVERY_TICKS {
-            return (outcome, None);
+            return None;
         }
         live.ticks = 0;
-        (outcome, Some(live.watch.take_counts()))
+        Some(live.watch.take_counts())
     });
-    if outcome.release.is_some() {
-        tracing::info!("hotkey watch: ended a hold press whose key-up it never saw");
-    }
-    if let Some(vk) = outcome.clear {
-        send_key_up(vk);
-    }
     if let Some((presses, drops)) = report {
         tracing::info!(
             "hotkey watch: {presses} hotkey press(es) seen in the last 30 min, \

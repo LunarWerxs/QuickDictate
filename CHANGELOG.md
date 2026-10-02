@@ -26,7 +26,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   same key-up once the key is released, so the next press works normally.
   When Windows still counted the key as down (a stuck key), it also handles
   that press itself; otherwise it leaves the press alone, since a Remote
-  Desktop window, a key remapper or a game may have taken the key on purpose.
+  Desktop window, a key remapper or a game may have taken the key on purpose,
+  and repairs the hotkey at most once every ten minutes.
   The watch never swallows or changes a key, ignores every key that is not a
   hotkey, and logs each such press plus a count of hotkey presses every half
   hour, so a dead key can now be told apart from one that never reached

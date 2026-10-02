@@ -98,24 +98,21 @@ fn dispatch_hotkey_press(id: i32, b: &HotkeyBindings<'_>, tx: &Sender<HotkeyEven
     }
 }
 
-/// Floor between the warnings for presses left alone (see [`act_on_dropped`]),
-/// so a Remote Desktop window that takes the hotkey key on every press does
-/// not fill the log.
-const LEFT_ALONE_WARN_INTERVAL: Duration = Duration::from_secs(10 * 60);
-
-/// When a left-alone press was last logged, and how many since went unlogged.
-static LEFT_ALONE_WARN: parking_lot::Mutex<(Option<Instant>, u32)> =
-    parking_lot::Mutex::new((None, 0));
-
 /// Act on a press Windows sent no `WM_HOTKEY` for (see [`watch`]): log it,
-/// register the binding again, clear the key once it is up, and, only when
-/// Windows had the key stuck down, send what the `WM_HOTKEY` would have.
+/// register the binding again and clear the key once it is up (when the watch
+/// says to repair), and, only for a stuck key, send what the `WM_HOTKEY`
+/// would have.
 ///
 /// A handled toggle press gets no long-press poller: that reads the key state
 /// Windows just showed it cannot be trusted with, and a false long press would
 /// paste the last dictation again. A handled hold press ends on the key-up the
 /// watch sees.
 fn act_on_dropped(dropped: &watch::Dropped, b: &HotkeyBindings<'_>, tx: &Sender<HotkeyEvent>) {
+    if !dropped.repair {
+        // Left alone and repaired recently: counted, logged with the next
+        // repair, nothing else to do.
+        return;
+    }
     let binding = if dropped.id == b.toggle_id {
         b.kb_toggle
     } else {
@@ -129,22 +126,13 @@ fn act_on_dropped(dropped: &watch::Dropped, b: &HotkeyBindings<'_>, tx: &Sender<
              again and clearing the key"
         );
     } else {
-        let mut last = LEFT_ALONE_WARN.lock();
-        if last
-            .0
-            .is_none_or(|t| t.elapsed() >= LEFT_ALONE_WARN_INTERVAL)
-        {
-            tracing::warn!(
-                "hotkey {combo}: the key reached QuickDictate but Windows sent no WM_HOTKEY \
-                 ({} more like it since the last line). Another program may have taken it \
-                 (Remote Desktop, a key remapper, a game), so the press is left alone; \
-                 registering the hotkey again and clearing the key in case Windows lost it",
-                last.1
-            );
-            *last = (Some(Instant::now()), 0);
-        } else {
-            last.1 += 1;
-        }
+        tracing::warn!(
+            "hotkey {combo}: the key reached QuickDictate but Windows sent no WM_HOTKEY \
+             ({} more like it since the last line). Another program may have taken it \
+             (Remote Desktop, a key remapper, a game), so the press is left alone; \
+             registering the hotkey again and clearing the key in case Windows lost it",
+            dropped.unlogged
+        );
     }
     if let Some((combo, mods, vk)) = binding {
         let registered = unsafe { register_one(dropped.id, combo, *mods, *vk, true) };
