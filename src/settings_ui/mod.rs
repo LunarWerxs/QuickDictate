@@ -25,6 +25,8 @@
 //! - [`history`]: the transcript-history browser (filter, multi-select, copy).
 //! - [`advanced`]: diagnostics, the data folder, and Per-App Profiles.
 //! - [`sync`]: the Connections settings-sync card.
+//! - [`licence`]: the Licence page, the Personal-or-Business question, and the
+//!   licence banners.
 //! - [`modals`]: the confirm prompts, the shared frame, and modal dispatch.
 //! - [`keys_modal`] / [`replacements_modal`] / [`stats_modal`]: one each.
 //! - [`keys`]: the provider list and the bulk key editor's parsing.
@@ -70,6 +72,7 @@ mod dictation;
 mod history;
 mod keys;
 mod keys_modal;
+mod licence;
 mod logic;
 mod modals;
 mod nav;
@@ -191,6 +194,12 @@ fn open_log_folder() {
 /// at where it used to be.
 pub fn is_open() -> bool {
     OPEN.load(Ordering::Acquire)
+}
+
+/// Open Settings on its Licence page: the licence notice's "Enter key".
+pub fn show_settings_on_licence(app: Arc<App>) {
+    licence::OPEN_LICENCE_PAGE.store(true, Ordering::Release);
+    show_settings(app);
 }
 
 pub fn show_settings(app: Arc<App>) {

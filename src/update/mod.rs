@@ -50,6 +50,7 @@ pub use install::download_and_install_now;
 #[cfg(test)]
 pub(crate) use install::{exe_asset_from_json, trusted_asset_url};
 pub use install_id::init_install_id;
+pub(crate) use install_id::new_install_id;
 
 use cache::*;
 use install::*;

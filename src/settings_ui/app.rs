@@ -222,6 +222,8 @@ pub(super) struct SettingsApp {
     pub(super) error_report_preview: Option<String>,
     /// Connections settings-sync control state.
     pub(super) sync: SyncUi,
+    /// The Licence page's key field and redeem in flight.
+    pub(super) licence: super::licence::LicenceUi,
     pub(super) stats_range: StatsRange,
     pub(super) stats_reset_confirm: bool,
     /// Scratch buffer for the global custom-vocabulary multiline editor —
@@ -298,6 +300,7 @@ impl eframe::App for SettingsApp {
         // asked for waiting forever. The worker's own `request_repaint` and the
         // restart deadline's `request_repaint_after` both still reach this hook.
         self.drain_sync(ctx);
+        self.drain_licence();
         self.poll_pending_restart(ctx);
 
         // A "Settings" click arrived while we were already running: reveal the
@@ -313,6 +316,10 @@ impl eframe::App for SettingsApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             ctx.request_repaint();
         }
+        // The licence notice's "Enter key" asked for the Licence page.
+        if super::licence::OPEN_LICENCE_PAGE.swap(false, Ordering::AcqRel) {
+            self.tab = nav::Tab::Licence;
+        }
 
         // Intercept the window close (X button / Alt-F4): cancel the actual OS
         // close (we manage "closing" ourselves as hide-and-reveal-later; see
@@ -322,6 +329,7 @@ impl eframe::App for SettingsApp {
         // replacements editor counts: its rows are folded into the draft first.
         if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.close_licence_question();
             self.commit_open_editor();
             if self.draft_is_dirty() {
                 self.modal = Some(Modal::UnsavedChanges);
@@ -377,7 +385,9 @@ impl eframe::App for SettingsApp {
                 // area: "you have no API key" and "an update is waiting" are
                 // true regardless of which page you are on, so they must not
                 // be something you can navigate away from.
+                self.licence_question_banner(ui);
                 self.onboarding_banner(ui);
+                self.licence_banner(ui);
                 self.update_available_banner(ui);
                 self.crash_report_banner(ui);
                 self.sign_in_nudge_banner(ui);
@@ -404,6 +414,7 @@ impl eframe::App for SettingsApp {
                             nav::Tab::Dictation => self.dictation_card(ui),
                             nav::Tab::Vocabulary => self.vocabulary_card(ui),
                             nav::Tab::History => self.history_card(ui),
+                            nav::Tab::Licence => self.licence_card(ui, &ctx),
                             nav::Tab::Advanced => self.advanced_card(ui),
                         }
                         ui.add_space(12.0);

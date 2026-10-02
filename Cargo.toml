@@ -126,6 +126,10 @@ sha2 = "0.11.0"
 flate2 = "1"
 tar = "0.4"
 libloading = "0.9.0"
+# Offline business-licence certificates: Ed25519 verify against the Connections
+# platform key compiled into the binary (see `licence::cert`). Verify only, so
+# no default features: no RNG, no signing, no std-only extras.
+ed25519-dalek = { version = "3", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
@@ -145,6 +149,8 @@ windows = { version = "0.58", features = [
     "Win32_Media_Multimedia",
     "Win32_System_Console",
     "Win32_System_ProcessStatus",
+    # Local calendar dates for the licence notices ("dictation stops on ...").
+    "Win32_System_Time",
     "Win32_System_Diagnostics_Debug",
     # Token integrity levels, so output.rs can tell the user when UIPI is
     # silently swallowing injected keystrokes into an elevated window.

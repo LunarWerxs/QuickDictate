@@ -18,7 +18,8 @@ use super::*;
 /// `sync.rs::rand_bytes`). Deliberately **never** derived from hostname, MAC,
 /// username, or any other machine identifier — the id must identify nothing
 /// but itself. `None` if the system RNG fails (no id beats a predictable one).
-pub(super) fn new_install_id() -> Option<String> {
+/// The licence module reuses it for its own install id (`licence::store`).
+pub(crate) fn new_install_id() -> Option<String> {
     use windows::Win32::Security::Cryptography::{
         BCryptGenRandom, BCRYPT_ALG_HANDLE, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
     };
