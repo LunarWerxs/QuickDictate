@@ -195,6 +195,11 @@ pub fn spawn_key_test(
 }
 
 async fn probe_key(client: &reqwest::Client, settings: &PolishSettings, key: &str) -> bool {
+    // The test sends the key itself, so it obeys the same rule as a real pass.
+    if !crate::config::polish_endpoint_allowed(&settings.endpoint) {
+        tracing::info!("polish key test: endpoint refused (not https, and not this PC)");
+        return false;
+    }
     let mut body = json!({
         "model": settings.model,
         "max_completion_tokens": 1,
