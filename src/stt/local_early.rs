@@ -20,10 +20,12 @@ use tokio::task::JoinHandle;
 pub(super) const EARLY_DECODE_TRIGGER_SECONDS: usize = 40;
 
 /// How often, and how long apart, a clip is retried when the shared worker is
-/// momentarily busy (another dictation's tail, or a prewarm, holds its one
-/// queue slot). Losing a stretch of a long dictation is worse than waiting.
-const BUSY_RETRIES: usize = 40;
-const BUSY_RETRY_DELAY: Duration = Duration::from_millis(250);
+/// momentarily busy (another dictation's tail, a prewarm, or a decode being
+/// cancelled holds its one queue slot): up to 10 s in all. Losing a stretch
+/// of a long dictation is worse than waiting, and short steps keep the wait
+/// after release from rounding up to a quarter second.
+const BUSY_RETRIES: usize = 200;
+const BUSY_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 /// Split the first finished clip off `pending` once enough audio has built
 /// up, leaving the rest in place. `None` while there is not enough yet.
@@ -83,7 +85,9 @@ impl EarlyDecoder {
     }
 }
 
-async fn decode_with_retry(
+/// Decode `pcm`, waiting out a momentarily busy worker. Stops retrying once
+/// `cancel` is set, so an abandoned decode never queues behind live ones.
+pub(super) async fn decode_with_retry(
     model_id: &str,
     language: &str,
     vocabulary: &str,
@@ -101,7 +105,11 @@ async fn decode_with_retry(
         )
         .await;
         match result {
-            Err(e) if e.contains("busy") && attempt < BUSY_RETRIES => {
+            Err(e)
+                if e.contains("busy")
+                    && attempt < BUSY_RETRIES
+                    && !cancel.load(std::sync::atomic::Ordering::Acquire) =>
+            {
                 attempt += 1;
                 tokio::time::sleep(BUSY_RETRY_DELAY).await;
             }

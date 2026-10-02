@@ -244,6 +244,11 @@ pub trait ProviderSink: Send {
     async fn keepalive(&mut self) -> Result<(), SendError> {
         Ok(())
     }
+    /// The hotkey was released: the live audio is complete, though the
+    /// post-release tail may still ship a trailing word. A batch provider can
+    /// start decoding now rather than at `commit`, so the decode runs while
+    /// the tail listens. Default: no-op.
+    async fn released(&mut self) {}
     /// Tear the transport down cleanly.
     async fn close(&mut self) -> Result<(), SendError>;
 }

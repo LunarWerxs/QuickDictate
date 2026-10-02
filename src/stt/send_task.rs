@@ -338,9 +338,16 @@ async fn recover_dead_socket(
 
 /// Phase 1 of [`run_send_task`]: forward mic audio to the provider as fast as
 /// it arrives, until the hotkey is released or the socket dies. Runs the
-/// stall watchdog for providers that support recovery.
-async fn send_task_live_phase(state: &mut SendTaskState, sent: &mut SentAudio, ws_dead: &mut bool) {
+/// stall watchdog for providers that support recovery. Returns when the last
+/// speech-bearing chunk went out, which is where the tail's quiet window
+/// starts counting.
+async fn send_task_live_phase(
+    state: &mut SendTaskState,
+    sent: &mut SentAudio,
+    ws_dead: &mut bool,
+) -> Option<tokio::time::Instant> {
     let mut watch = state.recovery.is_some().then(|| StallWatch::new(state));
+    let mut last_speech = None;
     while let Some(chunk) = next_live_chunk(state, *ws_dead).await {
         // Classify before shipping so the phantom-finalization guard (recv
         // task) can tell a commit backed by real speech from one conjured out
@@ -360,6 +367,7 @@ async fn send_task_live_phase(state: &mut SendTaskState, sent: &mut SentAudio, w
         *state.sent_progress.lock() = *sent;
         if is_speech {
             state.speech_shipped.fetch_add(1, Ordering::Release);
+            last_speech = Some(tokio::time::Instant::now());
         }
         if replayed {
             continue;
@@ -368,6 +376,7 @@ async fn send_task_live_phase(state: &mut SendTaskState, sent: &mut SentAudio, w
             watch_for_stall(state, watch, chunk, is_speech, ws_dead).await;
         }
     }
+    last_speech
 }
 
 /// The live phase's next mic chunk, or `None` once the hotkey is released,
@@ -417,8 +426,12 @@ async fn send_task_tail_phase(
     state: &mut SendTaskState,
     sent: &mut SentAudio,
     ws_dead: &mut bool,
+    last_live_speech: Option<tokio::time::Instant>,
 ) -> TailSilenceGate {
-    let mut run = TailRun::new();
+    if !*ws_dead {
+        state.sink.released().await;
+    }
+    let mut run = TailRun::new(last_live_speech);
     while !*ws_dead {
         let elapsed = run.elapsed();
         if run.hit_max(state, elapsed) {
@@ -490,12 +503,18 @@ struct TailRun {
 }
 
 impl TailRun {
-    fn new() -> Self {
+    /// `last_live_speech` is when the live phase last shipped speech. The
+    /// quiet window counts from there, not from the release: someone who
+    /// finished talking a second before pressing stop has already given it
+    /// its silence. Every tail used to wait the full window after the
+    /// release (0.8 s by default) even then, and in the owner's logs every
+    /// one of those waits shipped nothing.
+    fn new(last_live_speech: Option<tokio::time::Instant>) -> Self {
         let now = tokio::time::Instant::now();
         Self {
             gate: TailSilenceGate::default(),
             start: now,
-            last_speech: now,
+            last_speech: last_live_speech.map_or(now, |t| t.min(now)),
             last_send: now,
             chunks: 0,
             peak_rms: 0,
@@ -579,7 +598,7 @@ impl TailRun {
     /// has run at least [`TAIL_MIN`]) to end it. Logs the line the end is
     /// reported with.
     fn quiet_enough(&self, state: &SendTaskState, elapsed: Duration) -> bool {
-        if elapsed < TAIL_MIN || self.last_speech.elapsed() < state.tail_quiet {
+        if !tail_may_end(elapsed, self.last_speech.elapsed(), state.tail_quiet) {
             return false;
         }
         tracing::info!(
@@ -592,6 +611,13 @@ impl TailRun {
         );
         true
     }
+}
+
+/// The tail may end once it has run [`TAIL_MIN`] (the capture pipeline's
+/// last in-flight chunks land within it) and there has been no speech for the
+/// whole quiet window, counted from the last speech before or after release.
+fn tail_may_end(elapsed: Duration, since_speech: Duration, tail_quiet: Duration) -> bool {
+    elapsed >= TAIL_MIN && since_speech >= tail_quiet
 }
 
 /// Phase 3 of [`run_send_task`]: flush the session's resampler tail, then
@@ -647,8 +673,8 @@ pub(super) async fn run_send_task(mut state: SendTaskState) -> SentAudio {
     let mut sent = SentAudio::default();
     let mut ws_dead = false;
 
-    send_task_live_phase(&mut state, &mut sent, &mut ws_dead).await;
-    let mut gate = send_task_tail_phase(&mut state, &mut sent, &mut ws_dead).await;
+    let last_speech = send_task_live_phase(&mut state, &mut sent, &mut ws_dead).await;
+    let mut gate = send_task_tail_phase(&mut state, &mut sent, &mut ws_dead, last_speech).await;
     send_task_drain_phase(&mut state, &mut sent, &mut ws_dead, &mut gate).await;
 
     // Batch/local commit can spend seconds or minutes in inference. Stop
@@ -666,4 +692,37 @@ pub(super) async fn run_send_task(mut state: SendTaskState) -> SentAudio {
     sent.socket_died = ws_dead;
     *state.sent_progress.lock() = sent;
     sent
+}
+
+#[cfg(test)]
+mod tail_end_tests {
+    use super::*;
+
+    const QUIET: Duration = Duration::from_millis(800);
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[test]
+    fn quiet_before_the_release_counts_toward_the_tail() {
+        // Stopped talking a second before pressing stop: done at the minimum.
+        assert!(!tail_may_end(ms(200), ms(1200), QUIET));
+        assert!(tail_may_end(TAIL_MIN, ms(1250), QUIET));
+        // Still talking at the release: the whole window, as before.
+        assert!(!tail_may_end(ms(700), ms(700), QUIET));
+        assert!(tail_may_end(ms(800), ms(800), QUIET));
+        // 300 ms of quiet before the release leaves 500 ms to wait.
+        assert!(!tail_may_end(ms(450), ms(750), QUIET));
+        assert!(tail_may_end(ms(500), ms(800), QUIET));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_quiet_window_starts_at_the_last_live_speech() {
+        let spoke = tokio::time::Instant::now();
+        tokio::time::advance(ms(900)).await;
+        assert!(TailRun::new(Some(spoke)).last_speech.elapsed() >= ms(900));
+        // No speech before the release: the window starts at the release.
+        assert!(TailRun::new(None).last_speech.elapsed() < ms(1));
+    }
 }

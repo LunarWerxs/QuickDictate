@@ -92,7 +92,7 @@ Everything lives in `settings.json` (copied from `settings.example.json`). The f
 | `mouse_hotkey_passthrough` | When a hotkey is bound to a mouse button, whether that button *also* still reaches the app under your cursor (bool, default `false` = the button is claimed) |
 | `input_device` | Which microphone to record from. Empty (default) follows the Windows default; any part of a device name pins that one (`"yeti"`). See [Dictating from another machine](#dictating-from-another-machine-remote-desktop-rustdesk-and-friends) |
 | `reinsert_hold_ms` | How long a hold-mode key press must last before re-arming reinsert behavior, in ms (default `1500`) |
-| `listen_tail_ms` | Extra trailing listen time after you stop talking, in ms (default `800`) |
+| `listen_tail_ms` | Extra trailing listen time after you stop talking, in ms (default `800`). Quiet before you press stop counts toward it, so if you had already stopped talking the text comes 0.25 s after the key |
 | `delay_output_till_release` | Hybrid paste policy (bool) |
 | `clipboard_restore_delay_ms` | Delay before restoring your previous clipboard contents after a clipboard-paste, in ms (default `300`) |
 | `auto_space` / `auto_newline` / `auto_punct` | Output formatting toggles (bool) |

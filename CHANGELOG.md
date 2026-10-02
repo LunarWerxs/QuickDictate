@@ -40,6 +40,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the last few seconds. Through the real dictation path with Parakeet, a 199 s
   recording finished 0.34 s after release, word for word the same as decoding
   it whole. A four-hour safety stop remains for a dictation nobody ended.
+- **Text arrives up to a second sooner after you stop, on every provider.**
+  After the stop key, QuickDictate keeps listening until you have been quiet
+  for the "Keep listening after" window (0.8 s by default), in case a last
+  word is still coming. That quiet used to be counted only from the key
+  press, so someone who had finished talking a second earlier still waited
+  the whole 0.8 s; in the owner's logs that wait was 0.82 s on every one of
+  40 dictations and caught nothing each time. The quiet before the key press
+  now counts, so the wait is 0.25 s when you had already stopped talking.
+- **Local dictation: the model is done by the time QuickDictate stops
+  listening.** The leftover audio starts decoding the moment you press stop,
+  while QuickDictate listens for a last word, instead of after; a word that
+  does arrive restarts it. A dictation of 20 s or more also sends each
+  finished stretch to the model at your next pause, so only the words since
+  your last pause are left at the end. On an RTX 3090 with Parakeet the wait
+  after the key press (listening included) went from 1.0-1.6 s to 0.25-0.32 s when
+  you had paused, and 0.8 s when you stopped mid-sentence, for 11 s, 30 s and
+  199 s recordings alike, with the same words as before.
 
 ### Security
 

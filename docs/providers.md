@@ -255,11 +255,15 @@ when you come back, which is exactly when it is least welcome. Across 1,340
 measured dictations, ones arriving within 25 seconds of a reload took a median
 of 2.41s against 0.50s warm, and 73% of every dictation slower than 3 seconds
 had just followed a reload. The cursor indicator uses a spinner instead of
-a live word count because local transcription finishes after release. A long
-dictation (over 40 s) is transcribed while you speak, in clips of at most
-35 s cut at quiet moments, so release only waits for the last stretch however
-long you talked (a 199 s recording finished 0.34 s after release with
-Parakeet); there is no six-minute limit, only a four-hour safety stop.
+a live word count because local transcription finishes after release. Decoding
+starts the moment you press stop, while QuickDictate listens for a last word,
+and a dictation of 20 s or more is transcribed while you speak: each finished
+stretch goes to the model at your next pause (or, without one, every 35 s at
+the quietest moment). Release then only waits for the words since your last
+pause, however long you talked: with Parakeet on an RTX 3090 text arrived
+0.25-0.32 s after the key press when you had paused and 0.8 s when you stopped
+mid-sentence, for 11 s to 199 s recordings alike. There is no six-minute
+limit, only a four-hour safety stop.
 A hotkey press during that final step queues the next dictation so the valid
 pending result cannot be superseded and discarded. A queued hold-to-talk start
 is cancelled if you release the key before processing finishes. Vulkan is
