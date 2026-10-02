@@ -63,7 +63,7 @@ key or an internet connection. Microphone audio stays on your PC.
 - **Small app, on-demand models:** weights are not bundled in the executable or
   repository. They download to `%LOCALAPPDATA%\QuickDictate\local-stt`, use up to
   eight parallel connections when supported, and are size- and SHA-256-verified
-  before use. The first install also adds a shared runtime of roughly 80 MiB.
+  before use. The first install also adds a shared runtime of roughly 52 MiB.
 - **Less waiting after setup:** the selected local model prewarms in the background
   and stays ready between dictations. QuickDictate shows a spinner during final
   local processing, queues an early next hotkey press, switches models automatically,
@@ -149,7 +149,7 @@ plus Google's batch mode, all require an internet connection.
 **What are the system requirements?**
 QuickDictate runs on Windows 10/11 x64 only, there's no Mac or Linux build. The app itself
 is small; the optional offline models need extra disk space (524 MiB for Parakeet, 591 MiB
-for Whisper, 1.65 GiB for Cohere, plus an ~80 MiB shared runtime) and enough RAM/VRAM to keep the selected model
+for Whisper, 1.65 GiB for Cohere, plus an ~52 MiB shared runtime) and enough RAM/VRAM to keep the selected model
 resident while Local is active.
 
 **How is QuickDictate different from Wispr Flow, Talon Voice, or Windows Voice Access?**

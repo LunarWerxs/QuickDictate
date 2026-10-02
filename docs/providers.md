@@ -179,6 +179,14 @@ models (`latest_long` / `default`). Newer v2/Chirp models reject plain API-key
 auth, so they are out of scope here, don't set `stt_model` to a v2/Chirp
 model name for this provider.
 
+Measured 2026-10-02 on four 16-20 second clips, `latest_long` is the slowest
+and least accurate engine QuickDictate offers (5.9% word errors, text about
+3 s after release; `latest_short` was worse at 7.7%). Chirp 3 is Google's
+newer model, but v1 rejects it ("Incorrect model specified") and v2 refuses API
+keys ("API keys are not supported by this API"), so reaching it means a
+service-account login, which this bring-your-own-key app does not have. See
+[Not built yet](#not-built-yet) for the OpenRouter route.
+
 **Pricing:** Check Google Cloud's official Speech-to-Text pricing page for
 current rates and free-tier limits; both drift over time.
 
@@ -219,7 +227,7 @@ Hungarian, Italian, Latvian, Lithuanian, Maltese, Polish, Portuguese, Romanian,
 Russian, Slovak, Slovenian, Spanish, Swedish, Ukrainian).
 
 The executable contains none of these weights. Downloads go under
-`%LOCALAPPDATA%\QuickDictate\local-stt`; a shared runtime adds roughly 80 MiB
+`%LOCALAPPDATA%\QuickDictate\local-stt`; a shared runtime adds roughly 52 MiB
 once. Every artifact is pinned to an immutable upstream revision and verified
 by exact byte count plus SHA-256 before an atomic rename makes it usable.
 Large downloads use up to eight HTTP range workers when the server supports
@@ -295,3 +303,30 @@ nothing else changes.
 
 If a term never sticks no matter what, fall back to `text_replacements`: that
 runs locally on the recognised text and always wins.
+
+---
+
+## Not built yet
+
+Ideas that were checked and parked on purpose (owner decision, 2026-10-02),
+so nobody re-researches them from scratch.
+
+**OpenRouter as a "one key, many models" provider.** OpenRouter's
+`POST https://openrouter.ai/api/v1/audio/transcriptions` takes a plain
+OpenRouter API key and serves about two dozen speech models behind it, among
+them `google/chirp-3` (US$0.016/min, the same as Google direct), Gemini 3.5
+Transcribe, AssemblyAI Universal-3.5 Pro, Deepgram Nova-3, OpenAI
+`gpt-transcribe`, Parakeet and Qwen3-ASR. Audio goes up as base64
+`input_audio` (`data` + `format`, e.g. `wav`) and the text comes back in
+`text`. It would also be the only API-key route to Chirp 3.
+
+Why not now: it is upload-after-release only. There is no live stream, so no
+words while you talk, and every request takes an extra hop, while the
+streaming providers already finish 0.07-0.14 s after release (AssemblyAI,
+ElevenLabs). Good later as an extra for users who want many models on one
+key; it does not make anything faster. Before building it, time Chirp 3 on a
+funded OpenRouter key against the same clips (see `live_test.rs`).
+
+**Text-to-speech (Chirp 3 HD voices).** Not applicable: QuickDictate turns
+speech into text and never speaks.
+

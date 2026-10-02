@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-10-02
+
+Newer, faster speech engines across the board, from a live test of every model QuickDictate
+uses (four 16-20 second recordings, timed from key release to final text).
+
 ### Added
 
 - **OpenAI now defaults to `gpt-live-transcribe`.** On four 16-20 second test clips the final
