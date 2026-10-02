@@ -39,6 +39,9 @@ pub(super) fn default_provider() -> String {
 pub(super) fn default_local_model() -> String {
     crate::local_stt::default_model_id()
 }
+pub(super) fn default_local_idle_unload_minutes() -> u64 {
+    crate::local_stt::DEFAULT_IDLE_UNLOAD_MINUTES
+}
 pub(super) fn default_mode() -> String {
     "toggle".into()
 }

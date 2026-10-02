@@ -214,22 +214,76 @@ impl super::SettingsApp {
         }
     }
 
+    /// How long the model may sit idle before the worker releases it, `0`
+    /// meaning never. Presets rather than a free-typed number: the only
+    /// choice that really matters is "keep it or don't", and the reload it
+    /// avoids is several seconds landing on the next thing you say.
+    fn local_keep_warm_row(&mut self, ui: &mut egui::Ui) {
+        const CHOICES: [(u64, &str); 5] = [
+            (0, "Never — keep it loaded"),
+            (5, "After 5 minutes idle"),
+            (10, "After 10 minutes idle"),
+            (30, "After 30 minutes idle"),
+            (60, "After 1 hour idle"),
+        ];
+        let current = self.draft.local_idle_unload_minutes;
+        // A settings.json may carry any number, so fall back to describing it
+        // rather than silently showing one of the presets as selected.
+        let selected = CHOICES
+            .iter()
+            .find(|(minutes, _)| *minutes == current)
+            .map_or_else(
+                || format!("After {current} minutes idle"),
+                |(_, text)| (*text).to_string(),
+            );
+
+        ui.horizontal(|ui| {
+            ui.label("Release model").on_hover_text(TIP_KEEP_WARM);
+            egui::ComboBox::from_id_salt("local_idle_unload")
+                .width(260.0)
+                .selected_text(selected)
+                .show_ui(ui, |ui| {
+                    for (minutes, text) in CHOICES {
+                        ui.selectable_value(
+                            &mut self.draft.local_idle_unload_minutes,
+                            minutes,
+                            text,
+                        );
+                    }
+                })
+                .response
+                .on_hover_text(TIP_KEEP_WARM);
+        });
+        if self.draft.local_idle_unload_minutes == 0 {
+            ui.label(
+                RichText::new(
+                    "Stays in memory for as long as QuickDictate is running, so no dictation \
+                     ever waits for it to load.",
+                )
+                .size(11.0)
+                .color(muted()),
+            );
+        }
+    }
+
     /// The Local-provider block: the offline explainer, the active-model
-    /// picker, and one row per installable model with its install/cancel/
-    /// delete controls.
+    /// picker, the keep-warm choice, and one row per installable model with
+    /// its install/cancel/delete controls.
     fn local_model_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.add_space(8.0);
         ui.label(
             RichText::new(
                 "Runs fully offline after installation. Models are stored in Local AppData, \
-                 not in QuickDictate or this repository. The selected model stays warmed in \
-                 memory while Local is active; switching providers releases it.",
+                 not in QuickDictate or this repository. Switching providers releases the \
+                 model from memory.",
             )
             .size(12.0)
             .color(muted()),
         );
         ui.add_space(7.0);
         self.active_model_picker(ui);
+        ui.add_space(7.0);
+        self.local_keep_warm_row(ui);
         ui.add_space(7.0);
         for spec in crate::local_stt::MODELS {
             let snapshot = crate::local_stt::install_snapshot(spec.id);

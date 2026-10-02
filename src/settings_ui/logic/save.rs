@@ -43,6 +43,11 @@ impl SettingsApp {
         // so a microphone change takes effect on its own rather than waiting
         // for a restart.
         crate::audio::set_preferred_input(&cfg.input_device);
+        // Set the window before the command below, so the Prewarm /
+        // Unload that wakes the worker is already the new policy — that
+        // wake is also what lets a worker parked on the disabled
+        // branch pick a re-enabled window back up.
+        crate::local_stt::set_idle_unload_minutes(cfg.local_idle_unload_minutes);
         if leaving_local {
             crate::local_stt::request_unload();
         } else if cfg.stt_provider.eq_ignore_ascii_case("local") {

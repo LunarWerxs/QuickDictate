@@ -3,7 +3,7 @@
 //! One resident [`NativeEngine`] serialises every transcribe and prewarm, and
 //! releases multi-gigabyte weights on request or after an idle timeout.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -31,19 +31,52 @@ enum WorkerCommand {
 static WORKER: OnceLock<Result<mpsc::SyncSender<WorkerCommand>, String>> = OnceLock::new();
 static UNLOAD_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-/// How long the worker keeps an idle model resident before releasing it.
+/// Default for [`crate::config::Config::local_idle_unload_minutes`]: how long
+/// the worker keeps an idle model resident before releasing it.
 /// `request_unload` already handles the explicit case (Settings switches
 /// away from Local); this covers a user who leaves Local selected and simply
 /// stops dictating, which would otherwise pin multi-gigabyte weights in
 /// memory for the rest of the tray app's uptime.
-pub(super) const IDLE_UNLOAD_AFTER: Duration = Duration::from_secs(10 * 60);
+///
+/// Reloading is not cheap — a cold `Prewarm` costs several seconds and lands
+/// on the very next utterance — so a user with the RAM to spare can set the
+/// setting to `0` and never pay it.
+pub const DEFAULT_IDLE_UNLOAD_MINUTES: u64 = 10;
 
-/// Pure decision behind the idle unload: has the worker gone at least
-/// `IDLE_UNLOAD_AFTER` without a Transcribe or Prewarm command reaching it.
-/// Split out from `worker_loop` so the threshold has a fast unit test
-/// instead of needing a live worker thread and a real ten-minute wait.
-pub(super) fn idle_unload_due(idle_for: Duration) -> bool {
-    idle_for >= IDLE_UNLOAD_AFTER
+/// Live copy of the configured idle window, in seconds. Mirrors what
+/// `UNLOAD_REQUESTED` already does: the worker owns its own thread and must not
+/// reach into the config `ArcSwap` from inside the loop, so the settings layer
+/// pushes the value in via [`set_idle_unload_minutes`] instead.
+static IDLE_UNLOAD_SECS: AtomicU64 = AtomicU64::new(DEFAULT_IDLE_UNLOAD_MINUTES * 60);
+
+/// Apply `local_idle_unload_minutes`. `0` disables the idle unload entirely, so
+/// the model stays resident until the provider changes or the app exits.
+///
+/// A worker already parked in the disabled branch of [`worker_loop`] is blocked
+/// on `recv()` and will not observe a *re*-enabled window until the next
+/// command reaches it. That is not a gap in practice: every settings save that
+/// can change this value also sends `Prewarm` or `Unload`, which wakes the loop
+/// and restarts the wait against the new value.
+pub fn set_idle_unload_minutes(minutes: u64) {
+    IDLE_UNLOAD_SECS.store(minutes.saturating_mul(60), Ordering::Release);
+}
+
+/// The configured window, or `None` when the user has chosen to keep the model
+/// warm for the whole session.
+pub(super) fn idle_unload_after() -> Option<Duration> {
+    match IDLE_UNLOAD_SECS.load(Ordering::Acquire) {
+        0 => None,
+        secs => Some(Duration::from_secs(secs)),
+    }
+}
+
+/// Pure decision behind the idle unload: has the worker gone at least `after`
+/// without a Transcribe or Prewarm command reaching it. `None` means the unload
+/// is switched off, so it never comes due. Split out from `worker_loop` so the
+/// threshold has a fast unit test instead of needing a live worker thread and a
+/// real ten-minute wait.
+pub(super) fn idle_unload_due(idle_for: Duration, after: Option<Duration>) -> bool {
+    after.is_some_and(|after| idle_for >= after)
 }
 
 fn worker() -> Result<&'static mpsc::SyncSender<WorkerCommand>, String> {
@@ -133,16 +166,20 @@ pub fn request_unload() {
 }
 
 /// The idle-timeout branch of [`worker_loop`]: release the model once it has
-/// sat unused for `IDLE_UNLOAD_AFTER`, and hand back the `idle_since` the loop
-/// should keep waiting from.
-fn worker_handle_idle_timeout(engine: &mut Option<NativeEngine>, idle_since: Instant) -> Instant {
-    if !idle_unload_due(idle_since.elapsed()) {
+/// sat unused for `after`, and hand back the `idle_since` the loop should keep
+/// waiting from.
+fn worker_handle_idle_timeout(
+    engine: &mut Option<NativeEngine>,
+    idle_since: Instant,
+    after: Option<Duration>,
+) -> Instant {
+    if !idle_unload_due(idle_since.elapsed(), after) {
         return idle_since;
     }
     if engine.take().is_some() {
         tracing::info!(
             "local STT model unloaded after {} minutes idle",
-            IDLE_UNLOAD_AFTER.as_secs() / 60
+            after.map_or(0, |after| after.as_secs() / 60)
         );
     }
     Instant::now()
@@ -231,16 +268,24 @@ fn worker_loop(rx: mpsc::Receiver<WorkerCommand>) {
         // are handled synchronously below before the loop comes back here),
         // so a timeout can never race an in-flight transcription or prewarm.
         // Waiting for only the remaining budget, rather than the full
-        // constant, means a burst of quick commands does not each restart a
-        // fresh ten-minute window.
-        let command = match rx.recv_timeout(IDLE_UNLOAD_AFTER.saturating_sub(idle_since.elapsed()))
-        {
-            Ok(command) => command,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                idle_since = worker_handle_idle_timeout(&mut engine, idle_since);
-                continue;
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        // window, means a burst of quick commands does not each restart a
+        // fresh idle window.
+        let command = match idle_unload_after() {
+            // Idle unload switched off: park on a plain blocking receive. No
+            // timeout means no wakeups and no reload, so the model stays warm
+            // until the provider changes or the channel drops.
+            None => match rx.recv() {
+                Ok(command) => command,
+                Err(mpsc::RecvError) => break,
+            },
+            Some(after) => match rx.recv_timeout(after.saturating_sub(idle_since.elapsed())) {
+                Ok(command) => command,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    idle_since = worker_handle_idle_timeout(&mut engine, idle_since, Some(after));
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            },
         };
         idle_since = Instant::now();
         match command {

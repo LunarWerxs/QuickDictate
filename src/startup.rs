@@ -465,6 +465,9 @@ pub(crate) fn bring_up_app(
     }
     {
         let cfg = app.config.load();
+        // Push the idle window in before the first prewarm, so a `0` setting is
+        // already in effect when the worker parks after that initial load.
+        local_stt::set_idle_unload_minutes(cfg.local_idle_unload_minutes);
         if cfg.stt_provider.eq_ignore_ascii_case("local") {
             local_stt::request_prewarm(&cfg.local_model);
         }

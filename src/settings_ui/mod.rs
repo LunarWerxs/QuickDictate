@@ -141,6 +141,10 @@ const TIP_REPASTE: &str = "Hold your toggle hotkey this long to re-paste your mo
 const TIP_LISTEN_TAIL: &str = "After you stop talking, QuickDictate keeps listening this long \
      before finalizing — raise it if trailing words get cut off, lower it for a snappier finish. \
      Applies to your next dictation.";
+const TIP_KEEP_WARM: &str = "How long the model may sit unused before QuickDictate \
+     releases it from memory. Loading it back takes several seconds, and that wait lands on the \
+     next thing you say — so if you have the RAM to spare, choose Never and no dictation ever \
+     pays it. Applies immediately on save.";
 const TIP_DUCK: &str = "Mute or turn down music, videos and every other app while you dictate, \
      so nothing plays over you or ends up in the transcript. Each app goes back to its own volume \
      the moment QuickDictate stops listening, and one you adjust mid-dictation keeps your change. \

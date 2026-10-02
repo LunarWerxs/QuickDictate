@@ -9,10 +9,11 @@ use serde::{Deserialize, Serialize};
 
 use super::defaults::{
     default_clipboard_restore_delay_ms, default_close, default_false, default_height,
-    default_hold_hotkey, default_language, default_listen_tail_ms, default_local_model,
-    default_max_log_mb, default_mode, default_polish_deadline_ms, default_polish_endpoint,
-    default_polish_model, default_provider, default_reinsert_hold_ms, default_replacements,
-    default_replacements_mode, default_spinner, default_toggle_hotkey, default_true, default_width,
+    default_hold_hotkey, default_language, default_listen_tail_ms,
+    default_local_idle_unload_minutes, default_local_model, default_max_log_mb, default_mode,
+    default_polish_deadline_ms, default_polish_endpoint, default_polish_model, default_provider,
+    default_reinsert_hold_ms, default_replacements, default_replacements_mode, default_spinner,
+    default_toggle_hotkey, default_true, default_width,
 };
 
 /// Per-application override, matched against the foreground window's exe at
@@ -251,6 +252,17 @@ pub struct Config {
     /// settings sync, the repository, or the QuickDictate executable.
     #[serde(default = "default_local_model")]
     pub local_model: String,
+
+    /// Minutes the local model stays resident with no dictation before the
+    /// worker releases it; `0` keeps it warm for the tray app's whole uptime.
+    ///
+    /// The trade is memory against the first utterance after a pause. Holding
+    /// the weights costs a couple of gigabytes of RAM, but reloading them costs
+    /// several seconds and that cost always lands on a real dictation — the one
+    /// you just spoke after stepping away — which is the worst possible moment
+    /// for it. Anyone with the headroom should set `0`.
+    #[serde(default = "default_local_idle_unload_minutes")]
+    pub local_idle_unload_minutes: u64,
 
     /// DashScope region: `false` = mainland-China host (default),
     /// `true` = the `-intl` host for International accounts. A key from the
@@ -549,6 +561,7 @@ impl Default for Config {
             google_keys: Vec::new(),
             stt_model: None,
             local_model: default_local_model(),
+            local_idle_unload_minutes: default_local_idle_unload_minutes(),
             dashscope_intl: false,
             update_auto_check: true,
             install_id: String::new(),

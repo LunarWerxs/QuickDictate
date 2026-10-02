@@ -140,6 +140,15 @@ pub(super) const NEVER_SYNCED: &[&str] = &[
     // diagnostics get assembled into a report you can hand to LunarWerx)
     // made on a machine you were not looking at.
     "error_reporting_enabled",
+    // Not a taste preference but a standing claim on THIS machine's RAM: `0` holds a
+    // multi-gigabyte model resident for the app's whole uptime. Right on a workstation
+    // with headroom, actively harmful on a thin laptop, where pinning it can push the
+    // machine into swapping and make every dictation slower rather than faster. Same
+    // family as the window geometry above: the correct value is a property of the
+    // hardware, so each machine decides for itself. `local_model` syncs because it is a
+    // question of which transcription you want; this is a question of what the box can
+    // afford.
+    "local_idle_unload_minutes",
 ];
 
 // ---- Allowlist transforms (Config <-> synced JSON) -------------------------

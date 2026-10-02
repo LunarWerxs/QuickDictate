@@ -25,7 +25,9 @@ use super::postprocess::{
     cohere_chunk_ranges, collapse_pathological_repetitions, collapse_pathological_sentence_runs,
     COHERE_CLIP_MAX_SECONDS, COHERE_MIN_TAIL_SECONDS,
 };
-use super::worker::{idle_unload_due, IDLE_UNLOAD_AFTER};
+use super::worker::{
+    idle_unload_after, idle_unload_due, set_idle_unload_minutes, DEFAULT_IDLE_UNLOAD_MINUTES,
+};
 use super::{
     expected_runtime_marker, is_installed, model, model_verified, runtime_verified, ModelSpec,
     MODELS, RUNTIME_VERSION,
@@ -351,10 +353,52 @@ fn model_hash_mismatch_is_reported_and_not_cached_as_passing() {
 
 #[test]
 fn idle_unload_only_fires_once_the_full_window_elapses() {
-    assert!(!idle_unload_due(Duration::from_secs(0)));
-    assert!(!idle_unload_due(IDLE_UNLOAD_AFTER - Duration::from_secs(1)));
-    assert!(idle_unload_due(IDLE_UNLOAD_AFTER));
-    assert!(idle_unload_due(IDLE_UNLOAD_AFTER + Duration::from_secs(1)));
+    // The default is the 10 minutes it has always been, not whatever the
+    // constant happens to say.
+    let window = Duration::from_secs(10 * 60);
+    let after = Some(Duration::from_secs(DEFAULT_IDLE_UNLOAD_MINUTES * 60));
+    assert!(!idle_unload_due(Duration::from_secs(0), after));
+    assert!(!idle_unload_due(window - Duration::from_secs(1), after));
+    assert!(idle_unload_due(window, after));
+    assert!(idle_unload_due(window + Duration::from_secs(1), after));
+}
+
+/// The whole point of the `0` setting: no elapsed time, however long, ever
+/// makes the unload come due.
+#[test]
+fn idle_unload_never_fires_when_switched_off() {
+    assert!(!idle_unload_due(Duration::from_secs(0), None));
+    assert!(!idle_unload_due(Duration::from_secs(60 * 60 * 24), None));
+    assert!(!idle_unload_due(Duration::MAX, None));
+}
+
+/// `set_idle_unload_minutes` is the only writer of the global, and this is
+/// the only test that reads it back, so the shared state cannot race a
+/// sibling test. It restores the default before returning regardless.
+#[test]
+fn zero_minutes_switches_the_idle_unload_off() {
+    set_idle_unload_minutes(0);
+    assert_eq!(idle_unload_after(), None);
+    assert!(!idle_unload_due(Duration::MAX, idle_unload_after()));
+
+    // A custom window is honoured in minutes: due at 3, not a second before.
+    set_idle_unload_minutes(3);
+    let after = idle_unload_after();
+    assert!(!idle_unload_due(Duration::from_secs(3 * 60 - 1), after));
+    assert!(idle_unload_due(Duration::from_secs(3 * 60), after));
+
+    set_idle_unload_minutes(30);
+    assert_eq!(idle_unload_after(), Some(Duration::from_secs(30 * 60)));
+
+    // Absurd values saturate rather than wrapping into a short window.
+    set_idle_unload_minutes(u64::MAX);
+    assert_eq!(idle_unload_after(), Some(Duration::from_secs(u64::MAX)));
+
+    set_idle_unload_minutes(DEFAULT_IDLE_UNLOAD_MINUTES);
+    assert_eq!(
+        idle_unload_after(),
+        Some(Duration::from_secs(DEFAULT_IDLE_UNLOAD_MINUTES * 60))
+    );
 }
 
 #[test]

@@ -38,6 +38,7 @@
   "google_keys": [],
   "stt_model": null,
   "local_model": "cohere-q5",
+  "local_idle_unload_minutes": 10,
   "dashscope_intl": false,
   "update_auto_check": true,
   "update_auto_install": false,

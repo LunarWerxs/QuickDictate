@@ -240,7 +240,20 @@ When Local is selected, QuickDictate loads and prewarms the selected model in
 the background, then keeps it resident between dictations. This intentionally
 uses RAM/VRAM to avoid repeating model-load and Vulkan-pipeline startup on later
 dictations. It switches automatically when you select another model and unloads
-when you switch away from Local. The cursor indicator uses a spinner instead of
+when you switch away from Local.
+
+It also unloads after a period with no dictation, so that leaving Local selected
+and walking away does not pin gigabytes of weights for the rest of the tray
+app's uptime. **Release model** in Settings controls that period
+(`local_idle_unload_minutes` in settings.json); the default is 10 minutes and
+`0` disables it, keeping the model loaded for as long as QuickDictate runs.
+
+Choose `0` if the machine has the memory to spare. The reload is not free and
+its cost is not paid while you are away: it is paid by the first thing you say
+when you come back, which is exactly when it is least welcome. Across 1,340
+measured dictations, ones arriving within 25 seconds of a reload took a median
+of 2.41s against 0.50s warm, and 73% of every dictation slower than 3 seconds
+had just followed a reload. The cursor indicator uses a spinner instead of
 a live word count because local transcription runs as one batch after release;
 a hotkey press during that final batch queues the next dictation so the valid
 pending result cannot be superseded and discarded. A queued hold-to-talk start

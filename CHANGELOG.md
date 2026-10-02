@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **The local model can now be kept loaded.** Settings › Speech-to-text
+  provider › **Release model**, or `local_idle_unload_minutes` in settings.json,
+  where `0` means never. The default is unchanged at 10 minutes.
+
+  The idle unload exists so a user who stops dictating does not have multiple
+  gigabytes of weights pinned for the rest of the tray app's uptime, and that is
+  still the right default. But reloading costs several seconds and the cost is
+  paid at the worst possible moment: not while you are away, but on the very
+  next thing you say when you come back, which reads as "it's slow today"
+  rather than "it just reloaded".
+
+  Measured over 1,340 real dictations, transcriptions within 25 seconds of a
+  reload had a median of 2.41s against 0.50s warm, and **73% of every
+  slower-than-3-second dictation followed a reload**. On a machine with the RAM
+  to spare, `0` removes that entire class.
+
 ## [1.3.0] - 2026-10-02
 
 Newer, faster speech engines across the board, from a live test of every model QuickDictate
