@@ -30,9 +30,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and forth never restarts the evaluation.
 
   The new **Settings › Licence** page redeems the key from your purchase email,
-  has Buy buttons for both plans (US$19.99 once, or US$1.99 a month) and a link
-  to manage a licence you already hold, and shows only the key's last four
-  characters. A redeemed key comes back with a certificate signed by
+  has a Buy button for the perpetual licence (US$19.99 once) and a link that
+  opens an email to lunawerx@gmail.com to move or refund a licence you already
+  hold (full refund within 14 days of paying), and shows only the key's last
+  four characters. A redeemed key comes back with a certificate signed by
   Connections, which QuickDictate checks offline, so being licensed never
   depends on the network. The certificate is renewed quietly about once a day.
   A copy that was licensed and then went offline keeps working; only
