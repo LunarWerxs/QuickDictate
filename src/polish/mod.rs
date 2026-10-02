@@ -200,7 +200,9 @@ async fn probe_key(client: &reqwest::Client, settings: &PolishSettings, key: &st
         "max_completion_tokens": 1,
         "messages": [{ "role": "user", "content": "hi" }],
     });
-    if settings.model.starts_with("gemini") {
+    // "low" for any model that reasons: every Gemini and OpenAI reasoning
+    // model accepts it, and a one-token probe should not think at length.
+    if settings.model.starts_with("gemini") || edits::is_openai_reasoning_model(&settings.model) {
         body["reasoning_effort"] = json!("low");
     }
     match client

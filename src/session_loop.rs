@@ -293,11 +293,21 @@ mod tests {
             status_after_release(&with("google"), None),
             Status::Finalizing
         );
+        let older_openai = crate::config::Config {
+            stt_model: Some("gpt-4o-transcribe".into()),
+            ..with("openai")
+        };
         assert_eq!(
-            status_after_release(&with("openai"), None),
+            status_after_release(&older_openai, None),
             Status::Finalizing
         );
-        for streaming in ["elevenlabs", "deepgram", "assemblyai", "dashscope"] {
+        for streaming in [
+            "elevenlabs",
+            "deepgram",
+            "assemblyai",
+            "dashscope",
+            "openai",
+        ] {
             assert_eq!(status_after_release(&with(streaming), None), Status::Idle);
         }
     }

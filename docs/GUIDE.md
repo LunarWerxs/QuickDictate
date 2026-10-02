@@ -61,9 +61,9 @@ That replacement table, since it's the fiddly-but-lovely part:
 |---|---|---|---|
 | ElevenLabs (Scribe v2 realtime) | `elevenlabs` | Streaming | [elevenlabs.io/app/settings/api-keys](https://elevenlabs.io/app/settings/api-keys) |
 | Deepgram (nova-3) | `deepgram` | Streaming | [console.deepgram.com/signup](https://console.deepgram.com/signup) |
-| OpenAI (gpt-4o-transcribe, Realtime API) | `openai` | Streaming | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) |
+| OpenAI (gpt-live-transcribe, Realtime API) | `openai` | Streaming | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) |
 | AssemblyAI (Universal-Streaming v3) | `assemblyai` | Streaming | [assemblyai.com/dashboard/signup](https://www.assemblyai.com/dashboard/signup) |
-| DashScope (Alibaba Cloud Paraformer realtime-v2) | `dashscope` | Streaming | [dashscope.console.aliyun.com/apiKey](https://dashscope.console.aliyun.com/apiKey) |
+| DashScope (Alibaba Cloud Qwen-Audio 3.1 realtime) | `dashscope` | Streaming | [dashscope.console.aliyun.com/apiKey](https://dashscope.console.aliyun.com/apiKey) |
 | Google Cloud Speech-to-Text (v1 batch) | `google` | Batch (bounded ~55s uploads, results on release, no live word count) | [console.cloud.google.com/apis/credentials](https://console.cloud.google.com/apis/credentials) |
 | Local (Cohere Transcribe, Whisper or Parakeet) | `local` | Offline batch (results on release) | No key; install a model in Settings |
 

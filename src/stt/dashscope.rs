@@ -1,4 +1,14 @@
-//! Alibaba Cloud DashScope Paraformer realtime adapter.
+//! Alibaba Cloud DashScope realtime ASR adapter (Qwen-Audio 3.1 by default).
+//!
+//! The default moved from paraformer-realtime-v2 to
+//! qwen-audio-3.1-asr-flash-streaming on 2026-10-02: Alibaba calls Paraformer
+//! "an older-generation ASR model family" to migrate off, and on four 16-20 s
+//! clips the new model made 1.5% word errors against Paraformer's 3.6% for
+//! about the same finish time (0.62 s vs 0.58 s after release). It speaks the
+//! same run-task protocol, covers 30 languages (every one Paraformer did),
+//! accepts the same `language_hints`, and auto-detects without one (verified
+//! on Chinese and German clips). fun-asr-realtime was as accurate and a
+//! little faster but covers only Chinese, English and Japanese.
 //!
 //! Protocol is the richest of the streaming set: a JSON `run-task` handshake,
 //! then raw binary PCM16, then `finish-task` to end. The server acks with
@@ -29,7 +39,7 @@ use crate::keys::FailKind;
 // 401s at the WebSocket upgrade.
 const WS_URL_CN: &str = "wss://dashscope.aliyuncs.com/api-ws/v1/inference";
 const WS_URL_INTL: &str = "wss://dashscope-intl.aliyuncs.com/api-ws/v1/inference";
-const MODEL_ID: &str = "paraformer-realtime-v2";
+const MODEL_ID: &str = "qwen-audio-3.1-asr-flash-streaming";
 
 /// Hard cap on the post-connect `run-task` → `task-started` exchange. Without
 /// it, a connection the server accepts but never answers (black-holed network,
@@ -195,12 +205,12 @@ fn classify_error_code(code: &str) -> FailKind {
 
 /// Build the `run-task` payload for `model`/`opts`/`task_id`. Pure
 /// (fixture-tested); `connect` just sends this. `language_hints` is
-/// Paraformer realtime's array-of-language-codes parameter -- `opts.language`
+/// the realtime ASR models' array-of-language-codes parameter -- `opts.language`
 /// was previously computed by the runner but never placed anywhere in this
 /// payload, so a user's language choice was silently ignored.
 ///
 /// The hint is only sent for a NON-default language. QuickDictate shipped for
-/// months never sending it, which left Paraformer in its own auto-detect
+/// months never sending it, which left the model in its own auto-detect
 /// mode, and DashScope's user base skews heavily toward speakers relying on
 /// exactly that. The app-wide default language is "en-US" whether or not the
 /// user ever looked at the setting, so forcing `["en"]` on every default
@@ -441,7 +451,7 @@ mod tests {
             serde_json::json!(["es"])
         );
         // The default language ("en-US" -> "en") must NOT pin a language:
-        // omitting the field is what preserves Paraformer's auto-detect for
+        // omitting the field is what preserves the model's auto-detect for
         // every config that never touched the setting.
         let payload = build_run_task("t1", MODEL_ID, &test_opts("en"));
         let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();

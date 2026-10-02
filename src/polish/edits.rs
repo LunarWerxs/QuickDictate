@@ -20,15 +20,55 @@ pub(super) fn worth_polishing(text: &str) -> bool {
     (MIN_CHARS..=MAX_CHARS).contains(&n)
 }
 
-pub(super) async fn request_edits(
-    client: &reqwest::Client,
-    settings: &PolishSettings,
-    key: &str,
-    text: &str,
-) -> Result<Vec<Edit>, String> {
+/// OpenAI's reasoning families (GPT-5, GPT-6, the o-series). They think
+/// before answering unless told not to, and many reject a non-default
+/// `temperature` (measured 2026-10-02: gpt-5, gpt-5.5, gpt-5.6-*, gpt-6-*
+/// and o4-mini all 400 on `temperature: 0`), so they get neither the
+/// temperature nor the thinking.
+pub(super) fn is_openai_reasoning_model(model: &str) -> bool {
+    ["gpt-5", "gpt-6", "o1", "o3", "o4"]
+        .iter()
+        .any(|family| model.starts_with(family))
+}
+
+/// Reasoning models that refused `reasoning_effort: "none"` in this process;
+/// they are asked for `"low"` from then on. Measured 2026-10-02: gpt-5.1 and
+/// later plus gpt-6-luna/-sol take "none" (the fastest), while the original
+/// gpt-5 family, gpt-6-astra and o4-mini take only "low" -- which every
+/// reasoning model accepts. Learning it per model keeps a future model
+/// working without a release.
+fn low_effort_only() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static MODELS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    MODELS.get_or_init(Default::default)
+}
+
+/// The `reasoning_effort` to send, if any.
+///
+/// Gemini models think before answering unless told otherwise, and thinking
+/// is exactly what a millisecond budget cannot afford: the same model that
+/// answers in 0.6 s at "low" takes 3 s at its default. "low" rather than
+/// "none" on purpose for Gemini: gemini-3.6-flash, gemini-3.5-flash-lite,
+/// gemini-flash-latest and gemini-flash-lite-latest all 400 on "none"
+/// (measured 2026-08-13). OpenAI's non-reasoning models (gpt-4.1-*, gpt-4o-*)
+/// reject the field outright, so they get none.
+pub(super) fn reasoning_effort(model: &str) -> Option<&'static str> {
+    if model.starts_with("gemini") {
+        Some("low")
+    } else if is_openai_reasoning_model(model) {
+        let low = low_effort_only()
+            .lock()
+            .map(|m| m.contains(model))
+            .unwrap_or(false);
+        Some(if low { "low" } else { "none" })
+    } else {
+        None
+    }
+}
+
+pub(super) fn request_body(model: &str, text: &str, effort: Option<&str>) -> serde_json::Value {
     let mut body = json!({
-        "model": settings.model,
-        "temperature": 0,
+        "model": model,
         "max_completion_tokens": MAX_OUTPUT_TOKENS,
         "response_format": { "type": "json_object" },
         "messages": [
@@ -36,34 +76,72 @@ pub(super) async fn request_edits(
             { "role": "user", "content": text },
         ],
     });
-    // Gemini models think before answering unless told otherwise, and thinking
-    // is exactly what a millisecond budget cannot afford: the same model that
-    // answers in 0.6 s at "low" takes 3 s at its default. Sent only for Gemini
-    // because OpenAI's non-reasoning models reject the field outright.
-    //
-    // "low" rather than "none" on purpose. "none" is faster still on the
-    // models that take it, but gemini-3.6-flash, gemini-3.5-flash-lite,
-    // gemini-flash-latest and gemini-flash-lite-latest all 400 on it ("Request contains an invalid
-    // argument"), and silently failing on the best model available would be a
-    // poor trade for a couple hundred milliseconds. Measured 2026-08-13.
-    if settings.model.starts_with("gemini") {
-        body["reasoning_effort"] = json!("low");
+    if !is_openai_reasoning_model(model) {
+        body["temperature"] = json!(0);
     }
+    if let Some(effort) = effort {
+        body["reasoning_effort"] = json!(effort);
+    }
+    body
+}
+
+pub(super) async fn request_edits(
+    client: &reqwest::Client,
+    settings: &PolishSettings,
+    key: &str,
+    text: &str,
+) -> Result<Vec<Edit>, String> {
+    let effort = reasoning_effort(&settings.model);
+    let (status, raw) = post(
+        client,
+        settings,
+        key,
+        &request_body(&settings.model, text, effort),
+    )
+    .await?;
+    let (status, raw) =
+        if status == 400 && effort == Some("none") && raw.contains("reasoning_effort") {
+            if let Ok(mut models) = low_effort_only().lock() {
+                models.insert(settings.model.clone());
+            }
+            tracing::info!(
+                "polish: {} refused reasoning_effort \"none\"; using \"low\"",
+                settings.model
+            );
+            post(
+                client,
+                settings,
+                key,
+                &request_body(&settings.model, text, Some("low")),
+            )
+            .await?
+        } else {
+            (status, raw)
+        };
+    if !(200..300).contains(&status) {
+        // Truncated: an error body can be a full HTML error page.
+        let head: String = raw.chars().take(200).collect();
+        return Err(format!("HTTP {status} {head}"));
+    }
+    parse_reply(&raw)
+}
+
+async fn post(
+    client: &reqwest::Client,
+    settings: &PolishSettings,
+    key: &str,
+    body: &serde_json::Value,
+) -> Result<(u16, String), String> {
     let resp = client
         .post(&settings.endpoint)
         .bearer_auth(key)
-        .json(&body)
+        .json(body)
         .send()
         .await
         .map_err(|e| e.to_string())?;
-    let status = resp.status();
+    let status = resp.status().as_u16();
     let raw = resp.text().await.map_err(|e| e.to_string())?;
-    if !status.is_success() {
-        // Truncated: an error body can be a full HTML error page.
-        let head: String = raw.chars().take(200).collect();
-        return Err(format!("HTTP {} {head}", status.as_u16()));
-    }
-    parse_reply(&raw)
+    Ok((status, raw))
 }
 
 /// Pull the edit list out of an OpenAI-shaped chat completion. Written

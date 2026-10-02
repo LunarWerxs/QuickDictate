@@ -31,7 +31,9 @@ pub(super) fn make_provider_id(id: &str, cfg: &Config) -> Box<dyn SttProvider> {
         "dashscope" => Box::new(dashscope::DashScopeProvider {
             intl: cfg.dashscope_intl,
         }),
-        "openai" => Box::new(openai::OpenAiProvider),
+        "openai" => Box::new(openai::OpenAiProvider {
+            model: cfg.stt_model.clone(),
+        }),
         "google" => Box::new(google::GoogleProvider),
         "local" => Box::new(local::LocalProvider {
             model_id: cfg.local_model.clone(),
@@ -374,18 +376,31 @@ mod tests {
     /// users watch a "0" that never moves.
     #[test]
     fn only_the_commit_only_providers_hide_the_live_word_count() {
-        for id in ["elevenlabs", "deepgram", "assemblyai", "dashscope"] {
+        for id in [
+            "elevenlabs",
+            "deepgram",
+            "assemblyai",
+            "dashscope",
+            "openai",
+        ] {
             assert!(
                 provider_streams_interim_text(&with_provider(id)),
                 "{id} streams partials, so the pip should count words"
             );
         }
-        for id in ["google", "local", "openai"] {
+        for id in ["google", "local"] {
             assert!(
                 !provider_streams_interim_text(&with_provider(id)),
                 "{id} answers only after commit, so the pip should spin"
             );
         }
+        // OpenAI's older models answer only at commit; the pip follows the
+        // model the user picked, not just the provider.
+        let older_openai = Config {
+            stt_model: Some("gpt-4o-transcribe".into()),
+            ..with_provider("openai")
+        };
+        assert!(!provider_streams_interim_text(&older_openai));
         // An unknown id falls back to ElevenLabs, which does stream.
         assert!(provider_streams_interim_text(&with_provider("nonsense")));
     }

@@ -55,6 +55,16 @@ impl SttProvider for LocalProvider {
         opts: &SttSessionOpts,
     ) -> Result<ProviderSession, ConnectError> {
         if !crate::local_stt::is_installed(&self.model_id) {
+            if crate::local_stt::model_verified(&self.model_id) {
+                // The weights are here; only the runtime this build pins is
+                // missing (an app update). Start fetching it, and say so.
+                crate::local_stt::request_prewarm(&self.model_id);
+                return Err(ConnectError(format!(
+                    "'{}' is updating its offline runtime (a one-time ~17 MB download); \
+                     dictate again in a moment",
+                    self.model_id
+                )));
+            }
             return Err(ConnectError(format!(
                 "'{}' is not installed; install it in Settings → Speech-to-text provider",
                 self.model_id

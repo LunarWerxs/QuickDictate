@@ -69,7 +69,7 @@ change over time.
 
 - **`stt_provider` value:** `"openai"`
 - **Key array:** `"openai_keys"`
-- **Engine:** `gpt-4o-transcribe` via OpenAI's GA Realtime API, streaming at 24 kHz
+- **Engine:** `gpt-live-transcribe` via OpenAI's GA Realtime API, streaming at 24 kHz
 
 **Getting a key:**
 1. Go to <https://platform.openai.com/api-keys>.
@@ -80,6 +80,15 @@ change over time.
 
 **Notes:** Uses the general-availability Realtime API (not a beta/preview
 endpoint), streaming audio at 24 kHz. Streaming provider, live word count.
+
+The default became `gpt-live-transcribe` on 2026-10-02. Measured on four
+16-20 second clips through QuickDictate's own request: the final text arrives
+about 0.55 s after you release the key instead of 1.13 s with
+`gpt-4o-transcribe`, words appear while you are still talking (the older
+models send nothing until release), and it made no word errors (0.9% before).
+It runs at its `low` delay setting. `stt_model` can still pick
+`gpt-4o-transcribe`, `gpt-transcribe` or `gpt-4o-mini-transcribe`; those show
+the spinner until the text arrives.
 
 **Pricing:** Check OpenAI's official pricing page for current Realtime API
 rates; pricing drifts and varies by model.
@@ -110,7 +119,15 @@ figures drift.
 
 - **`stt_provider` value:** `"dashscope"`
 - **Key array:** `"dashscope_keys"`
-- **Engine:** Alibaba Cloud DashScope Paraformer (`paraformer-realtime-v2`), streaming
+- **Engine:** Alibaba Cloud Qwen-Audio 3.1 (`qwen-audio-3.1-asr-flash-streaming`), streaming
+
+The default moved from `paraformer-realtime-v2` on 2026-10-02: Alibaba calls
+Paraformer an older-generation model to migrate off, and on four 16-20 second
+clips Qwen-Audio 3.1 made 1.5% word errors against Paraformer's 3.6%, finishing
+about as fast (0.62 s vs 0.58 s after release). It covers 30 languages
+(including every one Paraformer did) and still detects the language when you
+leave it on the default. `stt_model: "paraformer-realtime-v2"` brings the old
+model back.
 
 **Getting a key:**
 1. Go to <https://dashscope.console.aliyun.com/apiKey>.
@@ -172,7 +189,15 @@ current rates and free-tier limits; both drift over time.
 - **`stt_provider` value:** `"local"`
 - **Key array:** none
 - **Mode:** offline batch; the transcript arrives after hotkey release
-- **Runtime:** pinned `transcribe.cpp` 0.1.3 CPU/Vulkan package
+- **Runtime:** pinned `transcribe.cpp` 0.2.4 CPU/Vulkan package (about 17 MB
+  to download)
+
+0.2.4 replaced 0.1.3 on 2026-10-02. It fixes Whisper silently dropping the end
+of a sentence after a pause when a vocabulary prompt is set, frees the GPU
+scratch memory after each run, trims Parakeet's memory use, and no longer
+cuts long outputs short. An installed model is kept: the app fetches only the
+new runtime the first time it starts (or the first time you dictate), then
+removes the old one unless another running copy is still using it.
 
 Choose **Local (offline)** in Settings. Pick any model, click **Install**, wait
 for the verified download, then Save. You can install any or all of the models:
@@ -263,9 +288,9 @@ nothing else changes.
 | ElevenLabs | `keyterms` | 50 terms, 20 characters each |
 | Deepgram | `keyterm` | 100 terms, and only on `nova-3`/`flux` models (older models reject the parameter) |
 | AssemblyAI | `keyterms_prompt` | 100 terms (their documented hard limit) |
-| OpenAI | transcription `prompt` | Terms are joined into one prompt string |
+| OpenAI | transcription `keywords` (`gpt-live-transcribe`) or `prompt` (older models) | One keyword per term; a term holding `<`, `>` or a line break is dropped because the API rejects the whole session over it. Older models get the terms joined into one prompt |
 | Google | `speechContexts[].phrases` | 5000 phrases |
-| DashScope | not supported | Paraformer needs a vocabulary registered up front through a separate API, so there is no inline term list to send |
+| DashScope | not supported | DashScope's realtime models need a vocabulary registered up front through a separate API, so there is no inline term list to send |
 | Local (offline) | Whisper `initial_prompt` | Whisper Large v3 Turbo only: terms are joined into one prompt, kept to whole terms within 200 bytes so that it and the text carried over from the previous window share Whisper's 223-token prompt budget, terms holding special-token text such as `<|en|>` are dropped, and it is re-applied to every 30-second window of a long dictation. Cohere Transcribe and Parakeet have no prompt input and ignore the list |
 
 If a term never sticks no matter what, fall back to `text_replacements`: that

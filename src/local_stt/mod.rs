@@ -23,8 +23,8 @@ pub use install::{
 };
 pub use worker::{request_prewarm, request_unload, transcribe};
 
-const RUNTIME_VERSION: &str = "0.1.3";
-const RUNTIME_SHA256: &str = "9f536cb0fb839bd305e6d92fb214fd417c7718a416a6c7646a9911fbd56fdad5";
+const RUNTIME_VERSION: &str = "0.2.4";
+const RUNTIME_SHA256: &str = "09705f54218817c065602ada8fd0f4d13b3f7fbb9d94929eeb3789c6c2b1f34a";
 
 #[derive(Clone, Copy, Debug)]
 pub struct ModelSpec {
@@ -117,7 +117,10 @@ fn runtime_verified(dir: &Path) -> bool {
             == Some(expected_runtime_marker().as_str())
 }
 
-pub fn is_installed(id: &str) -> bool {
+/// The model file itself is in place and verified, whatever the runtime's
+/// state. A build that pins a newer runtime finds the model this way and
+/// fetches only the runtime, never the multi-gigabyte weights again.
+pub fn model_verified(id: &str) -> bool {
     let Some(spec) = model(id) else {
         return false;
     };
@@ -129,6 +132,10 @@ pub fn is_installed(id: &str) -> bool {
     };
     path.metadata().map(|m| m.len()).ok() == Some(spec.download_bytes)
         && fs::read_to_string(marker).ok().as_deref() == Some(expected_marker(spec).as_str())
+}
+
+pub fn is_installed(id: &str) -> bool {
+    model_verified(id)
         && runtime_dir()
             .ok()
             .map(|p| runtime_verified(&p))

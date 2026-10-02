@@ -16,7 +16,7 @@ use super::download::{
     download_client, download_parallel, download_verified, range_segments, verify_model_hash_once,
     Fetch,
 };
-use super::install::{finish_operation, install, InstallPhase};
+use super::install::{finish_operation, install, prune_stale_runtimes, InstallPhase};
 use super::native::{
     join_and_clean, language_cstring, model_language, whisper_history_tokens,
     whisper_initial_prompt, ModelLoadParams, NativeEngine, RunParams, WhisperRunExt,
@@ -27,8 +27,8 @@ use super::postprocess::{
 };
 use super::worker::{idle_unload_due, IDLE_UNLOAD_AFTER};
 use super::{
-    expected_runtime_marker, is_installed, model, runtime_verified, ModelSpec, MODELS,
-    RUNTIME_VERSION,
+    expected_runtime_marker, is_installed, model, model_verified, runtime_verified, ModelSpec,
+    MODELS, RUNTIME_VERSION,
 };
 
 /// RED TEAM: the local-STT runtime arrives as a downloaded `.tar.gz` and is
@@ -417,9 +417,11 @@ fn decoder_loop_guard_is_conservative() {
 }
 
 #[test]
-fn ffi_layout_matches_transcribe_0_1_3_x64() {
-    assert_eq!(std::mem::size_of::<ModelLoadParams>(), 16);
-    assert_eq!(std::mem::size_of::<RunParams>(), 64);
+fn ffi_layout_matches_transcribe_0_2_4_x64() {
+    // 0.2 grew both: the int gpu_device became a device pointer (16 -> 24,
+    // per docs/migrating-to-0.2.md) and run params gained `diarize`.
+    assert_eq!(std::mem::size_of::<ModelLoadParams>(), 24);
+    assert_eq!(std::mem::size_of::<RunParams>(), 72);
     // transcribe_whisper_run_ext_init writes the library's own sizeof (80 on
     // x64) into this struct: any smaller and it would write past the end.
     assert_eq!(std::mem::size_of::<WhisperRunExt>(), 80);
@@ -689,10 +691,20 @@ fn join_and_clean_collapses_a_decoder_loop_that_spans_clips() {
 fn live_installed_cohere_prewarm_and_transcribe() {
     let spec = model("cohere-q5").unwrap();
     assert!(
-        is_installed(spec.id),
+        model_verified(spec.id),
         "install '{}' in QuickDictate Settings before running this test",
         spec.label
     );
+    if !is_installed(spec.id) {
+        // Installed under an older runtime than this build pins: what the
+        // app's runtime refresh does. It must fetch only the runtime.
+        let refresh = Instant::now();
+        install(spec, &AtomicBool::new(false)).unwrap();
+        eprintln!(
+            "runtime refresh for an installed model took {:.1}s",
+            refresh.elapsed().as_secs_f32()
+        );
+    }
 
     let pcm = read_speech_fixture().unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -716,4 +728,36 @@ fn live_installed_cohere_prewarm_and_transcribe() {
         !transcript.trim().is_empty(),
         "real Cohere inference returned an empty transcript"
     );
+}
+
+// Contract: activating a new runtime deletes older runtime folders, never the
+// active one, a staging folder, or a runtime a running copy has open.
+// Regression: a half-deleted runtime that an older QuickDictate still uses
+// loses its `.verified` marker, and that copy then offers to reinstall.
+#[test]
+fn prune_removes_old_runtimes_but_never_one_in_use() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let parent = test_path("prune-runtimes");
+    for dir in ["0.1.2", "0.1.3", "0.2.4", ".installing-7"] {
+        fs::create_dir_all(parent.join(dir)).unwrap();
+        fs::write(parent.join(dir).join("transcribe.dll"), b"stub").unwrap();
+    }
+    fs::write(parent.join("runtime-0.2.4.tar.gz"), b"archive").unwrap();
+    // Held open without delete sharing, the way a loaded DLL is.
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1) // FILE_SHARE_READ only
+        .open(parent.join("0.1.2").join("transcribe.dll"))
+        .unwrap();
+
+    prune_stale_runtimes(&parent, "0.2.4");
+
+    assert!(!parent.join("0.1.3").exists());
+    assert!(parent.join("0.2.4").join("transcribe.dll").is_file());
+    assert!(parent.join(".installing-7").is_dir());
+    assert!(parent.join("runtime-0.2.4.tar.gz").is_file());
+    assert!(parent.join("0.1.2").join("transcribe.dll").is_file());
+    drop(held);
+    let _ = fs::remove_dir_all(&parent);
 }

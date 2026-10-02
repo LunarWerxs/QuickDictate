@@ -98,6 +98,13 @@ pub async fn transcribe(
 /// dictation instead of making the first result appear to hang.
 pub fn request_prewarm(model_id: &str) {
     if !is_installed(model_id) {
+        // Installed under an older runtime than this build pins: fetch the
+        // runtime now (startup and Settings both land here) and prewarm after.
+        if super::model_verified(model_id) {
+            if let Err(e) = super::install::start_runtime_refresh(model_id) {
+                tracing::debug!("local runtime refresh for '{model_id}' not started: {e}");
+            }
+        }
         return;
     }
     let command = WorkerCommand::Prewarm(model_id.to_string());

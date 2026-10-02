@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **OpenAI now defaults to `gpt-live-transcribe`.** On four 16-20 second test clips the final
+  text arrives about 0.55 s after you let go of the key instead of 1.13 s, words appear while you
+  are still talking (the old default showed nothing until release), and it made no word errors
+  where `gpt-4o-transcribe` made 0.9%. Custom vocabulary goes in as its keyword list. Set
+  `stt_model` to `gpt-4o-transcribe` to keep the old model.
+- **DashScope now defaults to Qwen-Audio 3.1 (`qwen-audio-3.1-asr-flash-streaming`).** Alibaba
+  calls Paraformer an older generation to migrate off; on the same clips Qwen-Audio 3.1 made
+  1.5% word errors against Paraformer's 3.6% for about the same speed, covers 30 languages
+  including every one Paraformer did, and still detects the language on its own.
 - **A third offline model: NVIDIA Parakeet TDT 0.6B v3.** The smallest (524 MiB) and fastest
   local option: on an RTX 4070 Ti it loads in 1.7 s and turns a short phrase into text in 0.12 s,
   against 5.5 s and 0.31 s for Cohere. It covers 25 European languages; QuickDictate sends it
@@ -28,9 +37,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Offline runtime updated to transcribe.cpp 0.2.4** (from 0.1.3, a 17 MB download). It fixes
+  Whisper silently dropping the end of a sentence after a pause when a vocabulary prompt is set,
+  frees GPU scratch memory after each dictation, trims Parakeet's memory use, and stops long
+  outputs being cut short. Cohere also loads a little faster here (4.1 s vs 4.6 s) and decodes
+  a short phrase in 0.25 s instead of 0.31 s. **An installed model is kept:** the app fetches
+  only the new runtime on its first start (or first dictation) and removes the old runtime unless
+  another running copy still has it open.
 - **Less CPU between dictations.** The microphone stays open so a press starts instantly, but
   while nobody is dictating its audio is no longer converted sample by sample only to be thrown
   away.
+
+### Fixed
+
+- **The AI cleanup pass works with OpenAI's GPT-5, GPT-6 and o-series models.** It always sent
+  `temperature: 0`, which most of them reject, and let them think for seconds first. Those models
+  now get no temperature and `reasoning_effort: "none"`, falling back to `"low"` (remembered per
+  model) for the ones that refuse it, such as `gpt-6-astra`. The default stays `gpt-4.1-mini`: in
+  the same test it was as fast as any newer OpenAI model (0.9 s) and fixed 6 of 7 planted
+  mistakes.
 
 ## [1.2.2] - 2026-09-24
 

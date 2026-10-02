@@ -21,13 +21,18 @@ use super::{model, model_path, runtime_dir, RUNTIME_VERSION};
 type Status = c_int;
 type Session = c_void;
 
+/// `transcribe_model_load_params` (transcribe.cpp 0.2). `device` is an opaque
+/// handle from the runtime's device enumeration; left null (as
+/// `transcribe_model_load_params_init` sets it) the backend picks
+/// automatically, which is all this app asks for.
 #[repr(C)]
 pub(super) struct ModelLoadParams {
     struct_size: u64,
     backend: c_int,
-    gpu_device: c_int,
+    device: *const c_void,
 }
 
+/// `transcribe_run_params` (transcribe.cpp 0.2, which added `diarize`).
 #[repr(C)]
 pub(super) struct RunParams {
     struct_size: u64,
@@ -35,6 +40,7 @@ pub(super) struct RunParams {
     timestamps: c_int,
     pnc: c_int,
     itn: c_int,
+    diarize: c_int,
     language: *const c_char,
     target_language: *const c_char,
     keep_special_tags: bool,
@@ -42,8 +48,8 @@ pub(super) struct RunParams {
     spec_k_drafts: i32,
 }
 
-/// `transcribe_whisper_run_ext` from transcribe.cpp 0.1.3
-/// `include/transcribe/whisper.h`, reached through [`RunParams::family`].
+/// `transcribe_whisper_run_ext` from transcribe.cpp 0.2.4 (unchanged since
+/// 0.1.3) `include/transcribe/whisper.h`, reached through [`RunParams::family`].
 /// Mirrored here only to hand Whisper the user's custom vocabulary as its
 /// initial prompt: every other field keeps the value
 /// `transcribe_whisper_run_ext_init` gives it. The library's init writes its

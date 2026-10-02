@@ -361,7 +361,15 @@ async fn live_dashscope() {
 #[tokio::test]
 #[ignore = "live network + real key"]
 async fn live_openai() {
-    run_live("openai", Box::new(super::openai::OpenAiProvider)).await;
+    run_live(
+        "openai",
+        Box::new(super::openai::OpenAiProvider {
+            model: std::env::var("QUICKDICTATE_LIVE_MODEL")
+                .ok()
+                .filter(|m| !m.trim().is_empty()),
+        }),
+    )
+    .await;
 }
 
 #[tokio::test]

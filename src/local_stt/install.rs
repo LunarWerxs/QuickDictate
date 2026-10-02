@@ -14,11 +14,12 @@ use flate2::read::GzDecoder;
 use super::download::{check_cancelled, download_verified, write_atomic};
 use super::{
     expected_marker, expected_runtime_marker, is_installed, marker_path, model, model_dir,
-    root_dir, runtime_dir, runtime_verified, ModelSpec, RUNTIME_SHA256, RUNTIME_VERSION,
+    model_verified, root_dir, runtime_dir, runtime_verified, ModelSpec, RUNTIME_SHA256,
+    RUNTIME_VERSION,
 };
 
-const RUNTIME_URL: &str = "https://github.com/handy-computer/transcribe.cpp/releases/download/v0.1.3/transcribe-native-0.1.3-windows-x86_64-cpu-vulkan.tar.gz";
-const RUNTIME_BYTES: u64 = 25_957_910;
+const RUNTIME_URL: &str = "https://github.com/handy-computer/transcribe.cpp/releases/download/v0.2.4/transcribe-native-0.2.4-windows-x86_64-cpu-vulkan.tar.gz";
+const RUNTIME_BYTES: u64 = 17_433_342;
 const RUNTIME_ARCHIVE_ROOT: &str = "transcribe-native-windows-x86_64-cpu-vulkan";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,6 +190,19 @@ pub fn cancel_install(id: &str) -> Result<(), String> {
 }
 
 pub fn start_install(id: &str) -> Result<(), String> {
+    start_install_then(id, false)
+}
+
+/// The model is installed but this build pins a newer runtime than the one
+/// on disk: fetch only the runtime (the verified weights are kept, see
+/// [`install`]) and prewarm the model once it is usable, so an app update
+/// never makes a working Local setup ask to be installed again.
+pub(super) fn start_runtime_refresh(id: &str) -> Result<(), String> {
+    tracing::info!("local model '{id}' is installed; fetching the runtime this build pins");
+    start_install_then(id, true)
+}
+
+fn start_install_then(id: &str, prewarm_after: bool) -> Result<(), String> {
     let spec = *model(id).ok_or_else(|| format!("unknown local model '{id}'"))?;
     if is_installed(id) {
         return Ok(());
@@ -205,12 +219,17 @@ pub fn start_install(id: &str) -> Result<(), String> {
                 finish_operation(spec.id, InstallPhase::NotInstalled, 0, spec.download_bytes);
             } else {
                 match result {
-                    Ok(()) => finish_operation(
-                        spec.id,
-                        InstallPhase::Installed,
-                        spec.download_bytes,
-                        spec.download_bytes,
-                    ),
+                    Ok(()) => {
+                        finish_operation(
+                            spec.id,
+                            InstallPhase::Installed,
+                            spec.download_bytes,
+                            spec.download_bytes,
+                        );
+                        if prewarm_after {
+                            super::worker::request_prewarm(spec.id);
+                        }
+                    }
                     Err(e) => {
                         tracing::error!("local model '{}' install failed: {e}", spec.id);
                         finish_operation(spec.id, InstallPhase::Failed(e), 0, spec.download_bytes);
@@ -275,6 +294,11 @@ fn spawn_operation(
 pub(super) fn install(spec: &ModelSpec, cancel: &AtomicBool) -> Result<(), String> {
     ensure_runtime(spec, cancel)?;
     check_cancelled(cancel)?;
+    // Already-verified weights (size plus marker) are kept: a runtime bump
+    // must cost the runtime download, not the model's gigabytes again.
+    if model_verified(spec.id) {
+        return Ok(());
+    }
     set_state(
         spec.id,
         InstallPhase::DownloadingModel,
@@ -375,6 +399,34 @@ fn unpack_runtime(
     }
     fs::rename(&extracted, final_dir)
         .map_err(|e| format!("could not activate local runtime: {e}"))?;
+    if let Some(parent) = final_dir.parent() {
+        prune_stale_runtimes(parent, RUNTIME_VERSION);
+    }
     check_cancelled(cancel)?;
     Ok(())
+}
+
+/// Delete runtime folders other than `keep` under `runtime_parent`, once a
+/// newer runtime is active. Each is first renamed aside: Windows refuses to
+/// rename a folder whose DLLs a running process (an older QuickDictate copy
+/// still on that runtime) has loaded, so an in-use runtime is left whole
+/// rather than half-deleted. Dot-prefixed staging folders are not touched.
+pub(super) fn prune_stale_runtimes(runtime_parent: &Path, keep: &str) {
+    let Ok(entries) = fs::read_dir(runtime_parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == keep || name.starts_with('.') || !entry.path().is_dir() {
+            continue;
+        }
+        let aside = runtime_parent.join(format!(".stale-{name}-{}", std::process::id()));
+        match fs::rename(entry.path(), &aside) {
+            Ok(()) => match fs::remove_dir_all(&aside) {
+                Ok(()) => tracing::info!("removed old local runtime {name}"),
+                Err(e) => tracing::warn!("could not remove old local runtime {name}: {e}"),
+            },
+            Err(e) => tracing::info!("kept old local runtime {name} (in use?): {e}"),
+        }
+    }
 }

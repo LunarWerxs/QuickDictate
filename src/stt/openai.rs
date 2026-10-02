@@ -1,12 +1,17 @@
-//! OpenAI Realtime transcription adapter (gpt-4o-transcribe).
+//! OpenAI Realtime transcription adapter (gpt-live-transcribe by default).
 //!
 //! Uses the Realtime WebSocket with `intent=transcription` (the plain
 //! `/v1/audio/transcriptions` Whisper endpoint is batch-only). Audio is JSON
-//! base64 PCM16 at **24 kHz**. On connect we push a `transcription_session.update`
-//! to select the model and PCM16 format; transcription `.delta` events stream
-//! in (accumulated into a live partial) and `.completed` carries the final text.
+//! base64 PCM16 at **24 kHz**. On connect we push a `session.update` to select
+//! the model and PCM16 format; transcription `.delta` events stream in
+//! (accumulated into a live partial) and `.completed` carries the final text.
 //!
-//! Verified end-to-end against the live OpenAI Realtime API (2026-07);
+//! The default moved from gpt-4o-transcribe to gpt-live-transcribe on
+//! 2026-10-02, measured on four 16-20 s clips through this adapter's own
+//! wire shape: final text 0.55 s after commit instead of 1.13 s, words while
+//! the user is still talking instead of none, and no word errors (0.9%
+//! before). `stt_model` still selects any other model.
+//!
 //! `live_test::live_openai` exercises it with a real `OPENAI_KEYS` key.
 
 use async_trait::async_trait;
@@ -22,9 +27,19 @@ use super::ws::{self, Frame, WsReader, WsSink};
 use crate::keys::FailKind;
 
 const WS_URL: &str = "wss://api.openai.com/v1/realtime?intent=transcription";
-const DEFAULT_MODEL: &str = "gpt-4o-transcribe";
+const DEFAULT_MODEL: &str = "gpt-live-transcribe";
 
-pub struct OpenAiProvider;
+/// `model` is the user's `stt_model` override, if any: it decides whether
+/// words stream while they talk ([`SttProvider::streams_interim_text`]).
+pub struct OpenAiProvider {
+    pub model: Option<String>,
+}
+
+impl OpenAiProvider {
+    fn model(&self) -> &str {
+        self.model.as_deref().unwrap_or(DEFAULT_MODEL)
+    }
+}
 
 #[async_trait]
 impl SttProvider for OpenAiProvider {
@@ -39,14 +54,14 @@ impl SttProvider for OpenAiProvider {
         }
     }
 
-    /// Measured against the live API on 2026-09-11: with `turn_detection`
-    /// null (manual commit, what this adapter uses) OpenAI sends NO delta
-    /// while the user is speaking. The first one landed 0.9 s after commit
-    /// and the whole transcript streamed in over the next 100 ms. So the pip
-    /// spins here, like the batch providers, instead of showing a "0" that
-    /// never moves for the length of the dictation.
+    /// Depends on the model. With `turn_detection` null (manual commit, what
+    /// this adapter uses) gpt-4o-transcribe sends NO delta while the user is
+    /// speaking (measured 2026-09-11: the first landed 0.9 s after commit),
+    /// so for it the pip spins like the batch providers instead of showing a
+    /// "0" that never moves. The live models stream words during speech
+    /// ([`streams_while_speaking`]), so their pip counts them.
     fn streams_interim_text(&self) -> bool {
-        false
+        streams_while_speaking(self.model())
     }
 
     /// A key with no credit left connects and accepts audio; OpenAI says so
@@ -74,7 +89,7 @@ impl SttProvider for OpenAiProvider {
         key: &str,
         opts: &SttSessionOpts,
     ) -> Result<ProviderSession, ConnectError> {
-        let model = opts.model.as_deref().unwrap_or(DEFAULT_MODEL);
+        let model = opts.model.as_deref().unwrap_or(self.model());
         let mut conn = ws::connect(WS_URL, "Authorization", &format!("Bearer {key}")).await?;
 
         // Configure the transcription session (GA Realtime shape). Manual commit
@@ -93,17 +108,63 @@ impl SttProvider for OpenAiProvider {
     }
 }
 
+/// Whether `model` is OpenAI's live-transcription model, which takes a
+/// different `transcription` object (see [`build_session_update`]).
+fn is_live_model(model: &str) -> bool {
+    model.starts_with("gpt-live-transcribe")
+}
+
+/// Whether `model` sends transcript deltas while the user is still talking
+/// with manual commit. Measured 2026-10-02 on four 16-20 s clips: the live
+/// model and gpt-realtime-whisper send their first delta about 0.5-1.2 s
+/// into speech; gpt-4o-transcribe, gpt-4o-mini-transcribe and gpt-transcribe
+/// send nothing until the commit.
+fn streams_while_speaking(model: &str) -> bool {
+    is_live_model(model) || model.starts_with("gpt-realtime-whisper")
+}
+
+/// The live model's latency/accuracy dial (`minimal` .. `xhigh`). Measured
+/// 2026-10-02 against the same four clips: `low` returned the final 0.55 s
+/// after commit with its first delta 0.76 s into speech and no word errors;
+/// `minimal` was 0.38 s / 0.46 s but misheard a word.
+const LIVE_DELAY: &str = "low";
+
 /// Build the `session.update` payload for `model`/`opts`. Pure
-/// (fixture-tested); `connect` just serializes and sends this. Unlike the
-/// term-list biasing knobs the other providers use, `gpt-4o-transcribe`
-/// takes a free-text `prompt` -- `vocabulary_prompt()` joins the vocabulary
-/// into one. The field is added only when the vocabulary is non-empty, so a
-/// user with none set gets the exact same request as before this existed.
+/// (fixture-tested); `connect` just serializes and sends this.
+///
+/// `gpt-live-transcribe` takes `languages` (a list of bare codes; the
+/// singular `language` alongside it is rejected), `delay`, and the
+/// vocabulary as `keywords` -- one term each; a term holding `<`, `>` or a
+/// line break fails the whole session, so such terms are dropped. The older
+/// models take `language` and a free-text `prompt`, which
+/// `vocabulary_prompt()` builds. Either way the vocabulary field is added
+/// only when the vocabulary is non-empty.
 fn build_session_update(model: &str, opts: &SttSessionOpts) -> serde_json::Value {
-    let mut transcription = json!({ "model": model, "language": opts.language });
-    let prompt = opts.vocabulary_prompt();
-    if !prompt.is_empty() {
-        transcription["prompt"] = json!(prompt);
+    let language = opts.language.trim();
+    let detect = language.is_empty() || language.eq_ignore_ascii_case("auto");
+    let mut transcription = json!({ "model": model });
+    if is_live_model(model) {
+        if !detect {
+            transcription["languages"] = json!([language]);
+        }
+        transcription["delay"] = json!(LIVE_DELAY);
+        let keywords: Vec<&str> = opts
+            .custom_vocabulary
+            .iter()
+            .map(|term| term.trim())
+            .filter(|term| !term.is_empty() && !term.contains(['<', '>', '\r', '\n']))
+            .collect();
+        if !keywords.is_empty() {
+            transcription["keywords"] = json!(keywords);
+        }
+    } else {
+        if !detect {
+            transcription["language"] = json!(language);
+        }
+        let prompt = opts.vocabulary_prompt();
+        if !prompt.is_empty() {
+            transcription["prompt"] = json!(prompt);
+        }
     }
     json!({
         "type": "session.update",
@@ -363,19 +424,68 @@ mod tests {
         }
     }
 
+    const OLDER_MODEL: &str = "gpt-4o-transcribe";
+
+    fn transcription(model: &str, opts: &SttSessionOpts) -> serde_json::Value {
+        build_session_update(model, opts)["session"]["audio"]["input"]["transcription"].clone()
+    }
+
     #[test]
     fn empty_vocabulary_omits_prompt_field() {
-        let update = build_session_update(DEFAULT_MODEL, &test_opts(vec![]));
-        let transcription = &update["session"]["audio"]["input"]["transcription"];
-        assert!(transcription.get("prompt").is_none());
-        assert_eq!(transcription["model"], DEFAULT_MODEL);
-        assert_eq!(transcription["language"], "en");
+        let t = transcription(OLDER_MODEL, &test_opts(vec![]));
+        assert!(t.get("prompt").is_none());
+        assert_eq!(t["model"], OLDER_MODEL);
+        assert_eq!(t["language"], "en");
     }
 
     #[test]
     fn vocabulary_sets_prompt_field() {
-        let update = build_session_update(DEFAULT_MODEL, &test_opts(vec!["Anthropic", "Claude"]));
-        let transcription = &update["session"]["audio"]["input"]["transcription"];
-        assert_eq!(transcription["prompt"], "Anthropic, Claude");
+        let t = transcription(OLDER_MODEL, &test_opts(vec!["Anthropic", "Claude"]));
+        assert_eq!(t["prompt"], "Anthropic, Claude");
+    }
+
+    // Contract: the live model's session.update is the shape its API accepts.
+    // Regression (each verified live 2026-10-02): sending `language` with
+    // `languages` is rejected, and one keyword holding `<` fails the whole
+    // session, so either mistake would kill every OpenAI dictation.
+    #[test]
+    fn live_model_takes_languages_delay_and_clean_keywords() {
+        let t = transcription(
+            DEFAULT_MODEL,
+            &test_opts(vec!["Anthropic", " Claude ", "a<b", "two\nlines", ""]),
+        );
+        assert_eq!(t["model"], "gpt-live-transcribe");
+        assert_eq!(t["languages"], json!(["en"]));
+        assert!(t.get("language").is_none());
+        assert_eq!(t["delay"], LIVE_DELAY);
+        assert_eq!(t["keywords"], json!(["Anthropic", "Claude"]));
+        assert!(t.get("prompt").is_none());
+
+        let none = transcription(DEFAULT_MODEL, &test_opts(vec![]));
+        assert!(none.get("keywords").is_none());
+    }
+
+    #[test]
+    fn auto_language_sends_no_language_hint_to_either_shape() {
+        let mut opts = test_opts(vec![]);
+        opts.language = "auto".into();
+        assert!(transcription(DEFAULT_MODEL, &opts)
+            .get("languages")
+            .is_none());
+        assert!(transcription(OLDER_MODEL, &opts).get("language").is_none());
+    }
+
+    #[test]
+    fn only_streaming_models_promise_words_while_speaking() {
+        let pip = |model: Option<&str>| {
+            OpenAiProvider {
+                model: model.map(String::from),
+            }
+            .streams_interim_text()
+        };
+        assert!(pip(None));
+        assert!(pip(Some("gpt-realtime-whisper")));
+        assert!(!pip(Some(OLDER_MODEL)));
+        assert!(!pip(Some("gpt-transcribe")));
     }
 }

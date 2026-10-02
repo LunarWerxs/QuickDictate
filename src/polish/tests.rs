@@ -355,3 +355,83 @@ fn a_junk_reply_is_an_error_not_a_panic() {
     assert!(parse_reply(r#"{"choices":[]}"#).is_err());
     assert!(parse_reply(r#"{"choices":[{"message":{"content":"sorry!"}}]}"#).is_err());
 }
+
+// Contract: each model family gets the request its API accepts. Regression
+// (each measured live 2026-10-02): `temperature: 0` makes gpt-5.5, gpt-5.6-*,
+// gpt-6-* and o4-mini answer 400, `reasoning_effort` makes gpt-4.1-* answer
+// 400, and a reasoning model left at its default effort thinks for seconds,
+// so any of these silently ends the cleanup pass for that model.
+#[test]
+fn request_shape_follows_the_model_family() {
+    let shape = |model: &str| {
+        let body = request_body(model, "text", reasoning_effort(model));
+        (
+            body.get("temperature").is_some(),
+            body.get("reasoning_effort")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+        )
+    };
+    assert_eq!(shape("gpt-4.1-mini"), (true, None));
+    assert_eq!(
+        shape("gemini-flash-lite-latest"),
+        (true, Some("low".into()))
+    );
+    assert_eq!(shape("gpt-5.4-mini"), (false, Some("none".into())));
+    assert_eq!(shape("gpt-6-luna"), (false, Some("none".into())));
+    assert_eq!(shape("o4-mini"), (false, Some("none".into())));
+}
+
+/// Keys from the gitignored `my.keys.env` (the live STT tests' file).
+fn live_openai_keys() -> Vec<String> {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/my.keys.env");
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("OPENAI_KEYS=").map(String::from))
+        .map(|v| {
+            v.split(',')
+                .map(|k| k.trim().to_string())
+                .filter(|k| !k.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+// The real API is the only proof the shapes above are accepted, including
+// the "none" -> "low" fallback a low-only model (gpt-6-astra) needs.
+#[tokio::test]
+#[ignore = "live network + real OpenAI key"]
+async fn live_reasoning_models_answer_the_cleanup_request() {
+    let client = reqwest::Client::new();
+    let text = "So I was looking at the numbers and. I think we should push the launch.";
+    for model in ["gpt-5.4-mini", "gpt-6-astra", "gpt-4.1-mini"] {
+        let mut last = String::from("no key in my.keys.env");
+        let mut ok = false;
+        for key in live_openai_keys() {
+            let settings = PolishSettings {
+                endpoint: "https://api.openai.com/v1/chat/completions".into(),
+                model: model.into(),
+                keys: vec![key.clone()],
+                deadline: Duration::from_secs(10),
+            };
+            match request_edits(&client, &settings, &key, text).await {
+                Ok(edits) => {
+                    eprintln!(
+                        "{model}: {} edit(s), effort now {:?}",
+                        edits.len(),
+                        reasoning_effort(model)
+                    );
+                    ok = true;
+                    break;
+                }
+                // A dead or unfunded key is the key's problem; try the next.
+                Err(e) if e.starts_with("HTTP 401") || e.starts_with("HTTP 429") => last = e,
+                Err(e) => panic!("{model}: {e}"),
+            }
+        }
+        assert!(ok, "{model}: every key failed; last: {last}");
+    }
+    assert_eq!(reasoning_effort("gpt-6-astra"), Some("low"));
+    assert_eq!(reasoning_effort("gpt-5.4-mini"), Some("none"));
+}
