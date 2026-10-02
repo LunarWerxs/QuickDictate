@@ -88,7 +88,10 @@ pub(crate) struct Product {
 }
 
 /// Both products are sold per installation. Replace the ids and the URLs
-/// together when the products move.
+/// together when the products move. Only the perpetual one is offered: the
+/// monthly plan is off sale until a guest buyer can cancel without logging in
+/// (Legal room ruling, issue 1, 2026-10-02). Its entry stays so a key bought
+/// before then still verifies, and so it can return when the gates pass.
 pub(crate) const PRODUCTS: [Product; 2] = [
     Product {
         id: "bf8dca80-4036-48ad-91f4-80baa1dbb9e3",

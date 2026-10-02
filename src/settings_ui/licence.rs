@@ -162,21 +162,16 @@ impl super::SettingsApp {
             );
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                for plan in [Plan::Perpetual, Plan::Monthly] {
-                    let p = licence::product_for(plan);
-                    let label = match plan {
-                        Plan::Perpetual => "Buy perpetual",
-                        Plan::Monthly => "Buy monthly",
-                    };
-                    if ui
-                        .button(format!("{label} \u{00B7} {}", p.price))
-                        .on_hover_text(
-                            "Opens the checkout in your browser. The key arrives by email.",
-                        )
-                        .clicked()
-                    {
-                        licence::open_buy(plan);
-                    }
+                // Perpetual only: the monthly plan is off sale until a guest
+                // buyer can cancel without logging in (Legal room ruling,
+                // issue 1, 2026-10-02).
+                let p = licence::product_for(Plan::Perpetual);
+                if ui
+                    .button(format!("Buy perpetual \u{00B7} {}", p.price))
+                    .on_hover_text("Opens the checkout in your browser. The key arrives by email.")
+                    .clicked()
+                {
+                    licence::open_buy(Plan::Perpetual);
                 }
                 if ui
                     .link(RichText::new("Manage your licence").size(12.5))
