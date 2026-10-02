@@ -63,6 +63,7 @@ use crate::hotkeys::HotkeyEvent;
 // Split out of this file so the timing-critical callback can be reviewed on
 // its own; the hub keeps the configuration, the state, and installation.
 mod callback;
+pub(crate) use callback::{current_modifiers, key_down};
 
 #[cfg(test)]
 mod tests;

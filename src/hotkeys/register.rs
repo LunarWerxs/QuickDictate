@@ -56,12 +56,14 @@ pub(super) unsafe fn register_one(id: i32, combo: &str, mods: u32, vk: u32, quie
 /// message loop, so the hotkeys self-heal within a minute instead of the whole
 /// thread dying and leaving the app hotkey-dead until the next manual restart
 /// (the pre-fix behavior). Attempts are quiet; this fn owns the summary logs.
+/// Returns whether the toggle and hold bindings are registered (true for one
+/// that is not configured).
 fn register_initial(
     toggle_id: i32,
     toggle: Option<&ParsedCombo>,
     hold_id: i32,
     hold: Option<&ParsedCombo>,
-) {
+) -> (bool, bool) {
     let deadline = Instant::now() + STARTUP_REGISTER_BUDGET;
     let mut toggle_done = toggle.is_none();
     let mut hold_done = hold.is_none();
@@ -84,6 +86,7 @@ fn register_initial(
     } else if retried {
         tracing::info!("hotkeys registered after a brief retry (handoff from previous instance)");
     }
+    (toggle_done, hold_done)
 }
 
 /// One `register_initial` attempt for one binding: register it unless it is
@@ -156,6 +159,30 @@ fn start_mouse_hook(
     mouse_hook::ensure_installed();
 }
 
+/// Start the watch for presses Windows drops (see [`watch`]) on the keyboard
+/// bindings. Must run on the hotkey thread, for the same reason as the mouse
+/// hook.
+fn start_watch(
+    b: &HotkeyBindings<'_>,
+    toggle_registered: bool,
+    hold_registered: bool,
+    tx: &Sender<HotkeyEvent>,
+) {
+    let watched: Vec<(i32, u32, u32, bool)> = [
+        (b.toggle_id, b.kb_toggle, false),
+        (b.hold_id, b.kb_hold, true),
+    ]
+    .into_iter()
+    .filter_map(|(id, binding, hold)| binding.map(|(_, mods, vk)| (id, *mods, *vk, hold)))
+    .collect();
+    if watched.is_empty() {
+        return;
+    }
+    watch::start(&watched, tx.clone());
+    watch::set_registered(b.toggle_id, toggle_registered);
+    watch::set_registered(b.hold_id, hold_registered);
+}
+
 /// Pump this thread's messages until shutdown or `WM_QUIT`, handing each one
 /// to `dispatch_hotkey_message`.
 fn pump_hotkey_messages(b: &HotkeyBindings<'_>, tx: &Sender<HotkeyEvent>, stop_flag: &AtomicBool) {
@@ -189,6 +216,7 @@ fn release_hotkeys(b: &HotkeyBindings<'_>, rearm_timer: usize) {
             let _ = UnregisterHotKey(null_hwnd, b.hold_id);
         }
     }
+    watch::stop();
     // Drop the hook before we return, so a replacement process (Save &
     // Restart, or the self-updater) isn't racing a stale hook of ours for the
     // same buttons.
@@ -232,7 +260,9 @@ pub(super) fn run_hotkey_loop(
         reinsert_hold_duration,
     };
 
-    register_initial(toggle_id, kb_toggle, hold_id, kb_hold);
+    let (toggle_registered, hold_registered) =
+        register_initial(toggle_id, kb_toggle, hold_id, kb_hold);
+    start_watch(&bindings, toggle_registered, hold_registered, &tx);
 
     if bindings.has_mouse {
         start_mouse_hook(
