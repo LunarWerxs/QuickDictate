@@ -36,7 +36,7 @@ See the [changelog](../CHANGELOG.md) for what's changed release to release.
 - **Text streams in as you speak**, for the streaming providers, words paste back live instead of waiting for you to finish.
 - **Fix the words it always mishears**, a small replacement table turns "Chat GPT" into "ChatGPT", "Github" into "GitHub", and whatever else your accent and your provider disagree on.
 - **Updates itself, only if you let it**, an optional once-a-day check for a newer release (plus a button in Settings). Downloads are verified by size **and** SHA-256, and nothing installs until you say yes.
-- **Nothing else leaves your machine**, turn off *Check for updates daily* and even that check stops. Beyond it, nothing leaves your machine except your dictation audio (to the provider you chose), and, only if you opt in, Connections settings sync (preferences only, never keys/audio) or a daily anonymized usage rollup (aggregate word/audio/dictation totals, no dictated text).
+- **Nothing else leaves your machine**, turn off *Check for updates daily* and even that check stops. Beyond it, nothing leaves your machine except your dictation audio (to the provider you chose), and, only if you opt in, Connections settings sync (preferences only, never keys/audio) or a daily pseudonymous usage rollup (aggregate word/audio/dictation totals tied to a random install id, no dictated text).
 
 That replacement table, since it's the fiddly-but-lovely part:
 
@@ -70,7 +70,7 @@ That replacement table, since it's the fiddly-but-lovely part:
 A couple of gotchas:
 - **Google** is the only non-streaming one: long dictations upload in bounded ~55-second batches, but all results are held until release, so there is no live word count.
 - **Local** is also non-streaming, but uploads nothing. It buffers bounded 16 kHz PCM in memory and transcribes when you release the hotkey.
-- **DashScope is region-sensitive.** It defaults to the mainland-China host; set `"dashscope_intl": true` for the International host. A key from the wrong region just won't connect.
+- **DashScope is region-sensitive.** It defaults to the International (Singapore) host; set `"dashscope_intl": false` for the mainland-China host. A key from the wrong region just won't connect.
 
 Full per-provider setup notes live in [docs/providers.md](providers.md).
 
@@ -85,7 +85,7 @@ Everything lives in `settings.json` (copied from `settings.example.json`). The f
 | `stt_model` | Optional model-override string (`null` = provider default) |
 | `local_model` | Local model id: `"cohere-q5"` (default), `"whisper-turbo-q5"` or `"parakeet-v3-q5"` |
 | `local_idle_unload_minutes` | Minutes of no dictation before the local model is released from memory (default `10`). `0` keeps it loaded for as long as QuickDictate runs, so no dictation ever waits for a reload (Settings › Behavior › Never go to sleep) |
-| `dashscope_intl` | `false` = mainland-China host (default), `true` = International host |
+| `dashscope_intl` | `true` = International (Singapore) host (default), `false` = mainland-China host |
 | `language` | BCP-47 language tag, e.g. `"en-US"` |
 | `mode` | `"toggle"` or `"hold"` |
 | `toggle_hotkey` / `hold_hotkey` | Default `"f14"` / `"f13"`. Can be a key (`"f14"`, `"ctrl+shift+d"`) **or a mouse button**, see [Mouse buttons as hotkeys](#mouse-buttons-as-hotkeys) |
@@ -105,12 +105,12 @@ Everything lives in `settings.json` (copied from `settings.example.json`). The f
 | `log_transcripts` | Also log your full dictated text, not just summaries (bool, default `false`; deep debugging only) |
 | `max_log_mb` | Log-file rotation cap, in MB, before `quickdictate.log` is rolled over (default `5`) |
 | `error_reporting_enabled` | Show "Create an error report..." in Settings (bool, default `false`). Builds a plain-text report from your version, active provider, and recent redacted log lines for you to review and optionally save to `error-reports\` -- never audio or dictated text, and nothing is ever sent anywhere; see SECURITY.md |
-| `update_auto_check` | Check for a newer release at startup, at most once/day (bool, default `true`). Finding one **reports** it on the tray tooltip and the About pill; clicking the pill installs it |
+| `update_auto_check` | Check for a newer release at startup, at most once/day (bool, default `true`). Finding one **reports** it on the tray tooltip and the About pill; clicking the pill installs it. The About window obeys this switch: with it off, opening About checks nothing, and its pill reads **Check for updates** and checks only when you click it |
 | `update_auto_install` | Install a newer release with no prompt (bool, default `false`). Off by default because the download URL and its SHA-256 both come from the same release payload, so a click is the only thing standing between a compromised publish and every install; see SECURITY.md |
 | `protect_keys_at_rest` | Encrypt the API keys in `settings.json` with Windows DPAPI (bool, default `false`). **Costs portability:** a sealed file only decrypts for this Windows account on this machine, so copying the folder elsewhere means pasting the keys in again |
-| `share_usage_stats` | Send LunarWerx one anonymized daily rollup of your lifetime word/audio/dictation totals and provider mix (bool, default `false`). No dictated text, hostname, username, or account info; see SECURITY.md |
+| `share_usage_stats` | Send LunarWerx one pseudonymous daily rollup of your lifetime word/audio/dictation totals and provider mix, tied to a random install id (bool, default `false`). No dictated text, hostname, username, or account info; see SECURITY.md |
 | `custom_vocabulary` | Array of words/phrases sent to the provider to bias recognition (names, jargon, product names). Different from `text_replacements`, which repairs text *after* recognition; this tries to get it right the first time. Providers without a biasing parameter ignore it |
-| `install_id` | Random id sent with update checks (string, generated on first launch; never derived from your machine or identity, clear it for a fresh one) |
+| `install_id` | Random id sent only with the opt-in usage report, never with update checks (string, generated on first launch; never derived from your machine or identity, clear it for a fresh one) |
 | `run_at_startup` | Start QuickDictate at Windows login via the per-user Run key (bool, default `false`) |
 | `prewarm_keys` | Probe the active provider's keys at startup and queue a validated one (bool, default `true`) |
 | `text_replacements` | JSON object mapping misheard phrases to corrections. All rules apply in one pass over the original text (longest match wins); one rule's output is never re-processed by another, so write each rule as a direct source-to-final mapping rather than a chain |
@@ -286,7 +286,7 @@ QuickDictate is free for personal use and for use by charities, schools, public 
 
 ## Privacy
 
-QuickDictate streams your microphone audio to the **one third-party STT provider you select**, and only that one. Your API keys and your audio never touch the QuickDictate maintainer. The app itself reports two things, both to LunarWerx and both leaving nothing but numbers: the **optional daily update check**, and, only if you separately opt in, one **anonymized daily usage rollup** (aggregate word/audio/dictation totals and provider mix, never dictated text); the full disclosure for both is in [SECURITY.md](../.github/SECURITY.md), and each has its own Settings toggle you can turn off independently. Redeeming a licence key, and renewing its certificate about once a day after that, sends the key, a random install id and an anonymous hash of this machine's id to Connections' licensing service; personal copies with no key never make that call. Beyond that, nothing leaves your machine except your dictation audio (to the provider you chose) and, only if you opt in, Connections settings sync, which syncs preferences only (mode, language, hotkeys, STT provider/model, etc.) and never your API keys, audio, or transcripts. See [docs/SETTINGS_SYNC.md](SETTINGS_SYNC.md) for details, including how to turn it off. Locally, it only uses the OS clipboard and keystroke APIs to paste text into your focused window.
+QuickDictate streams your microphone audio to the **one third-party STT provider you select**, and only that one. Your API keys and your audio never touch the QuickDictate maintainer. The app itself reports two things, both to LunarWerx and both leaving nothing but numbers: the **optional daily update check**, and, only if you separately opt in, one **pseudonymous daily usage rollup** (aggregate word/audio/dictation totals and provider mix, tied to a random install id, never dictated text); the full disclosure for both is in [SECURITY.md](../.github/SECURITY.md), and each has its own Settings toggle you can turn off independently. Redeeming a licence key, and renewing its certificate about once a day after that, sends the key, a random install id and a one-way hash of this machine's id to Connections' licensing service; personal copies with no key never make that call. Beyond that, nothing leaves your machine except your dictation audio (to the provider you chose) and, only if you opt in, Connections settings sync, which syncs preferences only (mode, language, hotkeys, STT provider/model, etc.) and never your API keys, audio, or transcripts. See [docs/SETTINGS_SYNC.md](SETTINGS_SYNC.md) for details, including how to turn it off. Locally, it only uses the OS clipboard and keystroke APIs to paste text into your focused window.
 
 Local logging (`enable_logging`) writes event summaries, not your recognized text, to `logs\quickdictate.log` beside the exe. A separate `log_transcripts` setting, off by default, opts into logging the full dictated text for deep debugging; nothing written locally is ever sent anywhere. The Stats window uses a separate `quickdictate-stats.json` containing only numeric aggregates-never transcript text or API keys.
 
@@ -294,7 +294,7 @@ More detail in [SECURITY.md](../.github/SECURITY.md).
 
 ## Antivirus / SmartScreen
 
-The released `.exe` is currently **unsigned**, and QuickDictate installs a global hotkey and synthesizes keystrokes to paste text, which, to Windows Defender and SmartScreen, looks a lot like a keylogger. So you may get a "Windows protected your PC" prompt: click **More info** → **Run anyway**. Some antivirus tools may flag the binary too; it's a known false positive tied to the keystroke-injection technique, not anything malicious. Code signing is on the roadmap.
+Releases from v1.4.0 on are **code-signed**; earlier ones are not. QuickDictate installs a global hotkey and synthesizes keystrokes to paste text, which, to Windows Defender and SmartScreen, looks a lot like a keylogger, and a new signature takes a while to build SmartScreen reputation. So you may still get a "Windows protected your PC" prompt: click **More info** → **Run anyway**. Some antivirus tools may flag the binary too; it's a known false positive tied to the keystroke-injection technique, not anything malicious.
 
 ## Contributing
 
@@ -302,4 +302,4 @@ Bug reports and pull requests are welcome, there are issue templates under [.git
 
 ## License
 
-[PolyForm Noncommercial 1.0.0](../LICENSE), starting with v0.9.0: free for noncommercial use; commercial use needs a license from LunarWerx Studios, one per installation: [US$19.99 once](https://checkout.connections.icu/licence/bf8dca80-4036-48ad-91f4-80baa1dbb9e3) (perpetual); to move or refund one, email lunawerx@gmail.com. Releases through v0.8.0 were MIT, and that grant stays in effect for those copies. Made by [LunarWerx Studios](https://lunarwerx.com).
+[PolyForm Noncommercial 1.0.0](../LICENSE), starting with v0.9.0: free for personal use, and for nonprofit organisations and government bodies, and a business may try it free for up to 10 days on each installation (see the additional permissions in [LICENSE](../LICENSE)); commercial use needs a license from LunarWerx Studios, one per installation: [US$19.99 once](https://checkout.connections.icu/licence/bf8dca80-4036-48ad-91f4-80baa1dbb9e3) (perpetual). To move a license to another PC or ask for a refund, email [lunawerx@gmail.com](mailto:lunawerx@gmail.com). Releases through v0.8.0 were MIT, and that grant stays in effect for those copies. Made by [LunarWerx Studios](https://lunarwerx.com).

@@ -388,6 +388,36 @@ fn every_relocatable_entry_is_named_once() {
     assert_eq!(before, seen.len(), "a data file is listed twice");
 }
 
+#[test]
+fn relocatable_lists_the_prompt_state_usage_report_and_error_reports() {
+    for name in [
+        "quickdictate-feedback.json",
+        "quickdictate-nudge.json",
+        "quickdictate-crash-banner.json",
+        "quickdictate-usage-report.txt",
+        "error-reports",
+    ] {
+        assert!(RELOCATABLE.contains(&name), "{name} is not relocated");
+    }
+    // `folder_caution` skips the first entry as the thing it judges.
+    assert_eq!(RELOCATABLE[0], "logs");
+}
+
+#[test]
+fn migrate_into_moves_the_error_reports_folder_whole() {
+    let root = temp_dir("error-reports-move");
+    let (source, dest) = (root.join("old"), root.join("new"));
+    std::fs::create_dir_all(source.join("error-reports")).unwrap();
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::write(source.join("error-reports").join("report.txt"), b"r").unwrap();
+
+    migrate_into(&source, &dest);
+
+    assert!(dest.join("error-reports").join("report.txt").is_file());
+    assert!(!source.join("error-reports").exists());
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
 /// The 2026-09-18 incident: an isolated copy run under QUICKDICTATE_DATA_DIR
 /// swept the regular install's recorded folder and took its files. `init`
 /// passes no recorded folder for such a run, so only its own folders remain.

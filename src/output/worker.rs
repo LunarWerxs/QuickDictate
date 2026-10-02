@@ -387,9 +387,7 @@ pub(super) fn paste_processed(
             tracing::error!("paste PANICKED (caught; thread continues)");
             app.raise_error(ErrorKind::Generic);
             if keep_on_clipboard {
-                if let Err(e) = copy_to_clipboard(processed) {
-                    tracing::warn!("could not leave the transcription on the clipboard ({e:#})");
-                }
+                leave_on_clipboard(processed);
             }
         }
     }

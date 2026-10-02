@@ -37,7 +37,7 @@ const APP_ID: &str = "quickdictate";
 const APP_NAME: &str = "QuickDictate";
 
 /// Beside `quickdictate-stats.json` and the sync credential blob, for the reason in the module doc.
-const STATE_FILE: &str = "quickdictate-nudge.json";
+pub(crate) const STATE_FILE: &str = "quickdictate-nudge.json";
 
 // ===== on-disk shape =====
 

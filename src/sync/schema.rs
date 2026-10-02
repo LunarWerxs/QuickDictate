@@ -21,7 +21,7 @@ use super::STATS_KEY;
 ///   * `data_dir` — an absolute path on *this* PC. Syncing it would point a
 ///     second machine at a folder that may not exist there (or, worse, at
 ///     somebody else's folder that does);
-///   * `install_id` — this install's anonymous update-check id; syncing it
+///   * `install_id` — this install's pseudonymous usage-report id; syncing it
 ///     would merge two machines' identities into one;
 ///   * `update_auto_install` — a machine-local policy choice (whether *this*
 ///     machine applies updates unattended); syncing it would silently opt a
@@ -91,7 +91,7 @@ pub(super) const SYNCED_KEYS: &[&str] = &[
     // sealed blob: on another machine it seals THAT machine's keys with THAT account,
     // which is exactly what someone who turned it on here would want.
     "protect_keys_at_rest",
-    // "I'm fine with LunarWerx seeing an anonymized usage rollup" is a stated preference
+    // "I'm fine with LunarWerx seeing a pseudonymous usage rollup" is a stated preference
     // about the person, same shape as `update_auto_check` — not a machine property. Only
     // the boolean travels; each machine still reports under its own `install_id` (which
     // stays in NEVER_SYNCED below), so this can never merge two machines' identities.
@@ -134,7 +134,7 @@ pub(super) const NEVER_SYNCED: &[&str] = &[
     // above now sync; turning this one on somewhere from somewhere else is a privacy change
     // being made for you, on a machine you were not looking at.
     "log_transcripts",
-    "install_id", // anonymous per-install id; syncing would merge two machines' identities
+    "install_id", // pseudonymous per-install id; syncing would merge two machines' identities
     "update_auto_install", // machine-local unattended-update policy choice
     // Same reasoning as `log_transcripts`: turning this on somewhere from
     // somewhere else would be a privacy-relevant decision (whether local

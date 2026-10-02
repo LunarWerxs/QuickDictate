@@ -153,3 +153,25 @@ fn status_label_failed_is_red() {
     assert_eq!(text, "Check failed");
     assert_eq!(color, rgb(190, 110, 110));
 }
+
+#[test]
+fn status_label_idle_offers_a_check() {
+    let (_, text) = status_label(&Status::Idle);
+    assert_eq!(text, "Check for updates");
+}
+
+// ---- open_status ----
+
+#[test]
+fn opening_about_checks_only_when_update_checks_are_on() {
+    assert_eq!(open_status(true, false), Status::Checking);
+    // Off: opening the box alone must not reach the network.
+    assert_eq!(open_status(false, false), Status::Idle);
+}
+
+#[test]
+fn an_explicit_check_request_overrides_the_off_switch() {
+    // Settings' "Check for updates" item is itself the click.
+    assert_eq!(open_status(false, true), Status::Checking);
+    assert_eq!(open_status(true, true), Status::Checking);
+}

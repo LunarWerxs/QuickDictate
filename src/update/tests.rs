@@ -121,11 +121,25 @@ fn install_id_is_a_lowercase_v4_uuid_and_unique() {
 }
 
 #[test]
+fn update_check_request_carries_only_the_version() {
+    // An update check sends `?v=` and the
+    // User-Agent (a client default, so not on the request itself) and no
+    // install id, whatever settings.json holds.
+    let req = latest_request(&client().unwrap()).build().unwrap();
+    assert!(req.headers().get("x-install-id").is_none());
+    assert!(req.headers().is_empty(), "{:?}", req.headers());
+    assert_eq!(
+        req.url().as_str(),
+        format!("{RELEASES_API}?v={}", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
 #[ignore = "live network"]
 fn live_studio_latest_release_parses() {
     // The Studio proxy must relay GitHub's releases/latest JSON verbatim —
     // the same fields check() and latest_exe_asset() consume. NOTE: each
-    // run logs one anonymous analytics row on the endpoint.
+    // run logs one analytics row on the endpoint.
     let resp = client()
         .unwrap()
         .get(RELEASES_API)

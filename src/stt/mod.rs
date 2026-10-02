@@ -654,18 +654,14 @@ async fn run_session(
     // sites (and see `output.rs` for the paste-side log lines it also gates).
     let log_transcripts = cfg.log_transcripts;
 
-    // Cleanup-pass settings for the SPECULATIVE passes below. Which app the
-    // text lands in isn't known until paste time (the user may alt-tab
-    // mid-dictation), so speculation uses the globals and `output.rs` makes
-    // the authoritative per-app call. A speculated answer for an app that
-    // turns the pass off is simply never collected.
-    let polish_settings = cfg.polish_possible().then(|| polish::PolishSettings {
-        endpoint: cfg.polish_endpoint.clone(),
-        model: cfg.polish_model.clone(),
-        // `polish_possible` already established this is non-empty.
-        keys: cfg.polish_key_pool(),
-        deadline: Duration::from_millis(cfg.polish_deadline_ms),
-    });
+    // Cleanup-pass settings for the SPECULATIVE passes below, resolved for
+    // the app that was in front when the hotkey went down. Speculation sends
+    // the transcript to the polish host, so it must never run for an app
+    // whose profile turns the pass off. Which app the text finally lands in
+    // isn't known until paste time (the user may alt-tab mid-dictation), so
+    // `output.rs` still makes the authoritative per-app call: a speculated
+    // answer for an app that turns the pass off is simply never collected.
+    let polish_settings = polish::settings_for(&cfg, press.exe_at_start.as_deref());
     // Only worth speculating when commits actually pile up unpasted. With
     // `delay_output_till_release` off every commit is pasted the moment it
     // lands, so there is no held prefix to work ahead on.

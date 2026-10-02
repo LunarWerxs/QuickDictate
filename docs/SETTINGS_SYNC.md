@@ -20,9 +20,10 @@ itself. Once signed in:
   changes made on another machine show up automatically) and on first sign-in.
 - Your preferences are pushed up whenever you hit **Save** (or **Save &
   Restart**).
-- Clicking **Stop syncing** disconnects the account, deletes the synced copy
-  from the server, and drops the local sign-in, everything reverts to
-  local-only.
+- Clicking **Stop syncing** signs the app out and drops the local sign-in, so
+  everything reverts to local-only. It does not delete anything straight
+  away: your synced settings and up to 20 earlier versions move to your
+  Connections Trash, and are deleted for good when the Trash period ends.
 
 ### How two machines merge (since 1.2.1)
 
@@ -75,8 +76,15 @@ preference fields listed above.
 ## How to turn it off
 
 Open **Settings**, find the **Settings sync** card, and click **Stop
-syncing**. This removes your synced preferences from the server and signs
-the app out locally, QuickDictate goes back to fully local-only operation.
+syncing**. This signs the app out, and QuickDictate goes back to fully
+local-only operation. Your synced settings, and up to 20 earlier versions
+Connections keeps so you can roll back, move to your Connections Trash, where
+they are deleted for good when the Trash period ends: 90 days for anything
+deleted from 29 October 2026, and shorter before then. If your sign-in has
+expired, Stop syncing only signs you out on this PC and leaves the server copy
+where it is. To have your synced settings deleted at once, or if you can no
+longer sign in, email lunawerx@gmail.com and they are deleted within one
+month.
 
 See [.github/SECURITY.md](../.github/SECURITY.md) for the full data-handling
 policy.

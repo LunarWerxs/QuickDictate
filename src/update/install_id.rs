@@ -1,17 +1,19 @@
-//! The anonymous per-install id sent as `X-Install-Id` on update checks.
+//! The pseudonymous per-install id that keys the opt-in usage report
+//! (`stats::report`). Update checks used to send it as `X-Install-Id`; they no
+//! longer do (see `latest_request`), but the id is still generated here, at
+//! startup, so it is the same one whenever the report is switched on.
 //!
-//! Crypto-random and derived from nothing about the machine, so it identifies
-//! an install and not a person.
+//! Crypto-random and derived from nothing about the machine, so it is tied to
+//! no name. It is pseudonymous, not anonymous: it does link one install's
+//! reports together.
 
 use std::sync::Arc;
 
 use crate::config::Config;
 use crate::state::App;
 
-use super::*;
-
 // ---------------------------------------------------------------------------
-// Anonymous install id (X-Install-Id)
+// Pseudonymous install id
 // ---------------------------------------------------------------------------
 
 /// Crypto-random UUIDv4 via CNG (`BCryptGenRandom`, the same checked call as
@@ -47,35 +49,31 @@ pub(crate) fn new_install_id() -> Option<String> {
     ))
 }
 
-/// Resolve the anonymous install id and cache it for [`fetch_latest_json`]:
-/// reuse the one persisted in settings.json, or on the very first launch
-/// generate a fresh UUID and persist it (via [`Config::save_install_id`],
-/// which fills the template's empty slot in place rather than rewriting the
-/// whole file). Called once from `main()` before any check can run — both
-/// the startup auto-check and the tray/About manual path (which has no `App`
-/// handle) read the cached value. An id that failed to persist is **not**
-/// sent: it would change every launch and inflate the install count.
+/// Make sure the pseudonymous install id exists: keep the one persisted in
+/// settings.json, or on the very first launch generate a fresh UUID and
+/// persist it (via [`Config::save_install_id`], which fills the template's
+/// empty slot in place rather than rewriting the whole file). Called once
+/// from `main()` before anything else can save settings.json. An id that
+/// failed to persist is **not** kept: it would change every launch, and the
+/// usage report would count one machine as many.
 pub fn init_install_id(app: &App) {
     let cfg = app.config.load();
-    let existing = cfg.install_id.trim();
-    if !existing.is_empty() {
-        let _ = INSTALL_ID.set(existing.to_string());
+    if !cfg.install_id.trim().is_empty() {
         return;
     }
     let Some(id) = new_install_id() else {
-        tracing::warn!("update: system RNG failed; checks will carry no install id");
+        tracing::warn!("update: system RNG failed; no install id this launch");
         return;
     };
     let mut new_cfg = (**cfg).clone();
-    new_cfg.install_id = id.clone();
+    new_cfg.install_id = id;
     match new_cfg.save_install_id(&Config::settings_path()) {
         Ok(()) => {
             app.config.store(Arc::new(new_cfg));
-            let _ = INSTALL_ID.set(id);
-            tracing::info!("update: generated anonymous install id");
+            tracing::info!("update: generated pseudonymous install id");
         }
         Err(e) => {
-            tracing::warn!("update: could not persist install id ({e}); checks will carry none");
+            tracing::warn!("update: could not persist install id ({e}); none this launch");
         }
     }
 }

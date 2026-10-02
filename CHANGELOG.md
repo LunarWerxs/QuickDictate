@@ -43,6 +43,84 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   There is no Settings switch between personal and business on purpose. The
   key and certificate are sealed with Windows DPAPI under your account.
 
+### Changed
+
+- **Update checks no longer send an install id.** The check now carries only
+  the app version and QuickDictate's User-Agent, so it says which version is
+  asking and nothing about which copy. The random `install_id` stays in
+  settings.json, but only the opt-in usage report sends it.
+
+- **"Check for updates daily" off now means no checks at all.** Opening the
+  About window used to check every time, even with the setting off. Now it
+  checks on open only while the setting is on; with it off, the pill reads
+  **Check for updates** and checks once when you click it. The Settings
+  **Check for updates** item still checks straight away, because that click
+  is the request.
+
+- **The usage-report setting now says "pseudonymous", not "anonymous".** The
+  opt-in report carries your random install id, so it can be told apart from
+  other copies even though it never names you. The switch now reads **Share
+  pseudonymous usage stats with LunarWerx**, and its tooltip, SECURITY.md and
+  the guides say what it sends in those terms. What the report sends and the
+  `share_usage_stats` key are unchanged.
+
+- **DashScope now defaults to its international (Singapore) host.** It used to
+  default to the mainland-China host, so a new setup sent your voice to
+  Alibaba's servers in mainland China unless you ticked **International
+  account**. That tick is now on by default. Existing setups keep the host they
+  were on: a settings.json with DashScope keys and no `dashscope_intl` stays on
+  mainland China, because a mainland key does not work on the international
+  host, and the next save writes that choice out. Untick **International
+  account** on the DashScope card if your key is a mainland-China one.
+
+- **"Stop syncing" now says what it really does.** It never deleted anything:
+  it signs you out, and Connections moves your synced settings and up to 20
+  earlier versions to your Connections Trash, where they are deleted for good
+  when the Trash period ends. The button's tooltip and SETTINGS_SYNC.md used
+  to say it deleted them from the server; they now say this, and that
+  lunawerx@gmail.com deletes them at once on request.
+
+- **Free use and the business trial are now in LICENSE.** QuickDictate is free
+  for personal use and for nonprofit organisations and government bodies, and
+  a business may try it free for up to 10 days on each installation. LICENSE
+  now grants both in a paragraph from LUNARWERX LLC above the PolyForm text,
+  which it only adds to.
+
+- **The monthly licence is off sale.** LICENSE, the README and the guide now
+  offer only the US$19.99 perpetual licence, one per installation, and no
+  longer point anyone at a cancel page. To move a licence or ask for a refund,
+  email lunawerx@gmail.com.
+
+- **The install id is called pseudonymous everywhere.** The README, the guide
+  and the code comments now say "pseudonymous": the id is random and tied to
+  no name, but it links one install's reports together. The README and the
+  guide also say the About window obeys **Check for updates daily**.
+
+### Fixed
+
+- **Moving the data folder now takes every file with it.** The sign-in prompt,
+  feedback survey and crash banner state, the usage report's last-sent stamp
+  and the `error-reports` folder used to stay behind in the old folder, so the
+  prompts could ask again and saved reports went missing from **Open folder**.
+
+### Security
+
+- **The AI cleanup pass no longer works ahead for an app where it is off.**
+  While the hotkey is down, QuickDictate starts the cleanup pass early so the
+  answer is ready on release. It did that whenever cleanup was on for any app,
+  so a dictation into an app whose profile turns cleanup off was still sent to
+  the cleanup host. It now works ahead only when cleanup is on for the app
+  that was in front when you pressed the hotkey.
+
+- **Dictations the app puts on the clipboard stay out of Clipboard History.**
+  A long dictation pasted with Ctrl+V, and every dictation left there by
+  **Save everything to clipboard**, now goes on the clipboard marked for
+  Windows to leave out of Clipboard History and Cloud Clipboard, so with
+  either turned on Windows no longer keeps or syncs those transcripts. The
+  restore of your previous clipboard works as before. The **Copy** buttons on
+  the History page and the tray's recent transcriptions are you asking for a
+  copy, so they still make an ordinary one that history can keep.
+
 ## [1.4.0] - 2026-10-02
 
 Local dictation that keeps up with you: text appears a quarter second after you stop, dictations

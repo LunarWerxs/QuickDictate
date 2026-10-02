@@ -24,9 +24,11 @@
 //!     anything able to publish a release could otherwise reach every install
 //!     unattended within a day.
 //!   * the About window (Settings → About, or its "Check for updates" item):
-//!     the status pill checks on open and on click, and when an update is
-//!     waiting, clicking the pill installs it in-app via
-//!     [`download_and_install_now`] — it no longer opens the browser.
+//!     the status pill checks on open only while `update_auto_check` is on
+//!     (or when "Check for updates" opened it); otherwise it reads "Check for
+//!     updates" and checks once per click. When an update is waiting, clicking
+//!     the pill installs it in-app via [`download_and_install_now`] — it no
+//!     longer opens the browser.
 
 mod cache;
 mod flows;
@@ -57,12 +59,12 @@ use install::*;
 
 /// "Latest release" endpoint: the Connections Studio proxy, which relays
 /// GitHub's `releases/latest` JSON for LunarWerxs/QuickDictate **verbatim**
-/// (so parsing here is unchanged from the GitHub API) and logs one anonymous
-/// analytics row per hit as an install-count statistic — random id, version,
-/// and coarse CDN-derived geo, never the caller's IP; 90-day retention. The
-/// request carries the `X-Install-Id` header resolved by [`init_install_id`]
-/// plus the app version (`?v=`, for anonymous version-adoption stats). See
-/// SECURITY.md for the full disclosure. Release
+/// (so parsing here is unchanged from the GitHub API) and logs one analytics
+/// row per hit — version and CDN-derived geo, never the caller's IP; 90-day
+/// retention. The request carries only the app version (`?v=`, for
+/// version-adoption stats) and the shared User-Agent:
+/// no install id, so a check identifies no copy of the app (see
+/// `latest_request`). See SECURITY.md for the full disclosure. Release
 /// *binaries* still download straight from GitHub via the asset URLs in the
 /// payload. On any failure the check reports Failed — which the auto path
 /// treats as silence.
@@ -96,12 +98,6 @@ const CACHE_FILE: &str = "quickdictate-update.txt";
 /// Only one check/download may run at a time (tray spam, About + auto, etc.).
 static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
-/// Anonymous install id sent as `X-Install-Id` with releases-API hits so the
-/// endpoint can count unique installs rather than raw checks. Resolved once
-/// at startup by [`init_install_id`]; unset (RNG or persist failure) simply
-/// means the header is omitted.
-static INSTALL_ID: OnceLock<String> = OnceLock::new();
-
 /// The shared [`App`], published at startup so the **manual** update path — the
 /// About window, which runs on its own thread with no `App` reference — can
 /// signal a clean shutdown when it relaunches into the freshly-swapped exe. The
@@ -114,6 +110,16 @@ static APP_HANDLE: OnceLock<Arc<App>> = OnceLock::new();
 /// from `main()`, before the UI (hence any manual install) can come up.
 pub fn set_app_handle(app: &Arc<App>) {
     let _ = APP_HANDLE.set(Arc::clone(app));
+}
+
+/// Whether update checks are switched on (`update_auto_check`), for the About
+/// window, which has no `App` of its own. `false` before [`set_app_handle`]
+/// runs: with the setting unknown, About waits for a click rather than
+/// reaching the network on its own.
+pub fn auto_check_enabled() -> bool {
+    APP_HANDLE
+        .get()
+        .is_some_and(|app| app.config.load().update_auto_check)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -178,24 +184,27 @@ fn client() -> Option<reqwest::blocking::Client> {
 
 /// The last successful `fetch_latest_json` payload, held so the install step
 /// can reuse the JSON the user just said yes to instead of re-fetching — the
-/// SECURITY.md promise is **one anonymous row per check**, and a second fetch
+/// SECURITY.md promise is **one row per check**, and a second fetch
 /// would log a second row. `latest_exe_asset` *takes* it (single use), so a
 /// manual install path with no prior check still fetches fresh.
 static LAST_LATEST_JSON: Mutex<Option<serde_json::Value>> = Mutex::new(None);
 
-fn fetch_latest_json() -> Option<serde_json::Value> {
-    // ?v= reports the running version for the endpoint's anonymous
+/// The releases-API request: `?v=` and the client's shared User-Agent, and
+/// nothing else. It deliberately carries no install id (it sent one as
+/// `X-Install-Id` through 1.4.0): a stored identifier read
+/// back and sent on every check made each check personal data, and counting
+/// installs is not worth that. The id now travels only with the opt-in usage
+/// report (`stats::report`).
+fn latest_request(client: &reqwest::blocking::Client) -> reqwest::blocking::RequestBuilder {
+    // ?v= reports the running version for the endpoint's
     // version-adoption stats. The server also falls back to parsing the
     // User-Agent, but the explicit param is its preferred channel and
     // survives any edge/CDN header-forwarding change.
-    let url = format!("{RELEASES_API}?v={}", env!("CARGO_PKG_VERSION"));
-    let mut req = client()?.get(url);
-    // Only the latest-release check carries the install id — the binary
-    // download in download_and_install() goes to GitHub and must not.
-    if let Some(id) = INSTALL_ID.get() {
-        req = req.header("X-Install-Id", id.as_str());
-    }
-    let primary = match req.send() {
+    client.get(format!("{RELEASES_API}?v={}", env!("CARGO_PKG_VERSION")))
+}
+
+fn fetch_latest_json() -> Option<serde_json::Value> {
+    let primary = match latest_request(&client()?).send() {
         Ok(resp) if resp.status().is_success() => resp.json::<serde_json::Value>().ok(),
         Ok(resp) => {
             tracing::info!("update: releases API returned HTTP {}", resp.status());
@@ -220,9 +229,10 @@ fn fetch_latest_json() -> Option<serde_json::Value> {
 
 /// Ask GitHub directly when the Studio proxy fails.
 ///
-/// Deliberately carries no `X-Install-Id` and no `?v=`: this is a plain unauthenticated read,
-/// so it stays inside GitHub's anonymous rate limit and logs no analytics row, which keeps the
-/// SECURITY.md promise of one anonymous row per check intact (a fallback logs none at all).
+/// Deliberately carries no `?v=` (and, like the primary check, no install id): this is a plain
+/// unauthenticated read, so it stays inside GitHub's anonymous rate limit and logs no analytics
+/// row, which keeps the SECURITY.md promise of one row per check intact (a fallback
+/// logs none at all).
 fn fetch_github_fallback_json() -> Option<serde_json::Value> {
     let resp = client()?.get(GITHUB_LATEST_API).send().ok()?;
     if !resp.status().is_success() {

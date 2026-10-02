@@ -160,9 +160,12 @@ Voice Access is free and on-device but locked to Windows' own recognizer.
 
 **Is my data sent anywhere?**
 Your microphone audio goes only to the one cloud provider you select (or nowhere, with the
-Local option), never to the QuickDictate maintainer. The only thing QuickDictate itself
-reports is an optional once-daily update check. An opt-in settings sync feature can also
-sync preferences like hotkeys and language, but never your API keys, audio, or transcripts.
+Local option), never to the QuickDictate maintainer. QuickDictate itself reports only two
+things: the update check, at most once a day while *Check for updates daily* is on (the About
+window obeys that switch too: with it off, nothing is checked until you click **Check for
+updates**), and, only if you opt in, a pseudonymous daily usage rollup (numbers only, never
+your words, tied to a random install id). An opt-in settings sync feature can also sync
+preferences like hotkeys and language, but never your API keys, audio, or transcripts.
 
 **Do I need an account to use QuickDictate?**
 No. There's no QuickDictate account, login, or dashboard, the entire app is one local
@@ -185,12 +188,14 @@ focused application.
 ## 📄 License
 
 [PolyForm Noncommercial 1.0.0](LICENSE) © LunarWerx Studios, starting with v0.9.0. The source
-is available and free for noncommercial use; commercial use needs a license from LunarWerx
-Studios, one per installation: [US$19.99 once](https://checkout.connections.icu/licence/bf8dca80-4036-48ad-91f4-80baa1dbb9e3) (perpetual) or
-[US$1.99 a month](https://checkout.connections.icu/licence/955db7f6-6561-4a30-85d7-569ea3b3ff20) (cancel any time at
-[checkout.connections.icu/manage](https://checkout.connections.icu/manage)); for anything else, open an issue. Redeem the
-key from your purchase email in **Settings › Licence**; a business copy runs a 7-day evaluation
-until then. Releases through v0.8.0 were MIT, and that grant stays in effect for those copies. Made with care by
+is available and free for personal use, and for nonprofit organisations and government bodies;
+a business may try it free for up to 10 days on each installation (see the additional
+permissions in [LICENSE](LICENSE)). Commercial use needs a license from LunarWerx Studios, one
+per installation: [US$19.99 once](https://checkout.connections.icu/licence/bf8dca80-4036-48ad-91f4-80baa1dbb9e3)
+(perpetual). To move a license to another PC or ask for a refund, email
+[lunawerx@gmail.com](mailto:lunawerx@gmail.com); for anything else, open an issue. Redeem the key from your
+purchase email in **Settings › Licence**. Releases through v0.8.0 were MIT, and that
+grant stays in effect for those copies. Made with care by
 **[LunarWerx Studios](https://lunarwerx.com)**.
 Also from LunarWerx Studios: [RepoYeti](https://repoyeti.com),
 [SageThumbs](https://sagethumbs.lunarwerx.com), and

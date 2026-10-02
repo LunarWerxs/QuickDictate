@@ -122,7 +122,7 @@ pub(super) enum SyncPhase {
 pub(super) enum SyncEvent {
     /// Sign-in or silent resume finished.
     Connected(Result<crate::sync::Connected, String>),
-    /// Disconnect finished (remote doc deleted + local creds dropped).
+    /// Disconnect finished (remote doc moved to Trash + local creds dropped).
     Disconnected,
     /// A plain background push (Save, or the best-effort push before Save &
     /// Restart) finished. Unlike `Connected`, this never touches

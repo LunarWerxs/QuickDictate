@@ -283,7 +283,8 @@ pub fn schedule_stats_push(app: Arc<App>) {
     }
 }
 
-/// Disconnect: best-effort delete the remote doc, then always drop local creds.
+/// Disconnect: best-effort delete the remote doc (Connections moves it and its
+/// earlier versions to the account's Trash), then always drop local creds.
 pub fn disconnect() {
     let _guard = sync_guard();
     if let Some(creds) = load_creds() {

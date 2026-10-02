@@ -396,11 +396,9 @@ pub(crate) fn bring_up_app(
     app.restore_history();
     let keys = KeyPool::new(&app.config.load());
 
-    // Resolve (or first-generate + persist) the anonymous install id that
-    // update checks send as X-Install-Id (see SECURITY.md). Must run before
-    // anything else can save settings.json or fire a check — including the
-    // tray/About manual path, which has no App handle and reads the cached
-    // value from update::INSTALL_ID.
+    // Resolve (or first-generate + persist) the random install id that
+    // keys the opt-in usage report (see SECURITY.md; update checks no longer
+    // send it). Must run before anything else can save settings.json.
     update::init_install_id(&app);
 
     // Publish the App handle so the manual update path (the About window, on its
@@ -452,9 +450,10 @@ pub(crate) fn bring_up_app(
         update::spawn_startup_check(Arc::clone(&app));
     }
 
-    // Anonymous usage rollup (opt-in, off by default, see
+    // Pseudonymous usage rollup (opt-in, off by default, see
     // `Config::share_usage_stats`): once a day, send LunarWerx an
-    // aggregated, PII-free snapshot of this install's usage totals. A no-op
+    // aggregated snapshot of this install's usage totals, keyed by the
+    // install id and free of dictated text. A no-op
     // (returns immediately) unless the setting is on.
     stats::spawn_daily_report(Arc::clone(&app));
 
