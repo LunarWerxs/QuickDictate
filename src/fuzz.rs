@@ -401,7 +401,7 @@ fn target_licence_parse_reply(b: &[u8]) {
 
 fn target_licence_cert_verify(b: &[u8]) {
     if let Ok(text) = std::str::from_utf8(b) {
-        let _ = crate::licence::cert::verify(text, "qd-install-test-20261002", 1_790_950_000);
+        let _ = crate::licence::cert::verify(text, "qd-install-test-20261002b", 1_790_960_000);
     }
 }
 

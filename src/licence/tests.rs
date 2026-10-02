@@ -3,24 +3,25 @@ use super::posture::*;
 use super::redeem::{self, Reply};
 use super::*;
 
-/// A REAL certificate, minted 2026-10-02 by the live redeem door for a test
-/// licence that has since been cancelled. The signature stays valid forever,
-/// so it pins the parser, the base64url handling and the Ed25519 check against
-/// what Connections actually emits. Its claims: product = the perpetual id,
-/// sub `qd-install-test-20261002`, exp 1791031221 (2026-10-03T12:40:21Z).
+/// A REAL certificate, minted 2026-10-02 by Connections for a test licence on
+/// QuickDictate's own Pay account, since cancelled. The signature stays valid
+/// forever, so it pins the parser, the base64url handling and the Ed25519 check
+/// against what Connections actually emits. Its claims: product = the perpetual
+/// id, sub `qd-install-test-20261002b`, iat 1790952532, exp 1791038932
+/// (2026-10-03T14:48:52Z).
 const REAL_CERT: &str = concat!(
-    "eyJhdWQiOiJjb25uZWN0aW9ucy1saWNlbmNlIiwibGljIjoiMGJkNGY0MjUtNmZhMS00ZmQzLTlmODEtMjAx",
-    "ZmQxZWFhZGQ0IiwicHJvZHVjdCI6ImEwYWFiN2JiLWJhNDMtNGQ3Zi04NzcyLTNjOTM2NTliYWQ2OCIsInN1",
-    "YiI6InFkLWluc3RhbGwtdGVzdC0yMDI2MTAwMiIsInVuaXQiOiJpbnN0YWxsYXRpb24iLCJ0ZXJtIjoicGVy",
-    "cGV0dWFsIiwidW5pdHMiOjEsInNlYXQiOiI0NTQ1NGRlNC00MDFkLTQxMDAtYmJhZi1lZTdiMTQwZjhhY2Ii",
-    "LCJtYWludCI6bnVsbCwiY2VpbCI6bnVsbCwiaWF0IjoxNzkwOTQ0ODIxLCJleHAiOjE3OTEwMzEyMjF9.",
-    "cgEvSYi4Nav9Hp7GDjOJsM6R_FzqTYZ5p1-2Ti4mCEoxk_bdO122yn6DrNgcJZUuqtO6gtUmjCN91hJoBP6fAw"
+    "eyJhdWQiOiJjb25uZWN0aW9ucy1saWNlbmNlIiwibGljIjoiMmE1ODA2YjUtYjNlYi00Mjg0LTkyODUtM2Jm",
+    "YjhlZjg0MDM4IiwicHJvZHVjdCI6ImJmOGRjYTgwLTQwMzYtNDhhZC05MWY0LTgwYmFhMWRiYjllMyIsInN1",
+    "YiI6InFkLWluc3RhbGwtdGVzdC0yMDI2MTAwMmIiLCJ1bml0IjoiaW5zdGFsbGF0aW9uIiwidGVybSI6InBl",
+    "cnBldHVhbCIsInVuaXRzIjoxLCJzZWF0IjoiZjAxYWQzZjUtNTk2ZC00ZDI3LThhMmUtMTYwZmZlMThjODUx",
+    "IiwibWFpbnQiOm51bGwsImNlaWwiOm51bGwsImlhdCI6MTc5MDk1MjUzMiwiZXhwIjoxNzkxMDM4OTMyfQ.",
+    "TMOr7sXe1a99fstmjiGApZYA8Id8lMRke3WBXkNijPYBl1uBF0pYqbgLtwV_nVtzpERIjggQW4JWHnJ2UuiJAQ"
 );
-const REAL_SUB: &str = "qd-install-test-20261002";
-const REAL_EXP: u64 = 1_791_031_221;
+const REAL_SUB: &str = "qd-install-test-20261002b";
+const REAL_EXP: u64 = 1_791_038_932;
 /// Inside the certificate's window. Pinned, never the real clock: a test that
 /// passes until a date and then fails on its own is not a test.
-const INSIDE: u64 = 1_790_950_000;
+const INSIDE: u64 = 1_790_960_000;
 
 const DAY: u64 = 24 * 60 * 60;
 const T0: u64 = 1_790_000_000;
@@ -44,7 +45,7 @@ fn every_buy_link_points_at_its_own_product() {
 fn the_real_certificate_verifies_inside_its_window() {
     let v = cert::verify(REAL_CERT, REAL_SUB, INSIDE).unwrap();
     assert_eq!(v.plan, Plan::Perpetual);
-    assert_eq!(v.product_id, "a0aab7bb-ba43-4d7f-8772-3c93659bad68");
+    assert_eq!(v.product_id, "bf8dca80-4036-48ad-91f4-80baa1dbb9e3");
     assert_eq!(v.exp_unix, REAL_EXP);
     assert!(cert::verify(REAL_CERT, REAL_SUB, REAL_EXP - 1).is_ok());
 }

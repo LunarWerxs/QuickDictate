@@ -91,16 +91,16 @@ pub(crate) struct Product {
 /// together when the products move.
 pub(crate) const PRODUCTS: [Product; 2] = [
     Product {
-        id: "a0aab7bb-ba43-4d7f-8772-3c93659bad68",
+        id: "bf8dca80-4036-48ad-91f4-80baa1dbb9e3",
         plan: Plan::Perpetual,
         price: "US$19.99 once",
-        buy_url: "https://checkout.connections.icu/licence/a0aab7bb-ba43-4d7f-8772-3c93659bad68",
+        buy_url: "https://checkout.connections.icu/licence/bf8dca80-4036-48ad-91f4-80baa1dbb9e3",
     },
     Product {
-        id: "41b7e7f1-67b8-40ba-9d49-7ced20358da7",
+        id: "955db7f6-6561-4a30-85d7-569ea3b3ff20",
         plan: Plan::Monthly,
         price: "US$1.99 a month",
-        buy_url: "https://checkout.connections.icu/licence/41b7e7f1-67b8-40ba-9d49-7ced20358da7",
+        buy_url: "https://checkout.connections.icu/licence/955db7f6-6561-4a30-85d7-569ea3b3ff20",
     },
 ];
 
