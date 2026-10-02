@@ -187,8 +187,8 @@ impl super::SettingsApp {
             ui.add_space(6.0);
             ui.label(
                 RichText::new(
-                    "Personal use is free, always. A licence covers one installation; paste \
-                     the key from your purchase email above.",
+                    "Personal and nonprofit use is free, always. A licence covers one \
+                     installation; paste the key from your purchase email above.",
                 )
                 .size(11.5)
                 .color(muted()),
@@ -209,14 +209,14 @@ impl super::SettingsApp {
         banner_strip(ui, accent(), 0.16, 0.55, 14, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new("Using QuickDictate for work or a business?")
+                    RichText::new("Using QuickDictate for a for-profit business?")
                         .font(semibold(15.0))
                         .color(text()),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .button(RichText::new("\u{00D7}").size(14.0).color(muted()))
-                        .on_hover_text("Personal use")
+                        .on_hover_text("Personal or nonprofit")
                         .clicked()
                     {
                         answer = Some(licence::Mode::Personal);
@@ -226,18 +226,19 @@ impl super::SettingsApp {
             ui.add_space(4.0);
             ui.label(
                 RichText::new(
-                    "Business use needs a licence after a 7-day free evaluation. Personal use \
-                     is free, always.",
+                    "For-profit business use needs a licence after a 7-day free evaluation. \
+                     Personal use, and use by charities, schools, public research, public \
+                     health and government, is free, always.",
                 )
                 .size(12.5)
                 .color(muted()),
             );
             ui.add_space(8.0);
             button_row_right(ui, |ui| {
-                if ui.button("For work or a business").clicked() {
+                if ui.button("For-profit business").clicked() {
                     answer = Some(licence::Mode::Business);
                 }
-                if accent_button(ui, "Personal use").clicked() {
+                if accent_button(ui, "Personal or nonprofit").clicked() {
                     answer = Some(licence::Mode::Personal);
                 }
             });

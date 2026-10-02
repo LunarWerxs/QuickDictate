@@ -60,7 +60,7 @@ impl Tab {
             Tab::Dictation => "Hotkeys, timing, and how recognized text is typed.",
             Tab::Vocabulary => "Names and jargon the recognizer should expect.",
             Tab::History => "Browse, copy, and re-paste recent transcriptions.",
-            Tab::Licence => "Personal use is free. Business use needs a licence.",
+            Tab::Licence => "Personal and nonprofit use is free. Business use needs a licence.",
             Tab::Advanced => {
                 "Diagnostics, files, per-app profiles, and the rarely touched switches."
             }

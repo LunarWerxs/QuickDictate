@@ -128,7 +128,7 @@ fn posture_lines(s: &Snapshot) -> (String, String) {
     match s.posture {
         Posture::Personal => (
             "Personal".into(),
-            "Personal use: free, no licence needed.".into(),
+            "Personal or nonprofit use: free, no licence needed.".into(),
         ),
         Posture::Evaluation { ends_unix } => (
             format!(
