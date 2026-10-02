@@ -150,19 +150,6 @@ impl Config {
             .unwrap_or(self.polish_enabled)
     }
 
-    /// Could the cleanup pass run for *some* app? Used by the session runner,
-    /// which speculates while the hotkey is still down and does not yet know
-    /// where the text will land.
-    pub fn polish_possible(&self) -> bool {
-        if self.polish_key_pool().is_empty() {
-            return false;
-        }
-        if self.polish_enabled {
-            return true;
-        }
-        self.profiles_enabled && self.profiles.iter().any(|p| p.polish == Some(true))
-    }
-
     /// Keys for `polish_endpoint`, round-robined per request: the dedicated
     /// list if set, else the OpenAI pool (right for the default endpoint, and
     /// the reason `polish_keys` exists for everyone else). Falls back rather
