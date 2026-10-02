@@ -13,7 +13,7 @@
 //! Every read fails toward Personal: a missing key, a missing value, a value of
 //! the wrong type, a blob that will not unseal, all read as "nothing here".
 
-use super::cert;
+use super::cert::{self, CertError};
 use super::posture::{self, CertFacts, Facts, Mode, Plan, RenewalInputs};
 use super::redeem::{self, Reply};
 use super::RedeemReport;
@@ -37,6 +37,11 @@ const V_KEY_LAST4: &str = "KeyLast4";
 /// DPAPI-sealed.
 const V_CERTIFICATE: &str = "Certificate";
 const V_PENDING: &str = "CertificateError";
+/// DPAPI-sealed. A key Connections accepted with no certificate. It licenses
+/// nothing and displaces nothing until renewal brings a certificate that
+/// verifies, which promotes it to [`V_KEY`].
+const V_PENDING_KEY: &str = "PendingKey";
+const V_PENDING_LAST4: &str = "PendingKeyLast4";
 const V_RENEWED_AT: &str = "LastRenewal";
 const V_RENEWED_OK: &str = "LastRenewalOk";
 
@@ -158,20 +163,40 @@ impl Store {
     }
 
     /// Start the business evaluation on a Business copy that never held a
-    /// licence and has no clock. Returns whether it wrote anything.
+    /// licence and has no clock, or whose clock was stamped while the system
+    /// clock was behind ([`posture::CLOCK_FLOOR_UNIX`]) and can now be
+    /// restamped. Returns whether it wrote anything.
     ///
     /// Board #7127: when Connections holds the evaluation clock server-side,
     /// this is the one function that asks it instead of starting a local one.
     pub(super) fn start_evaluation_if_due(&self, now: u64) -> bool {
+        let started = self.get_u64(V_EVALUATION);
+        let restamp = started != 0 && !posture::stamp_is_set(started);
         if self.mode() != Some(Mode::Business)
-            || self.get_u64(V_EVALUATION) != 0
             || self.get_u64(V_LICENSED_SINCE) != 0
+            || (started != 0 && !restamp)
+            || (restamp && !posture::stamp_is_set(now))
         {
             return false;
         }
         self.put_u64(V_EVALUATION, now);
         tracing::info!("licence: business evaluation started");
         true
+    }
+
+    /// Restamp what a clock that was behind recorded, once the clock reads
+    /// past the floor: the evaluation start (see [`Self::start_evaluation_if_due`])
+    /// and a refusal, whose notice period then runs from now. Returns whether
+    /// it wrote anything.
+    pub(super) fn settle_clock(&self, now: u64) -> bool {
+        let mut wrote = self.start_evaluation_if_due(now);
+        let refused = self.get_u64(V_REFUSED);
+        if refused != 0 && !posture::stamp_is_set(refused) && posture::stamp_is_set(now) {
+            self.put_u64(V_REFUSED, now);
+            tracing::info!("licence: refusal restamped, the clock was behind");
+            wrote = true;
+        }
+        wrote
     }
 
     /// This installation's id, created once: `qd-` and a random UUID, derived
@@ -216,12 +241,14 @@ impl Store {
             }),
             key_last4: self.get_string(V_KEY_LAST4),
             pending_reason: self.get_string(V_PENDING),
+            pending_key_last4: self.get_string(V_PENDING_LAST4),
         }
     }
 
     pub(super) fn renewal_inputs(&self, now: u64) -> RenewalInputs {
         RenewalInputs {
             has_key: self.get_string(V_KEY).is_some(),
+            has_pending_key: self.get_string(V_PENDING_KEY).is_some(),
             refused: self.get_u64(V_REFUSED) != 0,
             cert_exp_unix: self.verified_certificate(now).map(|v| v.exp_unix),
             last_attempt_unix: self.get_u64(V_RENEWED_AT),
@@ -234,13 +261,51 @@ impl Store {
         redeem::normalize_key(&self.get_sealed(V_KEY)?)
     }
 
+    /// The pending key (accepted, no certificate yet), unsealed.
+    pub(super) fn pending_key(&self) -> Option<String> {
+        redeem::normalize_key(&self.get_sealed(V_PENDING_KEY)?)
+    }
+
+    /// The keys renewal should replay now: the stored key when
+    /// [`posture::renewal_due`] says so, and a pending key whenever its
+    /// throttle allows.
+    pub(super) fn keys_due_for_renewal(&self, now: u64, at_startup: bool) -> Vec<String> {
+        let r = self.renewal_inputs(now);
+        let mut keys = Vec::new();
+        if posture::renewal_due(now, &r, at_startup) {
+            keys.extend(self.stored_key());
+        }
+        if posture::pending_renewal_due(now, &r, at_startup) {
+            keys.extend(self.pending_key());
+        }
+        keys
+    }
+
+    fn forget_pending_key(&self) {
+        self.remove(V_PENDING_KEY);
+        self.remove(V_PENDING_LAST4);
+        self.remove(V_PENDING);
+    }
+
     pub(super) fn note_renewal_attempt(&self, now: u64, ok: bool) {
         self.put_u64(V_RENEWED_AT, now);
         self.put_u64(V_RENEWED_OK, u64::from(ok));
     }
 
+    /// Record what a renewal replay of `key` answered, but only if `key` is
+    /// still one renewal replays (the stored or the pending key). The reply
+    /// arrives up to 30 s after the key was read, and a key the user redeemed
+    /// meanwhile must not be overwritten by news about the old one: a reply for
+    /// a key no longer held is dropped (`None`). The caller holds the store
+    /// lock from here through the write, so nothing lands in between.
+    pub(super) fn apply_renewal(&self, key: &str, reply: Reply, now: u64) -> Option<RedeemReport> {
+        let current =
+            self.stored_key().as_deref() == Some(key) || self.pending_key().as_deref() == Some(key);
+        current.then(|| self.apply_redeem(key, reply, now, true))
+    }
+
     /// Record what a redeem (`is_renewal == false`: the user typed `key`) or a
-    /// renewal (the stored key replayed) answered, and say it in words.
+    /// renewal (a held key replayed) answered, and say it in words.
     pub(super) fn apply_redeem(
         &self,
         key: &str,
@@ -253,17 +318,28 @@ impl Store {
                 certificate,
                 certificate_error,
                 ..
-            } => self.apply_accepted(key, certificate, certificate_error, now),
+            } => {
+                let sub = self.install_id();
+                let judged = judge_accepted(certificate, certificate_error, |c| match &sub {
+                    Some(sub) => cert::verify(c, sub, now),
+                    None => Err(CertError::NotThisInstall),
+                });
+                self.apply_accepted(key, judged, now, is_renewal)
+            }
             Reply::Refused => {
                 // A refusal ends the stored licence only when it is about the
-                // stored key. A different key typed in and refused changes
-                // nothing about the licence already held.
-                if is_renewal || self.stored_key().as_deref() == Some(key) {
-                    if self.get_u64(V_REFUSED) == 0 {
+                // stored key. A refused pending key is simply forgotten, and a
+                // different key typed in and refused changes nothing.
+                if self.stored_key().as_deref() == Some(key) {
+                    if !posture::stamp_is_set(self.get_u64(V_REFUSED)) {
                         self.put_u64(V_REFUSED, now);
                     }
                     self.note_renewal_attempt(now, true);
                     tracing::info!("licence: Connections refused the stored key");
+                } else if self.pending_key().as_deref() == Some(key) {
+                    self.forget_pending_key();
+                    self.note_renewal_attempt(now, true);
+                    tracing::info!("licence: Connections refused the pending key");
                 }
                 RedeemReport::Rejected {
                     message: "That key wasn't accepted: it is unknown, or its licence has \
@@ -286,46 +362,120 @@ impl Store {
         }
     }
 
-    fn apply_accepted(
+    /// Write what [`judge_accepted`] decided. Only a certificate that verified
+    /// may replace what is held; nothing else here touches the licence.
+    pub(super) fn apply_accepted(
         &self,
         key: &str,
-        certificate: Option<String>,
-        certificate_error: Option<String>,
+        judged: Accepted,
         now: u64,
+        is_renewal: bool,
     ) -> RedeemReport {
-        if self.stored_key().as_deref() != Some(key) {
-            // A new key replaces the old licence wholesale, its certificate
-            // included: a certificate for the old key must not linger as if it
-            // were this one's.
-            self.remove(V_CERTIFICATE);
-            self.remove(V_PLAN);
-        }
-        self.put_sealed(V_KEY, key);
-        self.put_string(V_KEY_LAST4, &redeem::key_last4(key));
-        self.remove(V_REFUSED);
-        if self.get_u64(V_LICENSED_SINCE) == 0 {
-            self.put_u64(V_LICENSED_SINCE, now);
-        }
-        let verified = match (certificate.as_deref(), self.install_id()) {
-            (Some(c), Some(sub)) => cert::verify(c, &sub, now).ok().map(|v| (c, v)),
-            _ => None,
-        };
-        match verified {
-            Some((c, v)) => {
-                self.put_sealed(V_CERTIFICATE, c);
-                self.put_string(V_PLAN, v.plan.label());
-                self.remove(V_PENDING);
+        match judged {
+            Accepted::Licence {
+                certificate,
+                verified,
+            } => {
+                self.put_sealed(V_KEY, key);
+                self.put_string(V_KEY_LAST4, &redeem::key_last4(key));
+                self.put_sealed(V_CERTIFICATE, &certificate);
+                self.put_string(V_PLAN, verified.plan.label());
+                self.remove(V_REFUSED);
+                if self.get_u64(V_LICENSED_SINCE) == 0 {
+                    self.put_u64(V_LICENSED_SINCE, now);
+                }
+                // A key the user enters supersedes one still waiting; the
+                // stored key's own renewal leaves a waiting one to its retries.
+                if !is_renewal || self.pending_key().is_none_or(|p| p == key) {
+                    self.forget_pending_key();
+                }
                 self.note_renewal_attempt(now, true);
-                RedeemReport::Licensed { plan: v.plan }
+                RedeemReport::Licensed {
+                    plan: verified.plan,
+                }
             }
-            None => {
-                let reason = certificate_error
-                    .unwrap_or_else(|| "the certificate it sent did not verify".into());
+            Accepted::Pending { reason } => {
+                // Kept so renewal retries it, but beside the held licence,
+                // never over it: a key with no certificate proves nothing yet.
+                let held = self.stored_key().as_deref() == Some(key)
+                    || self.pending_key().as_deref() == Some(key);
+                if !held && self.put_sealed(V_PENDING_KEY, key) {
+                    self.put_string(V_PENDING_LAST4, &redeem::key_last4(key));
+                }
                 self.put_string(V_PENDING, &reason);
                 self.note_renewal_attempt(now, false);
                 RedeemReport::AcceptedNoCertificate { reason }
             }
+            Accepted::Refuse { error } => {
+                tracing::info!("licence: accepted key's certificate not used ({error:?})");
+                if is_renewal {
+                    self.note_renewal_attempt(now, false);
+                }
+                RedeemReport::Rejected {
+                    message: certificate_refusal(error).into(),
+                }
+            }
         }
+    }
+}
+
+/// What a 200 from the redeem door may change, decided before anything is
+/// written. The door is platform-wide and the request names no product, so a
+/// 200 only says the key is good for SOMETHING; the certificate is what says
+/// it is good for QuickDictate on this installation.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Accepted {
+    /// The certificate verified: this key becomes the licence.
+    Licence {
+        certificate: String,
+        verified: cert::Verified,
+    },
+    /// No certificate came: the key waits, licensing nothing, and renewal
+    /// retries it.
+    Pending { reason: String },
+    /// A certificate came and did not verify: nothing is stored.
+    Refuse { error: CertError },
+}
+
+/// The pure half of an accepted redeem. `check` verifies a certificate for
+/// this installation; the tests drive it with each error.
+pub(super) fn judge_accepted(
+    certificate: Option<String>,
+    certificate_error: Option<String>,
+    check: impl FnOnce(&str) -> Result<cert::Verified, CertError>,
+) -> Accepted {
+    let Some(certificate) = certificate else {
+        return Accepted::Pending {
+            reason: certificate_error.unwrap_or_else(|| "no certificate was sent".into()),
+        };
+    };
+    match check(&certificate) {
+        Ok(verified) => Accepted::Licence {
+            certificate,
+            verified,
+        },
+        Err(error) => Accepted::Refuse { error },
+    }
+}
+
+/// The sentence for a key whose certificate did not verify.
+pub(super) fn certificate_refusal(error: CertError) -> &'static str {
+    match error {
+        CertError::NotThisInstall => {
+            "That licence is bound to another installation of QuickDictate, not this one."
+        }
+        // Freshly minted a moment ago, so "expired" means this PC's clock is
+        // far ahead.
+        CertError::Expired => {
+            "That key's certificate arrived already expired, so this PC's clock looks \
+             wrong. Check the date and time in Windows, then try again."
+        }
+        CertError::Malformed
+        | CertError::BadEncoding
+        | CertError::BadSignature
+        | CertError::BadPayload
+        | CertError::WrongAudience
+        | CertError::WrongProduct => "That key is for a different product, not QuickDictate.",
     }
 }
 

@@ -18,8 +18,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Business licences, inside the app.** QuickDictate has been free for
   personal use and licensed for business use since v0.9.0, but nothing in the
   app knew the difference. Now the first launch asks once, in Settings, whether
-  you use it for work or a business. Personal use stays exactly as it was:
-  free, with no licensing word anywhere. Business use gets a 7-day evaluation
+  you use it for work or a business. Personal use stays free and is never
+  nagged or locked. Business use gets a 7-day evaluation
   with everything working, then three days in which each dictation start shows
   a small notice in the corner of the screen (it never takes the focus, so the
   dictation still lands where you were typing), and after that the hotkey shows

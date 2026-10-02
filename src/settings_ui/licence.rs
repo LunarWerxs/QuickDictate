@@ -250,8 +250,8 @@ impl super::SettingsApp {
         }
     }
 
-    /// The window is closing with the question still unanswered: that is
-    /// Personal, and the question is not asked again.
+    /// The window has really closed (see `hide_window`) with the question
+    /// still unanswered: that is Personal, and the question is not asked again.
     pub(super) fn close_licence_question(&mut self) {
         if licence::question_pending() {
             licence::answer_question(licence::Mode::Personal);

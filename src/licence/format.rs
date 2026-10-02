@@ -90,8 +90,38 @@ fn key_suffix(last4: Option<&str>) -> String {
         .unwrap_or_default()
 }
 
-/// The Licence page's status: a short headline and the sentence under it.
+/// The most characters a notice headline may have. The headline is one line
+/// at 16 px semibold Segoe UI in a 320 px box (the notice's 380 px less its
+/// padding and close button), and past this it is cut off with an ellipsis,
+/// which once hid the very words that said what was wrong.
+pub(crate) const NOTICE_HEADLINE_MAX_CHARS: usize = 34;
+
+/// The Licence page's status: a short headline and the sentence under it. A
+/// key waiting for its certificate is mentioned under whatever the posture
+/// says, since it changes nothing until the certificate verifies.
 pub(crate) fn status_lines(s: &Snapshot) -> (String, String) {
+    let (head, detail) = posture_lines(s);
+    match &s.pending_key_last4 {
+        Some(k) => {
+            let why = s
+                .pending_reason
+                .as_deref()
+                .map(|w| format!(" ({w})"))
+                .unwrap_or_default();
+            (
+                head,
+                format!(
+                    "{detail} Connections accepted the key ending {k} but has not sent its \
+                     certificate yet{why}; QuickDictate will keep trying, and that key \
+                     licenses this copy once it arrives."
+                ),
+            )
+        }
+        None => (head, detail),
+    }
+}
+
+fn posture_lines(s: &Snapshot) -> (String, String) {
     let key = key_suffix(s.key_last4.as_deref());
     match s.posture {
         Posture::Personal => (
@@ -129,11 +159,13 @@ pub(crate) fn status_lines(s: &Snapshot) -> (String, String) {
             "Licensed: perpetual".into(),
             format!("This copy is licensed for business use{key}."),
         ),
+        // No date: the certificate's expiry is days away at most and is not
+        // when the subscription bills.
         Posture::Licensed {
             plan: Plan::Monthly,
-            cert_exp_unix,
+            ..
         } => (
-            format!("Licensed: monthly, renews by {}", local_date(cert_exp_unix)),
+            "Licensed: monthly subscription".into(),
             format!("This copy is licensed for business use{key}."),
         ),
         Posture::LicensedRenewing { plan } => (
@@ -141,7 +173,11 @@ pub(crate) fn status_lines(s: &Snapshot) -> (String, String) {
                 Some(p) => format!("Licensed: {}", p.label()),
                 None => "Licensed".into(),
             },
-            match &s.pending_reason {
+            match s
+                .pending_reason
+                .as_ref()
+                .filter(|_| s.pending_key_last4.is_none())
+            {
                 Some(why) => format!(
                     "Connections accepted the key{key} but has not sent its certificate yet \
                      ({why}). QuickDictate will try again; dictation keeps working."
@@ -178,7 +214,7 @@ pub(crate) fn notice_text(p: Posture, last4: Option<&str>) -> (String, String) {
     let key = key_suffix(last4);
     match p {
         Posture::EvaluationEnded { stops_unix } => (
-            "QuickDictate needs a business licence".into(),
+            "A business licence is needed".into(),
             format!(
                 "The 7-day business evaluation has ended. Dictation stops on {} unless a \
                  licence key is entered.",
@@ -197,12 +233,12 @@ pub(crate) fn notice_text(p: Posture, last4: Option<&str>) -> (String, String) {
             },
         ),
         Posture::Locked { refused: true } => (
-            "Dictation is paused: this licence is no longer active".into(),
-            "Buy a licence, or enter another key, to keep dictating.".into(),
+            "Licence no longer active".into(),
+            "Dictation is paused. Buy a licence, or enter another key, to keep dictating.".into(),
         ),
         _ => (
-            "Dictation is paused: a licence is needed".into(),
-            "This copy is set up for business use and its 7-day evaluation has ended. Buy a \
+            "Business licence needed".into(),
+            "Dictation is paused: this copy's 7-day business evaluation has ended. Buy a \
              licence, or enter your key, to keep dictating."
                 .into(),
         ),
@@ -229,7 +265,7 @@ pub(crate) fn report_line(r: &RedeemReport) -> (String, bool) {
         RedeemReport::AcceptedNoCertificate { reason } => (
             format!(
                 "Key accepted, but Connections has not sent its certificate yet ({reason}). \
-                 QuickDictate will try again."
+                 QuickDictate will keep trying; the key licenses this copy once it arrives."
             ),
             false,
         ),

@@ -137,6 +137,12 @@ const FACTS_TTL: Duration = Duration::from_secs(300);
 
 static FACTS: Mutex<Option<(Instant, posture::Facts)>> = Mutex::new(None);
 
+/// Serialises every read-modify-write of the store: a redeem, a renewal's
+/// apply, the question, the evaluation clock. Held from re-reading what is
+/// stored through the write, NEVER across a network call (a redeem can take
+/// 30 s, and the Settings window and the renewal worker would queue behind it).
+static STORE_LOCK: Mutex<()> = Mutex::new(());
+
 /// The app handle, for the notice's "Enter key" button to open Settings with.
 static APP: OnceLock<Arc<App>> = OnceLock::new();
 
@@ -174,7 +180,11 @@ fn invalidate() {
 /// network: the first renewal runs on the worker thread.
 pub(crate) fn init(app: &Arc<App>) {
     let _ = APP.set(Arc::clone(app));
-    if store::Store::user().start_evaluation_if_due(now_unix()) {
+    let settled = {
+        let _held = STORE_LOCK.lock();
+        store::Store::user().settle_clock(now_unix())
+    };
+    if settled {
         invalidate();
     }
     let f = facts();
@@ -197,6 +207,7 @@ pub(crate) fn question_pending() -> bool {
 /// answering is recorded as Personal by the caller.
 pub(crate) fn answer_question(mode: Mode) {
     let s = store::Store::user();
+    let _held = STORE_LOCK.lock();
     s.set_mode(mode);
     let _ = s.start_evaluation_if_due(now_unix());
     tracing::info!("licence: answered {mode:?}");
@@ -213,6 +224,8 @@ pub(crate) struct Snapshot {
     pub key_last4: Option<String>,
     /// Why the last redeem came back with no certificate, when it did.
     pub pending_reason: Option<String>,
+    /// The last four characters of a key accepted with no certificate yet.
+    pub pending_key_last4: Option<String>,
 }
 
 pub(crate) fn snapshot() -> Snapshot {
@@ -223,6 +236,7 @@ pub(crate) fn snapshot() -> Snapshot {
         posture: posture::posture(now, &f),
         key_last4: f.key_last4.clone(),
         pending_reason: f.pending_reason.clone(),
+        pending_key_last4: f.pending_key_last4.clone(),
     }
 }
 
@@ -275,7 +289,8 @@ pub(crate) enum RedeemReport {
     /// Licensed, with a certificate that verified.
     Licensed { plan: Plan },
     /// Connections accepted the key but sent no certificate; it is kept and
-    /// retried. Carries Connections' reason.
+    /// retried, and licenses nothing until a certificate verifies. Carries
+    /// Connections' reason.
     AcceptedNoCertificate { reason: String },
     /// The key was refused, or is not shaped like a key. Carries the sentence.
     Rejected { message: String },
@@ -298,7 +313,10 @@ pub(crate) fn redeem_entered_key(raw: &str) -> RedeemReport {
     };
     let s = store::Store::user();
     let report = match exchange(&s, &key) {
-        Exchange::Reply(reply) => s.apply_redeem(&key, reply, now_unix(), false),
+        Exchange::Reply(reply) => {
+            let _held = STORE_LOCK.lock();
+            s.apply_redeem(&key, reply, now_unix(), false)
+        }
         Exchange::NoIdentity => RedeemReport::Unavailable,
     };
     invalidate();
@@ -312,9 +330,15 @@ enum Exchange {
     NoIdentity,
 }
 
-/// One round trip to the redeem door for `key`, as this install.
+/// One round trip to the redeem door for `key`, as this install. The install
+/// id may be created here, so it is read under the store lock; the round trip
+/// itself is not.
 fn exchange(s: &store::Store, key: &str) -> Exchange {
-    let (Some(subject), Some(fingerprint)) = (s.install_id(), store::device_fingerprint()) else {
+    let subject = {
+        let _held = STORE_LOCK.lock();
+        s.install_id()
+    };
+    let (Some(subject), Some(fingerprint)) = (subject, store::device_fingerprint()) else {
         return Exchange::NoIdentity;
     };
     Exchange::Reply(redeem::post(key, &subject, &fingerprint))
@@ -349,30 +373,41 @@ fn spawn_renewal_worker(app: Arc<App>) {
     }
 }
 
-/// One renewal decision, and the replay when it is due. `at_startup` skips the
+/// One renewal decision, and the replays that are due. `at_startup` skips the
 /// throttle: the brief is to renew on every start-up when the certificate is
 /// within its renewal window.
+///
+/// Each reply is applied only if its key is still held when it lands
+/// ([`store::Store::apply_renewal`]): the user may have redeemed another key
+/// during the round trip.
 fn renew_if_due(at_startup: bool) {
     let s = store::Store::user();
-    let now = now_unix();
-    let r = s.renewal_inputs(now);
-    if !posture::renewal_due(now, &r, at_startup) {
-        return;
-    }
-    let Some(key) = s.stored_key() else {
-        return;
+    let keys = {
+        let _held = STORE_LOCK.lock();
+        let now = now_unix();
+        if s.settle_clock(now) {
+            invalidate();
+        }
+        s.keys_due_for_renewal(now, at_startup)
     };
-    // Board #7130: when replay starts naming WHY a licence ended, carry the
-    // reason from here into the "no longer active" line.
-    match exchange(&s, &key) {
-        Exchange::Reply(reply) => {
-            let report = s.apply_redeem(&key, reply, now, true);
-            tracing::info!("licence: renewal {}", format::report_for_log(&report));
+    for key in keys {
+        // Board #7130: when replay starts naming WHY a licence ended, carry the
+        // reason from here into the "no longer active" line.
+        let exchanged = exchange(&s, &key);
+        let _held = STORE_LOCK.lock();
+        let now = now_unix();
+        match exchanged {
+            Exchange::Reply(reply) => match s.apply_renewal(&key, reply, now) {
+                Some(report) => {
+                    tracing::info!("licence: renewal {}", format::report_for_log(&report));
+                }
+                None => tracing::info!("licence: renewal reply dropped, the key changed meanwhile"),
+            },
+            Exchange::NoIdentity => {
+                s.note_renewal_attempt(now, false);
+                tracing::info!("licence: renewal skipped, no install identity");
+            }
         }
-        Exchange::NoIdentity => {
-            s.note_renewal_attempt(now, false);
-            tracing::info!("licence: renewal skipped, no install identity");
-        }
+        invalidate();
     }
-    invalidate();
 }

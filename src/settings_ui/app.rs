@@ -204,6 +204,24 @@ pub(super) enum PendingSaveKind {
     Restart,
 }
 
+/// What the window's X (or Alt-F4) does.
+#[derive(Debug, PartialEq, Eq)]
+enum OnClose {
+    /// Hide now, settling an unanswered licence question as Personal.
+    HideAndSettle,
+    /// Ask about the unsaved edits first. The question stays open: the user
+    /// may cancel and keep the window, and then nothing was answered.
+    AskUnsaved,
+}
+
+fn on_close(dirty: bool) -> OnClose {
+    if dirty {
+        OnClose::AskUnsaved
+    } else {
+        OnClose::HideAndSettle
+    }
+}
+
 pub(super) struct SettingsApp {
     pub(super) app: Arc<App>,
     pub(super) draft: Config,
@@ -329,13 +347,10 @@ impl eframe::App for SettingsApp {
         // replacements editor counts: its rows are folded into the draft first.
         if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.close_licence_question();
             self.commit_open_editor();
-            if self.draft_is_dirty() {
-                self.modal = Some(Modal::UnsavedChanges);
-            } else {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                OPEN.store(false, Ordering::Release);
+            match on_close(self.draft_is_dirty()) {
+                OnClose::AskUnsaved => self.modal = Some(Modal::UnsavedChanges),
+                OnClose::HideAndSettle => self.hide_window(ctx),
             }
         }
     }
@@ -437,6 +452,15 @@ impl eframe::App for SettingsApp {
 }
 
 impl SettingsApp {
+    /// Hide the window (a "close"; see `OPEN`). The one place a close lands,
+    /// so it is also the one place a still-unanswered licence question is
+    /// recorded as Personal: only once the window has really gone.
+    pub(super) fn hide_window(&mut self, ctx: &egui::Context) {
+        self.close_licence_question();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        OPEN.store(false, Ordering::Release);
+    }
+
     /// On the first frame, if we opened already signed in, silently resume
     /// and pull so this machine picks up settings changed on another device.
     fn kick_resume_once(&mut self, ctx: &egui::Context) {
@@ -506,6 +530,14 @@ mod tests {
             bulk: false,
             bulk_text: String::new(),
         }
+    }
+
+    /// X with unsaved edits opens a prompt the user may cancel to keep the
+    /// window: that must not answer the Personal-or-Business question.
+    #[test]
+    fn only_a_close_that_hides_settles_the_licence_question() {
+        assert_eq!(on_close(true), OnClose::AskUnsaved);
+        assert_eq!(on_close(false), OnClose::HideAndSettle);
     }
 
     // ---- Closing with an editor open (review fix F2) ----------------------

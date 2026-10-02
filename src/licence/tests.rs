@@ -24,7 +24,9 @@ const REAL_EXP: u64 = 1_791_038_932;
 const INSIDE: u64 = 1_790_960_000;
 
 const DAY: u64 = 24 * 60 * 60;
-const T0: u64 = 1_790_000_000;
+/// 2026-10-03, past [`CLOCK_FLOOR_UNIX`]: a stamp below the floor reads as
+/// one made by a clock that was behind.
+const T0: u64 = 1_791_000_000;
 
 // ---- The product table -----------------------------------------------------
 
@@ -461,6 +463,7 @@ fn renewal_is_due_near_expiry_throttled_and_never_after_a_refusal() {
     let now = T0;
     let base = RenewalInputs {
         has_key: true,
+        has_pending_key: false,
         refused: false,
         cert_exp_unix: Some(now + DAY),
         last_attempt_unix: now - 2 * DAY,
@@ -542,10 +545,77 @@ fn the_licensed_line_shows_only_the_last_four_key_characters() {
         },
         key_last4: Some("789K".into()),
         pending_reason: None,
+        pending_key_last4: None,
     };
     let (head, detail) = format::status_lines(&s);
     assert_eq!(head, "Licensed: perpetual");
     assert!(detail.contains("key ending 789K"), "{detail}");
+}
+
+/// The certificate's expiry is days away at most, and not when the
+/// subscription bills: a date there reads as "renews tomorrow".
+#[test]
+fn the_monthly_line_names_no_date() {
+    let s = Snapshot {
+        now_unix: T0,
+        posture: Posture::Licensed {
+            plan: Plan::Monthly,
+            cert_exp_unix: T0 + DAY,
+        },
+        key_last4: None,
+        pending_reason: None,
+        pending_key_last4: None,
+    };
+    assert_eq!(format::status_lines(&s).0, "Licensed: monthly subscription");
+}
+
+/// A key waiting for its certificate is mentioned, under a posture it has not
+/// changed.
+#[test]
+fn a_pending_key_is_mentioned_without_claiming_a_licence() {
+    let s = Snapshot {
+        now_unix: T0,
+        posture: Posture::Evaluation {
+            ends_unix: T0 + 7 * DAY,
+        },
+        key_last4: None,
+        pending_reason: Some("signing_key_unavailable".into()),
+        pending_key_last4: Some("WWW1".into()),
+    };
+    let (head, detail) = format::status_lines(&s);
+    assert_eq!(head, "Business evaluation, 7 days left");
+    assert!(detail.contains("key ending WWW1"), "{detail}");
+    assert!(detail.contains("signing_key_unavailable"), "{detail}");
+    let (line, _) = format::report_line(&RedeemReport::AcceptedNoCertificate {
+        reason: "signing_key_unavailable".into(),
+    });
+    assert!(!line.to_lowercase().contains("licensed"), "{line}");
+}
+
+/// The notice's headline is one line in a fixed box; past the limit the end is
+/// cut off, and that is where "no longer active" was.
+#[test]
+fn every_notice_headline_fits_its_line() {
+    for p in [
+        Posture::EvaluationEnded {
+            stops_unix: T0 + DAY,
+        },
+        Posture::NoLongerActive {
+            stops_unix: Some(T0 + DAY),
+        },
+        Posture::NoLongerActive { stops_unix: None },
+        Posture::Locked { refused: true },
+        Posture::Locked { refused: false },
+    ] {
+        let (head, _) = format::notice_text(p, Some("789K"));
+        assert!(
+            head.chars().count() <= format::NOTICE_HEADLINE_MAX_CHARS,
+            "{p:?}: {head:?}"
+        );
+    }
+    let (head, body) = format::notice_text(Posture::Locked { refused: true }, None);
+    assert!(head.contains("no longer active"), "{head}");
+    assert!(body.contains("Dictation is paused"), "{body}");
 }
 
 // ---- The store, end to end ----------------------------------------------------
@@ -643,8 +713,8 @@ fn the_store_carries_a_licence_through_expiry_refusal_and_a_new_key() {
     );
     assert!(!renewal_due(later, &s.renewal_inputs(later), true));
 
-    // Another key, accepted with no certificate yet: licensed again, with the
-    // reason on record and the old certificate gone.
+    // Another key, accepted with no certificate yet: it waits beside the
+    // refused one and changes nothing until a certificate verifies.
     let other = "esk_ZZZZZ-YYYYY-XXXXX-WWWW1";
     let report = s.apply_redeem(
         other,
@@ -663,9 +733,23 @@ fn the_store_carries_a_licence_through_expiry_refusal_and_a_new_key() {
         }
     );
     let f = s.load_facts(later);
-    assert_eq!(posture(later, &f), Posture::LicensedRenewing { plan: None });
+    assert_eq!(
+        posture(later, &f),
+        Posture::NoLongerActive {
+            stops_unix: Some(later + 3 * DAY)
+        }
+    );
     assert_eq!(f.pending_reason.as_deref(), Some("signing_key_unavailable"));
-    assert_eq!(f.key_last4.as_deref(), Some("WWW1"));
+    assert_eq!(f.key_last4.as_deref(), Some("789K"));
+    assert_eq!(f.pending_key_last4.as_deref(), Some("WWW1"));
+    assert_eq!(s.stored_key().as_deref(), Some(key));
+    // Renewal retries the pending key, hourly after that failure, and never
+    // the refused one.
+    assert!(s.keys_due_for_renewal(later + 60, false).is_empty());
+    assert_eq!(
+        s.keys_due_for_renewal(later + 3600, false),
+        vec![other.to_string()]
+    );
 }
 
 #[test]
@@ -694,4 +778,323 @@ fn a_different_key_refused_leaves_the_held_licence_alone() {
         posture(INSIDE, &s.load_facts(INSIDE)),
         Posture::Licensed { .. }
     ));
+}
+
+// ---- An accepted redeem: verify first, write after (review findings 1,4,5,10)
+
+const K1: &str = "esk_ABCDE-12345-FGHIJ-6789K";
+const K2: &str = "esk_ZZZZZ-YYYYY-XXXXX-WWWW1";
+
+/// A store holding nothing but this install's id, the one the test
+/// certificate names.
+fn scratch_store(tag: &str, sub: &str) -> (ScratchKey, store::Store) {
+    let scratch = ScratchKey::new(tag);
+    let s = store::Store::at(&scratch.0);
+    windows_registry::CURRENT_USER
+        .create(&scratch.0)
+        .unwrap()
+        .set_string("InstallId", sub)
+        .unwrap();
+    (scratch, s)
+}
+
+fn with_cert(cert: &str) -> Reply {
+    Reply::Accepted {
+        replayed: false,
+        certificate: Some(cert.into()),
+        certificate_error: None,
+    }
+}
+
+fn no_cert() -> Reply {
+    Reply::Accepted {
+        replayed: false,
+        certificate: None,
+        certificate_error: Some("signing_key_unavailable".into()),
+    }
+}
+
+/// REAL_CERT with one payload character changed: a 200 whose certificate
+/// fails the signature, as anything not signed for us does.
+fn tampered_cert() -> String {
+    let (p, sig) = REAL_CERT.split_once('.').unwrap();
+    let mut bad = p.to_string();
+    bad.replace_range(10..11, if &p[10..11] == "A" { "B" } else { "A" });
+    format!("{bad}.{sig}")
+}
+
+fn holding_k1(tag: &str) -> (ScratchKey, store::Store) {
+    let (scratch, s) = scratch_store(tag, REAL_SUB);
+    assert_eq!(
+        s.apply_redeem(K1, with_cert(REAL_CERT), INSIDE, false),
+        RedeemReport::Licensed {
+            plan: Plan::Perpetual
+        }
+    );
+    (scratch, s)
+}
+
+fn assert_holds_k1(s: &store::Store) {
+    let f = s.load_facts(INSIDE);
+    assert_eq!(
+        posture(INSIDE, &f),
+        Posture::Licensed {
+            plan: Plan::Perpetual,
+            cert_exp_unix: REAL_EXP
+        }
+    );
+    assert_eq!(s.stored_key().as_deref(), Some(K1));
+    assert_eq!(f.key_last4.as_deref(), Some("789K"));
+    assert_eq!(f.refused_unix, 0);
+}
+
+fn rejected_with(report: &RedeemReport, words: &str) {
+    match report {
+        RedeemReport::Rejected { message } => assert!(message.contains(words), "{message}"),
+        other => panic!("expected a rejection, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_accepted_certificate_is_judged_before_anything_is_written() {
+    let ok = cert::verify(REAL_CERT, REAL_SUB, INSIDE).unwrap();
+    assert_eq!(
+        store::judge_accepted(Some(REAL_CERT.into()), None, |_| Ok(ok)),
+        store::Accepted::Licence {
+            certificate: REAL_CERT.into(),
+            verified: ok
+        }
+    );
+    assert_eq!(
+        store::judge_accepted(None, Some("signing_key_unavailable".into()), |_| {
+            panic!("nothing to verify")
+        }),
+        store::Accepted::Pending {
+            reason: "signing_key_unavailable".into()
+        }
+    );
+    for error in [
+        CertError::Malformed,
+        CertError::BadEncoding,
+        CertError::BadSignature,
+        CertError::BadPayload,
+        CertError::WrongAudience,
+        CertError::WrongProduct,
+    ] {
+        assert_eq!(
+            store::judge_accepted(Some(REAL_CERT.into()), None, |_| Err(error)),
+            store::Accepted::Refuse { error }
+        );
+        assert_eq!(
+            store::certificate_refusal(error),
+            "That key is for a different product, not QuickDictate."
+        );
+    }
+    assert!(store::certificate_refusal(CertError::NotThisInstall).contains("another installation"));
+    assert!(store::certificate_refusal(CertError::Expired).contains("clock"));
+}
+
+/// A valid key for another Connections product gets a 200 from the
+/// platform-wide door, with that product's certificate. The licence held
+/// must come through untouched.
+#[test]
+fn a_foreign_product_certificate_leaves_a_held_licence_untouched() {
+    let (_scratch, s) = holding_k1("foreign-held");
+    let report = s.apply_accepted(
+        K2,
+        store::judge_accepted(Some("x.y".into()), None, |_| Err(CertError::WrongProduct)),
+        INSIDE,
+        false,
+    );
+    rejected_with(&report, "different product");
+    assert_holds_k1(&s);
+
+    // The same through the real verify: a certificate signed for nothing here.
+    let report = s.apply_redeem(K2, with_cert(&tampered_cert()), INSIDE, false);
+    rejected_with(&report, "different product");
+    assert_holds_k1(&s);
+}
+
+#[test]
+fn a_foreign_product_certificate_does_not_unlock_a_locked_evaluation() {
+    let (_scratch, s) = scratch_store("foreign-locked", REAL_SUB);
+    s.set_mode(Mode::Business);
+    assert!(s.start_evaluation_if_due(T0));
+    let day11 = T0 + 11 * DAY;
+    assert_eq!(
+        posture(day11, &s.load_facts(day11)),
+        Posture::Locked { refused: false }
+    );
+    let report = s.apply_accepted(
+        K2,
+        store::judge_accepted(Some("x.y".into()), None, |_| Err(CertError::WrongProduct)),
+        day11,
+        false,
+    );
+    rejected_with(&report, "different product");
+    s.apply_redeem(K2, with_cert(&tampered_cert()), day11, false);
+    let f = s.load_facts(day11);
+    assert_eq!(posture(day11, &f), Posture::Locked { refused: false });
+    assert_eq!(f.licensed_since_unix, 0);
+    assert_eq!(s.stored_key(), None);
+    assert!(s.keys_due_for_renewal(day11, true).is_empty());
+}
+
+#[test]
+fn another_installs_or_an_already_expired_certificate_stores_nothing() {
+    let (_scratch, s) = scratch_store("not-ours", "qd-some-other-install");
+    let report = s.apply_redeem(K1, with_cert(REAL_CERT), INSIDE, false);
+    rejected_with(&report, "another installation");
+    assert_eq!(s.stored_key(), None);
+    assert_eq!(s.load_facts(INSIDE).licensed_since_unix, 0);
+
+    let (_scratch, s) = scratch_store("clock-ahead", REAL_SUB);
+    let ahead = REAL_EXP + 400 * DAY;
+    let report = s.apply_redeem(K1, with_cert(REAL_CERT), ahead, false);
+    rejected_with(&report, "clock");
+    assert_eq!(s.stored_key(), None);
+    assert_eq!(s.load_facts(ahead).licensed_since_unix, 0);
+}
+
+/// A 200 with no certificate proves the key is good for something, not that
+/// it is good for QuickDictate: it waits, licensing nothing and displacing
+/// nothing, until renewal brings a certificate that verifies.
+#[test]
+fn an_accept_with_no_certificate_licenses_nothing_until_one_verifies() {
+    let (_scratch, s) = scratch_store("pending", REAL_SUB);
+    s.set_mode(Mode::Business);
+    assert!(s.start_evaluation_if_due(CLOCK_FLOOR_UNIX));
+    let evaluating = posture(INSIDE, &s.load_facts(INSIDE));
+    assert!(matches!(evaluating, Posture::Evaluation { .. }));
+
+    assert!(matches!(
+        s.apply_redeem(K2, no_cert(), INSIDE, false),
+        RedeemReport::AcceptedNoCertificate { .. }
+    ));
+    let f = s.load_facts(INSIDE);
+    assert_eq!(posture(INSIDE, &f), evaluating);
+    assert_eq!(f.licensed_since_unix, 0);
+    assert_eq!(f.pending_key_last4.as_deref(), Some("WWW1"));
+    assert_eq!(s.stored_key(), None);
+
+    // Renewal replays it, and a certificate that verifies promotes it.
+    assert_eq!(s.keys_due_for_renewal(INSIDE, true), vec![K2.to_string()]);
+    assert!(matches!(
+        s.apply_renewal(K2, with_cert(REAL_CERT), INSIDE),
+        Some(RedeemReport::Licensed { .. })
+    ));
+    let f = s.load_facts(INSIDE);
+    assert!(matches!(posture(INSIDE, &f), Posture::Licensed { .. }));
+    assert_eq!(s.stored_key().as_deref(), Some(K2));
+    assert_eq!(f.pending_key_last4, None);
+    assert_eq!(f.pending_reason, None);
+}
+
+#[test]
+fn an_accept_with_no_certificate_does_not_displace_a_held_licence() {
+    let (_scratch, s) = holding_k1("pending-held");
+    s.apply_redeem(K2, no_cert(), INSIDE, false);
+    assert_holds_k1(&s);
+    assert_eq!(
+        s.load_facts(INSIDE).pending_key_last4.as_deref(),
+        Some("WWW1")
+    );
+    // A refusal of the pending key forgets it and leaves the licence alone.
+    s.apply_renewal(K2, Reply::Refused, INSIDE);
+    assert_holds_k1(&s);
+    assert_eq!(s.load_facts(INSIDE).pending_key_last4, None);
+}
+
+#[test]
+fn a_renewal_whose_certificate_fails_changes_only_the_attempt_note() {
+    let (_scratch, s) = holding_k1("renew-bad");
+    let before = s.load_facts(INSIDE);
+    let report = s.apply_renewal(K1, with_cert(&tampered_cert()), INSIDE + 60);
+    assert!(matches!(report, Some(RedeemReport::Rejected { .. })));
+    assert_eq!(s.load_facts(INSIDE), before);
+    assert_holds_k1(&s);
+    let r = s.renewal_inputs(INSIDE + 60);
+    assert_eq!(r.last_attempt_unix, INSIDE + 60);
+    assert!(!r.last_attempt_ok);
+}
+
+// ---- Renewal against a key redeemed meanwhile (review findings 2,11) ---------
+
+/// The renewal worker read K1, then spent up to 30 s on the network while the
+/// user redeemed K2. Its reply is about a key no longer held and must change
+/// nothing, whatever it says.
+#[test]
+fn a_renewal_reply_for_a_replaced_key_is_dropped() {
+    let (_scratch, s) = holding_k1("cas");
+    s.apply_redeem(K2, with_cert(REAL_CERT), INSIDE, false);
+    assert_eq!(s.stored_key().as_deref(), Some(K2));
+    let before = s.load_facts(INSIDE);
+
+    assert_eq!(s.apply_renewal(K1, Reply::Refused, INSIDE), None);
+    assert_eq!(s.apply_renewal(K1, with_cert(REAL_CERT), INSIDE), None);
+    assert_eq!(s.apply_renewal(K1, no_cert(), INSIDE), None);
+    assert_eq!(s.load_facts(INSIDE), before);
+    assert_eq!(s.stored_key().as_deref(), Some(K2));
+    assert!(matches!(posture(INSIDE, &before), Posture::Licensed { .. }));
+}
+
+/// The user typed the key already held and Connections refused it: that is
+/// news about the stored licence, the same as a refused replay (finding 12).
+#[test]
+fn a_typed_refusal_of_the_stored_key_ends_the_licence() {
+    let (_scratch, s) = holding_k1("typed-refusal");
+    s.set_mode(Mode::Business);
+    s.apply_redeem(K1, Reply::Refused, INSIDE, false);
+    assert_eq!(
+        posture(INSIDE, &s.load_facts(INSIDE)),
+        Posture::NoLongerActive {
+            stops_unix: Some(INSIDE + 3 * DAY)
+        }
+    );
+    assert!(!renewal_due(INSIDE, &s.renewal_inputs(INSIDE), true));
+}
+
+// ---- A clock that was behind (review finding 3) -------------------------------
+
+#[test]
+fn a_stamp_from_a_clock_that_was_behind_never_locks() {
+    let behind = CLOCK_FLOOR_UNIX - 400 * DAY;
+    let now = T0 + 30 * DAY;
+    assert_eq!(
+        posture(now, &business(behind)),
+        Posture::Evaluation {
+            ends_unix: now + 7 * DAY
+        }
+    );
+    let refused = Facts {
+        licensed_since_unix: behind,
+        refused_unix: behind,
+        ..business(behind)
+    };
+    assert_eq!(
+        posture(now, &refused),
+        Posture::NoLongerActive {
+            stops_unix: Some(now + 3 * DAY)
+        }
+    );
+}
+
+#[test]
+fn the_store_restamps_what_a_clock_that_was_behind_recorded() {
+    let (scratch, s) = scratch_store("clock-behind", REAL_SUB);
+    s.set_mode(Mode::Business);
+    let behind = CLOCK_FLOOR_UNIX - 400 * DAY;
+    assert!(s.start_evaluation_if_due(behind));
+    // Still behind: nothing to restamp yet.
+    assert!(!s.settle_clock(behind + DAY));
+    // Put right: the evaluation runs from now.
+    assert!(s.settle_clock(T0));
+    assert_eq!(s.load_facts(T0).evaluation_started_unix, T0);
+    assert!(!s.settle_clock(T0 + DAY), "set once");
+
+    let key = windows_registry::CURRENT_USER.create(&scratch.0).unwrap();
+    key.set_u64("Refused", behind).unwrap();
+    assert!(s.settle_clock(T0));
+    assert_eq!(s.load_facts(T0).refused_unix, T0);
+    assert!(!s.settle_clock(T0 + DAY));
 }

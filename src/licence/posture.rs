@@ -49,6 +49,20 @@ pub(crate) const EVALUATION_SECS: u64 = 7 * DAY;
 /// before anything stops.
 pub(crate) const NOTICE_SECS: u64 = 3 * DAY;
 
+/// 2026-10-01T00:00:00Z, before any copy that asks the question existed. An
+/// evaluation start or a refusal stamped earlier than this was stamped by a
+/// clock that was behind, and counting from it would lock the copy the moment
+/// the clock is put right. Such a stamp reads as not set: the evaluation
+/// restarts from now and a refusal never locks until it is restamped (see
+/// `store::Store::settle_clock`). Fails toward working, never toward locked.
+pub(crate) const CLOCK_FLOOR_UNIX: u64 = 1_790_812_800;
+
+/// Whether a stored evaluation or refusal stamp counts (see
+/// [`CLOCK_FLOOR_UNIX`]).
+pub(crate) fn stamp_is_set(unix: u64) -> bool {
+    unix >= CLOCK_FLOOR_UNIX
+}
+
 /// Everything the decisions read, gathered by `store::Store::load_facts`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Facts {
@@ -56,11 +70,11 @@ pub(crate) struct Facts {
     pub mode: Option<Mode>,
     /// When the business evaluation started; `0` = not started.
     pub evaluation_started_unix: u64,
-    /// When this copy first held a licence (a verified certificate, or an
-    /// accepted redeem); `0` = never. Once set, silence never locks it.
+    /// When this copy first held a verified certificate; `0` = never. Once
+    /// set, silence never locks it.
     pub licensed_since_unix: u64,
     /// When Connections refused the stored key on replay; `0` = never. A new
-    /// accepted key clears it.
+    /// key whose certificate verifies clears it.
     pub refused_unix: u64,
     /// The plan of the last licence held, for a copy whose certificate lapsed.
     pub last_plan: Option<Plan>,
@@ -70,6 +84,9 @@ pub(crate) struct Facts {
     pub key_last4: Option<String>,
     /// Display only: why the last accepted redeem had no certificate.
     pub pending_reason: Option<String>,
+    /// Display only: the last four characters of a key Connections accepted
+    /// with no certificate. It licenses nothing until its certificate verifies.
+    pub pending_key_last4: Option<String>,
 }
 
 /// What a verified certificate grants.
@@ -112,6 +129,9 @@ pub(crate) enum Posture {
 /// 2. A valid certificate licenses, whatever the mode.
 /// 3. A copy that once held a licence keeps working through silence.
 /// 4. Only a Business copy that never held one runs the evaluation clock.
+///
+/// A key accepted with no certificate changes none of this: it waits, and the
+/// posture is whatever it was until its certificate verifies.
 pub(crate) fn posture(now: u64, f: &Facts) -> Posture {
     let mode = f.mode.unwrap_or(Mode::Personal);
     if f.refused_unix > 0 {
@@ -134,11 +154,19 @@ pub(crate) fn posture(now: u64, f: &Facts) -> Posture {
     }
 }
 
+/// A refusal stamped by a clock that was behind still says the licence ended,
+/// but its notice period runs from now until it is restamped, so it never
+/// locks on its own.
 fn refused_posture(now: u64, mode: Mode, refused_unix: u64) -> Posture {
     match mode {
         Mode::Personal => Posture::NoLongerActive { stops_unix: None },
         Mode::Business => {
-            let stops = refused_unix.saturating_add(NOTICE_SECS);
+            let from = if stamp_is_set(refused_unix) {
+                refused_unix
+            } else {
+                now
+            };
+            let stops = from.saturating_add(NOTICE_SECS);
             if now < stops {
                 Posture::NoLongerActive {
                     stops_unix: Some(stops),
@@ -151,10 +179,11 @@ fn refused_posture(now: u64, mode: Mode, refused_unix: u64) -> Posture {
 }
 
 /// The evaluation path for a Business copy that never held a licence. A clock
-/// nobody started (`0`) fails open to a full evaluation from now; a clock set
-/// back before the start is still inside the evaluation.
+/// nobody started (`0`, or a stamp below [`CLOCK_FLOOR_UNIX`]) fails open to a
+/// full evaluation from now; a clock set back before the start is still inside
+/// the evaluation.
 fn evaluation_posture(now: u64, started: u64) -> Posture {
-    if started == 0 {
+    if !stamp_is_set(started) {
         return Posture::Evaluation {
             ends_unix: now.saturating_add(EVALUATION_SECS),
         };
@@ -218,6 +247,8 @@ pub(crate) const RENEW_AFTER_FAILURE_SECS: u64 = 60 * 60;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RenewalInputs {
     pub has_key: bool,
+    /// A key accepted with no certificate, waiting for one.
+    pub has_pending_key: bool,
     pub refused: bool,
     /// The stored certificate's expiry, when one verifies.
     pub cert_exp_unix: Option<u64>,
@@ -240,9 +271,16 @@ pub(crate) fn renewal_due(now: u64, r: &RenewalInputs, at_startup: bool) -> bool
     if !needs {
         return false;
     }
-    if at_startup {
-        return true;
-    }
+    at_startup || throttle_passed(now, r)
+}
+
+/// Is a replay of the pending key (accepted, no certificate yet) due? Whenever
+/// one is waiting, whatever the stored licence is doing, on the same throttle.
+pub(crate) fn pending_renewal_due(now: u64, r: &RenewalInputs, at_startup: bool) -> bool {
+    r.has_pending_key && (at_startup || throttle_passed(now, r))
+}
+
+fn throttle_passed(now: u64, r: &RenewalInputs) -> bool {
     let wait = if r.last_attempt_ok {
         RENEW_AFTER_SUCCESS_SECS
     } else {
