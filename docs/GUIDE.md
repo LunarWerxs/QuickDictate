@@ -216,6 +216,8 @@ The tray menu is deliberately bare, **Settings…**, **Hide tray icon** (asks fi
 
 One nice touch: the global hotkeys re-register themselves every minute, so dictation keeps working after sleep/resume, a session lock, or an RDP reconnect, the usual moments where global hotkeys quietly die.
 
+Windows can also drop a hotkey press while the hotkey is still registered, so re-registering does not bring it back. QuickDictate watches its own hotkey keys for that: when one goes down and Windows says nothing, it handles the press itself after about a quarter of a second, registers the hotkey again, and clears the key Windows was holding, so the next press works normally. The log (`logs/quickdictate.log`) says so each time, and every half hour says how many hotkey presses it saw. If a key does nothing and the log shows neither a `WM_HOTKEY received` line nor a dropped-press line for it, the key never reached Windows: check the software behind it (for example a Logitech G HUB profile that changed with the app in front).
+
 ### Mouse buttons as hotkeys
 
 A hotkey doesn't have to be a key. The middle button and the two thumb buttons most mice carry can each drive dictation, on their own or with modifiers:

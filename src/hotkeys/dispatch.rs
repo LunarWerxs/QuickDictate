@@ -35,9 +35,20 @@ pub(super) struct HotkeyBindings<'a> {
 /// behavior is identical to having it inline.
 pub(super) fn dispatch_hotkey_message(msg: &MSG, b: &HotkeyBindings<'_>, tx: &Sender<HotkeyEvent>) {
     if msg.message == WM_TIMER {
-        rearm_hotkeys(b);
+        if watch::is_watch_timer(msg.wParam.0) {
+            for dropped in watch::on_timer() {
+                rescue_press(&dropped, b, tx);
+            }
+        } else {
+            rearm_hotkeys(b);
+        }
     } else if msg.message == WM_HOTKEY {
-        dispatch_hotkey_press(msg.wParam.0 as i32, b, tx);
+        let id = msg.wParam.0 as i32;
+        if watch::on_hotkey(id) {
+            dispatch_hotkey_press(id, b, tx);
+        }
+    } else if msg.message == watch::WM_WATCH_KEY_UP {
+        watch::send_key_up(msg.wParam.0 as u32);
     }
 }
 
@@ -45,14 +56,16 @@ pub(super) fn dispatch_hotkey_message(msg: &MSG, b: &HotkeyBindings<'_>, tx: &Se
 /// the mouse hook, and feed the outcome to `hotkeys_blocked()`.
 fn rearm_hotkeys(b: &HotkeyBindings<'_>) {
     let mut all_registered = true;
-    unsafe {
-        if let Some((combo, mods, vk)) = b.kb_toggle {
-            all_registered &= register_one(b.toggle_id, combo, *mods, *vk, true);
-        }
-        if let Some((combo, mods, vk)) = b.kb_hold {
-            all_registered &= register_one(b.hold_id, combo, *mods, *vk, true);
+    for (id, binding) in [(b.toggle_id, b.kb_toggle), (b.hold_id, b.kb_hold)] {
+        if let Some((combo, mods, vk)) = binding {
+            let registered = unsafe { register_one(id, combo, *mods, *vk, true) };
+            watch::set_registered(id, registered);
+            all_registered &= registered;
         }
     }
+    // The watch is a backstop, so a hook that will not install is logged but
+    // does not count as a blocked hotkey.
+    watch::rearm();
     if b.has_mouse {
         // Windows silently removes a low-level hook that overruns
         // LowLevelHooksTimeout, so the mouse side needs the same
@@ -82,6 +95,38 @@ fn dispatch_hotkey_press(id: i32, b: &HotkeyBindings<'_>, tx: &Sender<HotkeyEven
         if let Some((_, _, vk)) = b.kb_hold {
             spawn_release_poller(*vk, tx.clone());
         }
+    }
+}
+
+/// Handle a press Windows dropped (see [`watch`]): log it, register the binding
+/// again, and send what its `WM_HOTKEY` would have. A dropped toggle press gets
+/// no long-press poller: that reads the key state Windows just showed it cannot
+/// be trusted with, and a false long press would paste the last dictation
+/// again. A dropped hold press ends on the key-up the watch sees.
+fn rescue_press(dropped: &watch::Rescue, b: &HotkeyBindings<'_>, tx: &Sender<HotkeyEvent>) {
+    let binding = if dropped.id == b.toggle_id {
+        b.kb_toggle
+    } else {
+        b.kb_hold
+    };
+    let combo = binding.map_or("?", |(combo, _, _)| combo.as_str());
+    tracing::warn!(
+        "hotkey {combo}: the key went down but Windows sent no WM_HOTKEY;          handling the press here and registering the hotkey again"
+    );
+    if let Some((combo, mods, vk)) = binding {
+        let registered = unsafe { register_one(dropped.id, combo, *mods, *vk, true) };
+        watch::set_registered(dropped.id, registered);
+    }
+    if dropped.hold {
+        let _ = tx.send(HotkeyEvent::HoldPressed);
+        if !dropped.still_down {
+            let _ = tx.send(HotkeyEvent::HoldReleased);
+        }
+    } else {
+        let _ = tx.send(HotkeyEvent::TogglePressed);
+    }
+    if !dropped.still_down {
+        watch::send_key_up(dropped.vk);
     }
 }
 
