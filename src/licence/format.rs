@@ -93,7 +93,9 @@ fn key_suffix(last4: Option<&str>) -> String {
 /// The most characters a notice headline may have. The headline is one line
 /// at 16 px semibold Segoe UI in a 320 px box (the notice's 380 px less its
 /// padding and close button), and past this it is cut off with an ellipsis,
-/// which once hid the very words that said what was wrong.
+/// which once hid the very words that said what was wrong. A test holds every
+/// headline to it.
+#[cfg(test)]
 pub(crate) const NOTICE_HEADLINE_MAX_CHARS: usize = 34;
 
 /// The Licence page's status: a short headline and the sentence under it. A
