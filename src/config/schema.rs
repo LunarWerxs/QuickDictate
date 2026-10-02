@@ -532,9 +532,9 @@ pub struct Config {
     #[serde(default = "default_polish_model")]
     pub polish_model: String,
 
-    /// Key for `polish_endpoint`. Empty falls back to `openai_keys`, which is
-    /// the right thing when the endpoint is OpenAI's and wrong for anyone
-    /// else -- set this explicitly when you point it somewhere new.
+    /// Key for `polish_endpoint`. Empty falls back to `openai_keys`, but only
+    /// while the endpoint is OpenAI's own API: an OpenAI key is never sent to
+    /// another host, so point it somewhere new and you must set this too.
     #[serde(default)]
     pub polish_keys: Vec<String>,
 }

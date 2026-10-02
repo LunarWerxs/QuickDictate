@@ -121,6 +121,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the History page and the tray's recent transcriptions are you asking for a
   copy, so they still make an ordinary one that history can keep.
 
+- **AI cleanup no longer lends your OpenAI key to other hosts.** With no
+  cleanup key of its own set, the cleanup pass used your OpenAI speech key for
+  whatever `polish_endpoint` named, so pointing it at Groq, Cerebras or a local
+  server sent that host your OpenAI key with every dictation. The OpenAI key is
+  now used only when the endpoint is OpenAI's own API; anywhere else needs its
+  own key in **Manage keys**. The endpoint must also be `https://`, or plain
+  `http://` to this PC only (a local model server), so a transcript and its key
+  never cross a network unencrypted. Settings shows why the pass is off when the
+  endpoint is refused.
+
 ## [1.4.0] - 2026-10-02
 
 Local dictation that keeps up with you: text appears a quarter second after you stop, dictations

@@ -8,6 +8,7 @@ mod store;
 #[cfg(test)]
 mod tests;
 
+pub use query::polish_endpoint_allowed;
 pub use schema::{Config, EffectiveSettings, Profile};
 
 /// The settings template, **baked into the exe** (no separate

@@ -116,7 +116,16 @@ impl super::SettingsApp {
                 .iter()
                 .filter(|k| !k.trim().is_empty())
                 .count();
-            if keys == 0 {
+            if !crate::config::polish_endpoint_allowed(&self.draft.polish_endpoint) {
+                ui.label(
+                    RichText::new(
+                        "\u{2014} polish_endpoint must be https (or this PC), \
+                         until then pastes are unchanged",
+                    )
+                    .size(12.0)
+                    .color(bad()),
+                );
+            } else if keys == 0 {
                 ui.label(
                     RichText::new("\u{2014} needs an API key, until then pastes are unchanged")
                         .size(12.0)

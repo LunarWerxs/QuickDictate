@@ -612,3 +612,62 @@ fn max_log_mb_round_trips_through_json() {
     let c: Config = serde_json::from_str(json).unwrap();
     assert_eq!(c.max_log_mb, 0);
 }
+
+#[test]
+fn an_openai_key_is_never_lent_to_another_polish_host() {
+    let mut cfg = Config {
+        polish_enabled: true,
+        openai_keys: vec!["sk-openai".into()],
+        ..Default::default()
+    };
+    // The default endpoint is OpenAI's own API, so the speech key is fine.
+    assert_eq!(cfg.polish_key_pool(), vec!["sk-openai"]);
+    // Anywhere else, the OpenAI key must not ride along as the bearer token:
+    // with no cleanup key of its own the pass is simply off.
+    for elsewhere in [
+        "https://api.groq.com/openai/v1/chat/completions",
+        "http://localhost:11434/v1/chat/completions",
+        "https://api.openai.com.evil.example/v1/chat/completions",
+        "http://api.openai.com/v1/chat/completions",
+    ] {
+        cfg.polish_endpoint = elsewhere.into();
+        assert!(cfg.polish_key_pool().is_empty(), "{elsewhere}");
+        assert!(!cfg.polish_possible(), "{elsewhere}");
+    }
+    // Its own key works there, the OpenAI one still never joins it.
+    cfg.polish_endpoint = "https://api.groq.com/openai/v1/chat/completions".into();
+    cfg.polish_keys = vec!["gsk-groq".into()];
+    assert_eq!(cfg.polish_key_pool(), vec!["gsk-groq"]);
+}
+
+#[test]
+fn a_polish_endpoint_never_carries_text_over_plain_http_across_a_network() {
+    use super::polish_endpoint_allowed as ok;
+    assert!(ok("https://api.openai.com/v1/chat/completions"));
+    assert!(ok("https://api.groq.com/openai/v1/chat/completions"));
+    assert!(
+        ok("  https://example.com/v1  "),
+        "surrounding spaces are trimmed"
+    );
+    // Plain http only to this PC: a local model server.
+    assert!(ok("http://localhost:11434/v1/chat/completions"));
+    assert!(ok("http://LOCALHOST:1234/v1/chat/completions"));
+    assert!(ok("http://127.0.0.1:1234/v1/chat/completions"));
+    assert!(ok("http://[::1]:1234/v1/chat/completions"));
+    // Anything that would cross a network readable, or is not a URL at all.
+    assert!(!ok("http://api.groq.com/openai/v1/chat/completions"));
+    assert!(!ok("http://192.168.1.20:11434/v1/chat/completions"));
+    assert!(!ok("http://localhost.evil.example/v1"));
+    assert!(!ok("ftp://example.com/v1"));
+    assert!(!ok("api.openai.com/v1/chat/completions"));
+    assert!(!ok(""));
+    // With the endpoint refused, even a dedicated cleanup key is withheld.
+    let cfg = Config {
+        polish_enabled: true,
+        polish_endpoint: "http://api.groq.com/openai/v1/chat/completions".into(),
+        polish_keys: vec!["gsk-groq".into()],
+        ..Default::default()
+    };
+    assert!(cfg.polish_key_pool().is_empty());
+    assert!(!cfg.polish_possible());
+}
