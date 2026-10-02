@@ -43,6 +43,7 @@ pub(super) const SYNCED_KEYS: &[&str] = &[
     "reinsert_hold_ms",
     "listen_tail_ms",
     "clipboard_restore_delay_ms",
+    "keep_transcript_on_clipboard",
     "auto_space",
     "auto_newline",
     "auto_punct",

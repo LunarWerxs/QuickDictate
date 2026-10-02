@@ -140,6 +140,13 @@ pub struct Config {
     /// a change applies to the next dictation without a restart.
     #[serde(default = "default_clipboard_restore_delay_ms")]
     pub clipboard_restore_delay_ms: u64,
+    /// Leave every transcription on the clipboard, however it was delivered:
+    /// typed as keystrokes, pasted with Ctrl+V (whose restore is then
+    /// skipped), or not delivered at all. A dictation that landed in the
+    /// wrong place, or nowhere, is then one Ctrl+V away. Off by default,
+    /// because it replaces whatever you had copied. Read per paste.
+    #[serde(default = "default_false")]
+    pub keep_transcript_on_clipboard: bool,
     #[serde(default = "default_true")]
     pub auto_space: bool,
     #[serde(default = "default_false")]
@@ -534,6 +541,7 @@ impl Default for Config {
             reinsert_hold_ms: default_reinsert_hold_ms(),
             listen_tail_ms: default_listen_tail_ms(),
             clipboard_restore_delay_ms: default_clipboard_restore_delay_ms(),
+            keep_transcript_on_clipboard: false,
             auto_space: true,
             auto_newline: false,
             auto_punct: true,

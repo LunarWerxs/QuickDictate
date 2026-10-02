@@ -95,6 +95,7 @@ Everything lives in `settings.json` (copied from `settings.example.json`). The f
 | `listen_tail_ms` | Extra trailing listen time after you stop talking, in ms (default `800`). Quiet before you press stop counts toward it, so if you had already stopped talking the text comes 0.25 s after the key |
 | `delay_output_till_release` | Hybrid paste policy (bool) |
 | `clipboard_restore_delay_ms` | Delay before restoring your previous clipboard contents after a clipboard-paste, in ms (default `300`) |
+| `keep_transcript_on_clipboard` | Leave every dictation on the clipboard however it was delivered, so if it lands in the wrong place, or nowhere, Ctrl+V pastes it again (bool, default `false`; your previous clipboard is then not restored). Settings › Behavior › **Save everything to clipboard** |
 | `auto_space` / `auto_newline` / `auto_punct` | Output formatting toggles (bool) |
 | `enable_sound` | Play a sound on state changes (bool) |
 | `duck_other_audio` | Mute or turn down every other app that is playing sound (music, videos, calls) while you dictate, and put each one back the moment QuickDictate stops listening (bool, default `false`). Uses the per-app volume the Windows Volume mixer shows, so the system volume and QuickDictate's own sounds are untouched; an app whose volume you change mid-dictation keeps your change. Settings -> Dictation -> **Other audio** |

@@ -149,6 +149,10 @@ const TIP_NEVER_SLEEP: &str = "Keep the offline speech model loaded for as long 
      runs. Without this it is released after 10 idle minutes, and the next thing you say waits \
      several seconds while it loads back. Costs the model's memory: about 0.5 GB for Parakeet, \
      under 2 GB for Cohere. Same setting as Release model \u{203a} Never. Applies on save.";
+const TIP_KEEP_ON_CLIPBOARD: &str = "Leave every dictation on the clipboard after it is \
+     pasted, so if it lands in the wrong place, or nowhere, Ctrl+V pastes it again. Replaces \
+     whatever you had copied. Off, QuickDictate puts your own clipboard back after each paste. \
+     Applies to your next dictation.";
 const TIP_DUCK: &str = "Mute or turn down music, videos and every other app while you dictate, \
      so nothing plays over you or ends up in the transcript. Each app goes back to its own volume \
      the moment QuickDictate stops listening, and one you adjust mid-dictation keeps your change. \

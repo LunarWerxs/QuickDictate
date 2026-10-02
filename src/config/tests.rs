@@ -560,6 +560,15 @@ fn clipboard_restore_delay_round_trips_through_json() {
 }
 
 #[test]
+fn keep_transcript_on_clipboard_is_opt_in() {
+    assert!(!Config::default().keep_transcript_on_clipboard);
+    let c: Config = serde_json::from_str("{}").unwrap();
+    assert!(!c.keep_transcript_on_clipboard);
+    let c: Config = serde_json::from_str(r#"{ "keep_transcript_on_clipboard": true }"#).unwrap();
+    assert!(c.keep_transcript_on_clipboard);
+}
+
+#[test]
 fn max_log_mb_defaults_to_5() {
     assert_eq!(Config::default().max_log_mb, 5);
     let c: Config = serde_json::from_str("{}").unwrap();

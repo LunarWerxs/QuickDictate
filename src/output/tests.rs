@@ -142,6 +142,15 @@ fn the_undo_stack_is_capped_oldest_first() {
     assert_eq!(reachable, 50);
 }
 
+/// "Save everything to clipboard" must skip the restore, which is what would
+/// take the transcription back off the clipboard.
+#[test]
+fn keeping_the_transcription_skips_the_clipboard_restore() {
+    assert_eq!(restore_delay_for(true, 300), 0);
+    assert_eq!(restore_delay_for(false, 300), 300);
+    assert_eq!(restore_delay_for(false, 0), 0);
+}
+
 /// An app-compatibility entry that forces a delivery must beat the length
 /// rule both ways: a console ignores Ctrl+V however long the text is, and a
 /// window that drops keystrokes drops short text too.

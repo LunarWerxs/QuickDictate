@@ -51,7 +51,15 @@ pub fn copy_to_clipboard(text: &str) -> Result<()> {
     set_clipboard_unicode(text)
 }
 
-pub fn paste(text: &str, restore_delay_ms: u64, delivery: Delivery) -> Result<PasteOutcome> {
+/// Deliver `text` to the focused window. With `keep_on_clipboard` the text is
+/// also left on the clipboard whichever way it went, so Ctrl+V brings back a
+/// dictation that landed in the wrong place.
+pub fn paste(
+    text: &str,
+    restore_delay_ms: u64,
+    delivery: Delivery,
+    keep_on_clipboard: bool,
+) -> Result<PasteOutcome> {
     if text.is_empty() {
         return Ok(PasteOutcome::Typed);
     }
@@ -81,11 +89,15 @@ pub fn paste(text: &str, restore_delay_ms: u64, delivery: Delivery) -> Result<Pa
     let n = text.chars().count();
     if !uses_clipboard(delivery, n) {
         tracing::debug!("paste: sending {} chars via Unicode keystrokes", n);
-        return send_unicode_text(text).map(|()| PasteOutcome::Typed);
+        let typed = send_unicode_text(text);
+        if keep_on_clipboard {
+            leave_on_clipboard(text);
+        }
+        return typed.map(|()| PasteOutcome::Typed);
     }
 
     tracing::debug!("paste: {} chars via clipboard (instant)", n);
-    match paste_via_clipboard(text, restore_delay_ms) {
+    match paste_via_clipboard(text, restore_delay_for(keep_on_clipboard, restore_delay_ms)) {
         Ok(()) => Ok(PasteOutcome::Typed),
         Err(e) if delivery == Delivery::Clipboard => {
             // Listed as dropping synthetic keystrokes, so the keystroke
@@ -103,8 +115,30 @@ pub fn paste(text: &str, restore_delay_ms: u64, delivery: Delivery) -> Result<Pa
             // back to keystrokes is slower but it is the difference between a
             // slightly janky paste and a silently lost dictation.
             tracing::warn!("paste: clipboard path failed ({e:#}); falling back to keystrokes");
-            send_unicode_text(text).map(|()| PasteOutcome::Typed)
+            let typed = send_unicode_text(text);
+            if keep_on_clipboard {
+                leave_on_clipboard(text);
+            }
+            typed.map(|()| PasteOutcome::Typed)
         }
+    }
+}
+
+/// The clipboard path's restore delay. Keeping the transcription means not
+/// restoring at all: the restore is exactly what would take it off again.
+fn restore_delay_for(keep_on_clipboard: bool, restore_delay_ms: u64) -> u64 {
+    if keep_on_clipboard {
+        0
+    } else {
+        restore_delay_ms
+    }
+}
+
+/// Best effort, after the text was typed (or failed to be): a clipboard some
+/// other app is holding open must not turn a paste that worked into an error.
+fn leave_on_clipboard(text: &str) {
+    if let Err(e) = set_clipboard_unicode(text) {
+        tracing::warn!("paste: could not leave the transcription on the clipboard ({e:#})");
     }
 }
 

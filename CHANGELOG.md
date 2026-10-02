@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Save everything to clipboard.** Settings › Behavior, or
+  `keep_transcript_on_clipboard` in settings.json. When on, every dictation is
+  left on the clipboard however it was delivered: typed as keystrokes, pasted
+  with Ctrl+V (the restore of your previous clipboard is then skipped), or not
+  delivered at all. A dictation that landed in the wrong window, or nowhere, is
+  one Ctrl+V away. Off by default, because it replaces whatever you had copied.
+
 ## [1.4.0] - 2026-10-02
 
 Local dictation that keeps up with you: text appears a quarter second after you stop, dictations

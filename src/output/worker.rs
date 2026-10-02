@@ -318,7 +318,13 @@ pub(super) fn paste_processed(
     } else {
         tracing::info!("pasting {} char(s)", processed.chars().count());
     }
-    let restore_delay_ms = app.config.load().clipboard_restore_delay_ms;
+    let (restore_delay_ms, keep_on_clipboard) = {
+        let cfg = app.config.load();
+        (
+            cfg.clipboard_restore_delay_ms,
+            cfg.keep_transcript_on_clipboard,
+        )
+    };
 
     // Where this is about to land, for "scratch that". Captured BEFORE
     // injection (by the time the keystrokes are consumed the foreground
@@ -337,7 +343,7 @@ pub(super) fn paste_processed(
         .map_or(app_compat::Delivery::Auto, |entry| entry.delivery);
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        paste(processed, restore_delay_ms, delivery)
+        paste(processed, restore_delay_ms, delivery, keep_on_clipboard)
     }));
     // The transcript goes into history on EVERY outcome, not just success.
     // A failed paste used to be lost three ways at once (not typed, not on the
@@ -380,6 +386,11 @@ pub(super) fn paste_processed(
         Err(_) => {
             tracing::error!("paste PANICKED (caught; thread continues)");
             app.raise_error(ErrorKind::Generic);
+            if keep_on_clipboard {
+                if let Err(e) = copy_to_clipboard(processed) {
+                    tracing::warn!("could not leave the transcription on the clipboard ({e:#})");
+                }
+            }
         }
     }
 }

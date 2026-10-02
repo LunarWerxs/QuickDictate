@@ -68,6 +68,12 @@ impl super::SettingsApp {
                      automatically as soon as the daily check finds one, with no confirmation.",
                 );
             }
+            blue_check(
+                left,
+                &mut self.draft.keep_transcript_on_clipboard,
+                "Save everything to clipboard",
+            )
+            .on_hover_text(TIP_KEEP_ON_CLIPBOARD);
 
             let right = &mut cols[1];
             blue_check(
