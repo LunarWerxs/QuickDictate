@@ -1,10 +1,11 @@
-//! The anonymous per-install id that keys the opt-in usage report
+//! The pseudonymous per-install id that keys the opt-in usage report
 //! (`stats::report`). Update checks used to send it as `X-Install-Id`; they no
 //! longer do (see `latest_request`), but the id is still generated here, at
 //! startup, so it is the same one whenever the report is switched on.
 //!
-//! Crypto-random and derived from nothing about the machine, so it identifies
-//! an install and not a person.
+//! Crypto-random and derived from nothing about the machine, so it is tied to
+//! no name. It is pseudonymous, not anonymous: it does link one install's
+//! reports together.
 
 use std::sync::Arc;
 
@@ -12,7 +13,7 @@ use crate::config::Config;
 use crate::state::App;
 
 // ---------------------------------------------------------------------------
-// Anonymous install id
+// Pseudonymous install id
 // ---------------------------------------------------------------------------
 
 /// Crypto-random UUIDv4 via CNG (`BCryptGenRandom`, the same checked call as
@@ -47,7 +48,7 @@ pub(super) fn new_install_id() -> Option<String> {
     ))
 }
 
-/// Make sure the anonymous install id exists: keep the one persisted in
+/// Make sure the pseudonymous install id exists: keep the one persisted in
 /// settings.json, or on the very first launch generate a fresh UUID and
 /// persist it (via [`Config::save_install_id`], which fills the template's
 /// empty slot in place rather than rewriting the whole file). Called once
@@ -68,7 +69,7 @@ pub fn init_install_id(app: &App) {
     match new_cfg.save_install_id(&Config::settings_path()) {
         Ok(()) => {
             app.config.store(Arc::new(new_cfg));
-            tracing::info!("update: generated anonymous install id");
+            tracing::info!("update: generated pseudonymous install id");
         }
         Err(e) => {
             tracing::warn!("update: could not persist install id ({e}); none this launch");

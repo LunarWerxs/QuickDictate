@@ -58,10 +58,10 @@ use install::*;
 
 /// "Latest release" endpoint: the Connections Studio proxy, which relays
 /// GitHub's `releases/latest` JSON for LunarWerxs/QuickDictate **verbatim**
-/// (so parsing here is unchanged from the GitHub API) and logs one anonymous
-/// analytics row per hit — version and coarse CDN-derived geo, never the
-/// caller's IP; 90-day retention. The request carries only the app version
-/// (`?v=`, for anonymous version-adoption stats) and the shared User-Agent:
+/// (so parsing here is unchanged from the GitHub API) and logs one analytics
+/// row per hit — version and CDN-derived geo, never the caller's IP; 90-day
+/// retention. The request carries only the app version (`?v=`, for
+/// version-adoption stats) and the shared User-Agent:
 /// no install id, so a check identifies no copy of the app (see
 /// `latest_request`). See SECURITY.md for the full disclosure. Release
 /// *binaries* still download straight from GitHub via the asset URLs in the
@@ -183,7 +183,7 @@ fn client() -> Option<reqwest::blocking::Client> {
 
 /// The last successful `fetch_latest_json` payload, held so the install step
 /// can reuse the JSON the user just said yes to instead of re-fetching — the
-/// SECURITY.md promise is **one anonymous row per check**, and a second fetch
+/// SECURITY.md promise is **one row per check**, and a second fetch
 /// would log a second row. `latest_exe_asset` *takes* it (single use), so a
 /// manual install path with no prior check still fetches fresh.
 static LAST_LATEST_JSON: Mutex<Option<serde_json::Value>> = Mutex::new(None);
@@ -195,7 +195,7 @@ static LAST_LATEST_JSON: Mutex<Option<serde_json::Value>> = Mutex::new(None);
 /// installs is not worth that. The id now travels only with the opt-in usage
 /// report (`stats::report`).
 fn latest_request(client: &reqwest::blocking::Client) -> reqwest::blocking::RequestBuilder {
-    // ?v= reports the running version for the endpoint's anonymous
+    // ?v= reports the running version for the endpoint's
     // version-adoption stats. The server also falls back to parsing the
     // User-Agent, but the explicit param is its preferred channel and
     // survives any edge/CDN header-forwarding change.
@@ -230,7 +230,7 @@ fn fetch_latest_json() -> Option<serde_json::Value> {
 ///
 /// Deliberately carries no `?v=` (and, like the primary check, no install id): this is a plain
 /// unauthenticated read, so it stays inside GitHub's anonymous rate limit and logs no analytics
-/// row, which keeps the SECURITY.md promise of one anonymous row per check intact (a fallback
+/// row, which keeps the SECURITY.md promise of one row per check intact (a fallback
 /// logs none at all).
 fn fetch_github_fallback_json() -> Option<serde_json::Value> {
     let resp = client()?.get(GITHUB_LATEST_API).send().ok()?;

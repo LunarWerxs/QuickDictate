@@ -139,7 +139,7 @@ fn update_check_request_carries_only_the_version() {
 fn live_studio_latest_release_parses() {
     // The Studio proxy must relay GitHub's releases/latest JSON verbatim —
     // the same fields check() and latest_exe_asset() consume. NOTE: each
-    // run logs one anonymous analytics row on the endpoint.
+    // run logs one analytics row on the endpoint.
     let resp = client()
         .unwrap()
         .get(RELEASES_API)

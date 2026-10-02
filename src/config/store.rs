@@ -442,7 +442,7 @@ mod tests {
         assert!(!c.stt_provider.is_empty());
     }
 
-    // ---- Anonymous install id ----------------------------------------------
+    // ---- Pseudonymous install id -------------------------------------------
 
     #[test]
     fn install_id_defaults_empty_and_round_trips() {
