@@ -29,6 +29,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   **Check for updates** item still checks straight away, because that click
   is the request.
 
+- **The usage-report setting now says "pseudonymous", not "anonymous".** The
+  opt-in report carries your random install id, so it can be told apart from
+  other copies even though it never names you. The switch now reads **Share
+  pseudonymous usage stats with LunarWerx**, and its tooltip, SECURITY.md and
+  the guides say what it sends in those terms. What the report sends and the
+  `share_usage_stats` key are unchanged.
+
 ## [1.4.0] - 2026-10-02
 
 Local dictation that keeps up with you: text appears a quarter second after you stop, dictations

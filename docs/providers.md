@@ -300,9 +300,9 @@ feedback. Pick **Local** when privacy/offline use matters most and your machine
 has enough RAM/disk for the selected model; it also returns results on release.
 
 Whichever you choose, remember: your audio and API keys go only to the
-provider you select, never to the QuickDictate maintainer. (The only thing the
-app ever reports is the anonymous daily update-check ping described in
-[SECURITY.md](../.github/SECURITY.md).)
+provider you select, never to the QuickDictate maintainer. (The app itself
+reports only the daily update check and, if you opt in, the pseudonymous
+daily usage report, both described in [SECURITY.md](../.github/SECURITY.md).)
 
 ## Custom vocabulary support
 

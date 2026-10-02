@@ -280,7 +280,8 @@ pub struct Config {
     /// Automatically check for a newer release at startup (throttled to once
     /// per day). The check goes to LunarWerx's update endpoint (see
     /// `update::RELEASES_API`), which relays GitHub's release info and also
-    /// counts the hit as one anonymous ping — details in SECURITY.md.
+    /// counts the hit (version and User-Agent, no install id) — details in
+    /// SECURITY.md.
     /// Finding a newer release only *reports* it (tray tooltip + the About
     /// pill); installing it is a click, unless you opt into
     /// `update_auto_install`. With this off, opening About does not check
@@ -290,13 +291,14 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub update_auto_check: bool,
 
-    /// Anonymous install id, which keys the opt-in usage report
+    /// Random install id, which keys the opt-in usage report
     /// (`share_usage_stats`) so the endpoint counts one machine once. A
     /// crypto-random UUID generated locally on first launch (see
     /// `update::init_install_id`) — **never** derived from hostname, MAC,
     /// username, or any other machine/personal identifier, so it identifies
-    /// nothing but itself. Sent only with that report, never with update
-    /// checks (see SECURITY.md); clear the value to get a fresh id on the
+    /// nothing but itself. It is still stable per install, so the report it
+    /// keys is pseudonymous, not anonymous. Sent only with that report, never
+    /// with update checks (see SECURITY.md); clear the value to get a fresh id on the
     /// next launch.
     #[serde(default)]
     pub install_id: String,
@@ -467,13 +469,14 @@ pub struct Config {
     #[serde(default = "default_false")]
     pub protect_keys_at_rest: bool,
 
-    /// Opt in to sending LunarWerx one anonymized usage rollup a day: this
+    /// Opt in to sending LunarWerx one pseudonymous usage rollup a day: this
     /// install's lifetime word/audio/dictation totals and which providers
     /// you use, so the team can see aggregate feature adoption without
     /// adding a new pipeline. Off by default. Uses [`Self::install_id`] --
-    /// the same anonymous, crypto-random id already sent with update checks
-    /// -- as the only correlating value; no transcript text, hostname,
-    /// username, device id, or IP ever leaves the machine (see
+    /// the crypto-random install id, which update checks no longer send --
+    /// as the only correlating value, which makes the report pseudonymous,
+    /// not anonymous; no transcript text, hostname, username, device id, or
+    /// IP is ever in the payload (see
     /// `stats::report::anonymized_payload`, which builds the exact allowed
     /// field list rather than serializing the stats store wholesale).
     /// Turning this off just stops the next send -- it does not recall a

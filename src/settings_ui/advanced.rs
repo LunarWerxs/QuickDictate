@@ -207,13 +207,11 @@ impl super::SettingsApp {
             blue_check(
                 right,
                 &mut self.draft.share_usage_stats,
-                "Share anonymous usage stats with LunarWerx",
+                "Share pseudonymous usage stats with LunarWerx",
             )
             .on_hover_text(
-                "Once a day, send an anonymized rollup of your lifetime word/audio/\
-                 dictation totals and which providers you use -- never any dictated \
-                 text, hostname, username, or account info. Helps LunarWerx see which \
-                 features actually get used. Off by default; on or off any time.",
+                "Once a day: word and dictation counts and which providers you used, \
+                 tied to a random install id. Never your words or audio.",
             );
         });
     }
