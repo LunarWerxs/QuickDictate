@@ -442,18 +442,22 @@ impl NativeEngine {
     }
 }
 
-/// The clips one utterance is decoded as: Cohere audio is cut at quiet
-/// boundaries (its decoder loops on long input), every other model takes the
-/// whole utterance in one pass.
-fn clip_ranges(model_id: &str, pcm_i16: &[i16]) -> Vec<std::ops::Range<usize>> {
-    let ranges = if model_id == "cohere-q5" {
+/// The clips one utterance is decoded as. Cohere and Parakeet audio is cut
+/// at quiet boundaries into clips of at most 35 s; Whisper takes the whole
+/// utterance, since its runtime already windows it in 30 s steps.
+///
+/// Cohere's decoder loops on long input. Parakeet runs full attention, so one
+/// pass costs quadratically in its length: a 178 s dictation took 20 s in one
+/// pass on an RTX 3090 (2026-10-02), where 35 s clips stay linear.
+pub(super) fn clip_ranges(model_id: &str, pcm_i16: &[i16]) -> Vec<std::ops::Range<usize>> {
+    let ranges = if matches!(model_id, "cohere-q5" | "parakeet-v3-q5") {
         cohere_chunk_ranges(pcm_i16, 16_000)
     } else {
         std::iter::once(0..pcm_i16.len()).collect()
     };
     if ranges.len() > 1 {
         tracing::info!(
-            "local STT splitting {:.1}s Cohere audio into {} quiet-boundary clip(s)",
+            "local STT splitting {:.1}s {model_id} audio into {} quiet-boundary clip(s)",
             pcm_i16.len() as f32 / 16_000.0,
             ranges.len()
         );

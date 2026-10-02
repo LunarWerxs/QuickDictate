@@ -25,6 +25,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   slower-than-3-second dictation followed a reload**. On a machine with the RAM
   to spare, `0` removes that entire class.
 
+### Fixed
+
+- **Long Parakeet dictations no longer stall.** A long recording now reaches
+  Parakeet as clips of at most 35 s cut at quiet moments, as Cohere's already
+  did. In one pass, a 178 s dictation took 20 s on an RTX 3090 and a 177 s test
+  clip 8.7 s the first time; clipped, the same clip takes 3.0 s, with no words
+  lost at the cuts (9.1% vs 10.4% word errors on a 199 s read-aloud test).
+
 ## [1.3.0] - 2026-10-02
 
 Newer, faster speech engines across the board, from a live test of every model QuickDictate

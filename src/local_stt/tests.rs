@@ -18,7 +18,7 @@ use super::download::{
 };
 use super::install::{finish_operation, install, prune_stale_runtimes, InstallPhase};
 use super::native::{
-    join_and_clean, language_cstring, model_language, whisper_history_tokens,
+    clip_ranges, join_and_clean, language_cstring, model_language, whisper_history_tokens,
     whisper_initial_prompt, ModelLoadParams, NativeEngine, RunParams, WhisperRunExt,
 };
 use super::postprocess::{
@@ -418,6 +418,25 @@ fn cohere_long_audio_uses_quiet_boundaries_under_35_seconds() {
         .all(|range| range.len() <= sample_rate * COHERE_CLIP_MAX_SECONDS));
     assert!((32_900..=33_200).contains(&ranges[0].end));
     assert!((65_900..=66_200).contains(&ranges[1].end));
+}
+
+/// Parakeet's full attention makes one long pass quadratic, so a long
+/// dictation must reach it as the same <=35 s quiet-boundary clips Cohere
+/// gets; Whisper keeps one pass because its runtime windows the audio itself.
+#[test]
+fn long_parakeet_and_cohere_audio_is_clipped_but_whisper_is_not() {
+    let pcm = vec![1_000i16; 16_000 * 178];
+    for id in ["parakeet-v3-q5", "cohere-q5"] {
+        let ranges = clip_ranges(id, &pcm);
+        assert!(ranges.len() >= 6, "{id} got {} clip(s)", ranges.len());
+        assert!(ranges
+            .iter()
+            .all(|range| range.len() <= 16_000 * COHERE_CLIP_MAX_SECONDS));
+        assert_eq!(ranges.last().unwrap().end, pcm.len());
+    }
+    assert_eq!(clip_ranges("whisper-turbo-q5", &pcm), vec![0..pcm.len()]);
+    // A normal short dictation stays one clip for every model.
+    assert_eq!(clip_ranges("parakeet-v3-q5", &pcm[..16_000 * 20]).len(), 1);
 }
 
 #[test]
