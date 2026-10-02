@@ -37,7 +37,7 @@ pub(super) fn dispatch_hotkey_message(msg: &MSG, b: &HotkeyBindings<'_>, tx: &Se
     if msg.message == WM_TIMER {
         if watch::is_watch_timer(msg.wParam.0) {
             for dropped in watch::on_timer() {
-                rescue_press(&dropped, b, tx);
+                act_on_dropped(&dropped, b, tx);
             }
         } else {
             rearm_hotkeys(b);
@@ -98,32 +98,67 @@ fn dispatch_hotkey_press(id: i32, b: &HotkeyBindings<'_>, tx: &Sender<HotkeyEven
     }
 }
 
-/// Handle a press Windows dropped (see [`watch`]): log it, register the binding
-/// again, and send what its `WM_HOTKEY` would have. A dropped toggle press gets
-/// no long-press poller: that reads the key state Windows just showed it cannot
-/// be trusted with, and a false long press would paste the last dictation
-/// again. A dropped hold press ends on the key-up the watch sees.
-fn rescue_press(dropped: &watch::Rescue, b: &HotkeyBindings<'_>, tx: &Sender<HotkeyEvent>) {
+/// Floor between the warnings for presses left alone (see [`act_on_dropped`]),
+/// so a Remote Desktop window that takes the hotkey key on every press does
+/// not fill the log.
+const LEFT_ALONE_WARN_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+/// When a left-alone press was last logged, and how many since went unlogged.
+static LEFT_ALONE_WARN: parking_lot::Mutex<(Option<Instant>, u32)> =
+    parking_lot::Mutex::new((None, 0));
+
+/// Act on a press Windows sent no `WM_HOTKEY` for (see [`watch`]): log it,
+/// register the binding again, clear the key once it is up, and, only when
+/// Windows had the key stuck down, send what the `WM_HOTKEY` would have.
+///
+/// A handled toggle press gets no long-press poller: that reads the key state
+/// Windows just showed it cannot be trusted with, and a false long press would
+/// paste the last dictation again. A handled hold press ends on the key-up the
+/// watch sees.
+fn act_on_dropped(dropped: &watch::Dropped, b: &HotkeyBindings<'_>, tx: &Sender<HotkeyEvent>) {
     let binding = if dropped.id == b.toggle_id {
         b.kb_toggle
     } else {
         b.kb_hold
     };
     let combo = binding.map_or("?", |(combo, _, _)| combo.as_str());
-    tracing::warn!(
-        "hotkey {combo}: the key went down but Windows sent no WM_HOTKEY;          handling the press here and registering the hotkey again"
-    );
+    if dropped.handle {
+        tracing::warn!(
+            "hotkey {combo}: Windows still counted the key as down, so it sent no \
+             WM_HOTKEY for this press; handling the press here, registering the hotkey \
+             again and clearing the key"
+        );
+    } else {
+        let mut last = LEFT_ALONE_WARN.lock();
+        if last
+            .0
+            .is_none_or(|t| t.elapsed() >= LEFT_ALONE_WARN_INTERVAL)
+        {
+            tracing::warn!(
+                "hotkey {combo}: the key reached QuickDictate but Windows sent no WM_HOTKEY \
+                 ({} more like it since the last line). Another program may have taken it \
+                 (Remote Desktop, a key remapper, a game), so the press is left alone; \
+                 registering the hotkey again and clearing the key in case Windows lost it",
+                last.1
+            );
+            *last = (Some(Instant::now()), 0);
+        } else {
+            last.1 += 1;
+        }
+    }
     if let Some((combo, mods, vk)) = binding {
         let registered = unsafe { register_one(dropped.id, combo, *mods, *vk, true) };
         watch::set_registered(dropped.id, registered);
     }
-    if dropped.hold {
-        let _ = tx.send(HotkeyEvent::HoldPressed);
-        if !dropped.still_down {
-            let _ = tx.send(HotkeyEvent::HoldReleased);
+    if dropped.handle {
+        if dropped.hold {
+            let _ = tx.send(HotkeyEvent::HoldPressed);
+            if !dropped.still_down {
+                let _ = tx.send(HotkeyEvent::HoldReleased);
+            }
+        } else {
+            let _ = tx.send(HotkeyEvent::TogglePressed);
         }
-    } else {
-        let _ = tx.send(HotkeyEvent::TogglePressed);
     }
     if !dropped.still_down {
         watch::send_key_up(dropped.vk);

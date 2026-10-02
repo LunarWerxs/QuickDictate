@@ -17,17 +17,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
-- **A hotkey press Windows drops is no longer lost.** Windows can stop
-  answering a registered hotkey without a word: on one PC an F14 sent by
+- **A hotkey Windows stops answering now recovers on its own.** Windows can
+  stop answering a registered hotkey without a word: on one PC an F14 sent by
   Logitech G HUB did nothing for an hour, through a re-registration every
   minute, until one key-up for F14 was sent by hand. QuickDictate now watches
   its own hotkey keys. When one goes down and no hotkey message follows within
-  about a quarter of a second, it handles the press itself, registers the
-  hotkey again, and sends that same key-up once the key is released, so the
-  next press works normally. The watch never swallows or changes a key, ignores
-  every key that is not a hotkey or a modifier, and logs each dropped press
-  plus a count of hotkey presses every half hour, so a dead key can now be
-  told apart from a key that never reached Windows.
+  about a quarter of a second, it registers the hotkey again and sends that
+  same key-up once the key is released, so the next press works normally.
+  When Windows still counted the key as down (a stuck key), it also handles
+  that press itself; otherwise it leaves the press alone, since a Remote
+  Desktop window, a key remapper or a game may have taken the key on purpose.
+  The watch never swallows or changes a key, ignores every key that is not a
+  hotkey, and logs each such press plus a count of hotkey presses every half
+  hour, so a dead key can now be told apart from one that never reached
+  Windows.
 
 ## [1.4.0] - 2026-10-02
 

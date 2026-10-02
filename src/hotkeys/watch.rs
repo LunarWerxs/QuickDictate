@@ -3,23 +3,31 @@
 //! `RegisterHotKey` is a black box: when it stops answering, nothing says so.
 //! On 2 October 2026 a G HUB-driven F14 went silent for an hour while its
 //! binding stayed registered and was re-armed every minute, and one synthetic
-//! key-up for F14 brought it straight back. Whatever Windows was holding (most
-//! likely a key it believed was still down, so `MOD_NOREPEAT` took every fresh
-//! press for auto-repeat), the app could neither see it nor recover from it,
-//! and the log could not even say whether the key had reached Windows at all.
+//! key-up for F14 brought it straight back. The app could neither see that nor
+//! recover from it, and the log could not even say whether the key had reached
+//! Windows at all.
 //!
-//! So a passive `WH_KEYBOARD_LL` hook watches the configured keys, plus the
-//! modifier keys so a combo is matched exactly as Windows matches it. It never
+//! So a passive `WH_KEYBOARD_LL` hook watches the configured keys. It never
 //! swallows or changes a key, and every other key is ignored the moment its
-//! code is read. A fresh press of a hotkey key starts a short timer; the
-//! `WM_HOTKEY` that normally follows within a millisecond or two settles it.
-//! If the timer fires first, Windows dropped the press: the watch handles it
-//! itself, logs that it did, re-registers the binding, and once the key is up
-//! sends one key-up for it, which clears whatever Windows was holding.
+//! code is read. A fresh press of a hotkey key, with the modifiers Windows
+//! itself reports as held, starts a short timer; the `WM_HOTKEY` that normally
+//! follows within a millisecond or two settles it. If the timer fires first,
+//! Windows sent nothing for a press that reached it, and what happens depends
+//! on why:
 //!
-//! It also answers the question the old log could not. A press with neither a
-//! `WM_HOTKEY received` line nor a "dropped" line never reached Windows: the
-//! device or its software (a G HUB profile, say) sent nothing.
+//! - **Windows still counted the key as down** before this press, so
+//!   `MOD_NOREPEAT` took the press for auto-repeat. That is a stuck key, not a
+//!   choice anyone made: the watch handles the press itself.
+//! - **Windows did not count it as down.** Then another program may have taken
+//!   the key on purpose (a Remote Desktop window, a key remapper, a game that
+//!   turns hotkeys off), and starting a dictation behind its back would be
+//!   wrong. The press is left alone.
+//!
+//! Either way the watch logs it, registers the hotkey again, and once the key
+//! is up sends one key-up for it, the cure that worked on 2 October. A press
+//! with neither a `WM_HOTKEY received` line nor one of these lines most likely
+//! never reached Windows: the device or its software (a G HUB profile, say)
+//! sent nothing.
 //!
 //! Runs on the hotkey thread, like [`crate::mouse_hook`]: Windows calls a
 //! low-level hook on the thread that installed it while that thread pumps
@@ -36,13 +44,16 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
-    MAPVK_VK_TO_VSC, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, VIRTUAL_KEY,
+    MAPVK_VK_TO_VSC, MOD_NOREPEAT, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, KillTimer, PostThreadMessageW, SetTimer, SetWindowsHookExW,
-    UnhookWindowsHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED, WH_KEYBOARD_LL, WM_APP,
-    WM_KEYDOWN, WM_SYSKEYDOWN,
+    SystemParametersInfoW, UnhookWindowsHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
+    SPI_GETFILTERKEYS, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN,
+    WM_SYSKEYDOWN,
 };
+
+use crate::mouse_hook::{current_modifiers, key_down};
 
 use super::HotkeyEvent;
 
@@ -59,13 +70,19 @@ pub(super) const DROPPED_AFTER: Duration = Duration::from_millis(100);
 /// While a key is held its further downs are auto-repeat. Auto-repeat starts at
 /// most a second after the press (the slowest Windows keyboard delay) and then
 /// runs faster, so a down arriving longer than this after the previous one is
-/// a new press whose key-up never reached the watch.
+/// a new press whose key-up never reached the watch. FilterKeys can slow the
+/// repeat further; [`lost_up_gap`] widens this to match.
 pub(super) const LOST_UP_GAP: Duration = Duration::from_millis(1500);
 
 /// A `WM_HOTKEY` this soon after the watch handled a press itself, with no new
 /// press in between, is that same press arriving late (another program's slow
 /// hook held up the chain), not a second one.
 pub(super) const LATE_HOTKEY: Duration = Duration::from_millis(1500);
+
+/// A handled hold press whose key-up the watch never saw (the hook was gone
+/// for a moment) is ended by the re-arm tick once Windows reports the key up
+/// and it has been at least this long since the press.
+pub(super) const STALE_RELEASE_AFTER: Duration = Duration::from_secs(2);
 
 /// Marks the key-up the watch sends, so its own hook passes it by.
 const OUR_KEY_UP: usize = 0x5144_4b55; // "QDKU"
@@ -77,6 +94,14 @@ pub(super) const WM_WATCH_KEY_UP: u32 = WM_APP + 0x51;
 /// Re-arm ticks between the "still watching" lines in the log: half an hour at
 /// the 60-second re-arm.
 const REPORT_EVERY_TICKS: u32 = 30;
+
+/// A fresh press waiting on its `WM_HOTKEY`.
+#[derive(Debug, Clone, Copy)]
+struct Pending {
+    at: Instant,
+    /// Windows already counted the key as down when this press arrived.
+    windows_held: bool,
+}
 
 /// One configured keyboard binding, and what the watch knows about its key.
 #[derive(Debug)]
@@ -92,8 +117,7 @@ struct Key {
     registered: bool,
     down: bool,
     last_down: Option<Instant>,
-    /// A fresh press waiting on its `WM_HOTKEY`.
-    pending: Option<Instant>,
+    pending: Option<Pending>,
     /// When the watch last handled a press itself.
     rescued: Option<Instant>,
     /// A handled hold press is still down: its key-up ends the dictation.
@@ -102,15 +126,19 @@ struct Key {
     clear_owed: bool,
 }
 
-/// A dropped press, for the hotkey thread to handle.
+/// A press Windows sent no `WM_HOTKEY` for, for the hotkey thread to act on.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct Rescue {
+pub(super) struct Dropped {
     pub(super) id: i32,
     pub(super) vk: u32,
     pub(super) hold: bool,
+    /// Windows counted the key as down already, so it took the press for
+    /// auto-repeat: handle the press. Otherwise another program may have taken
+    /// the key on purpose, and the press is left alone.
+    pub(super) handle: bool,
     /// The key is still down. When it is not, the clearing key-up goes out
-    /// now (and a hold press ends at once); when it is, both wait for its
-    /// key-up.
+    /// now (and a handled hold press ends at once); when it is, both wait for
+    /// its key-up.
     pub(super) still_down: bool,
 }
 
@@ -119,46 +147,28 @@ pub(super) struct Rescue {
 pub(super) struct KeyOutcome {
     /// A press is waiting on its `WM_HOTKEY`: make sure the timer runs.
     pub(super) arm_timer: bool,
-    /// A handled hold press came up: send `HoldReleased`. Only ever the hold
+    /// A handled hold press is over: send `HoldReleased`. Only ever the hold
     /// binding's id.
     pub(super) release: Option<i32>,
     /// Send the clearing key-up for this key.
     pub(super) clear: Option<u32>,
 }
 
-/// The modifier keys, as a hook reports them, each with the `MOD_*` bit it
-/// stands for. Hardware reports the left/right codes; injected input (our own
-/// Ctrl+V among it) may use the generic ones.
-const MODIFIER_KEYS: [(u32, u32); 11] = [
-    (0x10, MOD_SHIFT.0),   // VK_SHIFT
-    (0xA0, MOD_SHIFT.0),   // VK_LSHIFT
-    (0xA1, MOD_SHIFT.0),   // VK_RSHIFT
-    (0x11, MOD_CONTROL.0), // VK_CONTROL
-    (0xA2, MOD_CONTROL.0), // VK_LCONTROL
-    (0xA3, MOD_CONTROL.0), // VK_RCONTROL
-    (0x12, MOD_ALT.0),     // VK_MENU
-    (0xA4, MOD_ALT.0),     // VK_LMENU
-    (0xA5, MOD_ALT.0),     // VK_RMENU
-    (0x5B, MOD_WIN.0),     // VK_LWIN
-    (0x5C, MOD_WIN.0),     // VK_RWIN
-];
-
-/// The watch's state. Pure: every input carries its own time, so the tests
-/// drive it without a keyboard.
+/// The watch's state. Pure: every input carries its own time and the key
+/// state Windows reported, so the tests drive it without a keyboard.
 #[derive(Debug)]
 pub(super) struct Watch {
     keys: Vec<Key>,
-    /// Which of [`MODIFIER_KEYS`] are down, one bit each.
-    modifiers_down: u16,
-    /// Fresh presses of a watched key, and drops handled, since the last report.
+    lost_up_gap: Duration,
+    /// Fresh presses of a watched key, and drops met, since the last report.
     presses: u32,
-    rescues: u32,
+    drops: u32,
 }
 
 impl Watch {
     /// `bindings` is `(id, mods, vk, hold)` for each keyboard binding, `mods`
     /// as parsed (with `MOD_NOREPEAT`). Every binding starts unregistered.
-    pub(super) fn new(bindings: &[(i32, u32, u32, bool)]) -> Self {
+    pub(super) fn new(bindings: &[(i32, u32, u32, bool)], lost_up_gap: Duration) -> Self {
         let keys = bindings
             .iter()
             .map(|&(id, mods, vk, hold)| Key {
@@ -177,9 +187,9 @@ impl Watch {
             .collect();
         Self {
             keys,
-            modifiers_down: 0,
+            lost_up_gap,
             presses: 0,
-            rescues: 0,
+            drops: 0,
         }
     }
 
@@ -189,37 +199,49 @@ impl Watch {
         }
     }
 
-    /// The `MOD_*` bits of the modifier keys down right now.
-    fn held_mods(&self) -> u32 {
-        MODIFIER_KEYS
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| self.modifiers_down & (1 << i) != 0)
-            .fold(0, |acc, (_, &(_, bit))| acc | bit)
+    /// Whether `vk` is one of the watched keys.
+    pub(super) fn watches(&self, vk: u32) -> bool {
+        self.keys.iter().any(|k| k.vk == vk)
     }
 
-    /// One key event from the hook.
-    pub(super) fn on_key(&mut self, vk: u32, down: bool, now: Instant) -> KeyOutcome {
-        if let Some(i) = MODIFIER_KEYS.iter().position(|&(m, _)| m == vk) {
-            if down {
-                self.modifiers_down |= 1 << i;
-            } else {
-                self.modifiers_down &= !(1 << i);
-            }
-            return KeyOutcome::default();
-        }
-        let mods = self.held_mods();
+    /// One key event from the hook. For a key-down, `mods` is the `MOD_*` bits
+    /// of the modifiers Windows reports as held and `windows_held` whether
+    /// Windows already counted this key as down, both read before Windows
+    /// takes this event in.
+    pub(super) fn on_key(
+        &mut self,
+        vk: u32,
+        down: bool,
+        mods: u32,
+        windows_held: bool,
+        now: Instant,
+    ) -> KeyOutcome {
         let mut out = KeyOutcome::default();
         let mut presses = 0;
         for k in self.keys.iter_mut().filter(|k| k.vk == vk) {
             if down {
-                let fresh = !k.down
-                    || k.last_down
-                        .is_none_or(|t| now.duration_since(t) > LOST_UP_GAP);
+                let lost_up = k.down
+                    && k.last_down
+                        .is_none_or(|t| now.duration_since(t) > self.lost_up_gap);
+                if lost_up {
+                    // The key-up the last handled press was waiting for never
+                    // came: settle what it owed now, or a hold dictation would
+                    // run on and Windows would stay wedged.
+                    if std::mem::take(&mut k.release_owed) {
+                        out.release = Some(k.id);
+                    }
+                    if std::mem::take(&mut k.clear_owed) {
+                        out.clear = Some(k.vk);
+                    }
+                }
+                let fresh = !k.down || lost_up;
                 k.down = true;
                 k.last_down = Some(now);
                 if fresh && k.registered && k.mods == mods {
-                    k.pending = Some(now);
+                    k.pending = Some(Pending {
+                        at: now,
+                        windows_held,
+                    });
                     k.rescued = None;
                     out.arm_timer = true;
                     presses += 1;
@@ -258,39 +280,103 @@ impl Watch {
 
     /// The watch timer fired. Returns the dropped presses, and whether a press
     /// is still waiting (so the timer must run again).
-    pub(super) fn on_timer(&mut self, now: Instant) -> (Vec<Rescue>, bool) {
-        let mut rescues = Vec::new();
+    pub(super) fn on_timer(&mut self, now: Instant) -> (Vec<Dropped>, bool) {
+        let mut dropped = Vec::new();
         let mut waiting = false;
         for k in &mut self.keys {
-            let Some(at) = k.pending else {
+            let Some(p) = k.pending else {
                 continue;
             };
-            if now.duration_since(at) < DROPPED_AFTER {
+            if now.duration_since(p.at) < DROPPED_AFTER {
                 waiting = true;
                 continue;
             }
             k.pending = None;
-            k.rescued = Some(now);
-            k.release_owed = k.hold && k.down;
+            let handle = p.windows_held;
+            if handle {
+                k.rescued = Some(now);
+                k.release_owed = k.hold && k.down;
+            }
             k.clear_owed = k.down;
-            rescues.push(Rescue {
+            dropped.push(Dropped {
                 id: k.id,
                 vk: k.vk,
                 hold: k.hold,
+                handle,
                 still_down: k.down,
             });
         }
-        self.rescues += rescues.len() as u32;
-        (rescues, waiting)
+        self.drops += dropped.len() as u32;
+        (dropped, waiting)
     }
 
-    /// Presses seen and drops handled since the last call, then zero both.
+    /// The re-arm tick's sweep: a handled hold press still waiting on a key-up
+    /// the hook never saw ends once Windows reports the key up. `is_down`
+    /// reads Windows' key state.
+    pub(super) fn on_rearm(&mut self, is_down: impl Fn(u32) -> bool, now: Instant) -> KeyOutcome {
+        let mut out = KeyOutcome::default();
+        for k in &mut self.keys {
+            let stale = k
+                .last_down
+                .is_some_and(|t| now.duration_since(t) >= STALE_RELEASE_AFTER);
+            if k.release_owed && stale && !is_down(k.vk) {
+                k.release_owed = false;
+                k.down = false;
+                out.release = Some(k.id);
+                if std::mem::take(&mut k.clear_owed) {
+                    out.clear = Some(k.vk);
+                }
+            }
+        }
+        out
+    }
+
+    /// Presses seen and drops met since the last call, then zero both.
     fn take_counts(&mut self) -> (u32, u32) {
         (
             std::mem::take(&mut self.presses),
-            std::mem::take(&mut self.rescues),
+            std::mem::take(&mut self.drops),
         )
     }
+}
+
+/// `FILTERKEYS`, for [`lost_up_gap`]; declared here rather than pulling in the
+/// whole accessibility API for six numbers.
+#[repr(C)]
+#[derive(Default)]
+struct FilterKeys {
+    cb_size: u32,
+    dw_flags: u32,
+    i_wait_msec: u32,
+    i_delay_msec: u32,
+    i_repeat_msec: u32,
+    i_bounce_msec: u32,
+}
+
+/// `FKF_FILTERKEYSON`.
+const FILTER_KEYS_ON: u32 = 0x1;
+
+/// [`LOST_UP_GAP`], widened when FilterKeys (Settings › Accessibility ›
+/// Keyboard) slows auto-repeat past it, so a slow repeat is never taken for a
+/// new press.
+fn lost_up_gap() -> Duration {
+    let mut fk = FilterKeys {
+        cb_size: std::mem::size_of::<FilterKeys>() as u32,
+        ..FilterKeys::default()
+    };
+    let read = unsafe {
+        SystemParametersInfoW(
+            SPI_GETFILTERKEYS,
+            fk.cb_size,
+            Some(std::ptr::addr_of_mut!(fk).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    if read.is_err() || fk.dw_flags & FILTER_KEYS_ON == 0 {
+        return LOST_UP_GAP;
+    }
+    let slowest = Duration::from_millis(u64::from(fk.i_delay_msec.max(fk.i_repeat_msec)));
+    LOST_UP_GAP.max(slowest + Duration::from_millis(500))
 }
 
 /// The watch as the hotkey thread runs it.
@@ -313,9 +399,10 @@ static HOOK: AtomicIsize = AtomicIsize::new(0);
 /// Start watching `bindings` (see [`Watch::new`]). Call on the hotkey thread,
 /// before its message loop, and only with at least one keyboard binding.
 pub(super) fn start(bindings: &[(i32, u32, u32, bool)], tx: Sender<HotkeyEvent>) {
+    let watch = Watch::new(bindings, lost_up_gap());
     LIVE.with_borrow_mut(|live| {
         *live = Some(Live {
-            watch: Watch::new(bindings),
+            watch,
             tx,
             timer: 0,
             noted_injected: false,
@@ -341,17 +428,17 @@ pub(super) fn stop() {
 /// Install the hook, replacing any earlier one: new first, then the old one
 /// unhooked, the same way and for the same reason as
 /// [`crate::mouse_hook::ensure_installed`] (Windows removes a slow hook without
-/// a word, so a stored handle proves nothing). Returns whether a hook is live.
-pub(super) fn install() -> bool {
+/// a word, so a stored handle proves nothing).
+fn install() {
     if LIVE.with_borrow(Option::is_none) {
-        return true;
+        return;
     }
     let module = unsafe { windows::Win32::System::LibraryLoader::GetModuleHandleW(None) };
     let hmod = match module {
         Ok(m) => windows::Win32::Foundation::HINSTANCE(m.0),
         Err(e) => {
             tracing::warn!("hotkey watch: GetModuleHandleW failed: {e}");
-            return false;
+            return;
         }
     };
     match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), hmod, 0) } {
@@ -362,11 +449,9 @@ pub(super) fn install() -> bool {
             } else {
                 let _ = unsafe { UnhookWindowsHookEx(HHOOK(old as *mut core::ffi::c_void)) };
             }
-            true
         }
         Err(e) => {
             tracing::warn!("hotkey watch: SetWindowsHookExW failed: {e} (will retry on re-arm)");
-            false
         }
     }
 }
@@ -400,8 +485,8 @@ pub(super) fn is_watch_timer(timer: usize) -> bool {
 }
 
 /// The watch timer fired: stop it, start it again if a press is still waiting,
-/// and return the presses Windows dropped.
-pub(super) fn on_timer() -> Vec<Rescue> {
+/// and return the presses Windows sent nothing for.
+pub(super) fn on_timer() -> Vec<Dropped> {
     LIVE.with_borrow_mut(|live| {
         let Some(live) = live else {
             return Vec::new();
@@ -410,39 +495,50 @@ pub(super) fn on_timer() -> Vec<Rescue> {
             let _ = unsafe { KillTimer(HWND::default(), live.timer) };
             live.timer = 0;
         }
-        let (rescues, waiting) = live.watch.on_timer(Instant::now());
+        let (dropped, waiting) = live.watch.on_timer(Instant::now());
         if waiting {
             live.timer = unsafe { SetTimer(HWND::default(), 0, TIMER_MS, None) };
         }
-        rescues
+        dropped
     })
 }
 
-/// One re-arm tick: reinstall the hook, and every half hour log what the
-/// watch saw, so the log shows it was alive across any stretch the hotkey
-/// seemed dead.
+/// One re-arm tick: reinstall the hook, end a handled hold press whose key-up
+/// the hook missed, and every half hour log what the watch saw, so the log
+/// shows it was alive across any stretch the hotkey seemed dead.
 pub(super) fn rearm() {
     install();
-    let report = LIVE.with_borrow_mut(|live| {
-        let live = live.as_mut()?;
+    let (outcome, report) = LIVE.with_borrow_mut(|live| {
+        let Some(live) = live.as_mut() else {
+            return (KeyOutcome::default(), None);
+        };
+        let outcome = live.watch.on_rearm(key_down, Instant::now());
+        if outcome.release.is_some() {
+            let _ = live.tx.send(HotkeyEvent::HoldReleased);
+        }
         live.ticks += 1;
         if live.ticks < REPORT_EVERY_TICKS {
-            return None;
+            return (outcome, None);
         }
         live.ticks = 0;
-        Some(live.watch.take_counts())
+        (outcome, Some(live.watch.take_counts()))
     });
-    if let Some((presses, rescues)) = report {
+    if outcome.release.is_some() {
+        tracing::info!("hotkey watch: ended a hold press whose key-up it never saw");
+    }
+    if let Some(vk) = outcome.clear {
+        send_key_up(vk);
+    }
+    if let Some((presses, drops)) = report {
         tracing::info!(
             "hotkey watch: {presses} hotkey press(es) seen in the last 30 min, \
-             {rescues} of them dropped by Windows and handled here"
+             {drops} of them with no WM_HOTKEY from Windows"
         );
     }
 }
 
 /// Send one key-up for `vk`, marked as ours. Clears a key Windows still holds
-/// as down after its press was dropped; the app with focus sees a lone key-up,
-/// which does nothing.
+/// as down; the app with focus sees a lone key-up, which does nothing.
 pub(super) fn send_key_up(vk: u32) {
     let scan = unsafe { MapVirtualKeyW(vk, MAPVK_VK_TO_VSC) } as u16;
     let input = INPUT {
@@ -457,11 +553,11 @@ pub(super) fn send_key_up(vk: u32) {
             },
         },
     };
+    // UIPI can drop it silently while an elevated window has focus, so this
+    // only says what was asked for.
     let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
     if sent == 1 {
-        tracing::info!(
-            "hotkey watch: sent one key-up for vk=0x{vk:02X} to clear Windows' key state"
-        );
+        tracing::info!("hotkey watch: asked Windows for one key-up of vk=0x{vk:02X} to clear it");
     } else {
         tracing::warn!("hotkey watch: SendInput refused the key-up for vk=0x{vk:02X}");
     }
@@ -478,7 +574,20 @@ fn on_key_event(vk: u32, down: bool, injected: bool) {
         // boundary and take the whole app down.
         let mut guard = cell.try_borrow_mut().ok()?;
         let live = guard.as_mut()?;
-        let out = live.watch.on_key(vk, down, Instant::now());
+        if !live.watch.watches(vk) {
+            return None;
+        }
+        // Windows' own view, read before it takes this event in: the same
+        // modifier state it matches hotkeys against, and whether it already
+        // counts this key as down.
+        let (mods, windows_held) = if down {
+            (current_modifiers(), key_down(vk))
+        } else {
+            (0, false)
+        };
+        let out = live
+            .watch
+            .on_key(vk, down, mods, windows_held, Instant::now());
         if out.arm_timer && live.timer == 0 {
             live.timer = unsafe { SetTimer(HWND::default(), 0, TIMER_MS, None) };
         }
