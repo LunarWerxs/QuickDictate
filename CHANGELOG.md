@@ -45,6 +45,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   host, and the next save writes that choice out. Untick **International
   account** on the DashScope card if your key is a mainland-China one.
 
+### Security
+
+- **Dictations the app puts on the clipboard stay out of Clipboard History.**
+  A long dictation pasted with Ctrl+V, and every dictation left there by
+  **Save everything to clipboard**, now goes on the clipboard marked for
+  Windows to leave out of Clipboard History and Cloud Clipboard, so with
+  either turned on Windows no longer keeps or syncs those transcripts. The
+  restore of your previous clipboard works as before. The **Copy** buttons on
+  the History page and the tray's recent transcriptions are you asking for a
+  copy, so they still make an ordinary one that history can keep.
+
 ## [1.4.0] - 2026-10-02
 
 Local dictation that keeps up with you: text appears a quarter second after you stop, dictations

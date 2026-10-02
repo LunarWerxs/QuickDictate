@@ -67,6 +67,30 @@ fn clipboard_text_is_nul_terminated_little_endian_utf16() {
     );
 }
 
+#[test]
+fn private_writes_carry_the_clipboard_history_opt_outs() {
+    // Microsoft's documented names; a typo here silently lets every paste
+    // into Clipboard History and Cloud Clipboard.
+    assert_eq!(
+        privacy_formats(ClipboardPrivacy::Private),
+        vec![
+            ("ExcludeClipboardContentFromMonitorProcessing", vec![0u8]),
+            ("CanIncludeInClipboardHistory", vec![0u8, 0, 0, 0]),
+            ("CanUploadToCloudClipboard", vec![0u8, 0, 0, 0]),
+        ]
+    );
+    // None of them is a block GlobalLock would refuse.
+    for (_, data) in privacy_formats(ClipboardPrivacy::Private) {
+        assert!(!data.is_empty());
+    }
+}
+
+#[test]
+fn ordinary_copies_add_no_extra_formats() {
+    // The History page's Copy buttons are the user asking for a normal copy.
+    assert!(privacy_formats(ClipboardPrivacy::Ordinary).is_empty());
+}
+
 fn target(window: isize, focus: isize, exe: &str) -> PasteTarget {
     PasteTarget {
         window,
