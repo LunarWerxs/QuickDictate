@@ -68,6 +68,19 @@ Cargo.toml: this list exists so none of them drift (SECURITY.md sat on
       executable's GUI subsystem, version metadata, embedded icon, and
       side-effect-free `--version` canary before publishing `quickdictate.exe`,
       `SHA256SUMS.txt`, and the matching CHANGELOG section.
+- [ ] Between validation and staging, the workflow signs `quickdictate.exe`
+      with Azure Artifact Signing (account `lunawerxsigning`, profile
+      `lunawerx-public-trust`) and fails unless the signature is `Valid`, names
+      LUNARWERX LLC, and carries an RFC 3161 timestamp. Signing changes the
+      file's bytes, so `SHA256SUMS.txt` and the GitHub asset digest are taken
+      after it; the `sha256(as validated)` digest in the earlier validation log
+      is the unsigned input and will not match them.
+
+      The job runs in the `release` environment because the Entra federated
+      credential `quickdictate-release` on the `lunawerx-artifact-signing` app
+      trusts only the subject `repo:LunarWerxs/QuickDictate:environment:release`.
+      Rename the environment or the repository and that credential must change
+      with it, or the Azure login step fails.
 
   The direct `quickdictate.exe` is intentionally both the human download and
   auto-update payload. A ZIP reduces the roughly 12 MB binary to about 6 MB, but

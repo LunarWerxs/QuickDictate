@@ -12,6 +12,9 @@ on:
 
 permissions:
   contents: write
+  # Mints the short-lived OIDC token that authenticates this run to Azure Artifact
+  # Signing as `lunawerx-artifact-signing`. No client secret is stored anywhere.
+  id-token: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -22,6 +25,10 @@ jobs:
     timeout-minutes: 60
     name: validate · build · smoke · publish
     runs-on: windows-latest
+    # The federated credential in Entra trusts exactly one subject:
+    # repo:LunarWerxs/QuickDictate:environment:release. Without this line the token
+    # carries a different subject and Azure refuses it.
+    environment: release
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
@@ -81,6 +88,71 @@ jobs:
             -ExePath target/release/quickdictate.exe `
             -ExpectedVersion $version
 
+      # Signing happens BEFORE the asset is staged and hashed: an Authenticode
+      # signature changes the file's bytes, so a digest taken first would never match
+      # what users download, and the self-updater verifies that digest.
+      # These two GUIDs are public identifiers of the `lunawerx-artifact-signing` app,
+      # not credentials. Nothing can be done with them: the federated credential in
+      # Entra only accepts a token whose subject is exactly
+      # repo:LunarWerxs/QuickDictate:environment:release, which only GitHub can mint
+      # for this repository. No subscription context is needed to reach the signing
+      # endpoint, so none is published here.
+      - name: Azure login (OIDC, no stored secret)
+        uses: azure/login@7ddb5af1ef8758cf1353cf3b42f940aee27ba21c # v3.0.2
+        with:
+          client-id: 71d21f76-5d65-40b3-921b-b97390cafa85
+          tenant-id: fdd11984-71bb-4c74-aca1-1d777f195b0f
+          allow-no-subscriptions: true
+
+      - name: Sign the executable (Azure Artifact Signing)
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: https://eus.codesigning.azure.net/
+          signing-account-name: lunawerxsigning
+          certificate-profile-name: lunawerx-public-trust
+          files: ${{ github.workspace }}\target\release\quickdictate.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          exclude-azure-cli-credential: false
+          exclude-environment-credential: true
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-shared-token-cache-credential: true
+          exclude-visual-studio-credential: true
+          exclude-visual-studio-code-credential: true
+          exclude-azure-powershell-credential: true
+          exclude-azure-developer-cli-credential: true
+          exclude-interactive-browser-credential: true
+
+      - name: Prove the signature is real
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature -LiteralPath target/release/quickdictate.exe
+          if ($sig.Status -ne 'Valid') {
+            throw "signature status is $($sig.Status), expected Valid"
+          }
+          $subject = $sig.SignerCertificate.Subject
+          if ($subject -notmatch 'LUNARWERX LLC') {
+            throw "signed by an unexpected certificate: $subject"
+          }
+          # Artifact Signing leaves live THREE DAYS. Status stays 'Valid' for that whole window
+          # with or without a countersignature, so Status alone certifies exactly the artifact
+          # that will be untrusted by the time anyone downloads it - green CI, published release,
+          # and SmartScreen back ~72 hours later. The countersignature is the only real proof.
+          if ($null -eq $sig.TimeStamperCertificate) {
+            throw 'signature has no RFC3161 countersignature - it stops validating in 3 days; check the signtool timestamp warning in the signing step above'
+          }
+          # And if the profile is ever moved to a long-lived certificate, the assertion above
+          # quietly stops meaning anything. Loose on purpose: a policy tripwire, not a flaky red.
+          $lifetimeHours = [math]::Round(
+            ($sig.SignerCertificate.NotAfter - $sig.SignerCertificate.NotBefore).TotalHours)
+          if ($lifetimeHours -gt 240) {
+            throw "signing leaf lifetime is ${lifetimeHours}h, not a short-lived Artifact Signing certificate - re-check what this gate is asserting"
+          }
+          Write-Host "signed by $subject"
+          Write-Host "timestamped by $($sig.TimeStamperCertificate.Subject) (leaf lifetime ${lifetimeHours}h)"
+
       - name: Stage release assets
         shell: pwsh
         run: |
@@ -90,6 +162,13 @@ jobs:
           $hash = (Get-FileHash -LiteralPath out/quickdictate.exe -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  quickdictate.exe" |
             Set-Content -LiteralPath out/SHA256SUMS.txt -Encoding ascii
+          # Echo the AUTHORITATIVE digest. The validation step earlier printed a sha256 of the
+          # binary BEFORE signing (correct for what it checks - PE structure, subsystem, version
+          # resources - none of which Authenticode touches), and signing changes the bytes. Without
+          # this line the log carries exactly one digest, and it is the one that matches neither
+          # SHA256SUMS.txt nor the GitHub asset digest the self-updater compares - a trap laid
+          # precisely for whoever is debugging an updater "sha256 mismatch".
+          Write-Host "[release-asset] published sha256:$hash"
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3

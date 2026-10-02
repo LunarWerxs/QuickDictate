@@ -84,4 +84,10 @@ if ($LASTEXITCODE -ne 0 -or $reportedVersion -cne $ExpectedVersion) {
 }
 
 $sha256 = (Get-FileHash -LiteralPath $exe.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-Write-Host "[release-binary] PASS - QuickDictate $ExpectedVersion, GUI subsystem, $iconGroups icon group(s), sha256:$sha256"
+# ⛔ LABEL IT AS THE INPUT, NOT AS "the" digest. In the release lane this check runs BEFORE the
+# Authenticode signing step, so signing changes the bytes and this value matches neither
+# SHA256SUMS.txt nor the GitHub asset digest the self-updater compares - while reading exactly like
+# the authoritative one to whoever is debugging a "sha256 mismatch". Deliberately NOT worded
+# "pre-signing": this same script also runs in ci.yml and scripts/check.ps1, where nothing signs
+# anything, and a label that is false in two of three lanes is just a different wrong answer.
+Write-Host "[release-binary] PASS - QuickDictate $ExpectedVersion, GUI subsystem, $iconGroups icon group(s), sha256(as validated):$sha256"

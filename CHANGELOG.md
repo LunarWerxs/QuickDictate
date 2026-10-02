@@ -41,6 +41,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   recording finished 0.34 s after release, word for word the same as decoding
   it whole. A four-hour safety stop remains for a dictation nobody ended.
 
+### Security
+
+- **Release builds are code-signed.** `quickdictate.exe` is signed by
+  LUNARWERX LLC through Azure Artifact Signing before it is hashed and
+  published, with an RFC 3161 timestamp so the signature stays valid after the
+  short-lived signing certificate expires. The release run authenticates to
+  Azure with GitHub's OIDC token; no signing secret is stored in the
+  repository. The run fails rather than publish an unsigned or untimestamped
+  executable.
+
 ## [1.3.0] - 2026-10-02
 
 Newer, faster speech engines across the board, from a live test of every model QuickDictate
