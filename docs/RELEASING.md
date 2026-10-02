@@ -19,15 +19,16 @@ Cargo.toml: this list exists so none of them drift (SECURITY.md sat on
   Get-ChildItem -Recurse -Include *.md,*.toml -Exclude CHANGELOG.md | Select-String '<old version>'
   ```
 
-- [ ] The **website is a separate repo** (`..\site`, `QuickDictate/quickdictate.github.io`) and
-      names the version in three places in `index.html`: the JSON-LD `softwareVersion`, the hero
-      eyebrow, and the closing paragraph. `sed -i 's/<old>/<new>/g' index.html` covers all three.
+- [ ] Nothing to edit on the **website** (`QuickDictate/quickdictate.github.io`, served at
+      quickdictate.lunarwerx.com by GitHub Pages). Its `sync-version` workflow rewrites the
+      version label and JSON-LD from the latest release by itself: daily at 06:40 UTC, or within
+      minutes when the release job's last step pokes it, which needs a token with Contents:
+      write on the site repo stored here as the `SITE_DISPATCH_TOKEN` secret. Visitors with
+      JavaScript see the new version at once either way; the download buttons use
+      `/releases/latest/download/quickdictate.exe` and never go stale.
 
-      ⚠️ **Do not touch `site\VERSION`.** That file is the *site's own* version (0.1.x), not the
-      app's, and a global find-and-replace across the site repo will happily rewrite it.
-
-      Push the site **after** the release workflow has published the assets, so the page never
-      advertises a version nobody can download yet.
+      ⚠️ **Do not touch the site's `VERSION` file.** That is the *site's own* version (1.0.x),
+      not the app's.
 
 ## 3. Verify
 

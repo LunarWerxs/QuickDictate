@@ -176,3 +176,28 @@ jobs:
           files: out/*
           body_path: RELEASE_NOTES.md
           fail_on_unmatched_files: true
+
+      # The website (QuickDictate/quickdictate.github.io) rewrites the version label and
+      # JSON-LD that crawlers and no-JS visitors read from the latest release, via its
+      # sync-version workflow: daily at 06:40 UTC, or at once on this repository_dispatch.
+      # Poking it here puts the new version on the page within minutes of the release
+      # instead of up to a day later. It needs a token that can write to the site repo,
+      # stored here as the SITE_DISPATCH_TOKEN secret; without one this step does nothing
+      # and the daily schedule still catches up. It can never fail the release: the
+      # assets are already public by the time it runs.
+      - name: Tell the website a release is out
+        continue-on-error: true
+        shell: pwsh
+        env:
+          SITE_DISPATCH_TOKEN: ${{ secrets.SITE_DISPATCH_TOKEN }}
+        run: |
+          if (-not $env:SITE_DISPATCH_TOKEN) {
+            Write-Host 'No SITE_DISPATCH_TOKEN secret; the website picks the release up on its daily sync.'
+            exit 0
+          }
+          Invoke-RestMethod -Method Post `
+            -Uri 'https://api.github.com/repos/QuickDictate/quickdictate.github.io/dispatches' `
+            -Headers @{ Authorization = "Bearer $env:SITE_DISPATCH_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' } `
+            -ContentType 'application/json' `
+            -Body '{"event_type":"release-published"}'
+          Write-Host 'Website sync requested.'
