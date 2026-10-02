@@ -24,13 +24,25 @@ try {
 
     # Copy only what's needed.  Robocopy is fastest and handles excludes natively;
     # /MIR mirrors, /XD excludes directories, /XF excludes files.
-    $excludeDirs  = @('target', '.git', '.vscode', '.idea', 'node_modules')
+    # A dev run uses the working tree as its data folder (src/paths), so the
+    # per-machine runtime output below can sit in the checkout: dictated text,
+    # the sealed sync token, logs, and agent notes. None of it is source.
+    $excludeDirs  = @('target', '.git', '.vscode', '.idea', 'node_modules',
+                      'logs', '.claude', '.arkitect', 'todo')
     $excludeFiles = @(
         'settings.json',   # a dev's real API keys live here — never ship it
         'quickdictate.log',
         'quickdictate-panic.log',
         'quickdictate-dev-port.txt',
         'quickdictate-update.txt',
+        'quickdictate-history.json',      # dictated text
+        'quickdictate-connections.dat',   # sealed settings-sync token
+        'quickdictate-stats.json',
+        'quickdictate-nudge.json',
+        'quickdictate-feedback.json',
+        'quickdictate-crash-banner.json',
+        'key-health.json',
+        '*_HANDOFF.md',
         '.env',
         '*.env',           # broad: my.keys.env and any local env file with keys
         '*.pem',
