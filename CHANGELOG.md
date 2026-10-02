@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **A third offline model: NVIDIA Parakeet TDT 0.6B v3.** The smallest (524 MiB) and fastest
+  local option: on an RTX 4070 Ti it loads in 1.7 s and turns a short phrase into text in 0.12 s,
+  against 5.5 s and 0.31 s for Cohere. It covers 25 European languages; QuickDictate sends it
+  the bare language code (`en-US` goes as `en`), which it needs. Pick it under **Local (offline)**
+  in Settings and click **Install**; it shares the existing runtime.
 - **Custom vocabulary now reaches the offline Whisper model.** Names and jargon on the Vocabulary
   page used to bias only the cloud providers; the local Whisper Large v3 Turbo run now gets them as
   its initial prompt, re-applied to every 30-second window of a long dictation, so a contact's or

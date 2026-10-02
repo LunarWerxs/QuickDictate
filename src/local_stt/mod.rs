@@ -4,7 +4,7 @@
 //! Settings can install one of the pinned model packs below into
 //! `%LOCALAPPDATA%\QuickDictate\local-stt`. Downloads use an immutable upstream
 //! revision, an exact byte count, and SHA-256; partial files never become active.
-//! Both models share one pinned transcribe.cpp CPU/Vulkan runtime.
+//! Every model shares one pinned transcribe.cpp CPU/Vulkan runtime.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -37,7 +37,7 @@ pub struct ModelSpec {
     sha256: &'static str,
 }
 
-pub const MODELS: [ModelSpec; 2] = [
+pub const MODELS: [ModelSpec; 3] = [
     ModelSpec {
         id: "cohere-q5",
         label: "Cohere Transcribe — Q5",
@@ -50,11 +50,20 @@ pub const MODELS: [ModelSpec; 2] = [
     ModelSpec {
         id: "whisper-turbo-q5",
         label: "Whisper Large v3 Turbo — Q5",
-        detail: "Smallest · 100 languages · 591 MiB",
+        detail: "Most languages · 100 languages · 591 MiB",
         download_bytes: 619_628_128,
         filename: "whisper-large-v3-turbo-Q5_K_M.gguf",
         url: "https://huggingface.co/handy-computer/whisper-large-v3-turbo-gguf/resolve/5eaf945c7978e564bae5b28a5b1639dd93c2bfb1/whisper-large-v3-turbo-Q5_K_M.gguf",
         sha256: "977b5db4e004349dffd1ab9caa10ba5aaba3fc3edd3ba72cadb84328a3203e36",
+    },
+    ModelSpec {
+        id: "parakeet-v3-q5",
+        label: "Parakeet TDT v3 — Q5",
+        detail: "Fastest · 25 European languages · 524 MiB",
+        download_bytes: 548_946_272,
+        filename: "parakeet-tdt-0.6b-v3-Q5_K_M.gguf",
+        url: "https://huggingface.co/handy-computer/parakeet-tdt-0.6b-v3-gguf/resolve/90f082450fcbacdb54e5900c44ef697c9ea59622/parakeet-tdt-0.6b-v3-Q5_K_M.gguf",
+        sha256: "cc722e76adc1a629fc0b2535de879d99b8160d07ad4c0215e2ca7d7ea0ae4b8f",
     },
 ];
 

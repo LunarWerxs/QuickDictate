@@ -18,8 +18,8 @@ use super::download::{
 };
 use super::install::{finish_operation, install, InstallPhase};
 use super::native::{
-    join_and_clean, language_cstring, whisper_history_tokens, whisper_initial_prompt,
-    ModelLoadParams, NativeEngine, RunParams, WhisperRunExt,
+    join_and_clean, language_cstring, model_language, whisper_history_tokens,
+    whisper_initial_prompt, ModelLoadParams, NativeEngine, RunParams, WhisperRunExt,
 };
 use super::postprocess::{
     cohere_chunk_ranges, collapse_pathological_repetitions, collapse_pathological_sentence_runs,
@@ -554,11 +554,27 @@ fn cancelling_download_stops_and_removes_partial_file() {
 #[test]
 #[ignore = "downloads a 591 MiB model and runs real native inference"]
 fn live_whisper_pack_download_load_and_transcribe() {
+    live_pack_download_load_and_transcribe("whisper-turbo-q5", &["en"]);
+}
+
+/// Parakeet v3 has no language auto-detect in transcribe.cpp, so this also
+/// proves the two values Settings actually sends: the `en-US` default and a
+/// blank/`auto` language (passed as no hint at all).
+#[test]
+#[ignore = "downloads a 524 MiB model and runs real native inference"]
+fn live_parakeet_pack_download_load_and_transcribe() {
+    live_pack_download_load_and_transcribe("parakeet-v3-q5", &["en-US", "auto"]);
+}
+
+/// Install `id` and the runtime into a scratch `LOCALAPPDATA`, then decode the
+/// speech fixture once per language. The scratch folder is always restored
+/// and removed (unless `QUICKDICTATE_KEEP_LOCAL_E2E` is set), whatever happens.
+fn live_pack_download_load_and_transcribe(id: &str, languages: &[&str]) {
     let root = std::env::temp_dir().join(format!("quickdictate-local-e2e-{}", std::process::id()));
     let old = std::env::var_os("LOCALAPPDATA");
     std::env::set_var("LOCALAPPDATA", &root);
 
-    let result = install_and_transcribe_whisper_fixture();
+    let result = install_and_transcribe_fixture(id, languages);
 
     if let Some(old) = old {
         std::env::set_var("LOCALAPPDATA", old);
@@ -571,22 +587,34 @@ fn live_whisper_pack_download_load_and_transcribe() {
     result.unwrap();
 }
 
-/// The body of `live_whisper_pack_download_load_and_transcribe`, run while
-/// `LOCALAPPDATA` points at a scratch folder so the caller can always restore
-/// it, whatever this returns.
-fn install_and_transcribe_whisper_fixture() -> Result<(), String> {
-    let spec = model("whisper-turbo-q5").unwrap();
+fn install_and_transcribe_fixture(id: &str, languages: &[&str]) -> Result<(), String> {
+    let spec = model(id).unwrap();
     if !is_installed(spec.id) {
         install(spec, &AtomicBool::new(false))?;
     }
     let pcm = read_speech_fixture()?;
     let cancel = Arc::new(AtomicBool::new(false));
     let mut engine = unsafe { NativeEngine::load()? };
-    let transcript = unsafe { engine.run(spec.id, "en", "", &pcm, &cancel)? }.unwrap_or_default();
-    if transcript.trim().is_empty() {
-        return Err("real local inference returned an empty transcript".into());
+    let prewarm_started = Instant::now();
+    unsafe { engine.prewarm(spec.id)? };
+    eprintln!(
+        "{id} prewarm completed in {:.2}s",
+        prewarm_started.elapsed().as_secs_f32()
+    );
+    for language in languages {
+        let started = Instant::now();
+        let transcript =
+            unsafe { engine.run(spec.id, language, "", &pcm, &cancel)? }.unwrap_or_default();
+        eprintln!(
+            "{id} [{language}] inference completed in {:.2}s: {transcript}",
+            started.elapsed().as_secs_f32()
+        );
+        if transcript.trim().is_empty() {
+            return Err(format!(
+                "real {id} inference with language '{language}' returned an empty transcript"
+            ));
+        }
     }
-    tracing::info!("local E2E transcript: {transcript}");
     Ok(())
 }
 
@@ -610,6 +638,19 @@ fn language_cstring_lets_the_model_detect_blank_or_auto() {
     assert_eq!(language_cstring("AUTO").unwrap(), None);
     assert_eq!(language_cstring("en").unwrap().as_deref(), Some(c"en"));
     assert!(language_cstring("e\0n").is_err());
+}
+
+/// The live Parakeet test proves "en-US" itself is rejected by the runtime;
+/// this keeps the Settings default from reaching it in the normal suite.
+#[test]
+fn parakeet_gets_a_bare_language_code_and_other_models_keep_theirs() {
+    assert_eq!(model_language("parakeet-v3-q5", "en-US"), "en");
+    assert_eq!(model_language("parakeet-v3-q5", "pt_BR"), "pt");
+    assert_eq!(model_language("parakeet-v3-q5", "de"), "de");
+    assert_eq!(model_language("parakeet-v3-q5", "auto"), "auto");
+    assert_eq!(model_language("parakeet-v3-q5", ""), "");
+    assert_eq!(model_language("cohere-q5", "en-US"), "en-US");
+    assert_eq!(model_language("whisper-turbo-q5", "en-US"), "en-US");
 }
 
 #[test]

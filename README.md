@@ -55,10 +55,11 @@ key or an internet connection. Microphone audio stays on your PC.
 | Model | Download | Best fit |
 | :-- | --: | :-- |
 | **Cohere Transcribe 03-2026 Q5_K_M** | 1.65 GiB | Accuracy-first default |
-| **Whisper Large v3 Turbo Q5_K_M** | 591 MiB | Smaller install and broader language coverage |
+| **Whisper Large v3 Turbo Q5_K_M** | 591 MiB | Broadest language coverage |
+| **Parakeet TDT 0.6B v3 Q5_K_M** | 524 MiB | Smallest and fastest, 25 European languages |
 
 - **Manage everything in Settings:** install, select, cancel a download, or delete
-  either model without hunting through folders.
+  any model without hunting through folders.
 - **Small app, on-demand models:** weights are not bundled in the executable or
   repository. They download to `%LOCALAPPDATA%\QuickDictate\local-stt`, use up to
   eight parallel connections when supported, and are size- and SHA-256-verified
@@ -76,7 +77,7 @@ key or an internet connection. Microphone audio stays on your PC.
 
 | | |
 | :-- | :-- |
-| 🔑 **Cloud or fully local** | Six bring-your-own-key services plus two optional offline models. Switch whenever you like. |
+| 🔑 **Cloud or fully local** | Six bring-your-own-key services plus three optional offline models. Switch whenever you like. |
 | ⌨️ **Types into any window** | Whatever has focus, your editor, a chat box, a terminal, or a web form. |
 | ✋ **Hold or tap** | Hold a key while you talk, or tap to start and stop. Both are configurable. |
 | 💬 **Clear live feedback** | Five cloud providers stream words as you talk; batch and Local modes show when the final result is processing. |
@@ -89,7 +90,7 @@ key or an internet connection. Microphone audio stays on your PC.
 2. Run `quickdictate.exe`. With no provider configured, Settings opens for you.
 3. Pick how you want to transcribe:
    - **Cloud:** choose one of the six services and use **Manage keys…** to paste your API key.
-   - **Offline:** choose **Local (offline)**, select Cohere or Whisper, and click **Install**.
+   - **Offline:** choose **Local (offline)**, select Cohere, Whisper or Parakeet, and click **Install**.
 4. Click **Save**, then press **F13** to hold or **F14** to toggle and start talking.
 
 > [!TIP]
@@ -117,9 +118,9 @@ a few real alternatives, based on their own public sites as of 2026-08:
 
 | | QuickDictate | Wispr Flow | Talon Voice | Windows Voice Access |
 | :-- | :-- | :-- | :-- | :-- |
-| **Speech engine** | Your pick of 6 cloud APIs (bring your own key) or 2 offline local models | Wispr's own cloud service | A scriptable voice-command engine; not general transcription by default | Built-in on-device Windows recognition |
+| **Speech engine** | Your pick of 6 cloud APIs (bring your own key) or 3 offline local models | Wispr's own cloud service | A scriptable voice-command engine; not general transcription by default | Built-in on-device Windows recognition |
 | **Account/cost** | No QuickDictate account, you pay your chosen provider directly, or nothing with Local | Free tier capped at 2,000 words/week on desktop and 1,000 on iPhone, unlimited on Android; Flow Pro or team plans for unlimited use | Free, developer accepts optional Patreon support | Free, built into Windows 11 |
-| **Works offline** | Yes, with the optional Local provider (Cohere or Whisper) | No, cloud only | Yes, its bundled Conformer engine runs on-device | Yes, after a one-time language-pack download |
+| **Works offline** | Yes, with the optional Local provider (Cohere, Whisper or Parakeet) | No, cloud only | Yes, its bundled Conformer engine runs on-device | Yes, after a one-time language-pack download |
 | **Platforms** | Windows 10/11 | Windows, macOS, iPhone, Android | Windows, macOS, Linux | Windows 11 22H2+ |
 | **Built for** | Speak, and it types into whatever's focused | Speak, and it types into whatever's focused | Hands-free computer control and voice coding, driven by user-written scripts | Accessibility-focused dictation and PC control |
 
@@ -140,15 +141,15 @@ OpenAI, AssemblyAI, DashScope, or Google), which bill you directly per their own
 or you can skip the cloud entirely and use the free offline Local provider.
 
 **Does it work offline?**
-Yes. Choose Local in Settings and install either the Cohere Transcribe or Whisper Large v3
-Turbo model (1.65 GiB and 591 MiB respectively); once installed, microphone audio never
+Yes. Choose Local in Settings and install the Cohere Transcribe, Whisper Large v3 Turbo or
+Parakeet TDT v3 model (1.65 GiB, 591 MiB and 524 MiB respectively); once installed, microphone audio never
 leaves your PC and no internet connection or API key is needed. The five cloud providers,
 plus Google's batch mode, all require an internet connection.
 
 **What are the system requirements?**
 QuickDictate runs on Windows 10/11 x64 only, there's no Mac or Linux build. The app itself
-is small; the optional offline models need extra disk space (591 MiB for Whisper, 1.65 GiB
-for Cohere, plus an ~80 MiB shared runtime) and enough RAM/VRAM to keep the selected model
+is small; the optional offline models need extra disk space (524 MiB for Parakeet, 591 MiB
+for Whisper, 1.65 GiB for Cohere, plus an ~80 MiB shared runtime) and enough RAM/VRAM to keep the selected model
 resident while Local is active.
 
 **How is QuickDictate different from Wispr Flow, Talon Voice, or Windows Voice Access?**
@@ -170,8 +171,8 @@ API key), unless you pick the Local offline provider, which needs no account or 
 
 **Which speech-to-text providers does QuickDictate support?**
 Six cloud providers, ElevenLabs, Deepgram, OpenAI, AssemblyAI, DashScope, and Google Cloud
-Speech-to-Text, plus an offline Local option with a choice of two models (Cohere Transcribe
-or Whisper Large v3 Turbo). Five of the six cloud providers stream words live as you talk;
+Speech-to-Text, plus an offline Local option with a choice of three models (Cohere Transcribe,
+Whisper Large v3 Turbo or Parakeet TDT v3). Five of the six cloud providers stream words live as you talk;
 Google and Local both return the full transcript when you release the hotkey.
 
 **Can I use QuickDictate in any application?**

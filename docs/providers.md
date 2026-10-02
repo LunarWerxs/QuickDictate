@@ -175,12 +175,23 @@ current rates and free-tier limits; both drift over time.
 - **Runtime:** pinned `transcribe.cpp` 0.1.3 CPU/Vulkan package
 
 Choose **Local (offline)** in Settings. Pick any model, click **Install**, wait
-for the verified download, then Save. You can install either or both models:
+for the verified download, then Save. You can install any or all of the models:
 
 | `local_model` | Model | Download | Intended tradeoff |
 |---|---|---:|---|
 | `cohere-q5` | Cohere Transcribe 03-2026 Q5_K_M | 1.65 GiB | Default; near-lossless accuracy/size balance |
-| `whisper-turbo-q5` | Whisper Large v3 Turbo Q5_K_M | 591 MiB | Smallest and broadest language coverage |
+| `whisper-turbo-q5` | Whisper Large v3 Turbo Q5_K_M | 591 MiB | Broadest language coverage (100 languages) |
+| `parakeet-v3-q5` | NVIDIA Parakeet TDT 0.6B v3 Q5_K_M | 524 MiB | Smallest and fastest; 25 European languages |
+
+Parakeet is the quickest to load and to transcribe: on an RTX 4070 Ti it
+prewarmed in 1.7 s and decoded a short test phrase in 0.12 s, where Cohere took
+5.5 s and 0.31 s. transcribe.cpp's published CPU numbers show the same order
+(Parakeet about 2.5x faster than Cohere and over 10x faster than Whisper Turbo).
+It takes a bare two-letter language code, so QuickDictate sends `en-US` as `en`;
+set **Language** to one of its 25 European languages (Bulgarian, Croatian,
+Czech, Danish, Dutch, English, Estonian, Finnish, French, German, Greek,
+Hungarian, Italian, Latvian, Lithuanian, Maltese, Polish, Portuguese, Romanian,
+Russian, Slovak, Slovenian, Spanish, Swedish, Ukrainian).
 
 The executable contains none of these weights. Downloads go under
 `%LOCALAPPDATA%\QuickDictate\local-stt`; a shared runtime adds roughly 80 MiB
@@ -209,13 +220,14 @@ For Cohere, long recordings are divided at the quietest available boundary
 into clips no longer than 35 seconds before native inference, then reassembled
 in order. This mirrors the model's intended long-form windowing and prevents a
 single several-minute decoder pass from falling into a repeated-phrase loop.
-Whisper keeps its native single-pass behavior.
+Whisper and Parakeet keep their native single-pass behavior.
 
 Local packs come from:
 
 - [handy-computer/transcribe.cpp](https://github.com/handy-computer/transcribe.cpp) (MIT)
 - [Cohere Transcribe GGUF](https://huggingface.co/handy-computer/cohere-transcribe-03-2026-gguf) (Apache-2.0 model)
 - [Whisper Large v3 Turbo GGUF](https://huggingface.co/handy-computer/whisper-large-v3-turbo-gguf) (MIT model)
+- [Parakeet TDT 0.6B v3 GGUF](https://huggingface.co/handy-computer/parakeet-tdt-0.6b-v3-gguf) (CC-BY-4.0 model, by NVIDIA)
 
 ---
 
@@ -254,7 +266,7 @@ nothing else changes.
 | OpenAI | transcription `prompt` | Terms are joined into one prompt string |
 | Google | `speechContexts[].phrases` | 5000 phrases |
 | DashScope | not supported | Paraformer needs a vocabulary registered up front through a separate API, so there is no inline term list to send |
-| Local (offline) | Whisper `initial_prompt` | Whisper Large v3 Turbo only: terms are joined into one prompt, kept to whole terms within 200 bytes so that it and the text carried over from the previous window share Whisper's 223-token prompt budget, terms holding special-token text such as `<|en|>` are dropped, and it is re-applied to every 30-second window of a long dictation. Cohere Transcribe has no prompt input and ignores the list |
+| Local (offline) | Whisper `initial_prompt` | Whisper Large v3 Turbo only: terms are joined into one prompt, kept to whole terms within 200 bytes so that it and the text carried over from the previous window share Whisper's 223-token prompt budget, terms holding special-token text such as `<|en|>` are dropped, and it is re-applied to every 30-second window of a long dictation. Cohere Transcribe and Parakeet have no prompt input and ignore the list |
 
 If a term never sticks no matter what, fall back to `text_replacements`: that
 runs locally on the recognised text and always wins.

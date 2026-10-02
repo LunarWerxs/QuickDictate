@@ -65,7 +65,7 @@ That replacement table, since it's the fiddly-but-lovely part:
 | AssemblyAI (Universal-Streaming v3) | `assemblyai` | Streaming | [assemblyai.com/dashboard/signup](https://www.assemblyai.com/dashboard/signup) |
 | DashScope (Alibaba Cloud Paraformer realtime-v2) | `dashscope` | Streaming | [dashscope.console.aliyun.com/apiKey](https://dashscope.console.aliyun.com/apiKey) |
 | Google Cloud Speech-to-Text (v1 batch) | `google` | Batch (bounded ~55s uploads, results on release, no live word count) | [console.cloud.google.com/apis/credentials](https://console.cloud.google.com/apis/credentials) |
-| Local (Cohere Transcribe or Whisper) | `local` | Offline batch (results on release) | No key; install a model in Settings |
+| Local (Cohere Transcribe, Whisper or Parakeet) | `local` | Offline batch (results on release) | No key; install a model in Settings |
 
 A couple of gotchas:
 - **Google** is the only non-streaming one: long dictations upload in bounded ~55-second batches, but all results are held until release, so there is no live word count.
@@ -83,7 +83,7 @@ Everything lives in `settings.json` (copied from `settings.example.json`). The f
 | `stt_provider` | `"elevenlabs"` \| `"deepgram"` \| `"openai"` \| `"assemblyai"` \| `"dashscope"` \| `"google"` \| `"local"` |
 | `elevenlabs_keys`, `deepgram_keys`, `openai_keys`, `assemblyai_keys`, `dashscope_keys`, `google_keys` | Per-provider arrays of API keys; add more than one to enable round-robin + health tracking |
 | `stt_model` | Optional model-override string (`null` = provider default) |
-| `local_model` | Local model id: `"cohere-q5"` (default) or `"whisper-turbo-q5"` |
+| `local_model` | Local model id: `"cohere-q5"` (default), `"whisper-turbo-q5"` or `"parakeet-v3-q5"` |
 | `dashscope_intl` | `false` = mainland-China host (default), `true` = International host |
 | `language` | BCP-47 language tag, e.g. `"en-US"` |
 | `mode` | `"toggle"` or `"hold"` |

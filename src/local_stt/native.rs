@@ -382,7 +382,7 @@ impl NativeEngine {
             return Ok(None);
         }
         let pcm: Vec<f32> = pcm_i16.iter().map(|&v| v as f32 / 32768.0).collect();
-        let language = language_cstring(language)?;
+        let language = language_cstring(model_language(model_id, language))?;
         let mut params = std::mem::zeroed::<RunParams>();
         unsafe { (self.api.run_params_init)(&mut params) };
         params.language = language
@@ -507,6 +507,17 @@ pub(super) fn whisper_initial_prompt(model_id: &str, vocabulary: &str) -> Option
 
 /// The run's language hint: `None` (let the model detect it) for blank or
 /// `auto`, otherwise the code as a C string.
+/// transcribe.cpp's Parakeet v3 takes a bare ISO 639-1 code and rejects the
+/// region-tagged form Settings stores ("en-US" fails as "unsupported
+/// language"). Cohere and Whisper keep exactly what they are given.
+pub(super) fn model_language<'a>(model_id: &str, language: &'a str) -> &'a str {
+    if model_id == "parakeet-v3-q5" {
+        language.split(['-', '_']).next().unwrap_or(language)
+    } else {
+        language
+    }
+}
+
 pub(super) fn language_cstring(language: &str) -> Result<Option<CString>, String> {
     if language.trim().is_empty() || language.eq_ignore_ascii_case("auto") {
         return Ok(None);
