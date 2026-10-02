@@ -8,9 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- **The local model can now be kept loaded.** Settings › Speech-to-text
-  provider › **Release model**, or `local_idle_unload_minutes` in settings.json,
-  where `0` means never. The default is unchanged at 10 minutes.
+- **The local model can now be kept loaded.** Settings › Behavior › **Never go
+  to sleep**, or for a different window Settings › Speech-to-text provider ›
+  **Release model**, or `local_idle_unload_minutes` in settings.json, where `0`
+  means never. The default is unchanged at 10 minutes.
 
   The idle unload exists so a user who stops dictating does not have multiple
   gigabytes of weights pinned for the rest of the tray app's uptime, and that is

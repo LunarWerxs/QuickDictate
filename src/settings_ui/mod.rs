@@ -145,6 +145,10 @@ const TIP_KEEP_WARM: &str = "How long the model may sit unused before QuickDicta
      releases it from memory. Loading it back takes several seconds, and that wait lands on the \
      next thing you say — so if you have the RAM to spare, choose Never and no dictation ever \
      pays it. Applies immediately on save.";
+const TIP_NEVER_SLEEP: &str = "Keep the offline speech model loaded for as long as QuickDictate \
+     runs. Without this it is released after 10 idle minutes, and the next thing you say waits \
+     several seconds while it loads back. Costs the model's memory: about 0.5 GB for Parakeet, \
+     under 2 GB for Cohere. Same setting as Release model \u{203a} Never. Applies on save.";
 const TIP_DUCK: &str = "Mute or turn down music, videos and every other app while you dictate, \
      so nothing plays over you or ends up in the transcript. Each app goes back to its own volume \
      the moment QuickDictate stops listening, and one you adjust mid-dictation keeps your change. \

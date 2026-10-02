@@ -2,6 +2,21 @@
 
 use super::*;
 
+/// The Behavior card's "Never go to sleep" box and the provider card's
+/// Release model picker write one field; the box must read a picker-set
+/// "Never" as ticked and an unticked box must never leave the model pinned.
+#[test]
+fn never_go_to_sleep_is_the_zero_minute_idle_window() {
+    use super::application::{idle_minutes_for, never_sleeps};
+    let default = crate::local_stt::DEFAULT_IDLE_UNLOAD_MINUTES;
+    assert!(never_sleeps(0));
+    assert!(!never_sleeps(default));
+    assert!(!never_sleeps(60));
+    assert_eq!(idle_minutes_for(true), 0);
+    assert_eq!(idle_minutes_for(false), default);
+    assert!(default > 0);
+}
+
 #[test]
 fn recorded_hotkeys_round_trip_through_the_parser() {
     // A bare F-key.

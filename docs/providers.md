@@ -247,6 +247,7 @@ and walking away does not pin gigabytes of weights for the rest of the tray
 app's uptime. **Release model** in Settings controls that period
 (`local_idle_unload_minutes` in settings.json); the default is 10 minutes and
 `0` disables it, keeping the model loaded for as long as QuickDictate runs.
+**Never go to sleep** under Behavior is the same `0` as a single checkbox.
 
 Choose `0` if the machine has the memory to spare. The reload is not free and
 its cost is not paid while you are away: it is paid by the first thing you say

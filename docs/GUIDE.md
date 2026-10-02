@@ -84,7 +84,7 @@ Everything lives in `settings.json` (copied from `settings.example.json`). The f
 | `elevenlabs_keys`, `deepgram_keys`, `openai_keys`, `assemblyai_keys`, `dashscope_keys`, `google_keys` | Per-provider arrays of API keys; add more than one to enable round-robin + health tracking |
 | `stt_model` | Optional model-override string (`null` = provider default) |
 | `local_model` | Local model id: `"cohere-q5"` (default), `"whisper-turbo-q5"` or `"parakeet-v3-q5"` |
-| `local_idle_unload_minutes` | Minutes of no dictation before the local model is released from memory (default `10`). `0` keeps it loaded for as long as QuickDictate runs, so no dictation ever waits for a reload |
+| `local_idle_unload_minutes` | Minutes of no dictation before the local model is released from memory (default `10`). `0` keeps it loaded for as long as QuickDictate runs, so no dictation ever waits for a reload (Settings › Behavior › Never go to sleep) |
 | `dashscope_intl` | `false` = mainland-China host (default), `true` = International host |
 | `language` | BCP-47 language tag, e.g. `"en-US"` |
 | `mode` | `"toggle"` or `"hold"` |

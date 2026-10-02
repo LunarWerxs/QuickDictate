@@ -5,6 +5,23 @@
 
 use super::*;
 
+/// "Never go to sleep" is the `0` of `local_idle_unload_minutes`, the same
+/// value the Release model picker's "Never" writes, so the two stay in step.
+pub(super) fn never_sleeps(idle_minutes: u64) -> bool {
+    idle_minutes == 0
+}
+
+/// Ticking the box means never; unticking it returns to the default window,
+/// since the box has no minutes of its own to restore (the Release model
+/// picker on the provider card still offers the other windows).
+pub(super) fn idle_minutes_for(never_sleep: bool) -> u64 {
+    if never_sleep {
+        0
+    } else {
+        crate::local_stt::DEFAULT_IDLE_UNLOAD_MINUTES
+    }
+}
+
 impl super::SettingsApp {
     pub(crate) fn application_card(&mut self, ui: &mut egui::Ui) {
         card(ui, |ui| {
@@ -67,6 +84,17 @@ impl super::SettingsApp {
                 "Clean up with AI before pasting",
             )
             .on_hover_text(TIP_POLISH);
+            // Only the Local provider has a model to put to sleep; hidden
+            // otherwise rather than shown-but-inert.
+            if self.draft.stt_provider.eq_ignore_ascii_case("local") {
+                let mut never = never_sleeps(self.draft.local_idle_unload_minutes);
+                if blue_check(right, &mut never, "Never go to sleep")
+                    .on_hover_text(TIP_NEVER_SLEEP)
+                    .changed()
+                {
+                    self.draft.local_idle_unload_minutes = idle_minutes_for(never);
+                }
+            }
         });
     }
 
