@@ -15,6 +15,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   delivered at all. A dictation that landed in the wrong window, or nowhere, is
   one Ctrl+V away. Off by default, because it replaces whatever you had copied.
 
+- **Business licences, inside the app.** QuickDictate has been free for
+  personal use and licensed for business use since v0.9.0, but nothing in the
+  app knew the difference. Now the first launch asks once, in Settings, whether
+  you use it for a for-profit business. Personal use, and use by charities,
+  schools, public research, public safety, health and environmental
+  organisations and government, stays free and is
+  never nagged or locked. Business use gets a 7-day evaluation
+  with everything working, then three days in which each dictation start shows
+  a small notice in the corner of the screen (it never takes the focus, so the
+  dictation still lands where you were typing), and after that the hotkey shows
+  the notice instead of starting. Answered for-profit by mistake? The Licence
+  page has **Switch to free use**, with an "are you sure?", and switching back
+  and forth never restarts the evaluation.
+
+  The new **Settings › Licence** page redeems the key from your purchase email,
+  has a Buy button for the perpetual licence (US$19.99 once) and a link that
+  opens an email to lunawerx@gmail.com to move or refund a licence you already
+  hold (full refund within 14 days of paying), and shows only the key's last
+  four characters. A redeemed key comes back with a certificate signed by
+  Connections, which QuickDictate checks offline, so being licensed never
+  depends on the network. The certificate is renewed quietly about once a day.
+  A copy that was licensed and then went offline keeps working; only
+  Connections saying the licence has ended stops it, and then only after the
+  same three days of notice.
+
+  There is no Settings switch between personal and business on purpose. The
+  key and certificate are sealed with Windows DPAPI under your account.
+
 ## [1.4.0] - 2026-10-02
 
 Local dictation that keeps up with you: text appears a quarter second after you stop, dictations

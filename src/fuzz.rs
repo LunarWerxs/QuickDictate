@@ -180,6 +180,32 @@ fn seed_asset_url() -> Vec<u8> {
     b"https://github.com/LunarWerxs/QuickDictate/releases/download/v9.9.9/quickdictate.exe".to_vec()
 }
 
+/// A licence redeem reply, as Connections' public door sends it, carrying a
+/// real signed certificate. Its answer decides whether this copy is licensed.
+fn seed_licence_redeem() -> Vec<u8> {
+    format!(
+        r#"{{"ok":true,"replayed":true,"seat":{{"id":"45454de4-401d-4100-bbaf-ee7b140f8acb"}},
+        "certificate":"{}","certificateExpiresAt":"2026-10-03T12:40:21Z",
+        "certificateAlgorithm":"Ed25519","certificateAudience":"connections-licence",
+        "certificateError":null}}"#,
+        seed_licence_certificate_text()
+    )
+    .into_bytes()
+}
+
+/// A real licence certificate (minted 2026-10-02 for a since-cancelled test
+/// licence): `<base64url payload>.<base64url signature>`.
+fn seed_licence_certificate_text() -> &'static str {
+    concat!(
+        "eyJhdWQiOiJjb25uZWN0aW9ucy1saWNlbmNlIiwibGljIjoiMGJkNGY0MjUtNmZhMS00ZmQzLTlmODEtMjAx",
+        "ZmQxZWFhZGQ0IiwicHJvZHVjdCI6ImEwYWFiN2JiLWJhNDMtNGQ3Zi04NzcyLTNjOTM2NTliYWQ2OCIsInN1",
+        "YiI6InFkLWluc3RhbGwtdGVzdC0yMDI2MTAwMiIsInVuaXQiOiJpbnN0YWxsYXRpb24iLCJ0ZXJtIjoicGVy",
+        "cGV0dWFsIiwidW5pdHMiOjEsInNlYXQiOiI0NTQ1NGRlNC00MDFkLTQxMDAtYmJhZi1lZTdiMTQwZjhhY2Ii",
+        "LCJtYWludCI6bnVsbCwiY2VpbCI6bnVsbCwiaWF0IjoxNzkwOTQ0ODIxLCJleHAiOjE3OTEwMzEyMjF9.",
+        "cgEvSYi4Nav9Hp7GDjOJsM6R_FzqTYZ5p1-2Ti4mCEoxk_bdO122yn6DrNgcJZUuqtO6gtUmjCN91hJoBP6fAw"
+    )
+}
+
 fn seeds() -> Vec<Seed> {
     vec![
         Seed {
@@ -209,6 +235,14 @@ fn seeds() -> Vec<Seed> {
         Seed {
             name: "asset-url",
             bytes: seed_asset_url(),
+        },
+        Seed {
+            name: "licence-redeem.json",
+            bytes: seed_licence_redeem(),
+        },
+        Seed {
+            name: "licence-certificate",
+            bytes: seed_licence_certificate_text().as_bytes().to_vec(),
         },
     ]
 }
@@ -270,6 +304,14 @@ fn targets() -> Vec<Target> {
         Target {
             name: "paths::expand",
             run: target_paths_expand,
+        },
+        Target {
+            name: "licence::redeem::parse_reply",
+            run: target_licence_parse_reply,
+        },
+        Target {
+            name: "licence::cert::verify",
+            run: target_licence_cert_verify,
         },
     ]
 }
@@ -348,6 +390,18 @@ fn target_voice_commands_detect(b: &[u8]) {
 fn target_paths_expand(b: &[u8]) {
     if let Ok(text) = std::str::from_utf8(b) {
         let _ = crate::paths::expand(text);
+    }
+}
+
+fn target_licence_parse_reply(b: &[u8]) {
+    for status in [200, 404, 409, 429, 500] {
+        let _ = crate::licence::redeem::parse_reply(status, b);
+    }
+}
+
+fn target_licence_cert_verify(b: &[u8]) {
+    if let Ok(text) = std::str::from_utf8(b) {
+        let _ = crate::licence::cert::verify(text, "qd-install-test-20261002b", 1_790_960_000);
     }
 }
 

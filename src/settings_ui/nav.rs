@@ -18,22 +18,25 @@ pub(crate) const NAV_ITEM_H: f32 = 34.0;
 
 /// One page of settings. The order here is the order in the rail, and it runs
 /// roughly in the order a new user needs them: pick a provider, tune how
-/// dictation behaves, teach it your words, look back at what it heard, and --
-/// last, because it is touched least -- the diagnostics and file switches.
+/// dictation behaves, teach it your words, look back at what it heard, the
+/// licence, and -- last, because it is touched least -- the diagnostics and
+/// file switches.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub(crate) enum Tab {
     Application,
     Dictation,
     Vocabulary,
     History,
+    Licence,
     Advanced,
 }
 
-pub(crate) const TABS: [Tab; 5] = [
+pub(crate) const TABS: [Tab; 6] = [
     Tab::Application,
     Tab::Dictation,
     Tab::Vocabulary,
     Tab::History,
+    Tab::Licence,
     Tab::Advanced,
 ];
 
@@ -44,6 +47,7 @@ impl Tab {
             Tab::Dictation => "Dictation",
             Tab::Vocabulary => "Vocabulary",
             Tab::History => "History",
+            Tab::Licence => "Licence",
             Tab::Advanced => "Advanced",
         }
     }
@@ -56,6 +60,7 @@ impl Tab {
             Tab::Dictation => "Hotkeys, timing, and how recognized text is typed.",
             Tab::Vocabulary => "Names and jargon the recognizer should expect.",
             Tab::History => "Browse, copy, and re-paste recent transcriptions.",
+            Tab::Licence => "Personal and nonprofit use is free. Business use needs a licence.",
             Tab::Advanced => {
                 "Diagnostics, files, per-app profiles, and the rarely touched switches."
             }
@@ -71,6 +76,7 @@ impl Tab {
             Tab::Dictation => "\u{E720}",   // microphone
             Tab::Vocabulary => "\u{E82D}",  // dictionary
             Tab::History => "\u{E81C}",     // history
+            Tab::Licence => "\u{E8D7}",     // key (permissions)
             Tab::Advanced => "\u{E90F}",    // repair (wrench)
         }
     }
@@ -179,7 +185,7 @@ mod tests {
         for tab in TABS {
             assert_eq!(TABS.iter().filter(|t| **t == tab).count(), 1);
         }
-        assert_eq!(TABS.len(), 5);
+        assert_eq!(TABS.len(), 6);
     }
 
     #[test]

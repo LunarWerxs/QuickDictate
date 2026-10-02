@@ -188,8 +188,9 @@ focused application.
 is available and free for noncommercial use; commercial use needs a license from LunarWerx
 Studios, one per installation: [US$19.99 once](https://checkout.connections.icu/licence/bf8dca80-4036-48ad-91f4-80baa1dbb9e3) (perpetual) or
 [US$1.99 a month](https://checkout.connections.icu/licence/955db7f6-6561-4a30-85d7-569ea3b3ff20) (cancel any time at
-[checkout.connections.icu/manage](https://checkout.connections.icu/manage)); for anything else, open an issue. Releases through v0.8.0 were MIT, and that
-grant stays in effect for those copies. Made with care by
+[checkout.connections.icu/manage](https://checkout.connections.icu/manage)); for anything else, open an issue. Redeem the
+key from your purchase email in **Settings › Licence**; a business copy runs a 7-day evaluation
+until then. Releases through v0.8.0 were MIT, and that grant stays in effect for those copies. Made with care by
 **[LunarWerx Studios](https://lunarwerx.com)**.
 Also from LunarWerx Studios: [RepoYeti](https://repoyeti.com),
 [SageThumbs](https://sagethumbs.lunarwerx.com), and

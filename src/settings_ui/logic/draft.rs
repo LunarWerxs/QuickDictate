@@ -35,6 +35,7 @@ impl SettingsApp {
             status: String::new(),
             error_report_preview: None,
             sync,
+            licence: Default::default(),
             stats_range: StatsRange::AllTime,
             stats_reset_confirm: false,
             vocabulary_text: String::new(),
@@ -108,6 +109,10 @@ impl SettingsApp {
             self.sync.rx = None;
         }
         self.sync.resume_kicked = false;
+        // A redeem still in flight keeps its receiver, so its answer still lands.
+        self.licence.key_input.clear();
+        self.licence.note.clear();
+        self.licence.is_error = false;
     }
     /// Rebuild the vocabulary text-editor scratch buffers (global + one per
     /// profile) from `self.draft`. Called whenever `draft` is replaced

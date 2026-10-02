@@ -16,9 +16,10 @@
 # The window screenshots ITSELF via egui's viewport capture a few frames after
 # opening (QUICKDICTATE_UI_SHOT); Settings is opened over the dev-trigger UDP
 # channel. -Tab <prefix> picks a page; -Open keys|keys-bulk|keys-test|
-# replacements|replacements-bulk|stats|nudge auto-opens a modal first.
+# replacements|replacements-bulk|stats|nudge auto-opens a modal first;
+# -Licence personal|business|question picks the licence state it sees.
 #
-# Usage: pwsh -File scripts\ui_shot.ps1 [-Shot out.png] [-Tab history] [-Open keys-bulk] [-UseDebugBuild]
+# Usage: pwsh -File scripts\ui_shot.ps1 [-Shot out.png] [-Tab history] [-Open keys-bulk] [-Licence business] [-UseDebugBuild]
 [CmdletBinding()]
 param(
     [string] $Shot = '',
@@ -34,8 +35,13 @@ param(
     # Optional --provider override for the launched exe.
     [string] $Provider = '',
     # Which nav page to capture (prefix match on the rail label).
-    [ValidateSet('', 'application', 'dictation', 'vocabulary', 'history', 'advanced')]
+    [ValidateSet('', 'application', 'dictation', 'vocabulary', 'history', 'licence', 'advanced')]
     [string] $Tab = '',
+    # The licence state the scratch copy sees, in its own registry key (never
+    # the real one): personal (the default, so no question banner), business
+    # (an evaluation started a few days ago), or question (never answered).
+    [ValidateSet('personal', 'business', 'question')]
+    [string] $Licence = 'personal',
     [switch] $UseDebugBuild,
     [int]    $DevPort = 7460,
     # Seed the scratch copy from the project root's REAL settings.json (your
@@ -90,6 +96,22 @@ if (-not $RealSettings) {
 }
 $cfg | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $scratch 'settings.json') -Encoding utf8
 
+# The licence store is per-user registry, not a file in the scratch folder, so
+# it gets a scratch KEY of its own (QUICKDICTATE_LICENCE_REGKEY, honoured only
+# under Software\): the shot must neither read nor answer the real question.
+$licenceKey = "Software\LunarWerx\QuickDictate\LicenceUiShot-$DevPort"
+$licenceHive = "HKCU:\$licenceKey"
+if (Test-Path $licenceHive) { Remove-Item $licenceHive -Recurse -Force }
+if ($Licence -ne 'question') {
+    New-Item -Path $licenceHive -Force | Out-Null
+    New-ItemProperty -Path $licenceHive -Name 'Mode' -Value $Licence -PropertyType String | Out-Null
+    if ($Licence -eq 'business') {
+        $started = [DateTimeOffset]::UtcNow.AddDays(-2).ToUnixTimeSeconds()
+        New-ItemProperty -Path $licenceHive -Name 'EvaluationStarted' -Value $started -PropertyType QWord | Out-Null
+    }
+}
+
+$env:QUICKDICTATE_LICENCE_REGKEY = $licenceKey
 $env:QUICKDICTATE_DATA_DIR = $scratch
 $env:QUICKDICTATE_DEV_PORT = "$DevPort"
 $env:QUICKDICTATE_UI_SHOT = $Shot
@@ -98,7 +120,7 @@ $env:QUICKDICTATE_UI_TAB = $Tab
 $procArgs = @{ FilePath = $scratchExe; PassThru = $true; WorkingDirectory = $scratch }
 if ($Provider) { $procArgs.ArgumentList = @('--provider', $Provider) }
 $proc = Start-Process @procArgs
-foreach ($name in 'QUICKDICTATE_DATA_DIR', 'QUICKDICTATE_DEV_PORT', 'QUICKDICTATE_UI_SHOT', 'QUICKDICTATE_UI_OPEN', 'QUICKDICTATE_UI_TAB') {
+foreach ($name in 'QUICKDICTATE_LICENCE_REGKEY', 'QUICKDICTATE_DATA_DIR', 'QUICKDICTATE_DEV_PORT', 'QUICKDICTATE_UI_SHOT', 'QUICKDICTATE_UI_OPEN', 'QUICKDICTATE_UI_TAB') {
     Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
 }
 
@@ -134,4 +156,5 @@ finally {
     if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
     $proc.WaitForExit(5000) | Out-Null
     Remove-Item $scratch -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item $licenceHive -Recurse -Force -ErrorAction SilentlyContinue
 }

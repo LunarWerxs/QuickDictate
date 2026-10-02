@@ -38,6 +38,9 @@ mod http;
 mod icon;
 mod key_checks;
 mod keys;
+/// Business licensing: Personal or Business, the evaluation, redeeming a key,
+/// and the offline certificate. See its module doc.
+mod licence;
 mod local_stt;
 mod logging;
 mod mouse_hook;
