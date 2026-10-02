@@ -9,7 +9,8 @@ use crate::mouse_hook::{is_mouse_vk, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2};
 
 use super::combo::vk_for;
 use super::watch::{
-    Dropped, KeyOutcome, Watch, DROPPED_AFTER, LATE_HOTKEY, LOST_UP_GAP, REPAIR_FLOOR,
+    mods_text, Dropped, KeyOutcome, Missed, Watch, DROPPED_AFTER, LATE_HOTKEY, LOST_UP_GAP,
+    REPAIR_FLOOR,
 };
 use super::*;
 
@@ -281,6 +282,18 @@ fn armed() -> KeyOutcome {
     }
 }
 
+fn missed(vk: u32, held: u32, needed: u32, registered: bool) -> KeyOutcome {
+    KeyOutcome {
+        missed: Some(Missed {
+            vk,
+            held,
+            needed,
+            registered,
+        }),
+        ..KeyOutcome::default()
+    }
+}
+
 fn cleared(vk: u32) -> KeyOutcome {
     KeyOutcome {
         clear: Some(vk),
@@ -408,6 +421,7 @@ fn a_handled_hold_press_ends_and_clears_on_its_key_up() {
             arm_timer: false,
             release: Some(HOLD),
             clear: Some(F13),
+            missed: None,
         }
     );
     // Owed once, not on every later key-up.
@@ -446,6 +460,7 @@ fn a_lost_key_up_is_settled_by_the_next_press() {
             arm_timer: true,
             release: Some(HOLD),
             clear: Some(F13),
+            missed: None,
         }
     );
     // ...but is not handled itself: after a key-up the watch missed, a stuck
@@ -571,10 +586,11 @@ fn modifiers_must_match_the_combo_exactly() {
     assert_eq!(w.on_key(D, true, ctrl_shift, UP, t + ms(120)), armed());
     assert!(w.on_hotkey(TOGGLE, t + ms(121)));
     w.on_key(D, false, 0, UP, t + ms(200));
-    // An extra Alt makes it a different combo, as it does for Windows.
+    // An extra Alt makes it a different combo, as it does for Windows: not
+    // waited on, only reported.
     assert_eq!(
         w.on_key(D, true, ctrl_shift | MOD_ALT.0, UP, t + ms(310)),
-        KeyOutcome::default()
+        missed(D, ctrl_shift | MOD_ALT.0, ctrl_shift, true)
     );
 }
 
@@ -584,7 +600,7 @@ fn a_binding_we_do_not_hold_is_not_watched() {
     let t = std::time::Instant::now();
     assert!(w.watches(F14));
     assert!(!w.watches(F13));
-    assert_eq!(w.on_key(F14, true, 0, STUCK, t), KeyOutcome::default());
+    assert_eq!(w.on_key(F14, true, 0, STUCK, t), missed(F14, 0, 0, false));
     assert_eq!(w.on_timer(t + ms(250)), (vec![], false));
     w.on_key(F14, false, 0, UP, t + ms(50));
     w.set_registered(TOGGLE, true);
@@ -596,4 +612,48 @@ fn a_hotkey_the_watch_never_saw_is_acted_on() {
     let mut w = watching();
     assert!(w.on_hotkey(TOGGLE, std::time::Instant::now()));
     assert!(w.on_hotkey(42, std::time::Instant::now()));
+}
+
+#[test]
+fn a_hotkey_key_held_with_an_extra_modifier_is_reported_not_waited_on() {
+    let mut w = watching();
+    let t = std::time::Instant::now();
+    // A stuck Ctrl turns F14 into Ctrl+F14, which Windows will not fire.
+    assert_eq!(
+        w.on_key(F14, true, MOD_CONTROL.0, UP, t),
+        missed(F14, MOD_CONTROL.0, 0, true)
+    );
+    // Its auto-repeat is not a second report.
+    assert_eq!(
+        w.on_key(F14, true, MOD_CONTROL.0, STUCK, t + ms(500)),
+        KeyOutcome::default()
+    );
+    w.on_key(F14, false, 0, UP, t + ms(600));
+    assert_eq!(w.on_timer(t + ms(700)), (vec![], false));
+    assert_eq!(w.on_key(F14, true, 0, UP, t + ms(800)), armed());
+    assert!(w.on_hotkey(TOGGLE, t + ms(801)));
+    assert_eq!(w.take_counts(), (1, 0, 1));
+}
+
+#[test]
+fn a_press_another_binding_on_the_key_takes_is_not_reported() {
+    let mut w = Watch::new(
+        &[
+            (TOGGLE, MOD_NOREPEAT.0, F14, false),
+            (HOLD, MOD_CONTROL.0 | MOD_NOREPEAT.0, F14, true),
+        ],
+        LOST_UP_GAP,
+    );
+    w.set_registered(TOGGLE, true);
+    w.set_registered(HOLD, true);
+    let t = std::time::Instant::now();
+    assert_eq!(w.on_key(F14, true, MOD_CONTROL.0, UP, t), armed());
+    assert_eq!(w.take_counts(), (1, 0, 0));
+}
+
+#[test]
+fn modifiers_read_as_a_person_names_them() {
+    assert_eq!(mods_text(0), "no modifier");
+    assert_eq!(mods_text(MOD_CONTROL.0 | MOD_SHIFT.0), "Ctrl+Shift");
+    assert_eq!(mods_text(MOD_WIN.0 | MOD_ALT.0), "Alt+Win");
 }

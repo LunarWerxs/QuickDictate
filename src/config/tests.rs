@@ -632,7 +632,10 @@ fn an_openai_key_is_never_lent_to_another_polish_host() {
     ] {
         cfg.polish_endpoint = elsewhere.into();
         assert!(cfg.polish_key_pool().is_empty(), "{elsewhere}");
-        assert!(!cfg.polish_possible(), "{elsewhere}");
+        assert!(
+            crate::polish::settings_for(&cfg, None).is_none(),
+            "{elsewhere}"
+        );
     }
     // Its own key works there, the OpenAI one still never joins it.
     cfg.polish_endpoint = "https://api.groq.com/openai/v1/chat/completions".into();
@@ -669,5 +672,5 @@ fn a_polish_endpoint_never_carries_text_over_plain_http_across_a_network() {
         ..Default::default()
     };
     assert!(cfg.polish_key_pool().is_empty());
-    assert!(!cfg.polish_possible());
+    assert!(crate::polish::settings_for(&cfg, None).is_none());
 }

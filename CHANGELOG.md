@@ -116,8 +116,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and repairs the hotkey at most once every ten minutes.
   The watch never swallows or changes a key, ignores every key that is not a
   hotkey, and logs each such press plus a count of hotkey presses every half
-  hour, so a dead key can now be told apart from one that never reached
-  Windows.
+  hour. It also logs a hotkey key that went down with an extra modifier held
+  (a stuck Ctrl makes F14 into Ctrl+F14, which Windows will not fire) or while
+  another program held the hotkey, so a dead key can now be told apart from
+  one that never reached Windows.
 
 ### Security
 
