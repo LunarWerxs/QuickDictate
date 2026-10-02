@@ -16,6 +16,13 @@
 //!
 //! Keys are read from the gitignored `my.keys.env`; a fixture/key that isn't
 //! present makes the test skip (print + return) rather than fail.
+//!
+//! `QUICKDICTATE_LIVE_MODEL=<id>` runs the session on that model instead of
+//! the provider's default (the same override `stt_model` gives users), so a
+//! candidate model can be timed against the default on the same fixture.
+//! `QUICKDICTATE_LIVE_WAV_16K` / `QUICKDICTATE_LIVE_WAV_24K` swap in another
+//! clip (e.g. an accuracy set scored outside the test); the known-phrase word
+//! check is skipped for it, only an empty transcript fails.
 
 use std::time::Duration;
 
@@ -48,6 +55,16 @@ fn keys_for(provider: &str) -> Vec<String> {
     Vec::new()
 }
 
+/// The clip named by `QUICKDICTATE_LIVE_WAV_16K` / `_24K` for this rate, if set.
+fn custom_fixture(rate: u32) -> Option<String> {
+    let var = if rate >= 24_000 {
+        "QUICKDICTATE_LIVE_WAV_24K"
+    } else {
+        "QUICKDICTATE_LIVE_WAV_16K"
+    };
+    std::env::var(var).ok().filter(|p| !p.trim().is_empty())
+}
+
 /// Load a mono PCM16 WAV fixture into i16 samples.
 fn load_wav(path: &str) -> Option<Vec<i16>> {
     let reader = hound::WavReader::open(path).ok()?;
@@ -68,7 +85,9 @@ async fn probe(provider: &dyn SttProvider, key: &str, samples: Vec<i16>) -> anyh
     let opts = SttSessionOpts {
         language: provider.language_for("en-US"),
         sample_rate: fmt.sample_rate,
-        model: None,
+        model: std::env::var("QUICKDICTATE_LIVE_MODEL")
+            .ok()
+            .filter(|m| !m.trim().is_empty()),
         custom_vocabulary: Vec::new(),
     };
     let ProviderSession { sink, mut stream } = provider
@@ -173,7 +192,10 @@ async fn collect_events(
     audio_ends: tokio::time::Instant,
 ) -> anyhow::Result<Heard> {
     let mut heard = Heard::default();
-    let hard_deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+    // A longer custom clip still gets its finals: never stop listening before
+    // the audio has been sent plus a generous flush window.
+    let hard_deadline = (tokio::time::Instant::now() + Duration::from_secs(25))
+        .max(audio_ends + Duration::from_secs(8));
     // Once a final chunk lands we only linger briefly for more (multi-segment),
     // rather than waiting out the hard deadline — OpenAI keeps the socket open.
     let mut deadline = hard_deadline;
@@ -226,6 +248,9 @@ fn assert_recognized(provider: &str, transcript: &str) {
         !transcript.trim().is_empty(),
         "[{provider}] empty transcript"
     );
+    if custom_fixture(16_000).is_some() {
+        return;
+    }
     assert!(
         hits >= 2,
         "[{provider}] too few expected words in transcript: {transcript:?}"
@@ -269,11 +294,10 @@ async fn run_live(provider_id: &str, provider: Box<dyn SttProvider>) {
         return;
     }
     // Feed the fixture that matches the provider's required rate (OpenAI = 24 kHz).
-    let wav = if provider.required_audio_format().sample_rate >= 24_000 {
-        WAV_24K
-    } else {
-        WAV_16K
-    };
+    let rate = provider.required_audio_format().sample_rate;
+    let default_wav = if rate >= 24_000 { WAV_24K } else { WAV_16K };
+    let wav = custom_fixture(rate).unwrap_or_else(|| default_wav.to_string());
+    let wav = wav.as_str();
     let Some(samples) = load_wav(wav) else {
         eprintln!("[{provider_id}] SKIP: missing {wav} (run scripts/gen_test_audio.ps1)");
         return;

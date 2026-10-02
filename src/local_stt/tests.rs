@@ -568,9 +568,15 @@ fn live_parakeet_pack_download_load_and_transcribe() {
 
 /// Install `id` and the runtime into a scratch `LOCALAPPDATA`, then decode the
 /// speech fixture once per language. The scratch folder is always restored
-/// and removed (unless `QUICKDICTATE_KEEP_LOCAL_E2E` is set), whatever happens.
+/// and removed, whatever happens, unless `QUICKDICTATE_KEEP_LOCAL_E2E` is set:
+/// then it is one fixed folder, so later runs reuse the downloads.
 fn live_pack_download_load_and_transcribe(id: &str, languages: &[&str]) {
-    let root = std::env::temp_dir().join(format!("quickdictate-local-e2e-{}", std::process::id()));
+    let keep = std::env::var_os("QUICKDICTATE_KEEP_LOCAL_E2E").is_some();
+    let root = if keep {
+        std::env::temp_dir().join("quickdictate-local-e2e")
+    } else {
+        std::env::temp_dir().join(format!("quickdictate-local-e2e-{}", std::process::id()))
+    };
     let old = std::env::var_os("LOCALAPPDATA");
     std::env::set_var("LOCALAPPDATA", &root);
 
@@ -581,7 +587,7 @@ fn live_pack_download_load_and_transcribe(id: &str, languages: &[&str]) {
     } else {
         std::env::remove_var("LOCALAPPDATA");
     }
-    if std::env::var_os("QUICKDICTATE_KEEP_LOCAL_E2E").is_none() {
+    if !keep {
         let _ = fs::remove_dir_all(&root);
     }
     result.unwrap();
@@ -618,10 +624,15 @@ fn install_and_transcribe_fixture(id: &str, languages: &[&str]) -> Result<(), St
     Ok(())
 }
 
-/// `test-audio/speech_16k.wav` as the 16 kHz mono PCM the engine takes.
+/// `test-audio/speech_16k.wav` (or the 16 kHz clip named by
+/// `QUICKDICTATE_LIVE_WAV_16K`, the same override the live provider tests
+/// take) as the 16 kHz mono PCM the engine takes.
 fn read_speech_fixture() -> Result<Vec<i16>, String> {
-    let mut reader =
-        hound::WavReader::open("test-audio/speech_16k.wav").map_err(|e| e.to_string())?;
+    let path = std::env::var("QUICKDICTATE_LIVE_WAV_16K")
+        .ok()
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| "test-audio/speech_16k.wav".into());
+    let mut reader = hound::WavReader::open(path).map_err(|e| e.to_string())?;
     assert_eq!(reader.spec().sample_rate, 16_000);
     assert_eq!(reader.spec().channels, 1);
     reader
