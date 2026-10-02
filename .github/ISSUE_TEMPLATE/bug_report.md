@@ -50,4 +50,4 @@ paste log excerpt here
 
 ### QuickDictate version
 
-<!-- e.g. v1.3.0, or the commit hash you built from -->
+<!-- e.g. v1.4.0, or the commit hash you built from -->

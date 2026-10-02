@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-02
+
+Local dictation that keeps up with you: text appears a quarter second after you stop, dictations
+of any length up to four hours, the model kept loaded on request, and the first signed release.
+
 ### Added
 
 - **The local model can now be kept loaded.** Settings › Behavior › **Never go
