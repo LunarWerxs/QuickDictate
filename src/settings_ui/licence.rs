@@ -189,8 +189,10 @@ impl super::SettingsApp {
             ui.add_space(6.0);
             ui.label(
                 RichText::new(
-                    "Personal and nonprofit use is free, always. A licence covers one \
-                     installation; paste the key from your purchase email above.",
+                    "Personal use, and use by charities, schools, public research, public \
+                     safety, health and environmental organisations and government, is \
+                     free. A licence covers one installation; paste the key from your \
+                     purchase email above.",
                 )
                 .size(11.5)
                 .color(muted()),
@@ -281,7 +283,7 @@ impl super::SettingsApp {
                     "For-profit business use is free for 10 days, then needs a licence. \
                      Personal use, and use by charities, schools, public research, public \
                      safety, health and environmental organisations and government, is \
-                     free, always.",
+                     free.",
                 )
                 .size(12.5)
                 .color(muted()),
