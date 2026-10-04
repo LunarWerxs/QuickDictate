@@ -352,12 +352,18 @@ pub(super) async fn download_parallel(fetch: &Fetch<'_>, workers: usize) -> Resu
             "parallel download was incomplete (expected {expected_bytes} bytes, got {downloaded})"
         ));
     }
-    let file = OpenOptions::new()
-        .write(true)
-        .open(part)
-        .map_err(|e| format!("could not open {} for flushing: {e}", part.display()))?;
-    file.sync_all()
-        .map_err(|e| format!("could not flush download: {e}"))
+    // Flush runs off the runtime: sync_all on a large file can block for seconds.
+    let part = part.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&part)
+            .map_err(|e| format!("could not open {} for flushing: {e}", part.display()))?;
+        file.sync_all()
+            .map_err(|e| format!("could not flush download: {e}"))
+    })
+    .await
+    .map_err(|e| format!("could not flush download: {e}"))?
 }
 
 /// Create `part` at its full pinned size up front, so every range writer can
