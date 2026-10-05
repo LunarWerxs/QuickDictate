@@ -3,6 +3,7 @@
 mod combo;
 mod dispatch;
 mod register;
+mod watch;
 
 #[cfg(test)]
 mod tests;

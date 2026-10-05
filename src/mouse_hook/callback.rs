@@ -26,13 +26,13 @@ use crate::hotkeys::HotkeyEvent;
 use super::*;
 
 /// True if `vk` is currently held down, per the async key state.
-fn key_down(vk: u32) -> bool {
+pub(crate) fn key_down(vk: u32) -> bool {
     (unsafe { GetAsyncKeyState(vk as i32) } as u16 & 0x8000) != 0
 }
 
 /// The modifier keys held right now, in `HOT_KEY_MODIFIERS` bit terms. A
 /// low-level mouse hook carries no modifier state of its own, so we sample it.
-fn current_modifiers() -> u32 {
+pub(crate) fn current_modifiers() -> u32 {
     const VK_SHIFT: u32 = 0x10;
     const VK_CONTROL: u32 = 0x11;
     const VK_MENU: u32 = 0x12;
