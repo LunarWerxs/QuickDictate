@@ -197,6 +197,11 @@ async fn polish_once(
 ) -> Option<String> {
     let started = Instant::now();
     let outcome = match key {
+        // `polish_key_pool` already hands out no key for such an endpoint;
+        // this is the last door before the transcript and the key leave.
+        Some(_) if !crate::config::polish_endpoint_allowed(&settings.endpoint) => {
+            Err("endpoint refused: not https, and not this PC".to_string())
+        }
         Some(key) => request_edits(client, settings, &key, text).await,
         None => Err("no key configured".to_string()),
     };

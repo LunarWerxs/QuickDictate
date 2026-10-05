@@ -164,15 +164,26 @@ impl Config {
     }
 
     /// Keys for `polish_endpoint`, round-robined per request: the dedicated
-    /// list if set, else the OpenAI pool (right for the default endpoint, and
-    /// the reason `polish_keys` exists for everyone else). Falls back rather
-    /// than merging, since keys for two different providers cannot both
-    /// authenticate against one endpoint.
+    /// list if set, else the OpenAI pool, but only while the endpoint is
+    /// OpenAI's own API. Falls back rather than merging, since keys for two
+    /// different providers cannot both authenticate against one endpoint.
+    ///
+    /// ⛔ An OpenAI key is never lent to another host. It used to be: with no
+    /// polish key set, every transcript went to whatever `polish_endpoint`
+    /// named (Groq, a local server, an endpoint that arrived through settings
+    /// sync) carrying the user's OpenAI key as its bearer token. Empty, which
+    /// turns the pass off, also when the endpoint may not carry a transcript
+    /// at all (see `polish_endpoint_allowed`).
     pub fn polish_key_pool(&self) -> Vec<String> {
+        if !polish_endpoint_allowed(&self.polish_endpoint) {
+            return Vec::new();
+        }
         let source = if self.polish_keys.iter().any(|k| !k.trim().is_empty()) {
             &self.polish_keys
-        } else {
+        } else if polish_endpoint_is_openai(&self.polish_endpoint) {
             &self.openai_keys
+        } else {
+            return Vec::new();
         };
         source
             .iter()
@@ -219,4 +230,31 @@ impl Config {
         );
         global
     }
+}
+
+/// May `endpoint` carry a transcript and a bearer key? https to any host, or
+/// plain http only to this PC (a local model server such as Ollama or LM
+/// Studio), never plain http across a network, where both would travel
+/// readable. Anything that does not parse is refused.
+pub fn polish_endpoint_allowed(endpoint: &str) -> bool {
+    let Ok(url) = url::Url::parse(endpoint.trim()) else {
+        return false;
+    };
+    match url.scheme() {
+        "https" => url.host().is_some(),
+        "http" => match url.host() {
+            Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+/// Is `endpoint` OpenAI's own API, the one host an OpenAI speech key may be
+/// lent to for the cleanup pass?
+fn polish_endpoint_is_openai(endpoint: &str) -> bool {
+    url::Url::parse(endpoint.trim())
+        .is_ok_and(|url| url.scheme() == "https" && url.host_str() == Some("api.openai.com"))
 }
