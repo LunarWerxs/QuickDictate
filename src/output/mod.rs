@@ -47,8 +47,10 @@ const MAX_SNAPSHOT_TOTAL_BYTES: usize = 48 * 1024 * 1024;
 /// the user can paste it wherever they want, instead of auto-pasting into the
 /// focused window. Unlike [`paste_via_clipboard`], this does NOT restore any
 /// prior clipboard contents — the whole point is to overwrite the clipboard.
+/// The user asked for this copy, so it is an ordinary one that Clipboard
+/// History may keep; every write the app makes on its own is private.
 pub fn copy_to_clipboard(text: &str) -> Result<()> {
-    set_clipboard_unicode(text)
+    set_clipboard_unicode(text, ClipboardPrivacy::Ordinary)
 }
 
 /// Deliver `text` to the focused window. With `keep_on_clipboard` the text is
@@ -69,14 +71,14 @@ pub fn paste(
     // without this check the app cheerfully logs "paste OK" into the void.
     // `None` means we could not tell, which we treat as "go ahead".
     if focus::foreground_is_elevated() == Some(true) {
-        set_clipboard_unicode(text)?;
+        set_clipboard_unicode(text, ClipboardPrivacy::Private)?;
         return Ok(PasteOutcome::LeftOnClipboard);
     }
 
     // The app-compatibility list says this window drops every kind of
     // injected input, so typing would be lost without a trace.
     if delivery == Delivery::Manual {
-        set_clipboard_unicode(text)?;
+        set_clipboard_unicode(text, ClipboardPrivacy::Private)?;
         return Ok(PasteOutcome::LeftForApp);
     }
 
@@ -106,7 +108,7 @@ pub fn paste(
             tracing::warn!(
                 "paste: clipboard path failed ({e:#}); leaving the text on the clipboard"
             );
-            set_clipboard_unicode(text)?;
+            set_clipboard_unicode(text, ClipboardPrivacy::Private)?;
             Ok(PasteOutcome::LeftForApp)
         }
         Err(e) => {
@@ -137,7 +139,7 @@ fn restore_delay_for(keep_on_clipboard: bool, restore_delay_ms: u64) -> u64 {
 /// Best effort, after the text was typed (or failed to be): a clipboard some
 /// other app is holding open must not turn a paste that worked into an error.
 fn leave_on_clipboard(text: &str) {
-    if let Err(e) = set_clipboard_unicode(text) {
+    if let Err(e) = set_clipboard_unicode(text, ClipboardPrivacy::Private) {
         tracing::warn!("paste: could not leave the transcription on the clipboard ({e:#})");
     }
 }

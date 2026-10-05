@@ -271,31 +271,38 @@ pub struct Config {
     #[serde(default = "default_local_idle_unload_minutes")]
     pub local_idle_unload_minutes: u64,
 
-    /// DashScope region: `false` = mainland-China host (default),
-    /// `true` = the `-intl` host for International accounts. A key from the
-    /// wrong region 401s at the WebSocket upgrade, so match this to your key.
-    #[serde(default = "default_false")]
+    /// DashScope region: `true` = the `-intl` (Singapore) host for
+    /// International accounts (default), `false` = the mainland-China host. A
+    /// key from the wrong region 401s at the WebSocket upgrade, so match this
+    /// to your key. A settings.json with DashScope keys and no value here
+    /// predates the international default and loads as `false` (see
+    /// `Config::keep_legacy_dashscope_region`).
+    #[serde(default = "default_true")]
     pub dashscope_intl: bool,
 
     /// Automatically check for a newer release at startup (throttled to once
     /// per day). The check goes to LunarWerx's update endpoint (see
     /// `update::RELEASES_API`), which relays GitHub's release info and also
-    /// counts the hit as one anonymous install ping — details in SECURITY.md.
+    /// counts the hit (version and User-Agent, no install id) — details in
+    /// SECURITY.md.
     /// Finding a newer release only *reports* it (tray tooltip + the About
     /// pill); installing it is a click, unless you opt into
-    /// `update_auto_install`. Settings → About "Check for updates" works
-    /// regardless of this flag, and there the update installs as soon as you
-    /// click the pill.
+    /// `update_auto_install`. With this off, opening About does not check
+    /// either: its pill reads "Check for updates" and checks once per click
+    /// (Settings' "Check for updates" item counts as that click), and there
+    /// the update installs as soon as you click the pill.
     #[serde(default = "default_true")]
     pub update_auto_check: bool,
 
-    /// Anonymous install id, sent as the `X-Install-Id` header with update
-    /// checks so the update endpoint can count unique installs instead of raw
-    /// hits. A crypto-random UUID generated locally on first launch (see
+    /// Random install id, which keys the opt-in usage report
+    /// (`share_usage_stats`) so the endpoint counts one machine once. A
+    /// crypto-random UUID generated locally on first launch (see
     /// `update::init_install_id`) — **never** derived from hostname, MAC,
     /// username, or any other machine/personal identifier, so it identifies
-    /// nothing but itself. Sent only with update checks (see SECURITY.md);
-    /// clear the value to get a fresh id on the next launch.
+    /// nothing but itself. It is still stable per install, so the report it
+    /// keys is pseudonymous, not anonymous. Sent only with that report, never
+    /// with update checks (see SECURITY.md); clear the value to get a fresh id on the
+    /// next launch.
     #[serde(default)]
     pub install_id: String,
 
@@ -465,13 +472,14 @@ pub struct Config {
     #[serde(default = "default_false")]
     pub protect_keys_at_rest: bool,
 
-    /// Opt in to sending LunarWerx one anonymized usage rollup a day: this
+    /// Opt in to sending LunarWerx one pseudonymous usage rollup a day: this
     /// install's lifetime word/audio/dictation totals and which providers
     /// you use, so the team can see aggregate feature adoption without
     /// adding a new pipeline. Off by default. Uses [`Self::install_id`] --
-    /// the same anonymous, crypto-random id already sent with update checks
-    /// -- as the only correlating value; no transcript text, hostname,
-    /// username, device id, or IP ever leaves the machine (see
+    /// the crypto-random install id, which update checks no longer send --
+    /// as the only correlating value, which makes the report pseudonymous,
+    /// not anonymous; no transcript text, hostname, username, device id, or
+    /// IP is ever in the payload (see
     /// `stats::report::anonymized_payload`, which builds the exact allowed
     /// field list rather than serializing the stats store wholesale).
     /// Turning this off just stops the next send -- it does not recall a
@@ -570,7 +578,7 @@ impl Default for Config {
             stt_model: None,
             local_model: default_local_model(),
             local_idle_unload_minutes: default_local_idle_unload_minutes(),
-            dashscope_intl: false,
+            dashscope_intl: true,
             update_auto_check: true,
             install_id: String::new(),
             run_at_startup: false,

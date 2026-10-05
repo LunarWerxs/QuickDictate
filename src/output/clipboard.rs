@@ -26,7 +26,7 @@ pub(super) fn paste_via_clipboard(text: &str, restore_delay_ms: u64) -> Result<(
     // `clipboard_restore_delay_ms = 0` means "don't restore": set our text,
     // paste, and leave the transcription on the clipboard.
     if restore_delay_ms == 0 {
-        set_clipboard_unicode(text)?;
+        set_clipboard_unicode(text, ClipboardPrivacy::Private)?;
         return send_ctrl_v();
     }
 
@@ -45,7 +45,7 @@ pub(super) fn paste_via_clipboard(text: &str, restore_delay_ms: u64) -> Result<(
         .ok_or_else(|| anyhow!("could not snapshot the clipboard, so not borrowing it"))?;
     let mut guard = ClipboardGuard::new(snapshot);
 
-    set_clipboard_unicode(text)?;
+    set_clipboard_unicode(text, ClipboardPrivacy::Private)?;
     // Clipboard "version" right after our write. If it differs at restore
     // time, some other process wrote the clipboard in between and restoring
     // the snapshot would clobber it, so the guard skips the restore. (The
@@ -316,11 +316,64 @@ fn open_clipboard() -> Result<()> {
     Err(anyhow!("OpenClipboard failed after retries"))
 }
 
-pub(super) fn set_clipboard_unicode(text: &str) -> Result<()> {
+/// Whether a clipboard write may land in Windows Clipboard History and Cloud
+/// Clipboard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ClipboardPrivacy {
+    /// The user asked for this copy (History's Copy buttons, the tray's
+    /// recent list), so it is an ordinary copy that history may keep.
+    Ordinary,
+    /// We put the text there ourselves, as part of a paste or "Save
+    /// everything to clipboard". The user never copied it, so it is kept out
+    /// of Clipboard History and never synced to the cloud.
+    Private,
+}
+
+/// The registered formats that go on the clipboard alongside the text, as
+/// `(format name, data)`. These are Microsoft's documented opt-outs: the
+/// exclude marker tells every clipboard monitor to ignore the content (its
+/// data is never read, but a zero-length block cannot be locked, so it gets
+/// one byte), and the two DWORD 0 flags spell the same thing out for
+/// Clipboard History and Cloud Clipboard in particular.
+pub(super) fn privacy_formats(privacy: ClipboardPrivacy) -> Vec<(&'static str, Vec<u8>)> {
+    match privacy {
+        ClipboardPrivacy::Ordinary => Vec::new(),
+        ClipboardPrivacy::Private => vec![
+            ("ExcludeClipboardContentFromMonitorProcessing", vec![0]),
+            ("CanIncludeInClipboardHistory", 0u32.to_le_bytes().to_vec()),
+            ("CanUploadToCloudClipboard", 0u32.to_le_bytes().to_vec()),
+        ],
+    }
+}
+
+pub(super) fn set_clipboard_unicode(text: &str, privacy: ClipboardPrivacy) -> Result<()> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
     let bytes = unicode_clipboard_bytes(text);
+    let mut markers: Vec<(u32, Vec<u8>)> = Vec::new();
+    for (name, data) in privacy_formats(privacy) {
+        let w: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        let id = unsafe { RegisterClipboardFormatW(PCWSTR(w.as_ptr())) };
+        if id == 0 {
+            return Err(anyhow!("could not register clipboard format {name}"));
+        }
+        markers.push((id, data));
+    }
     with_open_clipboard(|| {
         unsafe { EmptyClipboard()? };
-        put_open_clipboard_data(CF_UNICODETEXT.0 as u32, &bytes)
+        put_open_clipboard_data(CF_UNICODETEXT.0 as u32, &bytes)?;
+        // History reads the clipboard when we close it, so a marker that
+        // failed to go on must take the text off with it rather than let the
+        // transcript through unmarked.
+        for (fmt, data) in &markers {
+            if let Err(e) = put_open_clipboard_data(*fmt, data) {
+                unsafe {
+                    let _ = EmptyClipboard();
+                }
+                return Err(e);
+            }
+        }
+        Ok(())
     })
 }
 

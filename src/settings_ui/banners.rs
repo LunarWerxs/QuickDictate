@@ -1,12 +1,13 @@
 //! The banners pinned above the cards: first-run onboarding, an available
-//! update, and the one-time sign-in nudge.
+//! update, and the one-time sign-in nudge. The licence banners live with the
+//! Licence page, in `licence.rs`, and share this file's strip.
 
 use super::*;
 
 /// The tinted, rounded strip every banner sits in, and the gap below it.
 /// `fill` and `stroke` are how strongly `tint` shows in each. One definition,
 /// so the banners stacked above the page cannot drift apart in shape.
-fn banner_strip(
+pub(super) fn banner_strip(
     ui: &mut egui::Ui,
     tint: Color32,
     fill: f32,
@@ -51,7 +52,7 @@ struct AskStrip<'a> {
 }
 
 /// A small muted button, for the quiet ways out of an ask.
-fn quiet_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+pub(super) fn quiet_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     ui.button(RichText::new(label).size(12.0).color(muted()))
 }
 

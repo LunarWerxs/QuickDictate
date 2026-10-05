@@ -122,7 +122,7 @@ pub(super) enum SyncPhase {
 pub(super) enum SyncEvent {
     /// Sign-in or silent resume finished.
     Connected(Result<crate::sync::Connected, String>),
-    /// Disconnect finished (remote doc deleted + local creds dropped).
+    /// Disconnect finished (remote doc moved to Trash + local creds dropped).
     Disconnected,
     /// A plain background push (Save, or the best-effort push before Save &
     /// Restart) finished. Unlike `Connected`, this never touches
@@ -204,6 +204,24 @@ pub(super) enum PendingSaveKind {
     Restart,
 }
 
+/// What the window's X (or Alt-F4) does.
+#[derive(Debug, PartialEq, Eq)]
+enum OnClose {
+    /// Hide now, settling an unanswered licence question as Personal.
+    HideAndSettle,
+    /// Ask about the unsaved edits first. The question stays open: the user
+    /// may cancel and keep the window, and then nothing was answered.
+    AskUnsaved,
+}
+
+fn on_close(dirty: bool) -> OnClose {
+    if dirty {
+        OnClose::AskUnsaved
+    } else {
+        OnClose::HideAndSettle
+    }
+}
+
 pub(super) struct SettingsApp {
     pub(super) app: Arc<App>,
     pub(super) draft: Config,
@@ -222,6 +240,8 @@ pub(super) struct SettingsApp {
     pub(super) error_report_preview: Option<String>,
     /// Connections settings-sync control state.
     pub(super) sync: SyncUi,
+    /// The Licence page's key field and redeem in flight.
+    pub(super) licence: super::licence::LicenceUi,
     pub(super) stats_range: StatsRange,
     pub(super) stats_reset_confirm: bool,
     /// Scratch buffer for the global custom-vocabulary multiline editor —
@@ -298,6 +318,7 @@ impl eframe::App for SettingsApp {
         // asked for waiting forever. The worker's own `request_repaint` and the
         // restart deadline's `request_repaint_after` both still reach this hook.
         self.drain_sync(ctx);
+        self.drain_licence();
         self.poll_pending_restart(ctx);
 
         // A "Settings" click arrived while we were already running: reveal the
@@ -313,6 +334,10 @@ impl eframe::App for SettingsApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             ctx.request_repaint();
         }
+        // The licence notice's "Enter key" asked for the Licence page.
+        if super::licence::OPEN_LICENCE_PAGE.swap(false, Ordering::AcqRel) {
+            self.tab = nav::Tab::Licence;
+        }
 
         // Intercept the window close (X button / Alt-F4): cancel the actual OS
         // close (we manage "closing" ourselves as hide-and-reveal-later; see
@@ -323,11 +348,9 @@ impl eframe::App for SettingsApp {
         if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.commit_open_editor();
-            if self.draft_is_dirty() {
-                self.modal = Some(Modal::UnsavedChanges);
-            } else {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                OPEN.store(false, Ordering::Release);
+            match on_close(self.draft_is_dirty()) {
+                OnClose::AskUnsaved => self.modal = Some(Modal::UnsavedChanges),
+                OnClose::HideAndSettle => self.hide_window(ctx),
             }
         }
     }
@@ -377,7 +400,9 @@ impl eframe::App for SettingsApp {
                 // area: "you have no API key" and "an update is waiting" are
                 // true regardless of which page you are on, so they must not
                 // be something you can navigate away from.
+                self.licence_question_banner(ui);
                 self.onboarding_banner(ui);
+                self.licence_banner(ui);
                 self.update_available_banner(ui);
                 self.crash_report_banner(ui);
                 self.sign_in_nudge_banner(ui);
@@ -404,6 +429,7 @@ impl eframe::App for SettingsApp {
                             nav::Tab::Dictation => self.dictation_card(ui),
                             nav::Tab::Vocabulary => self.vocabulary_card(ui),
                             nav::Tab::History => self.history_card(ui),
+                            nav::Tab::Licence => self.licence_card(ui, &ctx),
                             nav::Tab::Advanced => self.advanced_card(ui),
                         }
                         ui.add_space(12.0);
@@ -426,6 +452,15 @@ impl eframe::App for SettingsApp {
 }
 
 impl SettingsApp {
+    /// Hide the window (a "close"; see `OPEN`). The one place a close lands,
+    /// so it is also the one place a still-unanswered licence question is
+    /// recorded as Personal: only once the window has really gone.
+    pub(super) fn hide_window(&mut self, ctx: &egui::Context) {
+        self.close_licence_question();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        OPEN.store(false, Ordering::Release);
+    }
+
     /// On the first frame, if we opened already signed in, silently resume
     /// and pull so this machine picks up settings changed on another device.
     fn kick_resume_once(&mut self, ctx: &egui::Context) {
@@ -495,6 +530,14 @@ mod tests {
             bulk: false,
             bulk_text: String::new(),
         }
+    }
+
+    /// X with unsaved edits opens a prompt the user may cancel to keep the
+    /// window: that must not answer the Personal-or-Business question.
+    #[test]
+    fn only_a_close_that_hides_settles_the_licence_question() {
+        assert_eq!(on_close(true), OnClose::AskUnsaved);
+        assert_eq!(on_close(false), OnClose::HideAndSettle);
     }
 
     // ---- Closing with an editor open (review fix F2) ----------------------

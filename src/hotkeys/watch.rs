@@ -26,10 +26,13 @@
 //!
 //! The watch logs it, registers the hotkey again, and once the key is up
 //! sends one key-up for it, the cure that worked on 2 October: always for a
-//! handled press, at most every ten minutes for one left alone. A press
-//! with neither a `WM_HOTKEY received` line nor one of these lines most likely
-//! never reached Windows: the device or its software (a G HUB profile, say)
-//! sent nothing.
+//! handled press, at most every ten minutes for one left alone.
+//!
+//! A hotkey key that goes down with an extra modifier held (a stuck Ctrl
+//! makes F14 Ctrl+F14, which Windows will not fire), or while the hotkey is
+//! not registered, is logged too, a few times per half hour. So a press with
+//! none of these lines and no `WM_HOTKEY received` never reached Windows: the
+//! device or its software (a G HUB profile, say) sent nothing.
 //!
 //! Runs on the hotkey thread, like [`crate::mouse_hook`]: Windows calls a
 //! low-level hook on the thread that installed it while that thread pumps
@@ -46,7 +49,7 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
-    MAPVK_VK_TO_VSC, MOD_NOREPEAT, VIRTUAL_KEY,
+    MAPVK_VK_TO_VSC, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, KillTimer, PostThreadMessageW, SetTimer, SetWindowsHookExW,
@@ -98,6 +101,9 @@ pub(super) const WM_WATCH_KEY_UP: u32 = WM_APP + 0x51;
 /// Re-arm ticks between the "still watching" lines in the log: half an hour at
 /// the 60-second re-arm.
 const REPORT_EVERY_TICKS: u32 = 30;
+
+/// [`Missed`] presses logged per report period; the rest are only counted.
+const MISSED_LOGS_PER_REPORT: u32 = 3;
 
 /// A fresh press waiting on its `WM_HOTKEY`.
 #[derive(Debug, Clone, Copy)]
@@ -158,6 +164,20 @@ pub(super) struct Dropped {
     pub(super) unlogged: u32,
 }
 
+/// A fresh press of a hotkey key that Windows will not fire the hotkey for,
+/// although it holds every modifier the hotkey needs: an extra modifier is
+/// held, or the hotkey is not registered. A press with fewer modifiers is
+/// typing and is never reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Missed {
+    pub(super) vk: u32,
+    /// `MOD_*` bits Windows reported as held.
+    pub(super) held: u32,
+    /// `MOD_*` bits the hotkey needs.
+    pub(super) needed: u32,
+    pub(super) registered: bool,
+}
+
 /// What a key event asks of the hook.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct KeyOutcome {
@@ -168,6 +188,8 @@ pub(super) struct KeyOutcome {
     pub(super) release: Option<i32>,
     /// Send the clearing key-up for this key.
     pub(super) clear: Option<u32>,
+    /// Log this press: Windows will not fire the hotkey for it.
+    pub(super) missed: Option<Missed>,
 }
 
 /// The watch's state. Pure: every input carries its own time and the key
@@ -180,9 +202,11 @@ pub(super) struct Watch {
     last_repair: Option<Instant>,
     /// Presses left alone without a repair since then.
     unlogged: u32,
-    /// Fresh presses of a watched key, and drops met, since the last report.
+    /// Fresh presses of a watched key, drops met and [`Missed`] presses, since
+    /// the last report.
     presses: u32,
     drops: u32,
+    missed: u32,
 }
 
 impl Watch {
@@ -214,6 +238,7 @@ impl Watch {
             unlogged: 0,
             presses: 0,
             drops: 0,
+            missed: 0,
         }
     }
 
@@ -251,6 +276,7 @@ impl Watch {
     ) -> KeyOutcome {
         let mut out = KeyOutcome::default();
         let mut presses = 0;
+        let mut missed = None;
         for k in self.keys.iter_mut().filter(|k| k.vk == vk) {
             if down {
                 let lost_up = k.down
@@ -286,6 +312,13 @@ impl Watch {
                     k.rescued = None;
                     out.arm_timer = true;
                     presses += 1;
+                } else if fresh && mods & k.mods == k.mods && (mods != k.mods || !k.registered) {
+                    missed.get_or_insert(Missed {
+                        vk,
+                        held: mods,
+                        needed: k.mods,
+                        registered: k.registered,
+                    });
                 }
             } else {
                 k.down = false;
@@ -299,6 +332,11 @@ impl Watch {
             }
         }
         self.presses += presses;
+        // Another binding on the same key took the press: nothing was missed.
+        if presses == 0 && missed.is_some() {
+            out.missed = missed;
+            self.missed += 1;
+        }
         out
     }
 
@@ -371,11 +409,13 @@ impl Watch {
         (dropped, waiting)
     }
 
-    /// Presses seen and drops met since the last call, then zero both.
-    fn take_counts(&mut self) -> (u32, u32) {
+    /// Presses seen, drops met and [`Missed`] presses since the last call, then
+    /// zero all three.
+    pub(super) fn take_counts(&mut self) -> (u32, u32, u32) {
         (
             std::mem::take(&mut self.presses),
             std::mem::take(&mut self.drops),
+            std::mem::take(&mut self.missed),
         )
     }
 }
@@ -427,6 +467,8 @@ struct Live {
     timer: usize,
     noted_injected: bool,
     ticks: u32,
+    /// [`Missed`] presses logged since the last report.
+    missed_logged: u32,
 }
 
 thread_local! {
@@ -447,6 +489,7 @@ pub(super) fn start(bindings: &[(i32, u32, u32, bool)], tx: Sender<HotkeyEvent>)
             timer: 0,
             noted_injected: false,
             ticks: 0,
+            missed_logged: 0,
         });
     });
     install();
@@ -557,12 +600,51 @@ pub(super) fn rearm() {
             return None;
         }
         live.ticks = 0;
+        live.missed_logged = 0;
         Some(live.watch.take_counts())
     });
-    if let Some((presses, drops)) = report {
+    if let Some((presses, drops, missed)) = report {
         tracing::info!(
             "hotkey watch: {presses} hotkey press(es) seen in the last 30 min, \
-             {drops} of them with no WM_HOTKEY from Windows"
+             {drops} of them with no WM_HOTKEY from Windows; {missed} more with an \
+             extra modifier held or the hotkey unregistered"
+        );
+    }
+}
+
+/// `MOD_*` bits as a person reads them: "Ctrl+Shift", or "no modifier".
+pub(super) fn mods_text(mods: u32) -> String {
+    let names: Vec<&str> = [
+        (MOD_CONTROL.0, "Ctrl"),
+        (MOD_ALT.0, "Alt"),
+        (MOD_SHIFT.0, "Shift"),
+        (MOD_WIN.0, "Win"),
+    ]
+    .iter()
+    .filter(|(bit, _)| mods & bit != 0)
+    .map(|&(_, name)| name)
+    .collect();
+    if names.is_empty() {
+        "no modifier".to_owned()
+    } else {
+        names.join("+")
+    }
+}
+
+fn log_missed(m: Missed) {
+    let vk = m.vk;
+    if m.registered {
+        tracing::info!(
+            "hotkey watch: the hotkey key vk=0x{vk:02X} went down with {} held, but the \
+             hotkey needs {}, so Windows does not fire it. If nobody is holding that key, \
+             it is stuck: press and release it once",
+            mods_text(m.held),
+            mods_text(m.needed)
+        );
+    } else {
+        tracing::info!(
+            "hotkey watch: the hotkey key vk=0x{vk:02X} went down while the hotkey is not \
+             registered (another program holds it); trying again at the next re-arm"
         );
     }
 }
@@ -615,7 +697,7 @@ fn on_key_event(vk: u32, down: bool, injected: bool) {
         } else {
             (0, false)
         };
-        let out = live
+        let mut out = live
             .watch
             .on_key(vk, down, mods, windows_held, Instant::now());
         if out.arm_timer && live.timer == 0 {
@@ -628,8 +710,18 @@ fn on_key_event(vk: u32, down: bool, injected: bool) {
         if out.release.is_some() {
             let _ = live.tx.send(HotkeyEvent::HoldReleased);
         }
+        if out.missed.is_some() {
+            if live.missed_logged < MISSED_LOGS_PER_REPORT {
+                live.missed_logged += 1;
+            } else {
+                out.missed = None;
+            }
+        }
         Some(out)
     });
+    if let Some(m) = outcome.as_ref().and_then(|o| o.missed) {
+        log_missed(m);
+    }
     if note_injected {
         tracing::info!(
             "hotkey key vk=0x{vk:02X} arrives as injected input (keyboard software such as \

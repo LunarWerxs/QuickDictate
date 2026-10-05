@@ -100,8 +100,10 @@ fn render_stop_syncing(ui: &mut egui::Ui, working: bool) -> bool {
         let clicked = ui
             .add_enabled(!working, egui::Button::new("Stop syncing"))
             .on_hover_text(
-                "Disconnect this device and delete your synced settings \
-                     from the cloud.",
+                "Sign this PC out. Your synced settings and up to 20 \
+                     earlier versions move to your Connections Trash and are \
+                     deleted for good when the Trash period ends. To have \
+                     them deleted at once, email lunawerx@gmail.com.",
             )
             .clicked();
         if working {

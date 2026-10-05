@@ -1,15 +1,24 @@
 QuickDictate is licensed under the PolyForm Noncommercial License 1.0.0,
 reproduced in full below.
 
-In plain terms: you may use, copy, modify, and share QuickDictate for any
-noncommercial purpose, free of charge. Commercial use requires a separate
-license from LunarWerx Studios, one per installation: US$19.99 once for a
-perpetual license at
-https://checkout.connections.icu/licence/bf8dca80-4036-48ad-91f4-80baa1dbb9e3
+In plain terms: you may use, copy, modify, and share QuickDictate for
+personal use, or by a nonprofit organisation or government body, free of
+charge. Commercial use, after the free 10-day trial described below, requires a
+separate license from LunarWerx Studios, one per installation: US$19.99 once
+for a perpetual license at
+https://checkout.connections.icu/licence/bf8dca80-4036-48ad-91f4-80baa1dbb9e3,
 or US$1.99 a month at
 https://checkout.connections.icu/licence/955db7f6-6561-4a30-85d7-569ea3b3ff20
-(cancel any time at https://checkout.connections.icu/manage). For anything else, open an
-issue at https://github.com/LunarWerxs/QuickDictate/issues.
+(cancel any time at https://checkout.connections.icu/manage).
+To move a license to another PC, or to ask for a refund, email
+lunawerx@gmail.com. For anything else, open an issue at
+https://github.com/LunarWerxs/QuickDictate/issues.
+
+Additional permissions from LUNARWERX LLC, which only add to the PolyForm
+Noncommercial License 1.0.0 below and take nothing away from it: any business
+may use QuickDictate free of charge to try it for up to 10 days from the day
+it first runs on each installation, and any nonprofit organisation or
+government body may use it free of charge for its own purposes.
 
 Releases through v0.8.0 were published under the MIT License. Changing the
 terms of later releases does not retract the permissions already granted for

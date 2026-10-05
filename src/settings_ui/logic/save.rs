@@ -141,7 +141,9 @@ impl SettingsApp {
     ///     promises "Your API keys are kept". The reset is written to disk at
     ///     once, so dropping the protect flag would re-write every kept key
     ///     in plaintext.
-    ///   * `install_id` — a machine identity for update checks, not a
+    ///   * `dashscope_intl` — the region the kept DashScope keys belong to; a
+    ///     mainland key reset onto the international host stops connecting.
+    ///   * `install_id` — a machine identity for the usage report, not a
     ///     preference (see `Config::install_id`'s doc comment).
     ///   * `window_width/height/x/y` — machine-local window geometry, same
     ///     category `sync.rs` already excludes from portable settings.
@@ -156,6 +158,7 @@ impl SettingsApp {
             local_keys: keep.local_keys.clone(),
             polish_keys: keep.polish_keys.clone(),
             protect_keys_at_rest: keep.protect_keys_at_rest,
+            dashscope_intl: keep.dashscope_intl,
             install_id: keep.install_id.clone(),
             window_width: keep.window_width,
             window_height: keep.window_height,

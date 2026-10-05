@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use super::defaults::default_replacements_mode;
 use super::{Config, Profile};
+use crate::polish::settings_for;
 
 #[test]
 fn defaults_to_elevenlabs_with_no_keys() {
@@ -152,13 +153,16 @@ fn polish_is_off_without_a_key_no_matter_what_is_enabled() {
         polish_enabled: true,
         ..Default::default()
     };
-    // Enabled but unauthenticated is not "possible" -- the session runner
+    // Enabled but unauthenticated resolves to nothing -- the session runner
     // must not fire speculative requests that can only 401.
-    assert!(!cfg.polish_possible());
+    assert!(settings_for(&cfg, None).is_none());
     cfg.openai_keys = vec!["  ".into()];
-    assert!(!cfg.polish_possible(), "a blank key is not a key");
+    assert!(
+        settings_for(&cfg, None).is_none(),
+        "a blank key is not a key"
+    );
     cfg.openai_keys = vec!["sk-test".into(), "sk-two".into()];
-    assert!(cfg.polish_possible());
+    assert!(settings_for(&cfg, None).is_some());
     assert_eq!(cfg.polish_key_pool(), vec!["sk-test", "sk-two"]);
     // A dedicated list REPLACES the OpenAI pool rather than extending it:
     // once `polish_endpoint` points somewhere else, an OpenAI key mixed
@@ -187,19 +191,46 @@ fn a_profile_overrides_polish_in_both_directions() {
         "a terminal wants raw text and an instant paste"
     );
 
-    // Off globally, on for one app: still possible, so speculation runs.
+    // Off globally, on for one app.
     cfg.polish_enabled = false;
     let mut on = profile("Slack", &["slack.exe"]);
     on.polish = Some(true);
     cfg.profiles = vec![on];
-    assert!(cfg.polish_possible());
     assert!(cfg.polish_for_exe(Some("slack.exe")));
     assert!(!cfg.polish_for_exe(Some("code.exe")));
 
     // `profiles_enabled: false` takes the per-app opt-in with it.
     cfg.profiles_enabled = false;
-    assert!(!cfg.polish_possible());
     assert!(!cfg.polish_for_exe(Some("slack.exe")));
+}
+
+#[test]
+fn speculation_follows_the_app_in_front_at_press_time() {
+    // The session runner speculates with `settings_for(cfg, exe_at_start)`,
+    // so a transcript only reaches the polish host while the hotkey is down
+    // when the pass is on for the app the user started dictating into.
+    let mut cfg = Config {
+        openai_keys: vec!["sk-test".into()],
+        polish_enabled: true,
+        ..Default::default()
+    };
+    let mut off = profile("Terminal", &["windowsterminal.exe"]);
+    off.polish = Some(false);
+    cfg.profiles = vec![off];
+    assert!(settings_for(&cfg, Some("slack.exe")).is_some());
+    assert!(
+        settings_for(&cfg, Some("windowsterminal.exe")).is_none(),
+        "cleanup is off for this app, so nothing is sent while held"
+    );
+
+    // Off globally and on for one app: only a press in that app speculates.
+    cfg.polish_enabled = false;
+    let mut on = profile("Slack", &["slack.exe"]);
+    on.polish = Some(true);
+    cfg.profiles = vec![on];
+    assert!(settings_for(&cfg, Some("slack.exe")).is_some());
+    assert!(settings_for(&cfg, Some("code.exe")).is_none());
+    assert!(settings_for(&cfg, None).is_none(), "unknown app: globals");
 }
 
 #[test]
@@ -601,7 +632,10 @@ fn an_openai_key_is_never_lent_to_another_polish_host() {
     ] {
         cfg.polish_endpoint = elsewhere.into();
         assert!(cfg.polish_key_pool().is_empty(), "{elsewhere}");
-        assert!(!cfg.polish_possible(), "{elsewhere}");
+        assert!(
+            crate::polish::settings_for(&cfg, None).is_none(),
+            "{elsewhere}"
+        );
     }
     // Its own key works there, the OpenAI one still never joins it.
     cfg.polish_endpoint = "https://api.groq.com/openai/v1/chat/completions".into();
@@ -638,5 +672,5 @@ fn a_polish_endpoint_never_carries_text_over_plain_http_across_a_network() {
         ..Default::default()
     };
     assert!(cfg.polish_key_pool().is_empty());
-    assert!(!cfg.polish_possible());
+    assert!(crate::polish::settings_for(&cfg, None).is_none());
 }

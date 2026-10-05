@@ -15,7 +15,95 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   delivered at all. A dictation that landed in the wrong window, or nowhere, is
   one Ctrl+V away. Off by default, because it replaces whatever you had copied.
 
+- **Business licences, inside the app.** QuickDictate has been free for
+  personal use and licensed for business use since v0.9.0, but nothing in the
+  app knew the difference. Now the first launch asks once, in Settings, whether
+  you use it for a for-profit business. Personal use, and use by charities,
+  schools, public research, public safety, health and environmental
+  organisations and government, stays free and is
+  never nagged or locked. Choosing business first opens a short explanation
+  (business use needs a licence, the 10-day free trial, and what happens when
+  it ends) with a **Back** button, and nothing is recorded until you start the
+  trial. Business use gets a 10-day free trial with everything working; in its
+  last three days each dictation start also shows a small notice in the corner
+  of the screen (it never takes the focus, so the dictation still lands where
+  you were typing), and after the 10th day the hotkey shows the notice instead
+  of starting. Answered for-profit by mistake? The Licence page has **Switch to
+  free use**, with an "are you sure?", and switching back and forth never
+  restarts the trial.
+
+  The new **Settings › Licence** page redeems the key from your purchase email,
+  has Buy buttons for the perpetual licence (US$19.99 once) and the monthly
+  plan (US$1.99 a month), and a link that opens an email to lunawerx@gmail.com
+  to move or refund a licence you already hold (full refund within 14 days of
+  paying), and shows only the key's last
+  four characters. A redeemed key comes back with a certificate signed by
+  Connections, which QuickDictate checks offline, so being licensed never
+  depends on the network. The certificate is renewed quietly about once a day.
+  A copy that was licensed and then went offline keeps working; only
+  Connections saying the licence has ended stops it, and then only after the
+  same three days of notice.
+
+  There is no Settings switch between personal and business on purpose. The
+  key and certificate are sealed with Windows DPAPI under your account.
+
+### Changed
+
+- **Update checks no longer send an install id.** The check now carries only
+  the app version and QuickDictate's User-Agent, so it says which version is
+  asking and nothing about which copy. The random `install_id` stays in
+  settings.json, but only the opt-in usage report sends it.
+
+- **"Check for updates daily" off now means no checks at all.** Opening the
+  About window used to check every time, even with the setting off. Now it
+  checks on open only while the setting is on; with it off, the pill reads
+  **Check for updates** and checks once when you click it. The Settings
+  **Check for updates** item still checks straight away, because that click
+  is the request.
+
+- **The usage-report setting now says "pseudonymous", not "anonymous".** The
+  opt-in report carries your random install id, so it can be told apart from
+  other copies even though it never names you. The switch now reads **Share
+  pseudonymous usage stats with LunarWerx**, and its tooltip, SECURITY.md and
+  the guides say what it sends in those terms. What the report sends and the
+  `share_usage_stats` key are unchanged.
+
+- **DashScope now defaults to its international (Singapore) host.** It used to
+  default to the mainland-China host, so a new setup sent your voice to
+  Alibaba's servers in mainland China unless you ticked **International
+  account**. That tick is now on by default. Existing setups keep the host they
+  were on: a settings.json with DashScope keys and no `dashscope_intl` stays on
+  mainland China, because a mainland key does not work on the international
+  host, and the next save writes that choice out. Untick **International
+  account** on the DashScope card if your key is a mainland-China one.
+
+- **"Stop syncing" now says what it really does.** It never deleted anything:
+  it signs you out, and Connections moves your synced settings and up to 20
+  earlier versions to your Connections Trash, where they are deleted for good
+  when the Trash period ends. The button's tooltip and SETTINGS_SYNC.md used
+  to say it deleted them from the server; they now say this, and that
+  lunawerx@gmail.com deletes them at once on request.
+
+- **Free use and the business trial are now in LICENSE.** QuickDictate is free
+  for personal use and for nonprofit organisations and government bodies, and
+  a business may try it free for up to 10 days on each installation. LICENSE
+  now grants both in a paragraph from LUNARWERX LLC above the PolyForm text,
+  which it only adds to.
+
+- **Moving or refunding a licence is by email.** To move a licence to another
+  PC or ask for a refund, email lunawerx@gmail.com.
+
+- **The install id is called pseudonymous everywhere.** The README, the guide
+  and the code comments now say "pseudonymous": the id is random and tied to
+  no name, but it links one install's reports together. The README and the
+  guide also say the About window obeys **Check for updates daily**.
+
 ### Fixed
+
+- **Moving the data folder now takes every file with it.** The sign-in prompt,
+  feedback survey and crash banner state, the usage report's last-sent stamp
+  and the `error-reports` folder used to stay behind in the old folder, so the
+  prompts could ask again and saved reports went missing from **Open folder**.
 
 - **A hotkey Windows stops answering now recovers on its own.** Windows can
   stop answering a registered hotkey without a word: on one PC an F14 sent by
@@ -30,10 +118,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and repairs the hotkey at most once every ten minutes.
   The watch never swallows or changes a key, ignores every key that is not a
   hotkey, and logs each such press plus a count of hotkey presses every half
-  hour, so a dead key can now be told apart from one that never reached
-  Windows.
+  hour. It also logs a hotkey key that went down with an extra modifier held
+  (a stuck Ctrl makes F14 into Ctrl+F14, which Windows will not fire) or while
+  another program held the hotkey, so a dead key can now be told apart from
+  one that never reached Windows.
 
 ### Security
+
+- **The AI cleanup pass no longer works ahead for an app where it is off.**
+  While the hotkey is down, QuickDictate starts the cleanup pass early so the
+  answer is ready on release. It did that whenever cleanup was on for any app,
+  so a dictation into an app whose profile turns cleanup off was still sent to
+  the cleanup host. It now works ahead only when cleanup is on for the app
+  that was in front when you pressed the hotkey.
+
+- **Dictations the app puts on the clipboard stay out of Clipboard History.**
+  A long dictation pasted with Ctrl+V, and every dictation left there by
+  **Save everything to clipboard**, now goes on the clipboard marked for
+  Windows to leave out of Clipboard History and Cloud Clipboard, so with
+  either turned on Windows no longer keeps or syncs those transcripts. The
+  restore of your previous clipboard works as before. The **Copy** buttons on
+  the History page and the tray's recent transcriptions are you asking for a
+  copy, so they still make an ordinary one that history can keep.
 
 - **AI cleanup no longer lends your OpenAI key to other hosts.** With no
   cleanup key of its own set, the cleanup pass used your OpenAI speech key for

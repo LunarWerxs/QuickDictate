@@ -5,8 +5,8 @@
 //! every successful dictation. Keeping a small numeric-only file prevents stale
 //! Settings saves from clobbering live totals. When Connections sync is enabled,
 //! a mergeable, numeric-only copy of the stats is included in the synced payload.
-//! Separately, and off by default, `report` can send LunarWerx one anonymized
-//! aggregate rollup a day (`Config::share_usage_stats`) -- distinct from sync,
+//! Separately, and off by default, `report` can send LunarWerx one pseudonymous
+//! aggregate rollup a day, keyed by the random install id (`Config::share_usage_stats`) -- distinct from sync,
 //! which carries a signed-in user's own stats back to their own account.
 
 mod aggregate;
@@ -25,6 +25,7 @@ use sha2::{Digest, Sha256};
 
 pub use aggregate::{DeviceStats, PeriodStats, ProviderStats};
 pub use report::spawn_daily_report;
+pub(crate) use report::CACHE_FILE as USAGE_REPORT_FILE;
 pub use store::StatsStore;
 pub use usage::{StatsRange, StatsView, UsageStats};
 

@@ -1,18 +1,19 @@
-//! Opt-in anonymized usage rollup to LunarWerx (`Config::share_usage_stats`).
+//! Opt-in pseudonymous usage rollup to LunarWerx (`Config::share_usage_stats`).
 //!
 //! WHY: QuickDictate already computes exactly the numbers a product-analytics
 //! dashboard would want -- provider mix, word/audio/dictation counts -- but
 //! keeps them strictly local (see `stats::usage::UsageStats`, the existing
 //! Settings-window charts). This lets LunarWerx see aggregate feature
 //! adoption fleet-wide without a new pipeline: it reuses the same
-//! `studio.connectionsapi.com/v1/app/quickdictate/*` endpoint family and
-//! anonymous `install_id` the update checker already established as a
-//! precedent (`update::RELEASES_API`, `update::init_install_id`). Off by
+//! `studio.connectionsapi.com/v1/app/quickdictate/*` endpoint family as the
+//! update checker (`update::RELEASES_API`) and the random `install_id`
+//! made at startup (`update::init_install_id`), which update checks no
+//! longer send, so this opt-in report is its only use. Off by
 //! default; a distinct, new capability from the already-shipped local usage
 //! stats and from `sync::mod` (which syncs a signed-in user's *own* stats
-//! back to their *own* account -- this instead sends one aggregate,
-//! unattributable-to-a-person rollup to the product team, only when the user
-//! opts in).
+//! back to their *own* account -- this instead sends one aggregate rollup,
+//! keyed by the install id and so pseudonymous rather than anonymous, to the
+//! product team, only when the user opts in).
 //!
 //! Adapted from PostHog's product-analytics idea (`posthog/posthog`,
 //! MIT-licensed), not ported: PostHog's autocapture/event pipeline has no
@@ -34,7 +35,7 @@ use super::{PeriodStats, UsageStats};
 #[cfg(test)]
 mod tests;
 
-/// Studio endpoint for the anonymized usage rollup -- a sibling of
+/// Studio endpoint for the pseudonymous usage rollup -- a sibling of
 /// `update::RELEASES_API` under the same `/v1/app/quickdictate/*` namespace.
 /// Registration is an owner action (same as `sync::CLIENT_ID`'s one-time
 /// OAuth-app registration); until it exists server-side, [`send_now`] simply
@@ -42,7 +43,7 @@ mod tests;
 /// forward, so no data is lost by the endpoint not existing yet.
 pub const USAGE_REPORT_API: &str = "https://studio.connectionsapi.com/v1/app/quickdictate/usage";
 
-const CACHE_FILE: &str = "quickdictate-usage-report.txt";
+pub(crate) const CACHE_FILE: &str = "quickdictate-usage-report.txt";
 
 /// At most one real network send per this interval, same cadence as the
 /// update checker (`update::CHECK_INTERVAL_SECS`) -- a daily aggregate is all
@@ -84,7 +85,7 @@ fn write_cache() {
 /// and a future field added to that struct for the *sync* merge machinery
 /// must not silently start riding along in this *report* payload too.
 /// `install_id` is the one identifier included -- the same crypto-random,
-/// machine-only id already sent with update checks, never derived from
+/// machine-only id made at startup (update checks no longer send it), never derived from
 /// hostname, MAC, username, or account.
 ///
 /// The counts are this install's own device row, not `UsageStats`' top-level

@@ -106,6 +106,13 @@ fn begin_session(
     what: std::fmt::Arguments<'_>,
 ) {
     let _ = active.take();
+    // A Business copy past its evaluation shows the licence notice here, and
+    // once it is locked the press starts nothing. Reads a cached snapshot:
+    // never the network, never a dialog that would take the focus.
+    if !crate::licence::allow_dictation_start() {
+        app.set_status(Status::Idle);
+        return;
+    }
     refresh_key_pool(app, keys);
     tracing::info!("{what}");
     app.set_status(Status::Starting);

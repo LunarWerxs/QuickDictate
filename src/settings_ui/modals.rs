@@ -326,8 +326,7 @@ impl super::SettingsApp {
         }
         if out.do_close_discard {
             self.modal = None;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            OPEN.store(false, Ordering::Release);
+            self.hide_window(ctx);
         }
         if out.do_close_save {
             if self.external_change_pending() {
@@ -340,8 +339,7 @@ impl super::SettingsApp {
             } else {
                 self.modal = None;
                 if self.save_and_sync(ctx) {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                    OPEN.store(false, Ordering::Release);
+                    self.hide_window(ctx);
                 }
                 // On failure (e.g. a hotkey conflict) `self.status` already
                 // carries the reason — matches the ordinary Save button.

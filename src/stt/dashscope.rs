@@ -34,9 +34,9 @@ use super::provider::{
 use super::ws::{self, WsConn};
 use crate::keys::FailKind;
 
-// Host is chosen by the `dashscope_intl` config flag: mainland-China (default)
-// vs. the `-intl` host for International accounts. A key from the wrong region
-// 401s at the WebSocket upgrade.
+// Host is chosen by the `dashscope_intl` config flag: the `-intl` (Singapore)
+// host for International accounts (default) vs. mainland-China. A key from the
+// wrong region 401s at the WebSocket upgrade.
 const WS_URL_CN: &str = "wss://dashscope.aliyuncs.com/api-ws/v1/inference";
 const WS_URL_INTL: &str = "wss://dashscope-intl.aliyuncs.com/api-ws/v1/inference";
 const MODEL_ID: &str = "qwen-audio-3.1-asr-flash-streaming";
