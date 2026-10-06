@@ -1,0 +1,24 @@
+{
+ "closed": null,
+ "def_hash": "0fff2020e99f60fb",
+ "id": "20261006-deps-total-a3de",
+ "idea": "drop once_cell: use std LazyLock/OnceLock (MSRV 1.95)",
+ "lane": "normal",
+ "metric": "deps_total",
+ "opened": {
+  "at": "2026-10-06T08:52:31+00:00",
+  "by": "blogi",
+  "commit": "b54b81cb99c43fe7dc0dd2233a99b665bb9d7dbb",
+  "machine": "MPC-HELL"
+ },
+ "pass_line": null,
+ "predict": {
+  "expect": 34.0,
+  "hi": 34.0,
+  "lo": 33.0,
+  "p_keep": 0.8
+ },
+ "probe_minutes": null,
+ "project": "quickdictate-beta1",
+ "schema": "hydra-rsi-trial/1"
+}

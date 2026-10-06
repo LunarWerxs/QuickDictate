@@ -48,8 +48,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crossbeam_channel::Sender;
-use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
+use std::sync::OnceLock as OnceCell;
 
 use crate::config::Config;
 pub(crate) use plan::LEFTOVERS_FILE;

@@ -20,8 +20,8 @@
 
 use std::path::{Path, PathBuf};
 
-use once_cell::sync::Lazy;
 use regex::Regex;
+use std::sync::LazyLock as Lazy;
 
 /// Folder error reports are saved into, inside the configured data folder
 /// (see `crate::paths::data_dir`) -- a sibling of `logs/`. `pub(crate)` so

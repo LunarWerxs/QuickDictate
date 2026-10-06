@@ -53,7 +53,7 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwapOption;
 use crossbeam_channel::Sender;
-use once_cell::sync::Lazy;
+use std::sync::LazyLock as Lazy;
 use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, WH_MOUSE_LL,
 };

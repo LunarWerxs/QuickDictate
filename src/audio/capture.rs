@@ -27,8 +27,8 @@ const DEVICE_RECHECK: std::time::Duration = std::time::Duration::from_secs(2);
 /// The configured microphone preference. Empty means "follow the Windows
 /// default input device". Swapped in at startup and whenever settings are
 /// saved, so a change applies without a restart.
-pub(super) static PREFERRED_INPUT: once_cell::sync::Lazy<arc_swap::ArcSwap<String>> =
-    once_cell::sync::Lazy::new(|| arc_swap::ArcSwap::from_pointee(String::new()));
+pub(super) static PREFERRED_INPUT: std::sync::LazyLock<arc_swap::ArcSwap<String>> =
+    std::sync::LazyLock::new(|| arc_swap::ArcSwap::from_pointee(String::new()));
 
 /// Publish the microphone preference from `settings.json`.
 pub fn set_preferred_input(name: &str) {

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
-use once_cell::sync::Lazy;
 use regex::{Regex, Replacer};
+use std::sync::LazyLock as Lazy;
 
 /// Compile a pattern that is a literal in this source file.
 ///
