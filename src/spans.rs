@@ -140,13 +140,16 @@ fn record(t: &Trace) -> Value {
 }
 
 fn write_record(t: &Trace) {
+    write_record_to(path(), t);
+}
+
+fn write_record_to(path: &std::path::Path, t: &Trace) {
     // A trace that never reached a release (a discarded or failed press) says
     // nothing about release-to-paste; keep the log to real dictations.
     if t.marks[Mark::KeyRelease as usize].is_none() {
         return;
     }
     let line = format!("{}\n", record(t));
-    let path = path();
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -164,16 +167,63 @@ mod tests {
     use super::*;
 
     #[test]
-    fn record_has_offsets_and_counts_but_no_text_field() {
-        let mut t = Trace::default();
-        t.marks[Mark::KeyRelease as usize] = Some(1200);
-        t.marks[Mark::PasteDone as usize] = Some(1900);
-        t.counts[Count::AudioBytesSent as usize] = 64000;
-        let v = record(&t);
-        assert_eq!(v["key_release_ms"], 1200);
-        assert_eq!(v["paste_done_ms"], 1900);
-        assert!(v["polish_done_ms"].is_null());
-        assert_eq!(v["audio_bytes_sent"], 64000);
-        assert!(v.get("text").is_none() && v.get("transcript").is_none());
+    fn written_line_has_all_offsets_and_counts_but_no_text_field() {
+        let mut t = Trace {
+            epoch: 7,
+            provider: "deepgram".into(),
+            ..Trace::default()
+        };
+        for (i, m) in [
+            Mark::Connected,
+            Mark::KeyRelease,
+            Mark::SttTail,
+            Mark::FinalTranscript,
+            Mark::PolishDone,
+            Mark::PasteDone,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            t.marks[m as usize] = Some(100 * (i as u64 + 1));
+        }
+        t.counts = [3, 40, 12, 64000];
+
+        let path = std::env::temp_dir().join(format!("qd-spans-test-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        write_record_to(&path, &t);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let v: Value = serde_json::from_str(text.trim_end()).unwrap();
+        for (key, want) in [
+            ("connected_ms", 100),
+            ("key_release_ms", 200),
+            ("stt_tail_ms", 300),
+            ("final_transcript_ms", 400),
+            ("polish_done_ms", 500),
+            ("paste_done_ms", 600),
+            ("stt_messages", 3),
+            ("polish_tokens_in", 40),
+            ("polish_tokens_out", 12),
+            ("audio_bytes_sent", 64000),
+        ] {
+            assert_eq!(v[key], want, "{key}");
+        }
+        // Only numbers, plus the provider id: nothing that could hold dictated text.
+        for (key, val) in v.as_object().unwrap() {
+            assert!(
+                key == "provider" || val.is_number() || val.is_null(),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_trace_with_no_key_release_writes_nothing() {
+        let path =
+            std::env::temp_dir().join(format!("qd-spans-test-skip-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        write_record_to(&path, &Trace::default());
+        assert!(!path.exists());
     }
 }

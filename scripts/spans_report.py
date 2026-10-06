@@ -74,4 +74,5 @@ def main():
               f"{'-' if r2p is None else r2p:>8}" + "".join(f"{r.get(c, 0):>16}" for c in COUNTS))
 
 
-main()
+if __name__ == "__main__":
+    main()

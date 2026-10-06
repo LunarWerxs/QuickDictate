@@ -64,6 +64,7 @@ pub(super) const SYNCED_KEYS: &[&str] = &[
     "dashscope_intl",
     "update_auto_check",
     "prewarm_keys",
+    "prewarm_on_keydown",
     "text_replacements",
     "enable_text_replacements",
     // Portable, secret-free preferences added to `Config` after this list was

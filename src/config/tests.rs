@@ -600,6 +600,15 @@ fn keep_transcript_on_clipboard_is_opt_in() {
 }
 
 #[test]
+fn prewarm_on_keydown_defaults_on_and_can_be_turned_off() {
+    assert!(Config::default().prewarm_on_keydown);
+    let c: Config = serde_json::from_str("{}").unwrap();
+    assert!(c.prewarm_on_keydown);
+    let c: Config = serde_json::from_str(r#"{ "prewarm_on_keydown": false }"#).unwrap();
+    assert!(!c.prewarm_on_keydown);
+}
+
+#[test]
 fn max_log_mb_defaults_to_5() {
     assert_eq!(Config::default().max_log_mb, 5);
     let c: Config = serde_json::from_str("{}").unwrap();
