@@ -588,7 +588,7 @@ fn cancelling_download_stops_and_removes_partial_file() {
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
     let (url, server) =
-        spawn_download_server(Arc::clone(&data), 1, false, Duration::from_millis(2));
+        spawn_download_server(Arc::clone(&data), 1, false, Duration::from_millis(10));
     let dest = test_path("cancel-download");
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = Arc::clone(&cancel);
@@ -606,7 +606,18 @@ fn cancelling_download_stops_and_removes_partial_file() {
             &worker_cancel,
         )
     });
-    std::thread::sleep(Duration::from_millis(30));
+    // Cancel only once bytes have arrived. A cancel before the worker connects returns early, the
+    // server then waits in accept() forever, and this test hung 20+ minutes on a loaded box
+    // (2026-10-06). Waiting for a partial file also makes the test prove what its name says.
+    let part = dest.with_extension("part");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !fs::metadata(&part).is_ok_and(|m| m.len() > 0) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the download never started"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
     cancel.store(true, Ordering::Release);
     let result = worker.join().unwrap();
     server.join().unwrap();
