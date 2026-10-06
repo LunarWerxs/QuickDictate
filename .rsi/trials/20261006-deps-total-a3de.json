@@ -1,5 +1,81 @@
 {
- "closed": null,
+ "closed": {
+  "a": {
+   "commit": "b54b81cb99c43fe7dc0dd2233a99b665bb9d7dbb",
+   "def_hash": "0fff2020e99f60fb",
+   "dirty": false,
+   "id": "m-20261006T085304-1c84d2",
+   "load_after": null,
+   "load_before": null,
+   "machine": "MPC-HELL",
+   "metric": "deps_total",
+   "project": "quickdictate-beta1",
+   "reason": null,
+   "seconds": null,
+   "settings": {
+    "gate": "exact",
+    "kind": "count",
+    "measure_files": {},
+    "measured_at": "2026-10-06T08:53:01+00:00",
+    "source": "index"
+   },
+   "started": "2026-10-06T08:53:04+00:00",
+   "status": "ok",
+   "value": 35
+  },
+  "applies_if": "once_cell",
+  "at": "2026-10-06T08:59:26+00:00",
+  "b": {
+   "commit": "0bb0ebb90f3049c7f4e78312d44e366809c95033",
+   "def_hash": "0fff2020e99f60fb",
+   "dirty": false,
+   "id": "m-20261006T085919-96e058",
+   "load_after": null,
+   "load_before": null,
+   "machine": "MPC-HELL",
+   "metric": "deps_total",
+   "project": "quickdictate-beta1",
+   "reason": null,
+   "seconds": null,
+   "settings": {
+    "gate": "exact",
+    "kind": "count",
+    "measure_files": {},
+    "measured_at": "2026-10-06T08:59:13+00:00",
+    "source": "index"
+   },
+   "started": "2026-10-06T08:59:19+00:00",
+   "status": "ok",
+   "value": 34
+  },
+  "guards": [
+   {
+    "a": 0,
+    "b": 0,
+    "declared": false,
+    "metric": "arkitect_gating_errors",
+    "state": "ok"
+   },
+   {
+    "a": 0,
+    "b": 0,
+    "declared": false,
+    "metric": "arkitect_warnings",
+    "state": "ok"
+   },
+   {
+    "a": 246,
+    "b": 246,
+    "declared": false,
+    "metric": "arkitect_no_data",
+    "state": "ok"
+   }
+  ],
+  "method": "exact: 35 -> 34",
+  "note": "drop once_cell dependency; std LazyLock/OnceLock cover all uses",
+  "pattern": "replace once_cell with std LazyLock/OnceLock",
+  "verdict": "kept"
+ },
  "def_hash": "0fff2020e99f60fb",
  "id": "20261006-deps-total-a3de",
  "idea": "drop once_cell: use std LazyLock/OnceLock (MSRV 1.95)",
