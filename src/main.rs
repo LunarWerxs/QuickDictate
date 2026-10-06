@@ -63,6 +63,7 @@ mod secretstore;
 mod session_loop;
 mod settings_ui;
 mod sound;
+mod spans;
 mod startup;
 mod state;
 mod stats;
@@ -138,5 +139,6 @@ fn main() -> Result<()> {
     // 50 ms here was shorter than the default 300 ms restore delay).
     let restore_delay = Duration::from_millis(started.app.config.load().clipboard_restore_delay_ms);
     started.wait_for_output(restore_delay + Duration::from_secs(1));
+    spans::flush();
     Ok(())
 }

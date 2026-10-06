@@ -31,7 +31,10 @@ async fn ship(sink: &mut Box<dyn ProviderSink>, chunk: &[i16], dead: &mut bool) 
     // all. A blackholed network while the user is holding the hotkey would
     // hang the whole session with no partials and no error until they let go.
     match tokio::time::timeout(SEND_TIMEOUT, sink.send_audio(chunk)).await {
-        Ok(Ok(())) => true,
+        Ok(Ok(())) => {
+            crate::spans::add(crate::spans::Count::AudioBytesSent, chunk.len() as u64 * 2);
+            true
+        }
         Ok(Err(e)) => {
             tracing::debug!("provider send error (subsequent sends will be skipped): {e}");
             *dead = true;

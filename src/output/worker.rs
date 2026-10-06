@@ -187,6 +187,7 @@ fn process_transcript(
         Some(settings) => app.polish.resolve(&settings, &raw).unwrap_or(raw),
         None => raw,
     };
+    crate::spans::mark(crate::spans::Mark::PolishDone);
 
     let processor = cache.get_or_build(current_cfg, exe_name.as_deref());
 
@@ -391,6 +392,7 @@ pub(super) fn paste_processed(
             }
         }
     }
+    crate::spans::mark(crate::spans::Mark::PasteDone);
 }
 
 /// Keep [`UNDO_TARGETS`] in step with the paste that just ran. `target` is

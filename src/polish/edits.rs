@@ -123,6 +123,17 @@ pub(super) async fn request_edits(
         let head: String = raw.chars().take(200).collect();
         return Err(format!("HTTP {status} {head}"));
     }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+        use crate::spans::{add, Count};
+        add(
+            Count::PolishTokensIn,
+            v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
+        );
+        add(
+            Count::PolishTokensOut,
+            v["usage"]["completion_tokens"].as_u64().unwrap_or(0),
+        );
+    }
     parse_reply(&raw)
 }
 

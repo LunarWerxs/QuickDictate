@@ -334,6 +334,7 @@ async fn connect_provider(
             return Err(SessionAbort::ConnectTimedOut(message).into());
         }
     };
+    crate::spans::mark(crate::spans::Mark::Connected);
     tracing::info!(
         "session[{epoch}] {provider_id} connected in {:?}",
         connect_start.elapsed()

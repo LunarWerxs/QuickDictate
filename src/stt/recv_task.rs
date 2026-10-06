@@ -257,6 +257,7 @@ fn handle_recv_event(
 ) -> RecvStep {
     let epoch = state.epoch;
     let provider_id = state.provider_id;
+    crate::spans::add(crate::spans::Count::SttMessages, 1);
     match ev {
         SttEvent::SessionStarted => {
             tracing::info!("session[{epoch}] {provider_id} session_started");

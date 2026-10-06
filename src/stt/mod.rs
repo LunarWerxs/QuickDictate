@@ -190,6 +190,7 @@ pub fn start_session(app: Arc<App>, keys: Arc<KeyPool>) -> SttHandle {
     let stop_ret = Arc::clone(&stop);
     let done_ret = Arc::clone(&done);
     let epoch = app.next_session_epoch();
+    crate::spans::begin(epoch);
     let app2 = Arc::clone(&app);
     let stats_session_guard = app.stats.session_guard();
     // Quiet other apps (opt-in) from the moment of the press, so the music is
@@ -259,6 +260,7 @@ async fn run_session_with_retries(
             .provider_for_exe(press.exe_at_start.as_deref())
             .unwrap_or_else(|| cfg.stt_provider.clone());
         app2.press_provider.store(Some(Arc::new(id.clone())));
+        crate::spans::set_provider(&id);
         let _ = provider.set(id);
     }
     let user_aborted = || stop.load(Ordering::Acquire) || app2.current_session_epoch() != epoch;
@@ -722,6 +724,7 @@ async fn run_session(
             .await;
     }
 
+    crate::spans::mark(crate::spans::Mark::KeyRelease);
     enter_release_phase(&app, &ctx, tail_quiet, tail_max, &release_pending);
 
     // Bound the wait so we never get stuck if something goes wrong. Streaming
@@ -733,6 +736,7 @@ async fn run_session(
     // floor (Google's 45 s dwarfs any tail).
     let send_deadline = finalize_timeout.max(tail_max + Duration::from_millis(600));
     let sent = join_send_task(send_task, &ctx, send_deadline).await;
+    crate::spans::mark(crate::spans::Mark::SttTail);
     // The send task is done with the microphone (its listening tail included),
     // so other apps can come back up now rather than after the wait for the
     // final transcript below, which for a batch provider is a whole upload.
@@ -760,6 +764,7 @@ async fn run_session(
 
     let got_committed = ctx.acc.committed_flag.load(Ordering::Acquire);
     let had_partial = promote_tail_transcript(&app, &ctx);
+    crate::spans::mark(crate::spans::Mark::FinalTranscript);
     if !got_committed && !had_partial && sent.chunks == 0 {
         tracing::warn!("session[{epoch}] produced no transcript (zero audio chunks sent -- session ended before mic was warm)");
     }
