@@ -1,0 +1,37 @@
+schema: hydra-rsi/1
+metrics:
+  - id: dictation.release_to_paste.p50
+    kind: time
+    better: lower
+    unit: ms
+    # key release -> paste done, median over the last 50 dictations in logs/spans.jsonl
+    measure: "python scripts/spans_report.py -n 50 --json"
+    pick: 'json:$.release_to_paste_ms.p50'
+    where: any
+    gate: band
+    repeat: 5
+    light: true
+
+  - id: dictation.stt_messages.per_dictation
+    kind: count
+    better: lower
+    unit: messages
+    measure: "python scripts/spans_report.py -n 50 --json"
+    pick: 'json:$.stt_messages.p50'
+    gate: report
+
+  - id: dictation.polish_tokens_out.per_dictation
+    kind: count
+    better: lower
+    unit: tokens
+    measure: "python scripts/spans_report.py -n 50 --json"
+    pick: 'json:$.polish_tokens_out.p50'
+    gate: report
+
+  - id: dictation.audio_bytes_sent.per_dictation
+    kind: count
+    better: lower
+    unit: bytes
+    measure: "python scripts/spans_report.py -n 50 --json"
+    pick: 'json:$.audio_bytes_sent.p50'
+    gate: report

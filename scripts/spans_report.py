@@ -55,7 +55,7 @@ def main():
         k, p = r.get("key_release_ms"), r.get("paste_done_ms")
         r["release_to_paste_ms"] = p - k if k is not None and p is not None else None
     out = {}
-    for name in SPANS + ["release_to_paste_ms"]:
+    for name in SPANS + ["release_to_paste_ms"] + COUNTS:
         xs = [r[name] for r in rows if r.get(name) is not None]
         if xs:
             out[name] = {"n": len(xs), "p50": median(xs), "p90": pct(xs, 90)}
