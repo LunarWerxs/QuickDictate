@@ -74,6 +74,14 @@ impl super::SettingsApp {
                 "Save everything to clipboard",
             )
             .on_hover_text(TIP_KEEP_ON_CLIPBOARD);
+            blue_check(
+                left,
+                &mut self.draft.prewarm_on_keydown,
+                "Warm the connection on key-down",
+            )
+            .on_hover_text(
+                "Start preparing the speech-to-text connection the moment you press the                  hotkey instead of when the first audio goes out. Turn off to connect lazily.",
+            );
 
             let right = &mut cols[1];
             blue_check(

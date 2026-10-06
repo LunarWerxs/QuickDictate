@@ -61,6 +61,19 @@ pub fn provider_id_streams_interim_text(id: &str, cfg: &Config) -> bool {
     make_provider_id(id, cfg).streams_interim_text()
 }
 
+/// Key-down warm-up (`Config::prewarm_on_keydown`): resolve the provider's
+/// streaming host in the background so the press's own handshake finds DNS
+/// already answered. Fire and forget; a failure changes nothing.
+pub(super) fn prewarm_on_keydown(app: &Arc<App>) {
+    let cfg = app.config.load_full();
+    let Some(host) = make_provider(&cfg).prewarm_host() else {
+        return;
+    };
+    app.rt.spawn(async move {
+        let _ = tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::lookup_host((host, 443))).await;
+    });
+}
+
 /// Startup key prewarm (§owner request, 2026-07-04): probe every key of the
 /// active provider in config order, mark dead/limited ones failed (so the
 /// session's `acquire` never wastes a press on them), and queue the first

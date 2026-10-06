@@ -191,6 +191,9 @@ pub fn start_session(app: Arc<App>, keys: Arc<KeyPool>) -> SttHandle {
     let done_ret = Arc::clone(&done);
     let epoch = app.next_session_epoch();
     crate::spans::begin(epoch);
+    if app.config.load().prewarm_on_keydown {
+        dispatch::prewarm_on_keydown(&app);
+    }
     let app2 = Arc::clone(&app);
     let stats_session_guard = app.stats.session_guard();
     // Quiet other apps (opt-in) from the moment of the press, so the music is

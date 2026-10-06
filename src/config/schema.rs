@@ -147,6 +147,11 @@ pub struct Config {
     /// because it replaces whatever you had copied. Read per paste.
     #[serde(default = "default_false")]
     pub keep_transcript_on_clipboard: bool,
+    /// Start warming the speech-to-text connection the moment the hotkey goes
+    /// down (the provider host is resolved while the session sets up) rather
+    /// than leaving all of it to the first audio. On by default. Read per press.
+    #[serde(default = "default_true")]
+    pub prewarm_on_keydown: bool,
     #[serde(default = "default_true")]
     pub auto_space: bool,
     #[serde(default = "default_false")]
@@ -550,6 +555,7 @@ impl Default for Config {
             listen_tail_ms: default_listen_tail_ms(),
             clipboard_restore_delay_ms: default_clipboard_restore_delay_ms(),
             keep_transcript_on_clipboard: false,
+            prewarm_on_keydown: true,
             auto_space: true,
             auto_newline: false,
             auto_punct: true,

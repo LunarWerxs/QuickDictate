@@ -24,6 +24,7 @@
   "delay_output_till_release": true,
   "clipboard_restore_delay_ms": 300,
   "keep_transcript_on_clipboard": false,
+  "prewarm_on_keydown": true,
   "spinner_type": "star_wars",
   "data_dir": "",
   "enable_logging": false,

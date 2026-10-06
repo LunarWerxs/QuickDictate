@@ -38,6 +38,10 @@ impl SttProvider for DeepgramProvider {
         "deepgram"
     }
 
+    fn prewarm_host(&self) -> Option<&'static str> {
+        Some("api.deepgram.com")
+    }
+
     /// Measured 2026-09-11 (`live_deepgram` at realtime pace): first partial
     /// ~1.1 s after speech starts, then one every ~1.1 s, and partials keep
     /// coming after each committed sentence. Comfortably inside the stall

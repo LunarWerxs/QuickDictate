@@ -47,6 +47,10 @@ impl SttProvider for OpenAiProvider {
         "openai"
     }
 
+    fn prewarm_host(&self) -> Option<&'static str> {
+        Some("api.openai.com")
+    }
+
     fn required_audio_format(&self) -> AudioFormat {
         // OpenAI Realtime expects 24 kHz PCM16.
         AudioFormat {

@@ -39,6 +39,10 @@ impl SttProvider for AssemblyAiProvider {
         "assemblyai"
     }
 
+    fn prewarm_host(&self) -> Option<&'static str> {
+        Some("streaming.assemblyai.com")
+    }
+
     /// Measured 2026-09-11 (`live_assemblyai` at realtime pace): first partial
     /// ~1.0 s after speech starts, then one every ~1.2 s, and partials keep
     /// coming after each committed sentence. Comfortably inside the stall

@@ -42,6 +42,10 @@ impl SttProvider for ElevenLabsProvider {
         "elevenlabs"
     }
 
+    fn prewarm_host(&self) -> Option<&'static str> {
+        Some("api.elevenlabs.io")
+    }
+
     fn required_audio_format(&self) -> AudioFormat {
         AudioFormat {
             sample_rate: 16_000,

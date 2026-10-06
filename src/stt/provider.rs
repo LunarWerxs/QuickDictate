@@ -109,6 +109,13 @@ pub trait SttProvider: Send + Sync {
     /// audio pipeline at this rate.
     fn required_audio_format(&self) -> AudioFormat;
 
+    /// The host this provider's socket goes to, resolved at key-down so the
+    /// handshake does not wait on DNS (see `Config::prewarm_on_keydown`).
+    /// `None` for providers with no fixed streaming host.
+    fn prewarm_host(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Cloud providers use the key pool. A fully local provider overrides this
     /// so connection/runtime failures are not misclassified as dead API keys.
     fn requires_api_key(&self) -> bool {
