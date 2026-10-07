@@ -1,0 +1,24 @@
+{
+ "closed": null,
+ "def_hash": "0fff2020e99f60fb",
+ "id": "20261007-deps-total-38d0",
+ "idea": "drop direct bytes dep: download chunk return type becomes impl Deref<Target=[u8]>",
+ "lane": "normal",
+ "metric": "deps_total",
+ "opened": {
+  "at": "2026-10-07T09:35:11+00:00",
+  "by": "blogi",
+  "commit": "2936b5342bfcbc65feb26982c070f85882d3e790",
+  "machine": "MPC-HELL"
+ },
+ "pass_line": null,
+ "predict": {
+  "expect": 33.0,
+  "hi": 34.0,
+  "lo": 33.0,
+  "p_keep": 0.5
+ },
+ "probe_minutes": null,
+ "project": "quickdictate-beta1",
+ "schema": "hydra-rsi-trial/1"
+}

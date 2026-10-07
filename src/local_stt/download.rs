@@ -208,7 +208,7 @@ async fn send_with_cancel(
 async fn next_chunk_with_cancel(
     response: &mut reqwest::Response,
     cancel: &AtomicBool,
-) -> Result<Option<bytes::Bytes>, String> {
+) -> Result<Option<impl std::ops::Deref<Target = [u8]>>, String> {
     until_cancelled(response.chunk(), cancel, "download read failed").await
 }
 
@@ -266,7 +266,7 @@ async fn download_single(fetch: &Fetch<'_>) -> Result<String, String> {
         if downloaded > expected_bytes {
             return Err("download exceeded its pinned size".into());
         }
-        hasher.update(&chunk);
+        hasher.update(&*chunk);
         file.write_all(&chunk)
             .map_err(|e| format!("download write failed: {e}"))?;
         fetch.report(downloaded);

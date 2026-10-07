@@ -2945,7 +2945,6 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "base64 0.23.1",
- "bytes",
  "cpal",
  "crossbeam-channel",
  "ed25519-dalek",
