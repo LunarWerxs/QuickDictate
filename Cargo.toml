@@ -1,6 +1,6 @@
 [package]
 name = "quickdictate"
-version = "1.4.0"
+version = "1.5.0"
 edition = "2021"
 description = "Fast Windows dictation with cloud and optional local speech recognition"
 # Source available, free for noncommercial use; see LICENSE. Releases through
@@ -124,6 +124,18 @@ sha2 = "0.11.0"
 flate2 = "1"
 tar = "0.4"
 libloading = "0.9.0"
+# Decodes the audio files the MCP `transcribe_file` tool accepts (wav, mp3,
+# m4a/aac, flac, ogg). Decode only: no encoders, no extra formats.
+symphonia = { version = "0.5", default-features = false, features = [
+    "wav",
+    "pcm",
+    "mp3",
+    "aac",
+    "isomp4",
+    "flac",
+    "ogg",
+    "vorbis",
+] }
 # Offline business-licence certificates: Ed25519 verify against the Connections
 # platform key compiled into the binary (see `licence::cert`). Verify only, so
 # no default features: no RNG, no signing, no std-only extras.

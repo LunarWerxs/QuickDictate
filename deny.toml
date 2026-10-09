@@ -78,6 +78,7 @@ allow = [
     # embeds, not code, and both permit redistribution in a binary.
     "OFL-1.1",
     "Ubuntu-font-1.0",
+    "MPL-2.0",     # symphonia (the MCP file decoder): file-level copyleft, unmodified use
 ]
 # A crate whose SPDX expression ANDs several ids needs EVERY term allowed.
 confidence-threshold = 0.93

@@ -105,6 +105,36 @@ key or an internet connection. Microphone audio stays on your PC.
 > you like. Existing files are moved across on the next start. (Or set `data_dir`
 > in `settings.json`; `%VARIABLES%` are expanded.)
 
+## Use from AI tools (MCP)
+
+QuickDictate can also serve as a transcription tool for AI apps. Run it with
+`--mcp` and it speaks the Model Context Protocol over stdio, with no window,
+tray icon or hotkey:
+
+```
+quickdictate.exe --mcp
+```
+
+For Claude Code, register it once:
+
+```
+claude mcp add --scope user quickdictate -- "C:\path\to\quickdictate.exe" --mcp
+```
+
+Other MCP clients take the same command in their JSON config. Settings ▸
+Advanced has both, ready to copy, with the exe's real path.
+
+- `list_engines` reports the installed local models and the cloud providers with
+  a key, and which one `transcribe_file` uses by default: local Parakeet if it is
+  installed, otherwise your configured provider.
+- `transcribe_file` takes an absolute path to a wav, mp3, m4a/mp4, aac, flac or
+  ogg file, with optional `engine` and `language`. It returns the text, the
+  duration and the engine used. Long recordings are fine.
+
+Local models never leave the PC. With a cloud engine, the audio goes to that
+provider, using your key, the same as dictation does. The server only does work
+when a client calls it.
+
 ## 📚 Learn more
 
 Every setting, per-provider setup, and the privacy details live in the

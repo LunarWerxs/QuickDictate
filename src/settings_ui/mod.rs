@@ -63,6 +63,7 @@ use crate::theme;
 // One file per surface so each can be reviewed on its own; the hub keeps the
 // shared state, the window plumbing, and the frame loop.
 mod advanced;
+mod ai_tools;
 mod app;
 mod application;
 mod banners;

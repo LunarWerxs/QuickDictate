@@ -43,6 +43,8 @@ mod keys;
 mod licence;
 mod local_stt;
 mod logging;
+/// Headless MCP server behind `quickdictate.exe --mcp`. See its module doc.
+mod mcp;
 mod mouse_hook;
 /// The "you could be signed in" prompt: app glue (persistence, identity, the decision).
 mod nudge;
@@ -90,6 +92,10 @@ use crate::startup::{
 fn main() -> Result<()> {
     if handle_version_flag() {
         return Ok(());
+    }
+
+    if std::env::args().any(|a| a == "--mcp") {
+        std::process::exit(mcp::run());
     }
 
     // Single-instance guard: claims a named mutex before anything else

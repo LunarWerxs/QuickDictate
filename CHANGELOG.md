@@ -6,7 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-10-09
+
 ### Added
+
+- **Use QuickDictate from AI apps (MCP server).** `quickdictate.exe --mcp` runs
+  a headless Model Context Protocol server over stdio. It has no window, tray
+  icon or hotkey, so it runs beside the app. Two tools: `transcribe_file` takes
+  an absolute path to a wav, mp3, m4a/mp4, aac, flac or ogg file (optional
+  `engine` and `language`) and returns the transcript with its duration; and
+  `list_engines` shows the installed local models and the cloud providers that
+  have a key here, and which one is used by default. Local models run offline.
+  Cloud use sends the file straight to the provider with your own key. Long
+  recordings work: a 90-minute file is decoded in one streaming pass. Settings ›
+  Advanced has the `claude mcp add` command and a JSON config, each with a copy
+  button.
 
 - **Save everything to clipboard.** Settings › Behavior, or
   `keep_transcript_on_clipboard` in settings.json. When on, every dictation is

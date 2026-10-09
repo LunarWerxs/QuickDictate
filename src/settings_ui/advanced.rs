@@ -119,6 +119,8 @@ impl super::SettingsApp {
             self.advanced_toggles(ui);
             self.data_folder_section(ui);
             self.error_report_section(ui);
+            ui.add_space(10.0);
+            self.ai_tools_section(ui);
             // "Active profiles" editor — shown only when a power user has
             // actually added `profiles` to settings.json. With none
             // configured, the toggle above is the whole story and we don't
