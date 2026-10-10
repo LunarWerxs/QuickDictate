@@ -8,6 +8,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [1.5.0] - 2026-10-09
 
+**TL;DR**
+
+- **AI apps can now transcribe audio files with QuickDictate** (`quickdictate.exe --mcp`).
+- **Save everything to clipboard**: every dictation stays one Ctrl+V away.
+- **Business licences inside the app**: free for personal, nonprofit, school and government
+  use; business use gets a 10-day trial, then US$19.99 once or US$1.99 a month.
+- **Update checks send no install id**, and switching off daily checks stops them all.
+- **DashScope defaults to its international host** for new setups.
+- **A hotkey Windows stops answering now recovers on its own.**
+- **Moving the data folder takes every file with it.**
+- **Security**: AI cleanup no longer runs ahead for an app where it is off, app clipboard
+  writes stay out of Clipboard History, and your OpenAI key is no longer sent to other cleanup
+  hosts (the endpoint must be https).
+
+<details><summary><b>Everything in 1.5.0</b></summary>
+
 ### Added
 
 - **Use QuickDictate from AI apps (MCP server).** `quickdictate.exe --mcp` runs
@@ -164,6 +180,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `http://` to this PC only (a local model server), so a transcript and its key
   never cross a network unencrypted. Settings shows why the pass is off when the
   endpoint is refused.
+
+</details>
 
 ## [1.4.0] - 2026-10-02
 
