@@ -129,6 +129,12 @@ try {
                 -ExePath target\release\quickdictate.exe `
                 -ExpectedVersion $version
         }
+        Step 'release notes' {
+            $version = (cargo metadata --no-deps --format-version 1 |
+                ConvertFrom-Json).packages[0].version
+            pwsh -File scripts\release_notes.ps1 -Version $version `
+                -OutPath (Join-Path ([System.IO.Path]::GetTempPath()) 'quickdictate-release-notes.md')
+        }
     }
 }
 finally {

@@ -51,24 +51,7 @@ jobs:
           if ($version -cne $tagVersion) {
             throw "tag $env:GITHUB_REF_NAME does not match Cargo.toml version $version"
           }
-          $lines = @(Get-Content -LiteralPath CHANGELOG.md)
-          $start = -1
-          for ($i = 0; $i -lt $lines.Count; $i++) {
-            if ($lines[$i] -match "^## \[$([regex]::Escape($version))\](?:\s|$)") {
-              $start = $i
-              break
-            }
-          }
-          if ($start -lt 0) { throw "CHANGELOG.md has no section for $version" }
-          $end = $lines.Count
-          for ($i = $start + 1; $i -lt $lines.Count; $i++) {
-            if ($lines[$i] -match '^## \[') { $end = $i; break }
-          }
-          $notes = @($lines | Select-Object -Skip ($start + 1) -First ($end - $start - 1))
-          if (-not (($notes -join "`n") -match '\S')) {
-            throw "CHANGELOG.md section for $version is empty"
-          }
-          $notes | Set-Content -LiteralPath RELEASE_NOTES.md -Encoding utf8
+          ./scripts/release_notes.ps1 -Version $version -OutPath RELEASE_NOTES.md
 
       - name: Format
         run: cargo fmt --all --check

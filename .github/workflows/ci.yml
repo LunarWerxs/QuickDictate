@@ -185,6 +185,13 @@ jobs:
             -ExePath target/release/quickdictate.exe `
             -ExpectedVersion $version
 
+      - name: Release notes build from CHANGELOG
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 |
+            ConvertFrom-Json).packages[0].version
+          ./scripts/release_notes.ps1 -Version $version -OutPath RELEASE_NOTES.md
+
   deny:
     timeout-minutes: 60
     name: cargo-deny (advisories · licenses · sources)

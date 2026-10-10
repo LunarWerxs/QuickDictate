@@ -11,6 +11,10 @@ Cargo.toml: this list exists so none of them drift (SECURITY.md sat on
 ## 2. Update the docs that name a version
 
 - [ ] `CHANGELOG.md`: move the `[Unreleased]` items into a new `## [X.Y.Z] - YYYY-MM-DD` section, leaving `[Unreleased]` empty at the top.
+      Open the section with a `**TL;DR**` line and one short bold headline per change that matters,
+      then fold the full list in `<details><summary><b>Everything in X.Y.Z</b></summary>` (1.5.0
+      is the model). `scripts/release_notes.ps1` turns it into the release page and refuses a
+      section of more than two changes with no TL;DR.
 - [ ] `.github/SECURITY.md`: "Supported Versions": update the "(currently the `X.Y.x` line)" note and the `X.Y.x (latest release)` table row.
 - [ ] `.github/ISSUE_TEMPLATE/bug_report.md`: refresh the example version in the "QuickDictate version" comment.
 - [ ] Sweep for stragglers referencing the *previous* version (ignore CHANGELOG history and test fixtures in `src/update.rs`):
