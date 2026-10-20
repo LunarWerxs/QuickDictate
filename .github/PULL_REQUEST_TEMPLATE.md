@@ -25,3 +25,4 @@ Describe any manual testing (which provider(s), which settings, what you spoke/t
 - [ ] `cargo clippy -- -D warnings` is clean
 - [ ] `cargo test` passes
 - [ ] No secrets committed (no API keys, no personal `settings.json` - only `settings.example.json` should be tracked)
+- [ ] **Required:** I have read and agree to the contribution terms in [CONTRIBUTING.md](https://github.com/LunarWerxs/QuickDictate/blob/main/CONTRIBUTING.md#licensing-of-contributions) - I grant LunarWerx LLC (LunarWerx Studios) a perpetual, irrevocable right to use, modify and **relicense** my contribution, including commercially (including assignment of copyright where the law allows it).
