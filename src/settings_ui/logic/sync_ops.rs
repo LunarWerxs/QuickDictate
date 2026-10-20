@@ -70,6 +70,12 @@ impl SettingsApp {
                 SyncEvent::Pushed(Err(error)) => {
                     self.status = format!("Saved locally, but cloud sync failed: {error}");
                 }
+                SyncEvent::Dictation(Ok(())) => {
+                    self.status = "Dictation will use your Connections minutes.".into();
+                }
+                SyncEvent::Dictation(Err(error)) => {
+                    self.status = format!("Connections dictation sign-in failed: {error}");
+                }
             }
         }
     }

@@ -162,10 +162,37 @@ impl super::SettingsApp {
                     );
             }
 
+            if self.draft.stt_provider == "connections" {
+                self.connections_minutes_row(ui, ctx);
+            }
+
             // (The "N key(s) configured" line was removed as noise — the
             // Manage keys… modal shows the actual keys and their verdicts.)
             self.key_test_status_row(ui, testing);
         });
+    }
+
+    /// The Connections engine has no key: it dictates with the minutes of the
+    /// Connections account linked for dictation, so the row offers that sign-in.
+    fn connections_minutes_row(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.add_space(6.0);
+        if crate::sync::dictation_signed_in() {
+            ui.label("Dictation uses your Connections minutes.");
+            return;
+        }
+        if ui
+            .button("Use my Connections minutes")
+            .on_hover_text(
+                "Sign in with Connections to dictate with its minutes. Settings sync stays off.",
+            )
+            .clicked()
+        {
+            self.spawn_sync(ctx, || {
+                SyncEvent::Dictation(
+                    crate::sync::connect_dictation().map_err(|e| format!("{e:#}")),
+                )
+            });
+        }
     }
 
     /// The provider dropdown plus its "Manage keys…" / "Test all keys"
@@ -191,7 +218,7 @@ impl super::SettingsApp {
                     "Which speech-to-text service transcribes your dictation. Add its \
                      API keys with Manage keys.",
                 );
-            if self.draft.stt_provider != "local" {
+            if !matches!(self.draft.stt_provider.as_str(), "local" | "connections") {
                 self.provider_key_buttons(ui, ctx, testing);
             }
         });

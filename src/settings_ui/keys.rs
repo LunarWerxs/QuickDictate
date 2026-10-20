@@ -18,6 +18,7 @@ pub(super) fn providers() -> Vec<(&'static str, &'static str)> {
         ("assemblyai", "AssemblyAI"),
         ("dashscope", "DashScope (Alibaba)"),
         ("google", "Google (batch)"),
+        ("connections", "Connections"),
         ("local", "Local (offline)"),
     ]
 }

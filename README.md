@@ -203,8 +203,8 @@ Settings window. You'll need an account with whichever cloud provider you choose
 API key), unless you pick the Local offline provider, which needs no account or key at all.
 
 **Which speech-to-text providers does QuickDictate support?**
-Six cloud providers, ElevenLabs, Deepgram, OpenAI, AssemblyAI, DashScope, and Google Cloud
-Speech-to-Text, plus an offline Local option with a choice of three models (Cohere Transcribe,
+Six bring-your-own-key cloud providers, ElevenLabs, Deepgram, OpenAI, AssemblyAI, DashScope, and Google Cloud
+Speech-to-Text, plus Connections Dictation (live, using your Connections minutes, no key), and an offline Local option with a choice of three models (Cohere Transcribe,
 Whisper Large v3 Turbo or Parakeet TDT v3). Five of the six cloud providers stream words live as you talk;
 Google and Local both return the full transcript when you release the hotkey.
 

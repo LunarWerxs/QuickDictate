@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+- **Connections Dictation engine.** Pick **Connections** in the speech-provider list, then **Use my Connections minutes** to sign in with your Connections account. Audio streams live to the Connections Dictation service, so no API key is needed. Signing in for dictation does not turn settings sync on, and signing out removes the engine's access.
+
 ## [1.5.0] - 2026-10-09
 
 **TL;DR**

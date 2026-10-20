@@ -119,6 +119,8 @@ pub struct Tokens {
     pub email: String,
     pub name: String,
     pub picture: String,
+    pub scope: String,
+    pub expires_in: u64,
 }
 
 /// Pull `sub` / `email` / `name` out of an `id_token` JWT payload (no signature
@@ -145,6 +147,11 @@ fn decode_identity(id_token: &str) -> (String, String, String) {
 /// Full interactive sign-in: loopback listener + system-browser OAuth (PKCE) +
 /// code→token exchange. Blocking; run on a worker thread.
 pub fn sign_in() -> Result<Tokens> {
+    sign_in_for(SCOPES)
+}
+
+/// [`sign_in`] asking for `scopes` instead of the sync set.
+pub fn sign_in_for(scopes: &str) -> Result<Tokens> {
     let pkce = pkce()?;
     let state = b64url(&rand_bytes(16)?);
 
@@ -154,7 +161,7 @@ pub fn sign_in() -> Result<Tokens> {
     let port = listener.local_addr()?.port();
     let redirect_uri = format!("http://127.0.0.1:{port}{REDIRECT_PATH}");
 
-    let url = authorize_url(&redirect_uri, &pkce.challenge, &state)?;
+    let url = authorize_url(&redirect_uri, &pkce.challenge, &state, scopes)?;
     open_browser(url.as_str());
     tracing::info!("connections: opened browser for sign-in on loopback :{port}");
 
@@ -189,18 +196,25 @@ pub fn sign_in() -> Result<Tokens> {
         email: if ui_email.is_empty() { email } else { ui_email },
         name: if ui_name.is_empty() { name } else { ui_name },
         picture: ui_picture,
+        scope: body["scope"].as_str().unwrap_or_default().to_string(),
+        expires_in: body["expires_in"].as_u64().unwrap_or(0),
     })
 }
 
 /// The authorize URL the browser opens: PKCE `S256` challenge, CSRF `state`,
 /// and the loopback `redirect_uri` the callback listener is bound to.
-pub(super) fn authorize_url(redirect_uri: &str, challenge: &str, state: &str) -> Result<url::Url> {
+pub(super) fn authorize_url(
+    redirect_uri: &str,
+    challenge: &str,
+    state: &str,
+    scopes: &str,
+) -> Result<url::Url> {
     let mut url = url::Url::parse(AUTH_URL).context("parse authorize url")?;
     url.query_pairs_mut()
         .append_pair("response_type", "code")
         .append_pair("client_id", CLIENT_ID)
         .append_pair("redirect_uri", redirect_uri)
-        .append_pair("scope", SCOPES)
+        .append_pair("scope", scopes)
         .append_pair("code_challenge", challenge)
         .append_pair("code_challenge_method", "S256")
         .append_pair("state", state);
@@ -362,6 +376,8 @@ pub fn refresh(refresh_token: &str) -> Result<Tokens> {
         email,
         name,
         picture: String::new(),
+        scope: body["scope"].as_str().unwrap_or_default().to_string(),
+        expires_in: body["expires_in"].as_u64().unwrap_or(0),
     })
 }
 

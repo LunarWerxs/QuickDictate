@@ -34,16 +34,16 @@ mod tests;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use serde_json::Value;
 
 use crate::state::App;
 
 // Re-exported so `crate::sync::<name>` keeps resolving exactly as it did when
 // this was one file; the orchestration below reads them through these too.
-pub use creds::{clear_creds, is_signed_in, load_creds, save_creds, Creds};
+pub use creds::{clear_creds, is_signed_in, load_creds, load_login, save_creds, Creds};
 pub use oauth::{fetch_avatar, refresh, sign_in, Tokens};
 pub use schema::{apply_synced_to_config, snapshot_to_synced, synced_stats};
 pub use store::{store_delete, store_pull, store_push};
@@ -66,6 +66,10 @@ const TOKEN_URL: &str = "https://accounts.connectionsapi.com/oauth/token";
 const USERINFO_URL: &str = "https://accounts.connectionsapi.com/oauth/userinfo";
 const STORE_BASE: &str = "https://studio.connectionsapi.com/v1/app-data";
 const SCOPES: &str = "openid profile email photo";
+const DICTATION_SCOPE: &str = "dictation:listen";
+/// Asked for by the Connections dictation engine's own sign-in. Requested
+/// incrementally: settings sync never asks for it.
+const DICTATION_SCOPES: &str = "openid profile email photo dictation:listen";
 const REDIRECT_PATH: &str = "/oauth/callback";
 const CREDS_FILE: &str = "quickdictate-connections.dat";
 const STATS_KEY: &str = "usage_stats";
@@ -86,6 +90,7 @@ const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(30);
 static SYNC_LOCK: Mutex<()> = Mutex::new(());
 static STATS_SYNC_QUEUED: AtomicBool = AtomicBool::new(false);
 static STORE_CACHE: Mutex<Option<CachedRemoteDoc>> = Mutex::new(None);
+static DICTATION_TOKEN: Mutex<Option<(String, Instant)>> = Mutex::new(None);
 
 /// Acquire [`SYNC_LOCK`], recovering the guard even if a previous holder
 /// panicked (the lock guards ordering, not invariant-bearing data).
@@ -129,6 +134,8 @@ pub fn connect_and_reconcile(local_snapshot: Value) -> Result<Connected> {
             email: tokens.email.clone(),
             name: tokens.name.clone(),
             picture: tokens.picture.clone(),
+            scope: tokens.scope.clone(),
+            sync: true,
         });
     }
     let avatar = fetch_avatar(&tokens.picture);
@@ -295,6 +302,95 @@ pub fn disconnect() {
     clear_creds();
     clear_store_cache();
     baseline::clear();
+    clear_dictation_token();
+}
+
+/// Sign in for the Connections dictation engine. Stores the login with the
+/// dictation scope. A login made only for dictation stays `sync: false`, so it
+/// never turns settings sync on.
+pub fn connect_dictation() -> Result<()> {
+    let tokens = oauth::sign_in_for(DICTATION_SCOPES)?;
+    let _guard = sync_guard();
+    if tokens.refresh_token.is_empty() {
+        bail!("Connections returned no refresh token; sign in again");
+    }
+    let existing = load_login();
+    let sync = existing.as_ref().is_some_and(|c| c.sync);
+    if existing
+        .as_ref()
+        .is_some_and(|c| c.sync && !c.sub.is_empty() && c.sub != tokens.sub)
+    {
+        bail!("this is a different Connections account from the one settings sync uses");
+    }
+    save_creds(&Creds {
+        refresh_token: tokens.refresh_token,
+        sub: tokens.sub,
+        email: tokens.email,
+        name: tokens.name,
+        picture: tokens.picture,
+        scope: tokens.scope,
+        sync,
+    })?;
+    clear_dictation_token();
+    Ok(())
+}
+
+/// A short-lived access token for the dictation service, refreshed from the
+/// stored login and cached in memory until it nearly expires.
+pub fn dictation_access_token() -> Result<String> {
+    {
+        let cached = DICTATION_TOKEN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((token, until)) = cached.as_ref() {
+            if Instant::now() < *until {
+                return Ok(token.clone());
+            }
+        }
+    }
+    let _guard = sync_guard();
+    let login = load_login()
+        .filter(|c| has_dictation_scope(&c.scope))
+        .ok_or_else(|| anyhow!("Connections dictation is not signed in"))?;
+    let tokens = refresh(&login.refresh_token)?;
+    persist_rotated(&login, &tokens);
+    let until = Instant::now() + Duration::from_secs(tokens.expires_in.saturating_sub(60));
+    *DICTATION_TOKEN.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((tokens.access_token.clone(), until));
+    Ok(tokens.access_token)
+}
+
+/// Drop the dictation grant after the service refuses it for missing scope, so
+/// the engine asks the user to sign in again. A login that also backs sync
+/// keeps working for sync.
+pub fn clear_dictation_scope() {
+    let _guard = sync_guard();
+    clear_dictation_token();
+    let Some(mut login) = load_login() else {
+        return;
+    };
+    if login.sync {
+        login.scope = login
+            .scope
+            .split_whitespace()
+            .filter(|s| *s != DICTATION_SCOPE)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let _ = save_creds(&login);
+    } else {
+        clear_creds();
+    }
+}
+
+/// Whether the stored login was granted the dictation scope.
+pub fn has_dictation_scope(scope: &str) -> bool {
+    scope.split_whitespace().any(|s| s == DICTATION_SCOPE)
+}
+
+pub fn dictation_signed_in() -> bool {
+    load_login().is_some_and(|c| has_dictation_scope(&c.scope))
+}
+
+fn clear_dictation_token() {
+    *DICTATION_TOKEN.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// Best-effort final flush used by the process shutdown path. The worker is

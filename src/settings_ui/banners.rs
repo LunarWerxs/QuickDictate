@@ -134,9 +134,11 @@ fn ask_strip_buttons(ui: &mut egui::Ui, strip: &AskStrip) -> Option<StripClick> 
 }
 
 /// Whether the first-run banner applies: a cloud provider is selected and no
-/// provider has a key yet. Local needs no key, so it is never nagged about.
+/// provider has a key yet. Local and Connections need no key, so they are never nagged about.
 fn needs_onboarding(draft: &Config) -> bool {
-    !draft.stt_provider.eq_ignore_ascii_case("local") && draft.providers_with_keys().is_empty()
+    !draft.stt_provider.eq_ignore_ascii_case("local")
+        && !draft.stt_provider.eq_ignore_ascii_case("connections")
+        && draft.providers_with_keys().is_empty()
 }
 
 /// The sign-in engine's answer for a click on its strip.

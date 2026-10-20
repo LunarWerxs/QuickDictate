@@ -129,6 +129,8 @@ pub(super) enum SyncEvent {
     /// `sync.phase`/`email`/`avatar` — it's just "did the write land" —
     /// so `drain_sync` reports it through `self.status` instead.
     Pushed(Result<(), String>),
+    /// A "Use my Connections minutes" sign-in finished; it never touches the sync phase.
+    Dictation(Result<(), String>),
 }
 
 /// UI-side sync state (the mechanics live in `crate::sync`).

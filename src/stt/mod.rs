@@ -8,6 +8,7 @@
 //! a small adapter in its own file.
 
 mod assemblyai;
+mod connections;
 mod dashscope;
 mod deepgram;
 mod elevenlabs;

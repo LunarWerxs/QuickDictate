@@ -28,7 +28,7 @@ See the [changelog](../CHANGELOG.md) for what's changed release to release.
 
 ## What you get
 
-- **Seven speech providers, your pick**, six cloud services plus a fully offline Local provider with two downloadable model choices. Switch whenever you want.
+- **Eight speech providers, your pick**, seven cloud services (six bring-your-own-key, plus Connections Dictation, which uses your Connections minutes) and a fully offline Local provider with two downloadable model choices. Switch whenever you want.
 - **Local models stay manageable**, large downloads use bounded parallel connections when supported, can be cancelled in Settings, and clean up incomplete files automatically. The selected model prewarms in the background and stays resident while Local is active for predictable response time; switch providers to release its RAM/VRAM.
 - **Bring your own key**, your keys, your account, your usage. Add more than one key per provider and QuickDictate round-robins between them with per-key health tracking (alive / quota / dead) and cooldown backoff. Hit a dead key mid-sentence? It rotates to the next one automatically, without dropping your press.
 - **Keys are checked before you need them**, on startup the active provider's keys get probed in the background, so a dead or rate-limited key is flagged before your first dictation and a good one is already queued. Health lives in memory only, a provider having a bad five minutes never permanently brands a key as dead; every launch re-checks.
@@ -65,6 +65,7 @@ That replacement table, since it's the fiddly-but-lovely part:
 | AssemblyAI (Universal-Streaming v3) | `assemblyai` | Streaming | [assemblyai.com/dashboard/signup](https://www.assemblyai.com/dashboard/signup) |
 | DashScope (Alibaba Cloud Qwen-Audio 3.1 realtime) | `dashscope` | Streaming | [dashscope.console.aliyun.com/apiKey](https://dashscope.console.aliyun.com/apiKey) |
 | Google Cloud Speech-to-Text (v1 batch) | `google` | Batch (bounded ~55s uploads, results on release, no live word count) | [console.cloud.google.com/apis/credentials](https://console.cloud.google.com/apis/credentials) |
+| Connections Dictation (live stream) | `connections` | Streaming | No key; choose **Use my Connections minutes** in Settings and sign in with your Connections account |
 | Local (Cohere Transcribe, Whisper or Parakeet) | `local` | Offline batch (results on release) | No key; install a model in Settings |
 
 A couple of gotchas:

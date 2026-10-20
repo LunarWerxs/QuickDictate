@@ -411,6 +411,8 @@ fn identity_backfill_takes_new_values_and_never_blanks_known_ones() {
         email: "known@example.com".into(),
         name: String::new(),
         picture: String::new(),
+        scope: String::new(),
+        sync: true,
     };
     assert!(fill_identity(
         &mut creds,
@@ -459,7 +461,7 @@ fn a_conflict_names_the_version_to_retry_against() {
 
 #[test]
 fn authorize_url_carries_pkce_state_and_the_loopback_redirect() {
-    let url = authorize_url("http://127.0.0.1:5123/oauth/callback", "chal", "st8").unwrap();
+    let url = authorize_url("http://127.0.0.1:5123/oauth/callback", "chal", "st8", SCOPES).unwrap();
     let pairs: BTreeMap<String, String> = url.query_pairs().into_owned().collect();
     assert_eq!(pairs["response_type"], "code");
     assert_eq!(pairs["client_id"], CLIENT_ID);
@@ -471,6 +473,42 @@ fn authorize_url_carries_pkce_state_and_the_loopback_redirect() {
     assert_eq!(pairs["code_challenge_method"], "S256");
     assert_eq!(pairs["state"], "st8");
     assert_eq!(pairs["scope"], SCOPES);
+}
+
+#[test]
+fn legacy_login_without_sync_flag_is_a_sync_login() {
+    let legacy: Creds = serde_json::from_str(r#"{"refresh_token":"rt","email":"a@b"}"#).unwrap();
+    assert!(legacy.sync);
+    assert!(legacy.scope.is_empty());
+    assert!(!has_dictation_scope(&legacy.scope));
+}
+
+#[test]
+fn dictation_scope_is_matched_as_a_whole_token() {
+    assert!(has_dictation_scope("openid profile email photo dictation:listen"));
+    assert!(!has_dictation_scope("openid profile email photo"));
+    assert!(!has_dictation_scope("dictation:listen_extra"));
+}
+
+#[test]
+fn sync_sign_in_never_asks_for_dictation() {
+    assert!(!SCOPES.contains("dictation:listen"));
+    let url = authorize_url("http://127.0.0.1:5123/oauth/callback", "chal", "st8", SCOPES).unwrap();
+    let pairs: BTreeMap<String, String> = url.query_pairs().into_owned().collect();
+    assert!(!pairs["scope"].contains("dictation:listen"));
+}
+
+#[test]
+fn dictation_sign_in_asks_for_the_listen_scope() {
+    let url = authorize_url(
+        "http://127.0.0.1:5123/oauth/callback",
+        "chal",
+        "st8",
+        DICTATION_SCOPES,
+    )
+    .unwrap();
+    let pairs: BTreeMap<String, String> = url.query_pairs().into_owned().collect();
+    assert_eq!(pairs["scope"], "openid profile email photo dictation:listen");
 }
 
 #[test]

@@ -12,7 +12,9 @@ use crate::keys::{FailKind, KeyPool};
 use crate::state::App;
 
 use super::provider::{ProviderSession, ProviderStream, SttEvent, SttProvider, SttSessionOpts};
-use super::{assemblyai, dashscope, deepgram, elevenlabs, google, local, openai, CONNECT_TIMEOUT};
+use super::{
+    assemblyai, connections, dashscope, deepgram, elevenlabs, google, local, openai, CONNECT_TIMEOUT,
+};
 
 /// Build the provider selected in settings.json. Unknown ids fall back to
 /// ElevenLabs (the baseline) with a warning. Providers are cheap unit structs,
@@ -28,6 +30,7 @@ pub(super) fn make_provider_id(id: &str, cfg: &Config) -> Box<dyn SttProvider> {
         "elevenlabs" => Box::new(elevenlabs::ElevenLabsProvider),
         "deepgram" => Box::new(deepgram::DeepgramProvider),
         "assemblyai" => Box::new(assemblyai::AssemblyAiProvider),
+        "connections" => Box::new(connections::ConnectionsProvider),
         "dashscope" => Box::new(dashscope::DashScopeProvider {
             intl: cfg.dashscope_intl,
         }),

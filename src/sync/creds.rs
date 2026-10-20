@@ -27,6 +27,18 @@ pub struct Creds {
     /// re-fetch + show the avatar on open without a fresh sign-in.
     #[serde(default)]
     pub picture: String,
+    /// Scopes the refresh token was granted, space-separated.
+    #[serde(default)]
+    pub scope: String,
+    /// Whether this login backs settings sync. A login made only for dictation
+    /// is stored with `false`; blobs written before the field existed were all
+    /// sync logins, hence the `true` default.
+    #[serde(default = "sync_login_default")]
+    pub sync: bool,
+}
+
+fn sync_login_default() -> bool {
+    true
 }
 
 fn creds_path() -> Option<PathBuf> {
@@ -45,10 +57,16 @@ pub fn save_creds(c: &Creds) -> Result<()> {
     Ok(())
 }
 
-pub fn load_creds() -> Option<Creds> {
+/// The stored login whether it backs sync or only dictation.
+pub fn load_login() -> Option<Creds> {
     let sealed = std::fs::read(creds_path()?).ok()?;
     let json = dpapi(false, &sealed)?;
     serde_json::from_slice(&json).ok()
+}
+
+/// The stored login only when it backs settings sync.
+pub fn load_creds() -> Option<Creds> {
+    load_login().filter(|c| c.sync)
 }
 
 pub fn clear_creds() {

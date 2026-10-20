@@ -26,7 +26,7 @@ impl Config {
     /// into elevenlabs). Same back-compat rule as [`Config::active_keys`].
     pub fn keys_for(&self, provider: &str) -> &[String] {
         match provider.trim().to_ascii_lowercase().as_str() {
-            "local" => &[],
+            "local" | "connections" => &[],
             "deepgram" => &self.deepgram_keys,
             "openai" => &self.openai_keys,
             "assemblyai" => &self.assemblyai_keys,
