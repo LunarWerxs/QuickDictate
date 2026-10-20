@@ -56,11 +56,15 @@ pub(super) fn dispatch_hotkey_message(msg: &MSG, b: &HotkeyBindings<'_>, tx: &Se
 /// the mouse hook, and feed the outcome to `hotkeys_blocked()`.
 fn rearm_hotkeys(b: &HotkeyBindings<'_>) {
     let mut all_registered = true;
+    let mut failed = Vec::new();
     for (id, binding) in [(b.toggle_id, b.kb_toggle), (b.hold_id, b.kb_hold)] {
         if let Some((combo, mods, vk)) = binding {
             let registered = unsafe { register_one(id, combo, *mods, *vk, true) };
             watch::set_registered(id, registered);
             all_registered &= registered;
+            if !registered {
+                failed.push(combo.clone());
+            }
         }
     }
     // The watch is a backstop, so a hook that will not install is logged but
@@ -73,7 +77,7 @@ fn rearm_hotkeys(b: &HotkeyBindings<'_>) {
         // every time, because a removed hook cannot be told from a live one.
         all_registered &= mouse_hook::ensure_installed();
     }
-    note_rearm_result(all_registered);
+    note_rearm_result(all_registered, failed);
     tracing::debug!("hotkeys re-armed");
 }
 

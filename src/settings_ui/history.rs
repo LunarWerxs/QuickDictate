@@ -204,7 +204,7 @@ impl super::SettingsApp {
         };
         match crate::output::copy_to_clipboard(&text) {
             Ok(()) => self.status = "Copied to clipboard.".into(),
-            Err(e) => self.status = format!("Copy failed: {e}"),
+            Err(e) => self.fail(format!("Copy failed: {e}")),
         }
     }
 
@@ -309,7 +309,7 @@ impl super::SettingsApp {
                     if n == 1 { "" } else { "s" }
                 );
             }
-            Err(e) => self.status = format!("Copy failed: {e}"),
+            Err(e) => self.fail(format!("Copy failed: {e}")),
         }
     }
 }

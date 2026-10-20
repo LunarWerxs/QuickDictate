@@ -489,16 +489,12 @@ pub(crate) fn bring_up_app(
 
     // Hotkeys.
     let cfg_now = app.config.load();
-    let toggle_combo = if cfg_now.hotkeys_enabled && !cfg_now.is_hold_mode() {
-        Some(cfg_now.toggle_hotkey.clone())
-    } else {
-        None
-    };
-    let hold_combo = if cfg_now.hotkeys_enabled {
-        Some(cfg_now.hold_hotkey.clone())
-    } else {
-        None
-    };
+    let (toggle_combo, hold_combo) = crate::hotkeys::claimed_combos(
+        cfg_now.hotkeys_enabled,
+        cfg_now.is_hold_mode(),
+        &cfg_now.toggle_hotkey,
+        &cfg_now.hold_hotkey,
+    );
     let reinsert_hold_duration = Duration::from_millis(cfg_now.reinsert_hold_ms);
     let hotkeys = HotkeyManager::start(
         toggle_combo,

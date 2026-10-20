@@ -361,7 +361,7 @@ impl super::SettingsApp {
                 // is already somebody else's.
                 self.status = crate::paths::folder_caution(&dir).unwrap_or_default();
             }
-            Err(e) => self.status = format!("Can't use that folder: {e}"),
+            Err(e) => self.fail(format!("Can't use that folder: {e}")),
         }
     }
 
@@ -376,7 +376,7 @@ impl super::SettingsApp {
                 self.status.clear();
             }
             None => {
-                self.status = "Windows did not report a LOCALAPPDATA folder.".to_string();
+                self.fail("Windows did not report a LOCALAPPDATA folder.");
             }
         }
     }
@@ -459,7 +459,7 @@ impl super::SettingsApp {
                         );
                         discard = true;
                     }
-                    Err(e) => self.status = format!("Could not save the report: {e}"),
+                    Err(e) => self.fail(format!("Could not save the report: {e}")),
                 }
             }
             if ui.button("Discard").clicked() {

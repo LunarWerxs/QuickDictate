@@ -57,6 +57,10 @@ static REARM_FAIL_STREAK: AtomicU32 = AtomicU32::new(0);
 /// as soon as a re-arm attempt succeeds again. Backs `hotkeys_blocked()`.
 static HOTKEYS_BLOCKED: AtomicBool = AtomicBool::new(false);
 
+/// The keyboard combos the latest re-arm could not register, as configured.
+/// Backs `blocked_hotkeys()`, so the settings window can name the key.
+static BLOCKED_COMBOS: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
+
 /// Last time the periodic re-arm logged a "still blocked" warning, for the
 /// `REARM_WARN_INTERVAL` rate limit.
 static LAST_BLOCKED_WARN: parking_lot::Mutex<Option<Instant>> = parking_lot::Mutex::new(None);
@@ -70,6 +74,43 @@ static LAST_BLOCKED_WARN: parking_lot::Mutex<Option<Instant>> = parking_lot::Mut
 /// state.
 pub fn hotkeys_blocked() -> bool {
     HOTKEYS_BLOCKED.load(Ordering::Acquire)
+}
+
+/// The keyboard combos (as configured) that another process is holding, once
+/// `hotkeys_blocked()` is true; empty otherwise. These are the running
+/// process's bindings, so a key the user has since changed in Settings may
+/// still be listed until the restart that applies the change.
+pub fn blocked_hotkeys() -> Vec<String> {
+    if hotkeys_blocked() {
+        BLOCKED_COMBOS.lock().clone()
+    } else {
+        Vec::new()
+    }
+}
+
+/// The (toggle, hold) combos to claim for a config. The toggle key is claimed
+/// only in toggle mode; the hold key whenever hotkeys are on, except when it is
+/// the toggle key itself: in toggle mode that would be a second claim on one
+/// key, which Windows refuses, and the refusal used to surface as "another app
+/// is holding one of these hotkeys" when the other app was QuickDictate. One key
+/// for both simply follows Mode.
+pub fn claimed_combos(
+    enabled: bool,
+    hold_mode: bool,
+    toggle: &str,
+    hold: &str,
+) -> (Option<String>, Option<String>) {
+    if !enabled {
+        return (None, None);
+    }
+    if hold_mode {
+        return (None, Some(hold.to_string()));
+    }
+    let same_key = matches!((parse_combo(toggle), parse_combo(hold)), (Ok(a), Ok(b)) if a == b);
+    (
+        Some(toggle.to_string()),
+        (!same_key).then(|| hold.to_string()),
+    )
 }
 
 /// Pure step function for the blocked-state streak, kept separate from the
@@ -90,7 +131,8 @@ fn step_blocked_streak(streak: u32, all_registered: bool) -> (u32, bool) {
 /// `hotkeys_blocked()` reports and (rate-limited) logging a warning so a
 /// permanently-claimed hotkey isn't silent forever even with no console
 /// attached (`windows_subsystem = "windows"`).
-fn note_rearm_result(all_registered: bool) {
+fn note_rearm_result(all_registered: bool, failed: Vec<String>) {
+    *BLOCKED_COMBOS.lock() = failed;
     let prev = REARM_FAIL_STREAK.load(Ordering::Acquire);
     let (streak, blocked) = step_blocked_streak(prev, all_registered);
     REARM_FAIL_STREAK.store(streak, Ordering::Release);

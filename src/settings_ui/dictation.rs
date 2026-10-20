@@ -162,17 +162,39 @@ impl super::SettingsApp {
 
             // Windows only grants a hotkey to the first process that asks for
             // it; if another app got there first, `RegisterHotKey` fails and
-            // that failure otherwise only reaches a log file. Surface it here
-            // so a combo Windows won't grant is never silently invisible.
-            if crate::hotkeys::hotkeys_blocked() {
+            // that failure otherwise only reaches a log file. Surface it here,
+            // naming the key, and only while the draft still uses that key: the
+            // running bindings change only on restart, so a key the user has
+            // already replaced is no longer theirs to fix.
+            let taken: Vec<String> = crate::hotkeys::blocked_hotkeys()
+                .into_iter()
+                .filter(|k| {
+                    hotkeys_conflict(k, &self.draft.toggle_hotkey)
+                        || hotkeys_conflict(k, &self.draft.hold_hotkey)
+                })
+                .collect();
+            if !taken.is_empty() {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(format!(
+                        "Another app already uses {}, so pressing it does nothing here. Pick \
+                         a different key.",
+                        taken.join(" and ")
+                    ))
+                    .size(11.5)
+                    .color(bad()),
+                );
+            } else if !self.draft.mode.eq_ignore_ascii_case("hold")
+                && hotkeys_conflict(&self.draft.toggle_hotkey, &self.draft.hold_hotkey)
+            {
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new(
-                        "Another app is holding one of these hotkeys \u{2014} try a different \
-                         combination.",
+                        "Toggle and Hold are the same key, so it follows Mode: tap to start, \
+                         tap to stop.",
                     )
                     .size(11.5)
-                    .color(bad()),
+                    .color(muted()),
                 );
             }
 

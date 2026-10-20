@@ -188,9 +188,7 @@ impl super::SettingsApp {
             .clicked()
         {
             self.spawn_sync(ctx, || {
-                SyncEvent::Dictation(
-                    crate::sync::connect_dictation().map_err(|e| format!("{e:#}")),
-                )
+                SyncEvent::Dictation(crate::sync::connect_dictation().map_err(|e| format!("{e:#}")))
             });
         }
     }

@@ -170,11 +170,10 @@ pub(super) fn capture_from_event(ev: &egui::Event) -> Option<Option<String>> {
 }
 
 /// Whether two hotkey combo strings parse to the identical (modifiers, vk)
-/// pair — the condition `SettingsApp::validate` rejects, since Windows can
-/// only register one of two identical `RegisterHotKey` calls and the loser
-/// just silently never fires. An unparsable combo is "not a conflict" here —
-/// `validate` already surfaces that parse error on its own before this ever
-/// runs. Comparing the *parsed* form (not the raw strings) is what makes this
+/// pair: one key set for both Toggle and Hold (which then follows Mode), or a
+/// blocked running key the draft still uses. An unparsable combo is "not a
+/// conflict" here; `validate` already surfaces that parse error on its own.
+/// Comparing the *parsed* form (not the raw strings) is what makes this
 /// case-insensitive and order-independent, matching `parse_combo`'s own
 /// normalisation (e.g. "Ctrl+Shift+D" and "shift+ctrl+d" both parse to the
 /// same pair).

@@ -131,7 +131,9 @@ fn refusal(status: u16, body: &str) -> ConnectError {
             "Connections dictation needs sign-in again; choose Use my Connections minutes".into(),
         );
     }
-    ConnectError(format!("Connections dictation refused the session (HTTP {status})"))
+    ConnectError(format!(
+        "Connections dictation refused the session (HTTP {status})"
+    ))
 }
 
 /// Open the streaming socket for `minted` and wait for the server's `ready`.
@@ -150,7 +152,11 @@ pub(super) async fn start(minted: &Minted) -> Result<ProviderSession, ConnectErr
     let mut conn = ws::open(request).await?;
     match tokio::time::timeout(READY_TIMEOUT, wait_for_ready(&mut conn)).await {
         Ok(result) => result?,
-        Err(_) => return Err(ConnectError("dictation did not become ready in time".into())),
+        Err(_) => {
+            return Err(ConnectError(
+                "dictation did not become ready in time".into(),
+            ))
+        }
     }
     Ok(ws::pcm_session(conn, STOP_FRAME, None, map_frame))
 }
@@ -267,8 +273,10 @@ mod tests {
                     .unwrap_or_default()
                     .to_string();
                 let _ = offered_tx.send(offered);
-                resp.headers_mut()
-                    .insert("Sec-WebSocket-Protocol", HeaderValue::from_static(SUBPROTOCOL));
+                resp.headers_mut().insert(
+                    "Sec-WebSocket-Protocol",
+                    HeaderValue::from_static(SUBPROTOCOL),
+                );
                 Ok(resp)
             },
         )

@@ -30,7 +30,9 @@ param(
     # It cannot conjure one: on a fresh profile the gate is shut and the shot honestly shows no
     # banner. Seed quickdictate-nudge.json in the scratch folder with a long-time user's history
     # to see it.
-    [ValidateSet('', 'keys', 'keys-bulk', 'replacements', 'replacements-bulk', 'keys-test', 'stats', 'nudge')]
+    # 'save-refused' presses Save on an unparsable hotkey, to show a refused save's reason;
+    # 'same-keys' sets Hold to the Toggle key, to show the note that one key follows Mode.
+    [ValidateSet('', 'keys', 'keys-bulk', 'replacements', 'replacements-bulk', 'keys-test', 'stats', 'nudge', 'save-refused', 'same-keys')]
     [string] $Open = '',
     # Optional --provider override for the launched exe.
     [string] $Provider = '',

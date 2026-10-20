@@ -26,6 +26,14 @@ impl SettingsApp {
                 }
             }
             "stats" => self.modal = Some(Modal::Stats),
+            // A save the validator refuses (a hotkey it cannot parse), through the
+            // real Save path, so the shot shows where its reason lands and how it reads.
+            "save-refused" => {
+                self.draft.toggle_hotkey = "not-a-key".into();
+                self.save();
+            }
+            // One key for both Toggle and Hold, to show the note that it follows Mode.
+            "same-keys" => self.draft.hold_hotkey = self.draft.toggle_hotkey.clone(),
             // The sign-in banner, which is otherwise unshootable: it fires on a real save,
             // and only for someone a week in with several sessions behind them, so nothing a
             // headless capture does on a fresh profile would ever produce it.

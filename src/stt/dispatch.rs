@@ -13,7 +13,8 @@ use crate::state::App;
 
 use super::provider::{ProviderSession, ProviderStream, SttEvent, SttProvider, SttSessionOpts};
 use super::{
-    assemblyai, connections, dashscope, deepgram, elevenlabs, google, local, openai, CONNECT_TIMEOUT,
+    assemblyai, connections, dashscope, deepgram, elevenlabs, google, local, openai,
+    CONNECT_TIMEOUT,
 };
 
 /// Build the provider selected in settings.json. Unknown ids fall back to

@@ -461,7 +461,13 @@ fn a_conflict_names_the_version_to_retry_against() {
 
 #[test]
 fn authorize_url_carries_pkce_state_and_the_loopback_redirect() {
-    let url = authorize_url("http://127.0.0.1:5123/oauth/callback", "chal", "st8", SCOPES).unwrap();
+    let url = authorize_url(
+        "http://127.0.0.1:5123/oauth/callback",
+        "chal",
+        "st8",
+        SCOPES,
+    )
+    .unwrap();
     let pairs: BTreeMap<String, String> = url.query_pairs().into_owned().collect();
     assert_eq!(pairs["response_type"], "code");
     assert_eq!(pairs["client_id"], CLIENT_ID);
@@ -485,7 +491,9 @@ fn legacy_login_without_sync_flag_is_a_sync_login() {
 
 #[test]
 fn dictation_scope_is_matched_as_a_whole_token() {
-    assert!(has_dictation_scope("openid profile email photo dictation:listen"));
+    assert!(has_dictation_scope(
+        "openid profile email photo dictation:listen"
+    ));
     assert!(!has_dictation_scope("openid profile email photo"));
     assert!(!has_dictation_scope("dictation:listen_extra"));
 }
@@ -493,7 +501,13 @@ fn dictation_scope_is_matched_as_a_whole_token() {
 #[test]
 fn sync_sign_in_never_asks_for_dictation() {
     assert!(!SCOPES.contains("dictation:listen"));
-    let url = authorize_url("http://127.0.0.1:5123/oauth/callback", "chal", "st8", SCOPES).unwrap();
+    let url = authorize_url(
+        "http://127.0.0.1:5123/oauth/callback",
+        "chal",
+        "st8",
+        SCOPES,
+    )
+    .unwrap();
     let pairs: BTreeMap<String, String> = url.query_pairs().into_owned().collect();
     assert!(!pairs["scope"].contains("dictation:listen"));
 }
@@ -508,7 +522,10 @@ fn dictation_sign_in_asks_for_the_listen_scope() {
     )
     .unwrap();
     let pairs: BTreeMap<String, String> = url.query_pairs().into_owned().collect();
-    assert_eq!(pairs["scope"], "openid profile email photo dictation:listen");
+    assert_eq!(
+        pairs["scope"],
+        "openid profile email photo dictation:listen"
+    );
 }
 
 #[test]

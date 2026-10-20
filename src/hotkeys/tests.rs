@@ -657,3 +657,34 @@ fn modifiers_read_as_a_person_names_them() {
     assert_eq!(mods_text(MOD_CONTROL.0 | MOD_SHIFT.0), "Ctrl+Shift");
     assert_eq!(mods_text(MOD_WIN.0 | MOD_ALT.0), "Alt+Win");
 }
+
+#[test]
+fn one_key_for_both_is_claimed_once_and_follows_mode() {
+    // Toggle mode, two keys: both claimed.
+    assert_eq!(
+        claimed_combos(true, false, "f14", "f13"),
+        (Some("f14".to_string()), Some("f13".to_string()))
+    );
+    // Toggle mode, one key for both (any spelling): claimed once, as the
+    // toggle. A second claim is the one Windows refuses, which read as
+    // "another app is holding one of these hotkeys".
+    assert_eq!(
+        claimed_combos(true, false, "f14", "F14"),
+        (Some("f14".to_string()), None)
+    );
+    assert_eq!(
+        claimed_combos(true, false, "ctrl+shift+d", "shift+ctrl+d"),
+        (Some("ctrl+shift+d".to_string()), None)
+    );
+    // Hold mode: only the hold key, shared or not.
+    assert_eq!(
+        claimed_combos(true, true, "f14", "f14"),
+        (None, Some("f14".to_string()))
+    );
+    assert_eq!(
+        claimed_combos(true, true, "f14", "f13"),
+        (None, Some("f13".to_string()))
+    );
+    // Hotkeys off: nothing.
+    assert_eq!(claimed_combos(false, false, "f14", "f13"), (None, None));
+}

@@ -235,6 +235,10 @@ pub(super) struct SettingsApp {
     pub(super) test_rx: Option<mpsc::Receiver<(String, bool)>>,
     pub(super) testing_left: usize,
     pub(super) status: String,
+    /// The text of the last failure written through `fail`. The footer paints
+    /// `status` as an error while it still equals this, so the next ordinary
+    /// status line drops back to the quiet tone with no reset to forget.
+    pub(super) status_failure: Option<String>,
     /// The currently-open error-report preview text (editable), or `None`
     /// when no report is being reviewed. Building the report never writes
     /// anything to disk; only "Save to file..." does. See

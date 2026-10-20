@@ -33,6 +33,7 @@ impl SettingsApp {
             test_rx: None,
             testing_left: 0,
             status: String::new(),
+            status_failure: None,
             error_report_preview: None,
             sync,
             licence: Default::default(),
@@ -201,14 +202,7 @@ impl SettingsApp {
             .map_err(|e| format!("Toggle hotkey: {e}"))?;
         crate::hotkeys::parse_combo(&self.draft.hold_hotkey)
             .map_err(|e| format!("Hold hotkey: {e}"))?;
-        if hotkeys_conflict(&self.draft.toggle_hotkey, &self.draft.hold_hotkey) {
-            return Err(format!(
-                "Toggle hotkey and Hold hotkey are both set to \"{}\" \u{2014} Windows can only \
-                 register one of them, so the other would silently never fire. Pick two \
-                 different combinations.",
-                self.draft.hold_hotkey.trim()
-            ));
-        }
+        // One key for both is fine: it follows Mode (`hotkeys::claimed_combos`).
         Ok(())
     }
 }

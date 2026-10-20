@@ -433,3 +433,13 @@ fn the_inline_sync_note_drops_what_the_synced_chip_already_says() {
         "Sync problem: offline"
     );
 }
+
+#[test]
+fn status_is_a_failure_only_while_it_still_shows_the_failure_text() {
+    let refused = "Not saved -- Toggle hotkey: unknown key";
+    assert!(status_is_failure(refused, Some(refused)));
+    // A later ordinary line drops back to the quiet tone by itself.
+    assert!(!status_is_failure("Saved.", Some(refused)));
+    assert!(!status_is_failure("", Some("")));
+    assert!(!status_is_failure("Saved.", None));
+}

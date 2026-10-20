@@ -7,7 +7,7 @@ impl SettingsApp {
     pub(crate) fn save(&mut self) -> bool {
         self.fold_vocabulary_into_draft();
         if let Err(e) = self.validate() {
-            self.status = format!("Not saved — {e}");
+            self.fail(format!("Not saved — {e}"));
             return false;
         }
         match self.persist(self.draft.clone()) {
@@ -17,7 +17,7 @@ impl SettingsApp {
                 true
             }
             Err(e) => {
-                self.status = format!("Save failed: {e}");
+                self.fail(format!("Save failed: {e}"));
                 false
             }
         }
@@ -239,7 +239,7 @@ impl SettingsApp {
                     .map_err(|e| format!("Could not restart QuickDictate: {e}"))
             });
         if let Err(e) = relaunch {
-            self.status = e;
+            self.fail(e);
             return;
         }
         self.app.shutdown.store(true, Ordering::Release);

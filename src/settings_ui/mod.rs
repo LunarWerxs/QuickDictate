@@ -40,7 +40,8 @@
 //! Set `QUICKDICTATE_UI_SHOT=<path.png>` and the window captures *itself* via
 //! egui's viewport screenshot a few frames after opening, writing the PNG to
 //! that path (`QUICKDICTATE_UI_OPEN=keys|keys-bulk|keys-test|replacements|
-//! replacements-bulk|stats` first opens a modal).
+//! replacements-bulk|stats` first opens a modal; `save-refused` presses Save on
+//! an unparsable hotkey; `same-keys` puts Hold on the Toggle key).
 //! `scripts/ui_shot.ps1` wraps the whole loop.
 //!
 //! ## Changing the window size or the Save button?
@@ -299,6 +300,7 @@ impl SettingsApp {
                 bottom: 10,
             }))
             .show(ui, |ui| {
+                self.status_line(ui);
                 ui.horizontal(|ui| {
                     if ui.button("About").clicked() {
                         do_about = true;
@@ -361,9 +363,8 @@ impl SettingsApp {
         }
     }
 
-    /// The right-aligned Save split-button: [ Save |▾ ], plus the save
-    /// status label. Returns (do_save, do_save_restart). Split out of
-    /// `bottom_action_bar` purely to keep its cognitive load down.
+    /// The right-aligned Save split-button: [ Save |▾ ]. Returns (do_save,
+    /// do_save_restart). Split out of `bottom_action_bar` purely to keep its cognitive load down.
     fn save_split_button(&mut self, ui: &mut egui::Ui) -> (bool, bool) {
         let mut do_save = false;
         let mut do_save_restart = false;
@@ -394,13 +395,35 @@ impl SettingsApp {
         if accent_button_rounded(ui, "Save", save_round, egui::vec2(0.0, SPLIT_BTN_H)).clicked() {
             do_save = true;
         }
-        // Save status fills the gap between the menu and Save. Restore
-        // normal spacing here since the split button above needed 0.
-        if !self.status.is_empty() {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            ui.add_space(6.0);
-            ui.label(RichText::new(self.status.clone()).color(muted()));
-        }
         (do_save, do_save_restart)
     }
+
+    /// The status line, on its own full-width row above the action buttons so
+    /// a long message wraps. It used to sit in the gap left of Save, where a
+    /// long one ran leftward underneath About and Stats and could not be read
+    /// (a refused save's hotkey-conflict reason, 2026-10-20). A failure sits in
+    /// the red danger box so it cannot be missed.
+    fn status_line(&self, ui: &mut egui::Ui) {
+        if self.status.is_empty() {
+            return;
+        }
+        if status_is_failure(&self.status, self.status_failure.as_deref()) {
+            danger_box(ui, |ui| ui.label(RichText::new(&self.status).color(bad())));
+        } else {
+            ui.label(RichText::new(&self.status).color(muted()));
+        }
+        ui.add_space(6.0);
+    }
+
+    /// Show `msg` in the status line as a failure (red, boxed).
+    pub(crate) fn fail(&mut self, msg: impl Into<String>) {
+        self.status = msg.into();
+        self.status_failure = Some(self.status.clone());
+    }
+}
+
+/// Whether the status line is showing a failure: only while it still carries
+/// the exact text `fail` last wrote.
+pub(crate) fn status_is_failure(status: &str, failure: Option<&str>) -> bool {
+    !status.is_empty() && failure == Some(status)
 }
