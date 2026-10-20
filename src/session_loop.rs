@@ -115,6 +115,10 @@ fn begin_session(
     }
     refresh_key_pool(app, keys);
     tracing::info!("{what}");
+    // The pip counts this press's words from 0. Left to the session, the
+    // reset came after the provider's handshake, so for that half second the
+    // pip showed the last dictation's count and then drained it away.
+    app.word_count.store(0, Ordering::Release);
     app.set_status(Status::Starting);
     *active = Some(stt::start_session(Arc::clone(app), Arc::clone(keys)));
 }

@@ -148,8 +148,8 @@ impl UiLoopState {
 
     /// Persist an explanation of the last dictation error on the tray
     /// tooltip, using `ErrorKind::tooltip()` so every named cause gets real
-    /// text instead of collapsing to a bare "!" -- keep it there until a
-    /// session actually connects (Listening) so the explanation outlives the
+    /// text instead of collapsing to a bare "!" -- keep it there until the
+    /// next dictation is listening (Listening) so the explanation outlives the
     /// brief error pip. See `error_glyph` for the pip's side of the same fix.
     pub(super) fn sync_error_tooltip(&mut self, tick: &TickSnapshot) {
         if tick.hotkey_blocked {

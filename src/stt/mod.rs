@@ -594,11 +594,7 @@ async fn run_session(
         stream,
         recovery,
     } = connected;
-
-    if app.promote_starting_to_listening() {
-        tracing::info!("session[{epoch}] visible state: Starting -> Listening");
-    }
-    crate::sound::play_start(cfg.enable_sound);
+    tracing::info!("session[{epoch}] connected");
 
     // The "keep listening after you stop" window (Settings → Dictation). It
     // sets the dynamic-tail silence timeout; the hard cap is that plus a fixed

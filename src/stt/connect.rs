@@ -185,6 +185,16 @@ pub(super) async fn establish_connected_session(
     // per-session resampler.
     let (samples_rx, flusher) = app.audio.subscribe(fmt.sample_rate);
 
+    // Every word from here on is kept: `samples_rx` buffers the microphone
+    // while the handshake below runs, and the session ships that backlog once
+    // connected (see below). So the pip turns green and the start sound plays
+    // now, not after the half second a network engine takes to answer. Only
+    // the first attempt of a press promotes, so a key rotation stays silent.
+    if app.promote_starting_to_listening() {
+        tracing::info!("session[{epoch}] visible state: Starting -> Listening");
+        crate::sound::play_start(cfg.enable_sound);
+    }
+
     let ProviderSession { sink, stream } =
         connect_provider(provider.as_ref(), &keys, &key, &key_suffix, &opts, epoch).await?;
 
