@@ -79,6 +79,7 @@ struct SessionReply {
 #[serde(tag = "type", rename_all = "lowercase")]
 enum Frame {
     Ready,
+    Queued,
     Interim {
         #[serde(alias = "transcript")]
         text: String,
@@ -165,7 +166,7 @@ async fn wait_for_ready(conn: &mut ws::WsConn) -> Result<(), ConnectError> {
     while let Some(frame) = conn.next().await {
         match frame {
             Ok(Message::Text(text)) => match serde_json::from_str::<Frame>(text.as_str()) {
-                Ok(Frame::Ready) => return Ok(()),
+                Ok(Frame::Ready | Frame::Queued) => return Ok(()),
                 Ok(Frame::End { reason }) => {
                     return Err(ConnectError(format!(
                         "dictation ended before it was ready: {reason}"
@@ -184,7 +185,7 @@ async fn wait_for_ready(conn: &mut ws::WsConn) -> Result<(), ConnectError> {
 /// Pure text-frame to event mapping. `None` for frames the runner ignores.
 fn map_frame(text: &str) -> Option<SttEvent> {
     match serde_json::from_str::<Frame>(text).ok()? {
-        Frame::Ready => None,
+        Frame::Ready | Frame::Queued => None,
         Frame::Interim { text } => non_empty(text).map(SttEvent::Partial),
         Frame::Final { text } => non_empty(text).map(SttEvent::Committed),
         Frame::End { reason } => Some(end_event(&reason)),
@@ -203,7 +204,8 @@ fn end_event(reason: &str) -> SttEvent {
         "limit" => failure("Connections dictation stopped at its time limit"),
         "credits" => failure("Connections minutes are used up"),
         "busy" => failure("Connections dictation is busy; try again shortly"),
-        "no_worker" | "worker_lost" => failure("Connections dictation lost its worker; try again"),
+        "no_worker" => failure("Connections dictation is restarting; try again in a minute"),
+        "worker_lost" => failure("Connections dictation lost its worker; try again"),
         "refused" => failure("Connections dictation refused this session"),
         other => failure(&format!("Connections dictation ended: {other}")),
     }
@@ -242,6 +244,27 @@ mod tests {
         assert!(matches!(
             map_frame(r#"{"type":"end","reason":"surprise"}"#),
             Some(SttEvent::ProviderFailure(m)) if m.ends_with("surprise")
+        ));
+    }
+
+    #[test]
+    fn queued_frame_is_ignored_once_started() {
+        assert!(map_frame(r#"{"type":"queued","position":3}"#).is_none());
+    }
+
+    #[test]
+    fn busy_and_no_worker_say_when_to_retry() {
+        assert!(matches!(
+            map_frame(r#"{"type":"end","reason":"busy"}"#),
+            Some(SttEvent::ProviderFailure(m)) if m == "Connections dictation is busy; try again shortly"
+        ));
+        assert!(matches!(
+            map_frame(r#"{"type":"end","reason":"no_worker"}"#),
+            Some(SttEvent::ProviderFailure(m)) if m == "Connections dictation is restarting; try again in a minute"
+        ));
+        assert!(matches!(
+            map_frame(r#"{"type":"end","reason":"worker_lost"}"#),
+            Some(SttEvent::ProviderFailure(m)) if m == "Connections dictation lost its worker; try again"
         ));
     }
 
@@ -335,5 +358,74 @@ mod tests {
             server.await.unwrap(),
             format!("{SUBPROTOCOL}, token.test-token")
         );
+    }
+
+    /// A dictation server with a full line: it sends `queued`, holds the audio the
+    /// client sends, and only after `stop` says `ready`, one transcript and `end`.
+    #[allow(clippy::result_large_err)]
+    async fn queued_server(listener: tokio::net::TcpListener) -> usize {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws =
+            tokio_tungstenite::accept_hdr_async(tcp, |_: &ServerRequest, mut resp: Response| {
+                resp.headers_mut().insert(
+                    "Sec-WebSocket-Protocol",
+                    HeaderValue::from_static(SUBPROTOCOL),
+                );
+                Ok(resp)
+            })
+            .await
+            .unwrap();
+        use futures_util::SinkExt;
+        ws.send(Message::Text(r#"{"type":"queued","position":2}"#.into()))
+            .await
+            .unwrap();
+        let mut audio_frames = 0;
+        while let Some(Ok(msg)) = ws.next().await {
+            match msg {
+                Message::Binary(_) => audio_frames += 1,
+                Message::Text(t) if t.as_str().contains("\"stop\"") => break,
+                _ => {}
+            }
+        }
+        ws.send(Message::Text(r#"{"type":"ready"}"#.into()))
+            .await
+            .unwrap();
+        for frame in [
+            r#"{"type":"interim","text":"hello"}"#,
+            r#"{"type":"final","text":"hello world"}"#,
+            r#"{"type":"end","reason":"stopped"}"#,
+        ] {
+            ws.send(Message::Text(frame.into())).await.unwrap();
+        }
+        audio_frames
+    }
+
+    #[tokio::test]
+    async fn queued_session_starts_at_once_and_its_audio_waits_in_line() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(queued_server(listener));
+
+        let minted = Minted {
+            url: format!("ws://{addr}/"),
+            token: "test-token".into(),
+        };
+        let mut session = start(&minted).await.unwrap();
+        session.sink.send_audio(&[1, 2, 3]).await.unwrap();
+        session.sink.commit().await.unwrap();
+
+        assert!(matches!(
+            session.stream.recv_event().await.unwrap(),
+            Some(SttEvent::Partial(t)) if t == "hello"
+        ));
+        assert!(matches!(
+            session.stream.recv_event().await.unwrap(),
+            Some(SttEvent::Committed(t)) if t == "hello world"
+        ));
+        assert!(matches!(
+            session.stream.recv_event().await.unwrap(),
+            Some(SttEvent::Closed(None))
+        ));
+        assert_eq!(server.await.unwrap(), 1);
     }
 }
