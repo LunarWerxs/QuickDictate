@@ -58,6 +58,15 @@ impl SttProvider for ConnectionsProvider {
         let minted = mint(&access, &opts.language).await?;
         start(&minted).await
     }
+
+    fn supports_stall_recovery(&self) -> bool {
+        true
+    }
+
+    // A session that moved workers decodes its replayed audio before its last words.
+    fn final_transcript_timeout(&self) -> Duration {
+        Duration::from_secs(6)
+    }
 }
 
 /// Where a minted session streams, and the token that authorizes it.
@@ -358,6 +367,31 @@ mod tests {
             server.await.unwrap(),
             format!("{SUBPROTOCOL}, token.test-token")
         );
+    }
+
+    #[tokio::test]
+    async fn end_frame_finishes_the_final_wait_before_its_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(fake_server(listener));
+
+        let minted = Minted {
+            url: format!("ws://{addr}/"),
+            token: "test-token".into(),
+        };
+        let mut session = start(&minted).await.unwrap();
+        session.sink.send_audio(&[1, 2, 3]).await.unwrap();
+        session.sink.commit().await.unwrap();
+
+        let began = std::time::Instant::now();
+        loop {
+            match session.stream.recv_event().await.unwrap() {
+                Some(SttEvent::Closed(_)) | None => break,
+                _ => {}
+            }
+        }
+        assert!(began.elapsed() < ConnectionsProvider.final_transcript_timeout());
+        server.await.unwrap();
     }
 
     /// A dictation server with a full line: it sends `queued`, holds the audio the

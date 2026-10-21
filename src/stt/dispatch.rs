@@ -507,7 +507,7 @@ mod tests {
     /// its live API: a partial within a couple of seconds and a steady cadence.
     #[test]
     fn stall_recovery_is_on_exactly_for_the_measured_streaming_providers() {
-        for id in ["elevenlabs", "deepgram", "assemblyai", "dashscope"] {
+        for id in ["elevenlabs", "deepgram", "assemblyai", "dashscope", "connections"] {
             assert!(
                 make_provider(&with_provider(id)).supports_stall_recovery(),
                 "{id} streams partials fast enough to be watched"
