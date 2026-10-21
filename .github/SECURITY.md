@@ -15,7 +15,7 @@ QuickDictate is a small source-available project without a dedicated security te
 
 Please **do not** open a public GitHub issue containing exploit details, proof-of-concept code, or other specifics that could put existing users at risk before a fix ships.
 
-Instead, open a normal issue **asking us to contact you** (don't include the exploit details there), or message the maintainers on [Discord](https://discord.gg/PsWpeNUzhk) and ask for a private channel. This lets you share details privately with the maintainer and coordinate a fix and disclosure timeline before anything is made public.
+Instead, report it through GitHub's private [Report a vulnerability](https://github.com/LunarWerxs/QuickDictate/security/advisories/new) form (the repository's *Security, Advisories* tab), or open a normal issue **asking us to contact you** (don't include the exploit details there), or message the maintainers on [Discord](https://discord.gg/PsWpeNUzhk) and ask for a private channel. This lets you share details privately with the maintainer and coordinate a fix and disclosure timeline before anything is made public.
 
 Please include:
 - The QuickDictate version (and whether you built from source or used a release binary).
