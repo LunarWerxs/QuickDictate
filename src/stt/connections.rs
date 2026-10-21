@@ -212,6 +212,7 @@ fn end_event(reason: &str) -> SttEvent {
         "stopped" | "idle" => SttEvent::Closed(None),
         "limit" => failure("Connections dictation stopped at its time limit"),
         "credits" => failure("Connections minutes are used up"),
+        "unavailable" => failure("Connections dictation could not confirm your minutes; try again"),
         "busy" => failure("Connections dictation is busy; try again shortly"),
         "no_worker" => failure("Connections dictation is restarting; try again in a minute"),
         "worker_lost" => failure("Connections dictation lost its worker; try again"),
@@ -249,6 +250,10 @@ mod tests {
         assert!(matches!(
             map_frame(r#"{"type":"end","reason":"credits"}"#),
             Some(SttEvent::ProviderFailure(m)) if m.contains("minutes")
+        ));
+        assert!(matches!(
+            map_frame(r#"{"type":"end","reason":"unavailable"}"#),
+            Some(SttEvent::ProviderFailure(m)) if m.contains("could not confirm your minutes")
         ));
         assert!(matches!(
             map_frame(r#"{"type":"end","reason":"surprise"}"#),
