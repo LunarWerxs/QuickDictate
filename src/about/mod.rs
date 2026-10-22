@@ -202,7 +202,7 @@ pub fn show_about_and_install(tag: String) {
         if raw != 0 {
             unsafe {
                 let _ = PostMessageW(
-                    HWND(raw as *mut c_void),
+                    Some(HWND(raw as *mut c_void)),
                     WM_ABOUT_INSTALL,
                     WPARAM(0),
                     LPARAM(0),
@@ -238,7 +238,7 @@ unsafe fn run_about() {
         lpfnWndProc: Some(about_wndproc),
         hInstance: hinst,
         lpszClassName: class,
-        hCursor: LoadCursorW(HINSTANCE::default(), IDC_ARROW).unwrap_or_default(),
+        hCursor: LoadCursorW(Some(HINSTANCE::default()), IDC_ARROW).unwrap_or_default(),
         hbrBackground: dark_bg_brush(), // theme-aware: light bg in light, dark bg in dark
         ..Default::default()
     };
@@ -277,9 +277,9 @@ unsafe fn run_about() {
         y,
         win_w,
         win_h,
-        HWND::default(),
-        HMENU::default(),
-        hinst,
+        Some(HWND::default()),
+        Some(HMENU::default()),
+        Some(hinst),
         None,
     ) else {
         return;
@@ -291,7 +291,7 @@ unsafe fn run_about() {
     let _ = ShowWindow(hwnd, SW_SHOW);
 
     let mut msg = MSG::default();
-    while GetMessageW(&mut msg, HWND::default(), 0, 0).as_bool() {
+    while GetMessageW(&mut msg, Some(HWND::default()), 0, 0).as_bool() {
         let _ = TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
@@ -382,7 +382,7 @@ unsafe fn begin_pending_install(hwnd: HWND) -> LRESULT {
     if st.is_null() || matches!((*st).status, Status::Updating) {
         return LRESULT(0);
     }
-    let _ = KillTimer(hwnd, SPINNER_TIMER);
+    let _ = KillTimer(Some(hwnd), SPINNER_TIMER);
     (*st).checking = false;
     (*st).status = Status::Available(tag);
     on_status_click(hwnd);
@@ -406,7 +406,7 @@ unsafe fn on_wm_timer(hwnd: HWND) -> LRESULT {
         invalidate_status(hwnd);
     } else {
         // No longer checking / updating — stop animating.
-        let _ = KillTimer(hwnd, SPINNER_TIMER);
+        let _ = KillTimer(Some(hwnd), SPINNER_TIMER);
     }
     LRESULT(0)
 }
@@ -422,7 +422,7 @@ unsafe fn on_wm_about_checked(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRE
         }
         return LRESULT(0);
     }
-    let _ = KillTimer(hwnd, SPINNER_TIMER);
+    let _ = KillTimer(Some(hwnd), SPINNER_TIMER);
     if !st.is_null() {
         (*st).checking = false;
         (*st).status = match wparam.0 {
@@ -446,7 +446,7 @@ unsafe fn on_wm_about_checked(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRE
 }
 
 unsafe fn on_wm_about_update_failed(hwnd: HWND, lparam: LPARAM) -> LRESULT {
-    let _ = KillTimer(hwnd, SPINNER_TIMER);
+    let _ = KillTimer(Some(hwnd), SPINNER_TIMER);
     // Reclaim the tag the worker boxed (dropped harmlessly if the window is
     // already gone).
     let tag = if lparam.0 != 0 {
@@ -489,8 +489,8 @@ unsafe fn on_wm_setcursor(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) 
             .iter()
             .any(|&h| h != 0 && h == over);
     if clickable {
-        if let Ok(hand) = LoadCursorW(HINSTANCE::default(), IDC_HAND) {
-            SetCursor(hand);
+        if let Ok(hand) = LoadCursorW(Some(HINSTANCE::default()), IDC_HAND) {
+            SetCursor(Some(hand));
         }
         return LRESULT(1);
     }
@@ -502,7 +502,7 @@ unsafe fn on_wm_dpichanged(hwnd: HWND, lparam: LPARAM) -> LRESULT {
         let r = &*(lparam.0 as *const RECT);
         let _ = SetWindowPos(
             hwnd,
-            HWND::default(),
+            Some(HWND::default()),
             r.left,
             r.top,
             r.right - r.left,
@@ -528,14 +528,14 @@ unsafe fn on_wm_destroy(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
 }
 
 unsafe fn on_wm_ncdestroy(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    let _ = KillTimer(hwnd, SPINNER_TIMER);
+    let _ = KillTimer(Some(hwnd), SPINNER_TIMER);
     ABOUT_HWND.store(0, Ordering::Release);
     let p = about_state(hwnd);
     if !p.is_null() {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
         let st = Box::from_raw(p);
         if let Some(icon) = st.gh_icon {
-            let _ = DeleteObject(icon);
+            let _ = DeleteObject(icon.into());
         }
     }
     PostQuitMessage(0);

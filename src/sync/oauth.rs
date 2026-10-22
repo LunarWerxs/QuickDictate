@@ -28,7 +28,7 @@ fn rand_bytes(n: usize) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; n];
     let status = unsafe {
         BCryptGenRandom(
-            BCRYPT_ALG_HANDLE::default(),
+            Some(BCRYPT_ALG_HANDLE::default()),
             &mut buf,
             BCRYPT_USE_SYSTEM_PREFERRED_RNG,
         )
@@ -94,7 +94,7 @@ fn open_browser(url: &str) {
     let wide: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
         ShellExecuteW(
-            HWND::default(),
+            Some(HWND::default()),
             w!("open"),
             PCWSTR(wide.as_ptr()),
             PCWSTR::null(),

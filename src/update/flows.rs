@@ -25,7 +25,7 @@ pub fn msg_box(
     let body_w: Vec<u16> = body.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
         MessageBoxW(
-            HWND::default(),
+            Some(HWND::default()),
             PCWSTR(body_w.as_ptr()),
             PCWSTR(title_w.as_ptr()),
             style | MB_TOPMOST,

@@ -22,7 +22,7 @@ pub(super) unsafe fn start_check(hwnd: HWND) {
     if !st.is_null() {
         (*st).spinner_angle = 0;
     }
-    let _ = SetTimer(hwnd, SPINNER_TIMER, SPINNER_INTERVAL_MS, None);
+    let _ = SetTimer(Some(hwnd), SPINNER_TIMER, SPINNER_INTERVAL_MS, None);
 
     let raw = hwnd.0 as isize;
     std::thread::spawn(move || {
@@ -44,7 +44,7 @@ pub(super) unsafe fn start_check(hwnd: HWND) {
             // If the window was torn down before the post landed, reclaim the
             // boxed tag (only the Available case carries one — lp != 0).
             if PostMessageW(
-                HWND(raw as *mut c_void),
+                Some(HWND(raw as *mut c_void)),
                 WM_ABOUT_CHECKED,
                 WPARAM(code),
                 LPARAM(lp),
@@ -61,7 +61,7 @@ pub(super) unsafe fn start_check(hwnd: HWND) {
 pub(super) unsafe fn invalidate_status(hwnd: HWND) {
     let st = about_state(hwnd);
     if !st.is_null() && (*st).status_pill != 0 {
-        let _ = InvalidateRect(HWND((*st).status_pill as *mut c_void), None, true);
+        let _ = InvalidateRect(Some(HWND((*st).status_pill as *mut c_void)), None, true);
     }
 }
 
@@ -81,7 +81,7 @@ pub(super) unsafe fn on_status_click(hwnd: HWND) {
         (*st).checking = true;
         (*st).status = Status::Updating;
         (*st).spinner_angle = 0;
-        let _ = SetTimer(hwnd, SPINNER_TIMER, SPINNER_INTERVAL_MS, None);
+        let _ = SetTimer(Some(hwnd), SPINNER_TIMER, SPINNER_INTERVAL_MS, None);
         invalidate_status(hwnd);
         start_install(hwnd, tag);
         return;
@@ -119,7 +119,7 @@ unsafe fn start_install(hwnd: HWND, tag: String) {
                 // here on failure (About closed mid-download).
                 let boxed = Box::into_raw(Box::new(tag));
                 if PostMessageW(
-                    HWND(raw as *mut c_void),
+                    Some(HWND(raw as *mut c_void)),
                     WM_ABOUT_UPDATE_FAILED,
                     WPARAM(0),
                     LPARAM(boxed as isize),

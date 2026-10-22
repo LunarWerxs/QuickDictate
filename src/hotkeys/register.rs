@@ -28,8 +28,8 @@ pub(super) unsafe fn register_one(id: i32, combo: &str, mods: u32, vk: u32, quie
     let null_hwnd = windows::Win32::Foundation::HWND::default();
     // Drop any stale registration first; failure here just means there wasn't
     // one (fresh start), which is fine.
-    let _ = UnregisterHotKey(null_hwnd, id);
-    match RegisterHotKey(null_hwnd, id, HOT_KEY_MODIFIERS(mods), vk) {
+    let _ = UnregisterHotKey(Some(null_hwnd), id);
+    match RegisterHotKey(Some(null_hwnd), id, HOT_KEY_MODIFIERS(mods), vk) {
         Ok(()) => {
             if !quiet {
                 tracing::info!(
@@ -191,8 +191,15 @@ fn pump_hotkey_messages(b: &HotkeyBindings<'_>, tx: &Sender<HotkeyEvent>, stop_f
         if stop_flag.load(Ordering::Acquire) {
             break;
         }
-        let got =
-            unsafe { GetMessageW(&mut msg, windows::Win32::Foundation::HWND::default(), 0, 0).0 };
+        let got = unsafe {
+            GetMessageW(
+                &mut msg,
+                Some(windows::Win32::Foundation::HWND::default()),
+                0,
+                0,
+            )
+            .0
+        };
         if got <= 0 {
             break;
         } // 0 = WM_QUIT, -1 = error
@@ -207,13 +214,13 @@ fn release_hotkeys(b: &HotkeyBindings<'_>, rearm_timer: usize) {
     unsafe {
         let null_hwnd = windows::Win32::Foundation::HWND::default();
         if rearm_timer != 0 {
-            let _ = KillTimer(null_hwnd, rearm_timer);
+            let _ = KillTimer(Some(null_hwnd), rearm_timer);
         }
         if b.kb_toggle.is_some() {
-            let _ = UnregisterHotKey(null_hwnd, b.toggle_id);
+            let _ = UnregisterHotKey(Some(null_hwnd), b.toggle_id);
         }
         if b.kb_hold.is_some() {
-            let _ = UnregisterHotKey(null_hwnd, b.hold_id);
+            let _ = UnregisterHotKey(Some(null_hwnd), b.hold_id);
         }
     }
     watch::stop();
@@ -279,7 +286,7 @@ pub(super) fn run_hotkey_loop(
     // (no window needed) re-registers both hotkeys every REARM_INTERVAL_MS.
     let rearm_timer = unsafe {
         SetTimer(
-            windows::Win32::Foundation::HWND::default(),
+            Some(windows::Win32::Foundation::HWND::default()),
             0,
             REARM_INTERVAL_MS,
             None,

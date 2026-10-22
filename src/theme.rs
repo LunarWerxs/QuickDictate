@@ -7,8 +7,9 @@
 use core::ffi::c_void;
 use std::sync::OnceLock;
 
+use windows::core::BOOL;
 use windows::core::{w, PCSTR, PCWSTR};
-use windows::Win32::Foundation::{BOOL, COLORREF, HMODULE, HWND, LRESULT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HMODULE, HWND, LRESULT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
 use windows::Win32::Graphics::Gdi::{
     CreateSolidBrush, SetBkColor, SetBkMode, SetTextColor, HBRUSH, HDC, TRANSPARENT,

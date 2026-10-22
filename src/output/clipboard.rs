@@ -277,14 +277,14 @@ fn put_open_clipboard_data(fmt: u32, bytes: &[u8]) -> Result<()> {
         }
         let dst = GlobalLock(hglob) as *mut u8;
         if dst.is_null() {
-            let _ = GlobalFree(hglob);
+            let _ = GlobalFree(Some(hglob));
             return Err(anyhow!("GlobalLock null for clipboard format {fmt}"));
         }
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
         let _ = GlobalUnlock(hglob);
-        if SetClipboardData(fmt, HANDLE(hglob.0)).is_err() {
+        if SetClipboardData(fmt, Some(HANDLE(hglob.0))).is_err() {
             // Ownership did NOT transfer, so this block is ours to free.
-            let _ = GlobalFree(hglob);
+            let _ = GlobalFree(Some(hglob));
             return Err(anyhow!(
                 "SetClipboardData failed for clipboard format {fmt}"
             ));
@@ -307,7 +307,7 @@ fn with_open_clipboard<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
 fn open_clipboard() -> Result<()> {
     for _ in 0..10 {
         unsafe {
-            if OpenClipboard(HWND::default()).is_ok() {
+            if OpenClipboard(Some(HWND::default())).is_ok() {
                 return Ok(());
             }
         }

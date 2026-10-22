@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use windows::core::{Interface, PWSTR};
-use windows::Win32::Foundation::{BOOL, S_OK};
+use windows::Win32::Foundation::S_OK;
 use windows::Win32::Media::Audio::{
     eRender, AudioSessionStateActive, AudioSessionStateExpired, IAudioSessionControl,
     IAudioSessionControl2, IAudioSessionEnumerator, IAudioSessionManager2, IMMDeviceEnumerator,
@@ -161,7 +161,7 @@ impl AppSession {
 
     fn set_muted(&self, muted: bool) -> bool {
         // SAFETY: as in `set_volume`.
-        unsafe { self.volume.SetMute(BOOL::from(muted), std::ptr::null()) }.is_ok()
+        unsafe { self.volume.SetMute(muted, std::ptr::null()) }.is_ok()
     }
 }
 

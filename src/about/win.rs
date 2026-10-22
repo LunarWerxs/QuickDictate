@@ -149,14 +149,14 @@ pub(super) unsafe fn gui_font_sized(hwnd: HWND, px: i32, weight: i32) -> HFONT {
 
 /// Pixel width of `text` rendered in the GUI font (for centering controls).
 pub(super) unsafe fn text_width(text: &str) -> i32 {
-    let hdc = GetDC(HWND::default());
-    let old = SelectObject(hdc, gui_font());
+    let hdc = GetDC(Some(HWND::default()));
+    let old = SelectObject(hdc, gui_font().into());
     let w = wide(text);
     let n = w.len().saturating_sub(1);
     let mut sz = SIZE::default();
     let _ = GetTextExtentPoint32W(hdc, &w[..n], &mut sz);
     SelectObject(hdc, old);
-    ReleaseDC(HWND::default(), hdc);
+    ReleaseDC(Some(HWND::default()), hdc);
     sz.cx
 }
 
@@ -187,24 +187,29 @@ pub(super) unsafe fn ctl(
         y,
         cw,
         ch,
-        parent,
-        HMENU(id as usize as *mut c_void),
-        hinst,
+        Some(parent),
+        Some(HMENU(id as usize as *mut c_void)),
+        Some(hinst),
         None,
     )
     .unwrap_or_default();
     SendMessageW(
         h,
         WM_SETFONT,
-        WPARAM(gui_font_for(parent).0 as usize),
-        LPARAM(1),
+        Some(WPARAM(gui_font_for(parent).0 as usize)),
+        Some(LPARAM(1)),
     );
     h
 }
 
 /// Set a static control's bitmap, freeing whatever bitmap it held before.
 pub(super) unsafe fn set_static_bitmap(ctl: HWND, hbmp: HBITMAP) {
-    let old = SendMessageW(ctl, super::STM_SETIMAGE, WPARAM(0), LPARAM(hbmp.0 as isize));
+    let old = SendMessageW(
+        ctl,
+        super::STM_SETIMAGE,
+        Some(WPARAM(0)),
+        Some(LPARAM(hbmp.0 as isize)),
+    );
     if old.0 != 0 {
         let _ = DeleteObject(HGDIOBJ(old.0 as *mut c_void));
     }
@@ -214,11 +219,11 @@ pub(super) unsafe fn set_static_bitmap(ctl: HWND, hbmp: HBITMAP) {
 /// delete it. For an alpha bitmap comctl32 v6 holds a copy rather than
 /// `original`, and the detach hands that copy back, so both are deleted.
 pub(super) unsafe fn release_static_bitmap(ctl: HWND, original: HBITMAP) {
-    let held = SendMessageW(ctl, super::STM_SETIMAGE, WPARAM(0), LPARAM(0));
+    let held = SendMessageW(ctl, super::STM_SETIMAGE, Some(WPARAM(0)), Some(LPARAM(0)));
     if held.0 != 0 && held.0 != original.0 as isize {
         let _ = DeleteObject(HGDIOBJ(held.0 as *mut c_void));
     }
-    let _ = DeleteObject(original);
+    let _ = DeleteObject(original.into());
 }
 
 /// Straight-RGBA (top row first) → premultiplied 32-bpp DIB-section HBITMAP
@@ -234,9 +239,17 @@ pub(super) unsafe fn rgba_to_hbitmap(w: u32, h: u32, rgba: &[u8]) -> Option<HBIT
     bmi.bmiHeader.biPlanes = 1;
     bmi.bmiHeader.biBitCount = 32;
     let mut bits: *mut c_void = std::ptr::null_mut();
-    let hbmp = CreateDIBSection(HDC::default(), &bmi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+    let hbmp = CreateDIBSection(
+        Some(HDC::default()),
+        &bmi,
+        DIB_RGB_COLORS,
+        &mut bits,
+        None,
+        0,
+    )
+    .ok()?;
     if bits.is_null() {
-        let _ = DeleteObject(hbmp);
+        let _ = DeleteObject(hbmp.into());
         return None;
     }
     let px = (w as usize) * (h as usize);
@@ -260,7 +273,7 @@ pub(crate) fn open_url(url: &str) {
     let u = wide(url);
     unsafe {
         ShellExecuteW(
-            HWND::default(),
+            Some(HWND::default()),
             w!("open"),
             PCWSTR(u.as_ptr()),
             PCWSTR::null(),

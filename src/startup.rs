@@ -140,7 +140,7 @@ fn activate_running_instance() {
         let found = unsafe { FindWindowW(PCWSTR(class_name.as_ptr()), PCWSTR::null()) };
         if let Ok(hwnd) = found {
             if !hwnd.0.is_null() && msg_id != 0 {
-                let post = unsafe { PostMessageW(hwnd, msg_id, WPARAM(0), LPARAM(0)) };
+                let post = unsafe { PostMessageW(Some(hwnd), msg_id, WPARAM(0), LPARAM(0)) };
                 if let Err(e) = post {
                     tracing::warn!("single-instance: PostMessageW failed: {e}");
                 }

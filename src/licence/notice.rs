@@ -169,7 +169,7 @@ unsafe fn run(headline: &str, body: &str) -> Option<Click> {
         lpfnWndProc: Some(wnd_proc),
         hInstance: h_instance,
         lpszClassName: PCWSTR(class.as_ptr()),
-        hCursor: LoadCursorW(HINSTANCE::default(), IDC_HAND).unwrap_or_default(),
+        hCursor: LoadCursorW(Some(HINSTANCE::default()), IDC_HAND).unwrap_or_default(),
         ..Default::default()
     };
     // 1410 = ERROR_CLASS_ALREADY_EXISTS: the second notice of the process.
@@ -208,17 +208,17 @@ unsafe fn run(headline: &str, body: &str) -> Option<Click> {
         y,
         w,
         h,
-        HWND::default(),
-        HMENU::default(),
-        h_instance,
+        Some(HWND::default()),
+        Some(HMENU::default()),
+        Some(h_instance),
         None,
     )
     .ok()?;
     let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-    SetTimer(hwnd, 1, VISIBLE_MS, None);
+    SetTimer(Some(hwnd), 1, VISIBLE_MS, None);
 
     let mut msg = MSG::default();
-    while GetMessageW(&mut msg, HWND::default(), 0, 0).as_bool() {
+    while GetMessageW(&mut msg, Some(HWND::default()), 0, 0).as_bool() {
         let _ = TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
@@ -236,10 +236,10 @@ unsafe fn font(px_height: i32, weight: i32) -> HFONT {
         0,
         0,
         0,
-        DEFAULT_CHARSET.0 as u32,
-        OUT_DEFAULT_PRECIS.0 as u32,
-        CLIP_DEFAULT_PRECIS.0 as u32,
-        ANTIALIASED_QUALITY.0 as u32,
+        DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS,
+        CLIP_DEFAULT_PRECIS,
+        ANTIALIASED_QUALITY,
         (VARIABLE_PITCH.0 as u32) | (FF_DONTCARE.0 as u32),
         PCWSTR(face.as_ptr()),
     )
@@ -248,7 +248,7 @@ unsafe fn font(px_height: i32, weight: i32) -> HFONT {
 unsafe fn fill(hdc: HDC, r: &RECT, rgb: (u8, u8, u8)) {
     let brush = CreateSolidBrush(colorref(rgb));
     FillRect(hdc, r, brush);
-    let _ = DeleteObject(brush);
+    let _ = DeleteObject(brush.into());
 }
 
 unsafe fn text(
@@ -259,7 +259,7 @@ unsafe fn text(
     f: HFONT,
     fmt: windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT,
 ) {
-    let old = SelectObject(hdc, f);
+    let old = SelectObject(hdc, f.into());
     SetTextColor(hdc, colorref(rgb));
     let mut buf = s.to_vec();
     let mut rect = *r;
@@ -327,8 +327,8 @@ unsafe fn paint(hwnd: HWND) {
             normal,
             centred,
         );
-        let _ = DeleteObject(head);
-        let _ = DeleteObject(normal);
+        let _ = DeleteObject(head.into());
+        let _ = DeleteObject(normal.into());
     });
     let _ = EndPaint(hwnd, &ps);
 }

@@ -67,7 +67,7 @@ impl Overlay {
             lpfnWndProc: Some(overlay_wnd_proc),
             hInstance: h_instance,
             lpszClassName: PCWSTR(class_name.as_ptr()),
-            hCursor: LoadCursorW(HINSTANCE::default(), IDC_ARROW).unwrap_or_default(),
+            hCursor: LoadCursorW(Some(HINSTANCE::default()), IDC_ARROW).unwrap_or_default(),
             ..Default::default()
         };
         let atom = RegisterClassExW(&wc);
@@ -93,17 +93,17 @@ impl Overlay {
             CW_USEDEFAULT,
             size,
             size,
-            HWND::default(),
-            HMENU::default(),
-            h_instance,
+            Some(HWND::default()),
+            Some(HMENU::default()),
+            Some(h_instance),
             None,
         )?;
 
         // 32-bit top-down BGRA DIB section. CreateDIBSection hands us the raw
         // pixel buffer so we can write directly without GDI's rasterizer.
-        let screen_dc = GetDC(HWND::default());
-        let mem_dc = CreateCompatibleDC(screen_dc);
-        let _ = ReleaseDC(HWND::default(), screen_dc);
+        let screen_dc = GetDC(Some(HWND::default()));
+        let mem_dc = CreateCompatibleDC(Some(screen_dc));
+        let _ = ReleaseDC(Some(HWND::default()), screen_dc);
 
         let mut bmi: BITMAPINFO = std::mem::zeroed();
         bmi.bmiHeader = BITMAPINFOHEADER {
@@ -120,11 +120,12 @@ impl Overlay {
             biClrImportant: 0,
         };
         let mut pixels_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        let bitmap = CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut pixels_ptr, None, 0)?;
+        let bitmap =
+            CreateDIBSection(Some(mem_dc), &bmi, DIB_RGB_COLORS, &mut pixels_ptr, None, 0)?;
         if pixels_ptr.is_null() {
             anyhow::bail!("CreateDIBSection returned null pixel pointer");
         }
-        SelectObject(mem_dc, bitmap);
+        SelectObject(mem_dc, bitmap.into());
 
         // Built once here rather than per-repaint -- see the `font_ui`/
         // `font_icon` doc comment on the struct. Two distinct fonts: the
@@ -200,7 +201,7 @@ impl Overlay {
         } else {
             self.font_ui
         };
-        let old_font = SelectObject(self.mem_dc, font);
+        let old_font = SelectObject(self.mem_dc, font.into());
         let _ = SetBkMode(self.mem_dc, TRANSPARENT);
 
         // Drop shadow: 1 px down-right, black.
@@ -258,10 +259,10 @@ impl Overlay {
         };
         if let Err(e) = UpdateLayeredWindow(
             self.hwnd,
-            HDC::default(),
+            Some(HDC::default()),
             Some(&pt_dst),
             Some(&sz),
-            self.mem_dc,
+            Some(self.mem_dc),
             Some(&pt_src),
             COLORREF(0),
             Some(&blend),
@@ -407,10 +408,10 @@ unsafe fn create_label_font(size: i32, height_factor: f32, face_name: &str) -> H
         0u32,
         0u32,
         0u32,
-        DEFAULT_CHARSET.0 as u32,
-        OUT_DEFAULT_PRECIS.0 as u32,
-        CLIP_DEFAULT_PRECIS.0 as u32,
-        ANTIALIASED_QUALITY.0 as u32,
+        DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS,
+        CLIP_DEFAULT_PRECIS,
+        ANTIALIASED_QUALITY,
         (VARIABLE_PITCH.0 as u32) | (FF_DONTCARE.0 as u32),
         PCWSTR(face.as_ptr()),
     )
@@ -419,9 +420,9 @@ unsafe fn create_label_font(size: i32, height_factor: f32, face_name: &str) -> H
 impl Drop for Overlay {
     fn drop(&mut self) {
         unsafe {
-            let _ = DeleteObject(self.font_ui);
-            let _ = DeleteObject(self.font_icon);
-            let _ = DeleteObject(self.bitmap);
+            let _ = DeleteObject(self.font_ui.into());
+            let _ = DeleteObject(self.font_icon.into());
+            let _ = DeleteObject(self.bitmap.into());
             let _ = DeleteDC(self.mem_dc);
         }
     }

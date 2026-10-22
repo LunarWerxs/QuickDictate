@@ -503,7 +503,7 @@ pub(super) fn stop() {
     }
     if let Some(live) = LIVE.with_borrow_mut(Option::take) {
         if live.timer != 0 {
-            let _ = unsafe { KillTimer(HWND::default(), live.timer) };
+            let _ = unsafe { KillTimer(Some(HWND::default()), live.timer) };
         }
     }
 }
@@ -524,7 +524,7 @@ fn install() {
             return;
         }
     };
-    match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), hmod, 0) } {
+    match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), Some(hmod), 0) } {
         Ok(h) => {
             let old = HOOK.swap(h.0 as isize, Ordering::AcqRel);
             if old == 0 {
@@ -575,12 +575,12 @@ pub(super) fn on_timer() -> Vec<Dropped> {
             return Vec::new();
         };
         if live.timer != 0 {
-            let _ = unsafe { KillTimer(HWND::default(), live.timer) };
+            let _ = unsafe { KillTimer(Some(HWND::default()), live.timer) };
             live.timer = 0;
         }
         let (dropped, waiting) = live.watch.on_timer(Instant::now());
         if waiting {
-            live.timer = unsafe { SetTimer(HWND::default(), 0, TIMER_MS, None) };
+            live.timer = unsafe { SetTimer(Some(HWND::default()), 0, TIMER_MS, None) };
         }
         dropped
     })
@@ -701,7 +701,7 @@ fn on_key_event(vk: u32, down: bool, injected: bool) {
             .watch
             .on_key(vk, down, mods, windows_held, Instant::now());
         if out.arm_timer && live.timer == 0 {
-            live.timer = unsafe { SetTimer(HWND::default(), 0, TIMER_MS, None) };
+            live.timer = unsafe { SetTimer(Some(HWND::default()), 0, TIMER_MS, None) };
         }
         if out.arm_timer && injected && !live.noted_injected {
             live.noted_injected = true;
