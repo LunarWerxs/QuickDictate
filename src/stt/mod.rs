@@ -55,7 +55,8 @@ use send_task::{run_send_task, SendTaskState, StallRecovery};
 mod stall_tests;
 
 pub use dispatch::{
-    provider_id_streams_interim_text, provider_streams_interim_text, spawn_key_test, spawn_prewarm,
+    provider_id_requires_api_key, provider_id_streams_interim_text, provider_streams_interim_text,
+    spawn_key_test, spawn_prewarm,
 };
 
 const TAIL_MIN: Duration = Duration::from_millis(250);

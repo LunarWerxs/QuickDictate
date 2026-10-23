@@ -65,6 +65,12 @@ pub fn provider_id_streams_interim_text(id: &str, cfg: &Config) -> bool {
     make_provider_id(id, cfg).streams_interim_text()
 }
 
+/// Whether the provider `id` needs an API key at all (Connections Dictation and the local model
+/// do not). Startup onboarding asks this so a keyless engine is not treated as "nothing set up".
+pub fn provider_id_requires_api_key(id: &str, cfg: &Config) -> bool {
+    make_provider_id(id, cfg).requires_api_key()
+}
+
 /// Key-down warm-up (`Config::prewarm_on_keydown`): resolve the provider's
 /// streaming host in the background so the press's own handshake finds DNS
 /// already answered. Fire and forget; a failure changes nothing.

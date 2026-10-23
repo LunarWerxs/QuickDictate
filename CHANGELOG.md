@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 - **Connections Dictation engine.** Pick **Connections** in the speech-provider list, then **Use my Connections minutes** to sign in with your Connections account. Audio streams live to the Connections Dictation service, so no API key is needed. Signing in for dictation does not turn settings sync on, and signing out removes the engine's access.
+- **No Settings window at launch when you dictate without a key.** Starting with Connections Dictation selected, or with a local model installed, no longer shows the "No API keys configured" notice or opens Settings.
 - **One press, one paste.** With output held until you release the hotkey, the provider's last words now join the same paste instead of landing a moment later as a second one that could overwrite the first before the app had read it. A press is also one entry in Recent transcriptions, so a long-press replay brings back the whole press.
 
 ## [1.5.0] - 2026-10-09

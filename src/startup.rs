@@ -158,6 +158,15 @@ fn activate_running_instance() {
     );
 }
 
+/// True when nothing can dictate yet: no usable key, and the selected provider is not a keyless
+/// one (Connections Dictation), and no local model is installed. Only then does startup warn and
+/// open Settings.
+fn no_provider_usable(cfg: &Config, has_usable_key: bool, local_model_installed: bool) -> bool {
+    !has_usable_key
+        && !local_model_installed
+        && crate::stt::provider_id_requires_api_key(&cfg.stt_provider, cfg)
+}
+
 fn should_open_settings_on_start(is_settings_relaunch: bool, has_usable_key: bool) -> bool {
     is_settings_relaunch || !has_usable_key
 }
@@ -409,7 +418,15 @@ pub(crate) fn bring_up_app(
     // First-run / empty-key onboarding (§6), or a deliberate Settings "Save &
     // Restart" hand-off: reopen Settings in the replacement process so the user
     // returns to the window they initiated the restart from.
-    let has_usable_key = keys.has_usable_key();
+    // Not just "has a key": Connections Dictation and an installed local model dictate without one.
+    let local_model_installed = crate::local_stt::MODELS
+        .iter()
+        .any(|m| crate::local_stt::is_installed(m.id));
+    let has_usable_key = !no_provider_usable(
+        &app.config.load(),
+        keys.has_usable_key(),
+        local_model_installed,
+    );
     let is_settings_relaunch = std::env::args().any(|arg| arg == "--relaunch");
 
     // Count this launch for the "you could be signed in" prompt — but NOT a Save & Restart
@@ -524,6 +541,30 @@ pub(crate) fn bring_up_app(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_keyless_selected_provider_is_usable_without_keys() {
+        let cfg = Config {
+            stt_provider: "connections".into(),
+            ..Config::default()
+        };
+        assert!(!no_provider_usable(&cfg, false, false));
+    }
+
+    #[test]
+    fn an_installed_local_model_is_usable_without_keys() {
+        assert!(!no_provider_usable(&Config::default(), false, true));
+    }
+
+    #[test]
+    fn nothing_usable_still_opens_settings() {
+        let cfg = Config {
+            stt_provider: "elevenlabs".into(),
+            ..Config::default()
+        };
+        assert!(no_provider_usable(&cfg, false, false));
+        assert!(!no_provider_usable(&cfg, true, false));
+    }
 
     #[test]
     fn settings_relaunch_reopens_settings_for_configured_users() {
