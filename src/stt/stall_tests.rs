@@ -370,6 +370,9 @@ fn a_late_commit_after_release_joins_the_one_held_paste() {
 
     // Live output (delay off) is unchanged: release pastes what is buffered.
     acc.chunks_buf.lock().push("Buffered.".into());
-    assert_eq!(release_flush_chunks(false, &acc), vec!["Buffered.".to_string()]);
+    assert_eq!(
+        release_flush_chunks(false, &acc),
+        vec!["Buffered.".to_string()]
+    );
     assert!(!commit_is_held(false));
 }

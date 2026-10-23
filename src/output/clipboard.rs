@@ -28,8 +28,7 @@ use super::*;
 const CLIPBOARD_READ_GAP: Duration = Duration::from_millis(600);
 
 /// When the last clipboard paste queued its Ctrl+V.
-static LAST_CTRL_V: parking_lot::Mutex<Option<std::time::Instant>> =
-    parking_lot::Mutex::new(None);
+static LAST_CTRL_V: parking_lot::Mutex<Option<std::time::Instant>> = parking_lot::Mutex::new(None);
 
 /// Sleep out whatever is left of [`CLIPBOARD_READ_GAP`] since the previous
 /// paste's Ctrl+V, so a second paste can never replace text the target has not
