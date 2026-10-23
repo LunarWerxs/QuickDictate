@@ -51,12 +51,12 @@ unsafe fn pill_frame(hwnd: HWND, hdc: HDC, rc: &RECT) {
 
 /// Blit an opaque bitmap into `dst` at `(x,y)`, `w`×`h`.
 pub(super) unsafe fn blit(dst: HDC, hbmp: HBITMAP, x: i32, y: i32, w: i32, h: i32) {
-    let mdc = CreateCompatibleDC(dst);
+    let mdc = CreateCompatibleDC(Some(dst));
     if mdc.is_invalid() {
         return;
     }
-    let old = SelectObject(mdc, hbmp);
-    let _ = BitBlt(dst, x, y, w, h, mdc, 0, 0, SRCCOPY);
+    let old = SelectObject(mdc, hbmp.into());
+    let _ = BitBlt(dst, x, y, w, h, Some(mdc), 0, 0, SRCCOPY);
     SelectObject(mdc, old);
     let _ = DeleteDC(mdc);
 }
@@ -90,7 +90,7 @@ pub(super) unsafe fn draw_ver_pill(hwnd: HWND, d: &DRAWITEMSTRUCT) {
     let icon_px = s(hwnd, ICON);
     let gap = s(hwnd, 7);
     let ver = version_label();
-    SelectObject(hdc, gui_font_for(hwnd));
+    SelectObject(hdc, gui_font_for(hwnd).into());
     let tw = measure(hdc, &ver);
     let group = icon_px + gap + tw;
     let gx = rc.left + center_offset(rc.right - rc.left, group);
@@ -134,7 +134,7 @@ unsafe fn draw_spinner(hwnd: HWND, hdc: HDC, x: i32, y: i32, dotd: i32, angle: i
     if pen.is_invalid() {
         return;
     }
-    let old = SelectObject(hdc, pen);
+    let old = SelectObject(hdc, pen.into());
     let (cx, cy) = (x + dotd / 2, y + dotd / 2);
     let r = (dotd / 2) as f32;
     let a0 = (angle as f32).to_radians();
@@ -147,7 +147,7 @@ unsafe fn draw_spinner(hwnd: HWND, hdc: HDC, x: i32, y: i32, dotd: i32, angle: i
     let ey = cy - (r * a1.sin()) as i32;
     let _ = GdiArc(hdc, x, y, x + dotd, y + dotd, sx, sy, ex, ey);
     SelectObject(hdc, old);
-    let _ = DeleteObject(pen);
+    let _ = DeleteObject(pen.into());
 }
 
 pub(super) unsafe fn draw_status_pill(hwnd: HWND, d: &DRAWITEMSTRUCT) {
@@ -161,7 +161,7 @@ pub(super) unsafe fn draw_status_pill(hwnd: HWND, d: &DRAWITEMSTRUCT) {
     let checking = !st.is_null() && matches!((*st).status, Status::Checking | Status::Updating);
     let dotd = s(hwnd, 10);
     let gap = s(hwnd, 8);
-    SelectObject(hdc, gui_font_for(hwnd));
+    SelectObject(hdc, gui_font_for(hwnd).into());
     let tw = measure(hdc, &text);
     let group = dotd + gap + tw;
     let gx = rc.left + center_offset(rc.right - rc.left, group);

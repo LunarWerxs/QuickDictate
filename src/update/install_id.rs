@@ -28,7 +28,7 @@ pub(crate) fn new_install_id() -> Option<String> {
     let mut b = [0u8; 16];
     let status = unsafe {
         BCryptGenRandom(
-            BCRYPT_ALG_HANDLE::default(),
+            Some(BCRYPT_ALG_HANDLE::default()),
             &mut b,
             BCRYPT_USE_SYSTEM_PREFERRED_RNG,
         )

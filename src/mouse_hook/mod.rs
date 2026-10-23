@@ -234,7 +234,7 @@ pub fn ensure_installed() -> bool {
             return false;
         }
     };
-    match unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), hmod, 0) } {
+    match unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), Some(hmod), 0) } {
         Ok(h) => {
             let old = HOOK.swap(h.0 as isize, Ordering::AcqRel);
             if old == 0 {

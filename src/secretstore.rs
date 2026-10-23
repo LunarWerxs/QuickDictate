@@ -53,7 +53,7 @@ pub fn dpapi(encrypt: bool, data: &[u8]) -> Option<Vec<u8>> {
             return None;
         }
         let bytes = std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec();
-        let _ = LocalFree(HLOCAL(out.pbData as *mut core::ffi::c_void));
+        let _ = LocalFree(Some(HLOCAL(out.pbData as *mut core::ffi::c_void)));
         Some(bytes)
     }
 }

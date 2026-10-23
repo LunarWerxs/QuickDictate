@@ -66,16 +66,10 @@ impl SettingsApp {
         }
         if self.shot_ready(&mode) && !self.shot_requested {
             self.shot_requested = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
-        }
-        let image = ctx.input(|i| {
-            i.raw.events.iter().find_map(|e| match e {
-                egui::Event::Screenshot { image, .. } => Some(image.clone()),
-                _ => None,
-            })
-        });
-        if let Some(img) = image {
-            save_shot(&img, &path);
+            // egui 0.37 hands the frame to a callback instead of an input event.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(
+                egui::ScreenshotCallback::new(move |img| save_shot(&img, &path)),
+            ));
         }
         ctx.request_repaint(); // keep frames flowing while the hook is armed
     }

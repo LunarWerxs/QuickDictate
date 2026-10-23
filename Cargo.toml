@@ -95,7 +95,7 @@ arc-swap = "1"
 # PNG decode/resize for the About box artwork (LunarWerx wordmark, GitHub mark).
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 # Settings window (tray → "Settings…"). glow backend keeps it lean-ish.
-eframe = { version = "0.36", default-features = false, features = [
+eframe = { version = "0.37", default-features = false, features = [
     "default_fonts",
     "glow",
 ] }
@@ -120,13 +120,13 @@ reqwest = { version = "0.13", default-features = false, features = [
 # Optional local-STT packs are downloaded at runtime, never embedded in this
 # crate. These small helpers verify/extract the pinned native/model artifacts
 # and load the native C ABI only after a user selects Local.
-sha2 = "0.11.0"
+sha2 = "0.11.1"
 flate2 = "1"
 tar = "0.4"
 libloading = "0.9.0"
 # Decodes the audio files the MCP `transcribe_file` tool accepts (wav, mp3,
 # m4a/aac, flac, ogg). Decode only: no encoders, no extra formats.
-symphonia = { version = "0.5", default-features = false, features = [
+symphonia = { version = "0.6", default-features = false, features = [
     "wav",
     "pcm",
     "mp3",
@@ -142,7 +142,7 @@ symphonia = { version = "0.5", default-features = false, features = [
 ed25519-dalek = { version = "3", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = [
+windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",
@@ -169,6 +169,6 @@ windows = { version = "0.58", features = [
     "Win32_UI_Controls",
     "Win32_UI_HiDpi",
 ] }
-tray-icon = "0.25.0"
+tray-icon = "0.26.1"
 # HKCU Run-key management for the run_at_startup setting.
 windows-registry = "0.100"

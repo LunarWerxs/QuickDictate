@@ -23,7 +23,7 @@ use super::*;
 /// the mechanism that notices `WM_QUIT` and starts shutdown.
 pub(super) fn pump_win32_messages(app: &App) {
     let mut msg = MSG::default();
-    while unsafe { PeekMessageW(&mut msg, HWND::default(), 0, 0, PM_REMOVE).as_bool() } {
+    while unsafe { PeekMessageW(&mut msg, Some(HWND::default()), 0, 0, PM_REMOVE).as_bool() } {
         unsafe {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);

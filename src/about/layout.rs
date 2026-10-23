@@ -53,8 +53,8 @@ pub(super) unsafe fn build_about(hwnd: HWND) {
     SendMessageW(
         title,
         WM_SETFONT,
-        WPARAM(gui_font_sized(hwnd, 26, 700).0 as usize),
-        LPARAM(1),
+        Some(WPARAM(gui_font_sized(hwnd, 26, 700).0 as usize)),
+        Some(LPARAM(1)),
     );
     ctl(
         hwnd,

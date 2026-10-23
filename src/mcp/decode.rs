@@ -6,13 +6,13 @@
 use std::fs::File;
 use std::path::Path;
 
-use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
+use symphonia::core::codecs::CodecParameters;
 use symphonia::core::errors::Error as SymError;
-use symphonia::core::formats::FormatOptions;
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::{FormatOptions, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
 
 pub const TARGET_RATE: u32 = 16_000;
 
@@ -45,34 +45,35 @@ pub fn decode_file(path: &Path) -> Result<Decoded, String> {
     let stream = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
     hint.with_extension(&ext);
-    let probed = symphonia::default::get_probe()
-        .format(
+    let mut format = symphonia::default::get_probe()
+        .probe(
             &hint,
             stream,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
+            FormatOptions::default(),
+            MetadataOptions::default(),
         )
         .map_err(|e| format!("could not read the audio container: {e}"))?;
-    let mut format = probed.format;
-    let track = format
-        .tracks()
-        .iter()
-        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
-        .ok_or("the file has no decodable audio track")?;
-    let track_id = track.id;
-    let source_rate = track
-        .codec_params
+    let (track_id, params) = {
+        let track = format
+            .default_track(TrackType::Audio)
+            .ok_or("the file has no decodable audio track")?;
+        let Some(CodecParameters::Audio(params)) = track.codec_params.as_ref() else {
+            return Err("the audio track has no codec parameters".into());
+        };
+        (track.id, params.clone())
+    };
+    let source_rate = params
         .sample_rate
         .ok_or("the audio track does not state its sample rate")?;
-    let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &DecoderOptions::default())
+    let mut decoder: Box<dyn AudioDecoder> = symphonia::default::get_codecs()
+        .make_audio_decoder(&params, &AudioDecoderOptions::default())
         .map_err(|e| format!("no decoder for this audio codec: {e}"))?;
 
     let mut resampler = Resampler::new(source_rate);
     loop {
         let packet = match format.next_packet() {
-            Ok(packet) => packet,
-            Err(SymError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Ok(Some(packet)) => packet,
+            Ok(None) => break,
             Err(SymError::ResetRequired) => {
                 return Err(
                     "the audio stream changed format mid-file, which is not supported".into(),
@@ -80,7 +81,7 @@ pub fn decode_file(path: &Path) -> Result<Decoded, String> {
             }
             Err(e) => return Err(format!("the audio is damaged or unreadable: {e}")),
         };
-        if packet.track_id() != track_id {
+        if packet.track_id != track_id {
             continue;
         }
         let decoded = match decoder.decode(&packet) {
@@ -88,11 +89,10 @@ pub fn decode_file(path: &Path) -> Result<Decoded, String> {
             Err(SymError::DecodeError(_)) => continue,
             Err(e) => return Err(format!("could not decode the audio: {e}")),
         };
-        let spec = *decoded.spec();
-        let channels = spec.channels.count().max(1);
-        let mut buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
-        buf.copy_interleaved_ref(decoded);
-        for frame in buf.samples().chunks_exact(channels) {
+        let channels = decoded.spec().channels().count().max(1);
+        let mut samples: Vec<f32> = Vec::new();
+        decoded.copy_to_vec_interleaved(&mut samples);
+        for frame in samples.chunks_exact(channels) {
             let mono = frame.iter().sum::<f32>() / channels as f32;
             resampler.push(mono);
         }

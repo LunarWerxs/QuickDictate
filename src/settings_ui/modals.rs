@@ -216,6 +216,10 @@ impl super::SettingsApp {
     /// Centered modal card (native `egui::Modal` — handles the dim backdrop,
     /// centering, and Escape/backdrop-to-close). Returns true when the user
     /// dismissed it via backdrop/Escape so the caller can treat that as Cancel.
+    // `Id::new` is deprecated in egui 0.37, but this modal's id has to stay the
+    // same hash every frame (its open state is keyed on it), and `Id::unique`
+    // would change it each frame.
+    #[allow(deprecated)]
     pub(crate) fn modal_frame(
         ctx: &egui::Context,
         title: &str,
