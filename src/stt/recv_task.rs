@@ -413,9 +413,11 @@ fn handle_committed_event(
 
     // Hybrid paste flow:
     //   before release              -> HOLD (accumulate)
-    //   after release               -> LIVE (paste each chunk)
+    //   after release               -> HOLD too, so the press is ONE paste
+    //                                  (finalize flushes once recv has drained
+    //                                  or hit the last-words cap)
     //   delay_until_release = false -> LIVE throughout
-    if state.delay_until_release && !released {
+    if commit_is_held(state.delay_until_release) {
         hold_commit(state, final_text);
     } else {
         log_transcript(
@@ -426,6 +428,14 @@ fn handle_committed_event(
         );
         deliver_transcript(&state.recv_app.transcript_tx, final_text);
     }
+}
+
+/// Whether a kept commit is held for the single end-of-press paste. With
+/// delayed output the hold goes on after release too: the last words of a long
+/// press arrive a moment after it, and pasting them on their own is a second
+/// paste (a second history entry, a second clipboard write).
+pub(super) fn commit_is_held(delay_until_release: bool) -> bool {
+    delay_until_release
 }
 
 /// Log recognized text: the text itself only when the user opted into

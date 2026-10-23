@@ -339,3 +339,37 @@ async fn providers_without_recovery_never_reconnect() {
     let sent = finish(h).await;
     assert_eq!(sent.chunks, 120);
 }
+
+/// The session-190 shape with made-up text: many chunks held, the hotkey
+/// released, and one more commit arriving about half a second later. Release
+/// must paste nothing under delayed output, the late commit must join the held
+/// text, and the single end-of-press flush then carries everything.
+#[test]
+fn a_late_commit_after_release_joins_the_one_held_paste() {
+    use super::finalize::release_flush_chunks;
+    use super::recv_task::{commit_is_held, SessionAccumulators};
+
+    let acc = SessionAccumulators::new();
+    for i in 0..18 {
+        acc.chunks_buf.lock().push(format!("Held sentence {i}."));
+    }
+
+    assert!(
+        release_flush_chunks(true, &acc).is_empty(),
+        "release must not paste while the provider's last words are pending"
+    );
+    assert_eq!(acc.chunks_buf.lock().len(), 18, "still held after release");
+
+    // ~0.5 s after release the server's last sentence commits.
+    assert!(commit_is_held(true), "a post-release commit is held too");
+    acc.chunks_buf.lock().push("The late last sentence.".into());
+
+    let one_paste = std::mem::take(&mut *acc.chunks_buf.lock()).join(" ");
+    assert!(one_paste.starts_with("Held sentence 0."));
+    assert!(one_paste.ends_with("The late last sentence."));
+
+    // Live output (delay off) is unchanged: release pastes what is buffered.
+    acc.chunks_buf.lock().push("Buffered.".into());
+    assert_eq!(release_flush_chunks(false, &acc), vec!["Buffered.".to_string()]);
+    assert!(!commit_is_held(false));
+}

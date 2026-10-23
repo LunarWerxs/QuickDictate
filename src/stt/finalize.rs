@@ -159,9 +159,24 @@ pub(super) fn enter_release_phase(
     // chunks the server sends from this point on.
     release_pending.store(true, Ordering::Release);
 
-    // Then flush anything held during the session so release feels snappy.
-    let release_flush: Vec<String> = std::mem::take(&mut *ctx.acc.chunks_buf.lock());
+    // Held text stays held: the provider's last words are still on their way,
+    // and pasting now would make one press two pastes (and two history
+    // entries). `promote_tail_transcript` flushes it all once recv has drained
+    // or hit the last-words cap. Without delayed output nothing is held.
+    let release_flush = release_flush_chunks(ctx.delay_until_release, &ctx.acc);
     flush_held(app, epoch, &release_flush, "release flush");
+}
+
+/// What the hotkey release itself pastes: nothing under delayed output (all of
+/// it waits for [`promote_tail_transcript`]), otherwise whatever is buffered.
+pub(super) fn release_flush_chunks(
+    delay_until_release: bool,
+    acc: &SessionAccumulators,
+) -> Vec<String> {
+    if delay_until_release {
+        return Vec::new();
+    }
+    std::mem::take(&mut *acc.chunks_buf.lock())
 }
 
 /// Paste held commit chunks as one transcript, unless the user discarded the

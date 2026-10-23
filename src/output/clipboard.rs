@@ -22,12 +22,60 @@ use super::*;
 // Path B: Clipboard paste (longer text — appears all at once)
 // ---------------------------------------------------------------------------
 
+/// How long a target app gets to read the clipboard for a Ctrl+V we queued
+/// before the next paste may overwrite it. A busy Electron box can take
+/// several hundred ms to act on a queued Ctrl+V.
+const CLIPBOARD_READ_GAP: Duration = Duration::from_millis(600);
+
+/// When the last clipboard paste queued its Ctrl+V.
+static LAST_CTRL_V: parking_lot::Mutex<Option<std::time::Instant>> =
+    parking_lot::Mutex::new(None);
+
+/// Sleep out whatever is left of [`CLIPBOARD_READ_GAP`] since the previous
+/// paste's Ctrl+V, so a second paste can never replace text the target has not
+/// read yet.
+fn wait_for_previous_paste_read() {
+    let since_last = (*LAST_CTRL_V.lock()).map(|t| t.elapsed());
+    let wait = read_gap_left(since_last);
+    if !wait.is_zero() {
+        std::thread::sleep(wait);
+    }
+}
+
+/// How much of [`CLIPBOARD_READ_GAP`] is left, `since_last` after the previous
+/// paste's Ctrl+V (`None`: there was no previous paste).
+fn read_gap_left(since_last: Option<Duration>) -> Duration {
+    since_last.map_or(Duration::ZERO, |d| CLIPBOARD_READ_GAP.saturating_sub(d))
+}
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+
+    #[test]
+    fn a_paste_right_after_another_waits_out_the_read_gap() {
+        assert_eq!(read_gap_left(None), Duration::ZERO);
+        assert_eq!(
+            read_gap_left(Some(Duration::from_millis(481))),
+            CLIPBOARD_READ_GAP - Duration::from_millis(481)
+        );
+        assert_eq!(read_gap_left(Some(CLIPBOARD_READ_GAP)), Duration::ZERO);
+    }
+}
+
+fn send_paste_ctrl_v() -> Result<()> {
+    let sent = send_ctrl_v();
+    *LAST_CTRL_V.lock() = Some(std::time::Instant::now());
+    sent
+}
+
 pub(super) fn paste_via_clipboard(text: &str, restore_delay_ms: u64) -> Result<()> {
+    wait_for_previous_paste_read();
     // `clipboard_restore_delay_ms = 0` means "don't restore": set our text,
     // paste, and leave the transcription on the clipboard.
     if restore_delay_ms == 0 {
         set_clipboard_unicode(text, ClipboardPrivacy::Private)?;
-        return send_ctrl_v();
+        return send_paste_ctrl_v();
     }
 
     // Snapshot everything the clipboard currently holds, then hand ownership
@@ -52,7 +100,7 @@ pub(super) fn paste_via_clipboard(text: &str, restore_delay_ms: u64) -> Result<(
     // sequence number bumps on writes only; clipboard-history listeners
     // merely *read* and don't affect it.)
     guard.expect_seq = Some(unsafe { GetClipboardSequenceNumber() });
-    send_ctrl_v()?;
+    send_paste_ctrl_v()?;
     // Wait for the target app to consume the paste before restoring.
     // SendInput only *queues* the Ctrl+V -- the target reads the clipboard
     // whenever it gets around to processing the keystroke, and a busy

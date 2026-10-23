@@ -44,6 +44,9 @@ pub struct TranscriptHistory {
     version: u64,
     /// The `id` the next pushed entry gets. Never reused within a run.
     next_id: u64,
+    /// `(dictation epoch, entry id)` of the entry the latest press created, so
+    /// text that arrives later in the same press extends it.
+    last_press: Option<(u64, u64)>,
 }
 
 impl TranscriptHistory {
@@ -52,6 +55,7 @@ impl TranscriptHistory {
             entries: VecDeque::new(),
             version: 0,
             next_id: 1,
+            last_press: None,
         }
     }
 
@@ -92,6 +96,33 @@ impl TranscriptHistory {
         });
         self.entries.truncate(HISTORY_CAP);
         self.version = self.version.wrapping_add(1);
+    }
+
+    /// Record a paste made during dictation `epoch`. One press is one entry:
+    /// when the newest entry is still the one this epoch started, the text is
+    /// appended to it (a late commit after the release flush), so replay and
+    /// the tray give the whole press instead of its last fragment.
+    pub fn push_for_press(&mut self, epoch: u64, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        let newest_id = self.entries.front().map(|e| e.id);
+        if let (Some((press, id)), Some(newest)) = (self.last_press, newest_id) {
+            if press == epoch && id == newest {
+                if let Some(entry) = self.entries.front_mut() {
+                    let glue = !entry.text.ends_with(char::is_whitespace)
+                        && !text.starts_with(char::is_whitespace);
+                    if glue {
+                        entry.text.push(' ');
+                    }
+                    entry.text.push_str(&text);
+                    self.version = self.version.wrapping_add(1);
+                    return;
+                }
+            }
+        }
+        self.push(text);
+        self.last_press = self.entries.front().map(|e| (epoch, e.id));
     }
 
     /// Current version counter; changes every time `push` adds an entry.
@@ -347,11 +378,11 @@ impl App {
     }
 
     /// Add a dictation to the history and write the list to disk (when
-    /// `persist_history` is on). The write is synchronous and small -- at most
-    /// 50 short strings -- so the entry is durable before this returns, which
-    /// is what makes a self-update's relaunch safe to run right after a paste.
-    pub fn record_history(&self, text: String) {
-        self.history.lock().push(text);
+    /// `persist_history` is on), for a paste made during dictation `epoch`:
+    /// text arriving late in the same press extends that press's entry
+    /// instead of adding a second one.
+    pub fn record_press_history(&self, epoch: u64, text: String) {
+        self.history.lock().push_for_press(epoch, text);
         self.sync_history_file();
     }
 
@@ -514,6 +545,20 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_late_paste_of_the_same_press_extends_its_entry() {
+        let mut h = TranscriptHistory::new();
+        h.push_for_press(7, "The first part of the press.".into());
+        h.push_for_press(7, "And its late tail.".into());
+        assert_eq!(h.snapshot().len(), 1);
+        assert_eq!(
+            h.most_recent().unwrap().text,
+            "The first part of the press. And its late tail."
+        );
+        h.push_for_press(8, "A new press.".into());
+        assert_eq!(h.snapshot().len(), 2);
+    }
 
     #[test]
     fn most_recent_reflects_the_latest_push() {
