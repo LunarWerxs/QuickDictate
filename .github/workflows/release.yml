@@ -164,8 +164,10 @@ jobs:
           Copy-Item -LiteralPath target/release/quickdictate.exe `
             -Destination out/quickdictate.exe
           $hash = (Get-FileHash -LiteralPath out/quickdictate.exe -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  quickdictate.exe" |
-            Set-Content -LiteralPath out/SHA256SUMS.txt -Encoding ascii
+          # LF, not the CRLF Set-Content writes on Windows: `sha256sum -c` on Linux and macOS
+          # reads the CR as part of the file name and reports the download missing.
+          Set-Content -LiteralPath out/SHA256SUMS.txt -Value "$hash  quickdictate.exe`n" `
+            -NoNewline -Encoding ascii
           # Echo the AUTHORITATIVE digest. The validation step earlier printed a sha256 of the
           # binary BEFORE signing (correct for what it checks - PE structure, subsystem, version
           # resources - none of which Authenticode touches), and signing changes the bytes. Without
