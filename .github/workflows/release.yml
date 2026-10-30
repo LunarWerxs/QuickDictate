@@ -1,0 +1,234 @@
+name: Release
+
+# QuickDictate is a genuinely portable, single Windows executable. Its ~12 MB direct `.exe`
+# is both the obvious human download and the self-updater payload. A ZIP saves about 6 MB, but
+# keeping one canonical asset avoids an archive extractor in the running dictation app and
+# preserves updates from every already-published build. GitHub supplies the mandatory SHA-256
+# digest the updater verifies.
+
+# The code lives in the private LunarWerxs/QuickDictate-private; this workflow stays in the
+# public storefront repo, because the Entra federated credential trusts exactly
+# repo:LunarWerxs/QuickDictate:environment:release and Windows minutes are free here.
+# To release: push tag vX.Y.Z to the private repo, then run
+#   gh workflow run release.yml -R LunarWerxs/QuickDictate -f version=X.Y.Z
+# The job builds that private tag and publishes the release, creating the public tag on
+# this repo's main (no code in it), so the release's "Source code" archives stay empty.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, without the v (the private repo must already have tag vX.Y.Z)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  # Mints the short-lived OIDC token that authenticates this run to Azure Artifact
+  # Signing as `lunawerx-artifact-signing`. No client secret is stored anywhere.
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    timeout-minutes: 60
+    name: validate · build · smoke · publish
+    runs-on: windows-latest
+    # The federated credential in Entra trusts exactly one subject:
+    # repo:LunarWerxs/QuickDictate:environment:release. Without this line the token
+    # carries a different subject and Azure refuses it.
+    environment: release
+    env:
+      RELEASE_TAG: v${{ inputs.version }}
+    steps:
+      # SOURCE_DEPLOY_KEY is a read-only deploy key on the private repo. Only a manual
+      # dispatch runs this job, never a fork's pull request, so the key stays here.
+      - name: Check out the private source at the release tag
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: LunarWerxs/QuickDictate-private
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          cache-on-failure: true
+
+      - name: Validate tag, version, and changelog
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 |
+            ConvertFrom-Json).packages[0].version
+          $tagVersion = $env:RELEASE_TAG.TrimStart('v')
+          if ($version -cne $tagVersion) {
+            throw "tag $env:RELEASE_TAG does not match Cargo.toml version $version"
+          }
+          ./scripts/release_notes.ps1 -Version $version -OutPath RELEASE_NOTES.md
+
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked --no-fail-fast
+      - name: Build release executable
+        run: cargo build --release --locked
+
+      - name: Validate the exact public executable
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 |
+            ConvertFrom-Json).packages[0].version
+          ./scripts/check_release_binary.ps1 `
+            -ExePath target/release/quickdictate.exe `
+            -ExpectedVersion $version
+
+      # Signing happens BEFORE the asset is staged and hashed: an Authenticode
+      # signature changes the file's bytes, so a digest taken first would never match
+      # what users download, and the self-updater verifies that digest.
+      # These two GUIDs are public identifiers of the `lunawerx-artifact-signing` app,
+      # not credentials. Nothing can be done with them: the federated credential in
+      # Entra only accepts a token whose subject is exactly
+      # repo:LunarWerxs/QuickDictate:environment:release, which only GitHub can mint
+      # for this repository. No subscription context is needed to reach the signing
+      # endpoint, so none is published here.
+      - name: Azure login (OIDC, no stored secret)
+        uses: azure/login@7ddb5af1ef8758cf1353cf3b42f940aee27ba21c # v3.0.2
+        with:
+          client-id: 71d21f76-5d65-40b3-921b-b97390cafa85
+          tenant-id: fdd11984-71bb-4c74-aca1-1d777f195b0f
+          allow-no-subscriptions: true
+
+      - name: Sign the executable (Azure Artifact Signing)
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: https://eus.codesigning.azure.net/
+          signing-account-name: lunawerxsigning
+          certificate-profile-name: lunawerx-public-trust
+          files: ${{ github.workspace }}\target\release\quickdictate.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          exclude-azure-cli-credential: false
+          exclude-environment-credential: true
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-shared-token-cache-credential: true
+          exclude-visual-studio-credential: true
+          exclude-visual-studio-code-credential: true
+          exclude-azure-powershell-credential: true
+          exclude-azure-developer-cli-credential: true
+          exclude-interactive-browser-credential: true
+
+      - name: Prove the signature is real
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature -LiteralPath target/release/quickdictate.exe
+          if ($sig.Status -ne 'Valid') {
+            throw "signature status is $($sig.Status), expected Valid"
+          }
+          $subject = $sig.SignerCertificate.Subject
+          if ($subject -notmatch 'LUNARWERX LLC') {
+            throw "signed by an unexpected certificate: $subject"
+          }
+          # Artifact Signing leaves live THREE DAYS. Status stays 'Valid' for that whole window
+          # with or without a countersignature, so Status alone certifies exactly the artifact
+          # that will be untrusted by the time anyone downloads it - green CI, published release,
+          # and SmartScreen back ~72 hours later. The countersignature is the only real proof.
+          if ($null -eq $sig.TimeStamperCertificate) {
+            throw 'signature has no RFC3161 countersignature - it stops validating in 3 days; check the signtool timestamp warning in the signing step above'
+          }
+          # And if the profile is ever moved to a long-lived certificate, the assertion above
+          # quietly stops meaning anything. Loose on purpose: a policy tripwire, not a flaky red.
+          $lifetimeHours = [math]::Round(
+            ($sig.SignerCertificate.NotAfter - $sig.SignerCertificate.NotBefore).TotalHours)
+          if ($lifetimeHours -gt 240) {
+            throw "signing leaf lifetime is ${lifetimeHours}h, not a short-lived Artifact Signing certificate - re-check what this gate is asserting"
+          }
+          Write-Host "signed by $subject"
+          Write-Host "timestamped by $($sig.TimeStamperCertificate.Subject) (leaf lifetime ${lifetimeHours}h)"
+
+      - name: Stage release assets
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path out -Force | Out-Null
+          Copy-Item -LiteralPath target/release/quickdictate.exe `
+            -Destination out/quickdictate.exe
+          $hash = (Get-FileHash -LiteralPath out/quickdictate.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  quickdictate.exe" |
+            Set-Content -LiteralPath out/SHA256SUMS.txt -Encoding ascii
+          # Echo the AUTHORITATIVE digest. The validation step earlier printed a sha256 of the
+          # binary BEFORE signing (correct for what it checks - PE structure, subsystem, version
+          # resources - none of which Authenticode touches), and signing changes the bytes. Without
+          # this line the log carries exactly one digest, and it is the one that matches neither
+          # SHA256SUMS.txt nor the GitHub asset digest the self-updater compares - a trap laid
+          # precisely for whoever is debugging an updater "sha256 mismatch".
+          Write-Host "[release-asset] published sha256:$hash"
+
+      # The public repo's tag ruleset lets only a deploy key create a tag, so a tag pushed by
+      # hand from an old clone of the code (which would publish the code) is refused.
+      # STOREFRONT_TAG_KEY is that write key, held only by this `release` environment. The
+      # tag points at the storefront's main, which holds no code.
+      - name: Tag the storefront's main for this release
+        shell: bash
+        env:
+          TAG_KEY: ${{ secrets.STOREFRONT_TAG_KEY }}
+        run: |
+          remote="git@github.com:${{ github.repository }}.git"
+          key="$RUNNER_TEMP/storefront_tag_key"
+          printf '%s\n' "$TAG_KEY" > "$key"
+          chmod 600 "$key"
+          export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          git init -q "$RUNNER_TEMP/storefront"
+          cd "$RUNNER_TEMP/storefront"
+          existing=$(git ls-remote "$remote" "refs/tags/$RELEASE_TAG" | cut -f1)
+          if [ "$existing" = "${{ github.sha }}" ]; then
+            echo "$RELEASE_TAG already tags ${{ github.sha }}"
+          else
+            git fetch -q --depth 1 "https://github.com/${{ github.repository }}.git" "${{ github.sha }}"
+            git push -q "$remote" "FETCH_HEAD:refs/tags/$RELEASE_TAG"
+            echo "tagged ${{ github.sha }} as $RELEASE_TAG"
+          fi
+          rm -f "$key"
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: out/*
+          body_path: RELEASE_NOTES.md
+          fail_on_unmatched_files: true
+
+      # The website (QuickDictate/quickdictate.github.io) rewrites the version label and
+      # JSON-LD that crawlers and no-JS visitors read from the latest release, via its
+      # sync-version workflow: daily at 06:40 UTC, or at once on this repository_dispatch.
+      # Poking it here puts the new version on the page within minutes of the release
+      # instead of up to a day later. It needs a token that can write to the site repo,
+      # stored here as the SITE_DISPATCH_TOKEN secret; without one this step does nothing
+      # and the daily schedule still catches up. It can never fail the release: the
+      # assets are already public by the time it runs.
+      - name: Tell the website a release is out
+        continue-on-error: true
+        shell: pwsh
+        env:
+          SITE_DISPATCH_TOKEN: ${{ secrets.SITE_DISPATCH_TOKEN }}
+        run: |
+          if (-not $env:SITE_DISPATCH_TOKEN) {
+            Write-Host 'No SITE_DISPATCH_TOKEN secret; the website picks the release up on its daily sync.'
+            exit 0
+          }
+          Invoke-RestMethod -Method Post `
+            -Uri 'https://api.github.com/repos/QuickDictate/quickdictate.github.io/dispatches' `
+            -Headers @{ Authorization = "Bearer $env:SITE_DISPATCH_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' } `
+            -ContentType 'application/json' `
+            -Body '{"event_type":"release-published"}'
+          Write-Host 'Website sync requested.'

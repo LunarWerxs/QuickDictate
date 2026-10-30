@@ -1,0 +1,355 @@
+# Provider Setup Guide
+
+QuickDictate supports bring-your-own-key cloud speech-to-text (STT), or an
+optional local model that keeps audio offline. This guide covers all seven
+providers.
+
+> **As of 2026-07.** Provider endpoints, consoles, model names, and pricing
+> pages can and do change after this was written, if a link or field name
+> below doesn't match what you see, check the provider's current
+> documentation.
+
+## Before you start
+
+1. Copy `settings.example.json` to `settings.json` if you haven't already.
+   `settings.json` is gitignored, your keys never get committed.
+2. Pick a provider and set `"stt_provider"` to its exact value (listed in each
+   section below).
+3. Add one or more keys to that provider's key array (also a JSON array of
+   strings, you can list multiple keys and QuickDictate will round-robin
+   across them with per-key health tracking and cooldown backoff, handy for
+   e.g. a personal key plus a work key).
+4. Save and restart QuickDictate for the change to take effect.
+
+Only the key array for your active cloud `stt_provider` needs to be filled in;
+the others can stay empty. The Local provider needs no key.
+
+---
+
+## ElevenLabs
+
+- **`stt_provider` value:** `"elevenlabs"`
+- **Key array:** `"elevenlabs_keys"`
+- **Engine:** ElevenLabs Scribe v2 realtime (streaming)
+
+**Getting a key:**
+1. Go to <https://elevenlabs.io/app/settings/api-keys>.
+2. Sign up or log in.
+3. Create an API key on that page and copy it.
+4. Paste it into `elevenlabs_keys` in `settings.json`, e.g. `["your-key-here"]`.
+
+**Notes:** Streaming provider, you'll see words appear live as you speak.
+
+**Pricing:** Check ElevenLabs' official pricing page for current rates; prices
+and included quotas drift over time, so don't rely on cached numbers.
+
+---
+
+## Deepgram
+
+- **`stt_provider` value:** `"deepgram"`
+- **Key array:** `"deepgram_keys"`
+- **Engine:** Deepgram nova-3 (streaming)
+
+**Getting a key:**
+1. Go to <https://console.deepgram.com/signup>.
+2. Create an account (Deepgram typically offers free credit on signup, check
+   the console for current terms).
+3. In the Deepgram console, create an API key.
+4. Paste it into `deepgram_keys` in `settings.json`.
+
+**Notes:** Streaming provider, live word count as you speak.
+
+**Pricing:** Check Deepgram's official pricing page for current rates; figures
+change over time.
+
+---
+
+## OpenAI
+
+- **`stt_provider` value:** `"openai"`
+- **Key array:** `"openai_keys"`
+- **Engine:** `gpt-live-transcribe` via OpenAI's GA Realtime API, streaming at 24 kHz
+
+**Getting a key:**
+1. Go to <https://platform.openai.com/api-keys>.
+2. Sign up or log in to your OpenAI platform account.
+3. Create a new secret key and copy it (you won't be able to view it again
+   later).
+4. Paste it into `openai_keys` in `settings.json`.
+
+**Notes:** Uses the general-availability Realtime API (not a beta/preview
+endpoint), streaming audio at 24 kHz. Streaming provider, live word count.
+
+The default became `gpt-live-transcribe` on 2026-10-02. Measured on four
+16-20 second clips through QuickDictate's own request: the final text arrives
+about 0.55 s after you release the key instead of 1.13 s with
+`gpt-4o-transcribe`, words appear while you are still talking (the older
+models send nothing until release), and it made no word errors (0.9% before).
+It runs at its `low` delay setting. `stt_model` can still pick
+`gpt-4o-transcribe`, `gpt-transcribe` or `gpt-4o-mini-transcribe`; those show
+the spinner until the text arrives.
+
+**Pricing:** Check OpenAI's official pricing page for current Realtime API
+rates; pricing drifts and varies by model.
+
+---
+
+## AssemblyAI
+
+- **`stt_provider` value:** `"assemblyai"`
+- **Key array:** `"assemblyai_keys"`
+- **Engine:** AssemblyAI Universal-Streaming (v3), streaming, English
+
+**Getting a key:**
+1. Go to <https://www.assemblyai.com/dashboard/signup>.
+2. Sign up or log in.
+3. Copy your API key from the dashboard.
+4. Paste it into `assemblyai_keys` in `settings.json`.
+
+**Notes:** Streaming provider (live word count). Universal-Streaming v3 in
+QuickDictate is English-only.
+
+**Pricing:** Check AssemblyAI's official pricing page for current rates;
+figures drift.
+
+---
+
+## DashScope (Alibaba Cloud)
+
+- **`stt_provider` value:** `"dashscope"`
+- **Key array:** `"dashscope_keys"`
+- **Engine:** Alibaba Cloud Qwen-Audio 3.1 (`qwen-audio-3.1-asr-flash-streaming`), streaming
+
+The default moved from `paraformer-realtime-v2` on 2026-10-02: Alibaba calls
+Paraformer an older-generation model to migrate off, and on four 16-20 second
+clips Qwen-Audio 3.1 made 1.5% word errors against Paraformer's 3.6%, finishing
+about as fast (0.62 s vs 0.58 s after release). It covers 30 languages
+(including every one Paraformer did) and still detects the language when you
+leave it on the default. `stt_model: "paraformer-realtime-v2"` brings the old
+model back.
+
+**Getting a key:**
+1. Go to <https://dashscope.console.aliyun.com/apiKey>.
+2. Sign up or log in to Alibaba Cloud and open the DashScope console.
+3. Create an API key and copy it.
+4. Paste it into `dashscope_keys` in `settings.json`.
+
+**Notes, region matters:** DashScope keys are region-locked.
+- By default QuickDictate connects to the **International** (Singapore)
+  host (`"dashscope_intl": true`).
+- If your key was issued for the **mainland-China** region, set
+  `"dashscope_intl": false` in `settings.json`, or untick
+  **International account** on the DashScope card in Settings.
+- A key from the wrong region will simply fail to connect, if DashScope
+  doesn't work, this mismatch is the first thing to check.
+
+Streaming provider, live word count.
+
+**Pricing:** Check Alibaba Cloud DashScope's official pricing page for current
+rates; figures drift and can differ between the mainland and international
+offerings.
+
+---
+
+## Google Cloud Speech-to-Text
+
+- **`stt_provider` value:** `"google"`
+- **Key array:** `"google_keys"`
+- **Engine:** Google Cloud Speech-to-Text, **batch** v1 (`speech:recognize` REST endpoint, plain API key via `?key=`)
+
+**This provider is different from the other five:** it uses batch recognition,
+not a live stream. There is **no live word count while you're speaking**.
+QuickDictate uploads completed 55-second blocks in the background during an
+unusually long dictation so audio memory stays bounded, then sends the final
+partial block when you stop. All results remain withheld until release and
+arrive together, in order.
+
+**Getting a key:**
+1. Go to <https://console.cloud.google.com/apis/credentials>.
+2. Create or select a Google Cloud project.
+3. Enable the **"Cloud Speech-to-Text API"** for that project.
+4. Attach a billing account to the project. Google's free tier for this API is
+   typically around 60 minutes/month, but confirm current limits in the
+   console, this is exactly the kind of figure that drifts.
+5. Create an API key under **Credentials** and copy it.
+6. Paste it into `google_keys` in `settings.json`.
+
+**Model note:** QuickDictate talks to the v1 endpoint and only supports v1
+models (`latest_long` / `default`). Newer v2/Chirp models reject plain API-key
+auth, so they are out of scope here, don't set `stt_model` to a v2/Chirp
+model name for this provider.
+
+Measured 2026-10-02 on four 16-20 second clips, `latest_long` is the slowest
+and least accurate engine QuickDictate offers (5.9% word errors, text about
+3 s after release; `latest_short` was worse at 7.7%). Chirp 3 is Google's
+newer model, but v1 rejects it ("Incorrect model specified") and v2 refuses API
+keys ("API keys are not supported by this API"), so reaching it means a
+service-account login, which this bring-your-own-key app does not have. See
+[Not built yet](#not-built-yet) for the OpenRouter route.
+
+**Pricing:** Check Google Cloud's official Speech-to-Text pricing page for
+current rates and free-tier limits; both drift over time.
+
+---
+
+## Local (offline)
+
+- **`stt_provider` value:** `"local"`
+- **Key array:** none
+- **Mode:** offline batch; the transcript arrives after hotkey release
+- **Runtime:** pinned `transcribe.cpp` 0.2.4 CPU/Vulkan package (about 17 MB
+  to download)
+
+0.2.4 replaced 0.1.3 on 2026-10-02. It fixes Whisper silently dropping the end
+of a sentence after a pause when a vocabulary prompt is set, frees the GPU
+scratch memory after each run, trims Parakeet's memory use, and no longer
+cuts long outputs short. An installed model is kept: the app fetches only the
+new runtime the first time it starts (or the first time you dictate), then
+removes the old one unless another running copy is still using it.
+
+Choose **Local (offline)** in Settings. Pick any model, click **Install**, wait
+for the verified download, then Save. You can install any or all of the models:
+
+| `local_model` | Model | Download | Intended tradeoff |
+|---|---|---:|---|
+| `cohere-q5` | Cohere Transcribe 03-2026 Q5_K_M | 1.65 GiB | Default; near-lossless accuracy/size balance |
+| `whisper-turbo-q5` | Whisper Large v3 Turbo Q5_K_M | 591 MiB | Broadest language coverage (100 languages) |
+| `parakeet-v3-q5` | NVIDIA Parakeet TDT 0.6B v3 Q5_K_M | 524 MiB | Smallest and fastest; 25 European languages |
+
+Parakeet is the quickest to load and to transcribe: on an RTX 4070 Ti it
+prewarmed in 1.7 s and decoded a short test phrase in 0.12 s, where Cohere took
+5.5 s and 0.31 s. transcribe.cpp's published CPU numbers show the same order
+(Parakeet about 2.5x faster than Cohere and over 10x faster than Whisper Turbo).
+It takes a bare two-letter language code, so QuickDictate sends `en-US` as `en`;
+set **Language** to one of its 25 European languages (Bulgarian, Croatian,
+Czech, Danish, Dutch, English, Estonian, Finnish, French, German, Greek,
+Hungarian, Italian, Latvian, Lithuanian, Maltese, Polish, Portuguese, Romanian,
+Russian, Slovak, Slovenian, Spanish, Swedish, Ukrainian).
+
+The executable contains none of these weights. Downloads go under
+`%LOCALAPPDATA%\QuickDictate\local-stt`; a shared runtime adds roughly 52 MiB
+once. Every artifact is pinned to an immutable upstream revision and verified
+by exact byte count plus SHA-256 before an atomic rename makes it usable.
+Large downloads use up to eight HTTP range workers when the server supports
+them and safely fall back to one stream otherwise. **Cancel** stops an active
+install and immediately discards its `.part` file; files left by a forced exit
+are discarded on the next attempt. The trash button deletes that model's
+directory; the small shared runtime stays available for other models.
+
+When Local is selected, QuickDictate loads and prewarms the selected model in
+the background, then keeps it resident between dictations. This intentionally
+uses RAM/VRAM to avoid repeating model-load and Vulkan-pipeline startup on later
+dictations. It switches automatically when you select another model and unloads
+when you switch away from Local.
+
+It also unloads after a period with no dictation, so that leaving Local selected
+and walking away does not pin gigabytes of weights for the rest of the tray
+app's uptime. **Release model** in Settings controls that period
+(`local_idle_unload_minutes` in settings.json); the default is 10 minutes and
+`0` disables it, keeping the model loaded for as long as QuickDictate runs.
+**Never go to sleep** under Behavior is the same `0` as a single checkbox.
+
+Choose `0` if the machine has the memory to spare. The reload is not free and
+its cost is not paid while you are away: it is paid by the first thing you say
+when you come back, which is exactly when it is least welcome. Across 1,340
+measured dictations, ones arriving within 25 seconds of a reload took a median
+of 2.41s against 0.50s warm, and 73% of every dictation slower than 3 seconds
+had just followed a reload. The cursor indicator uses a spinner instead of
+a live word count because local transcription finishes after release. Decoding
+starts the moment you press stop, while QuickDictate listens for a last word,
+and a dictation of 20 s or more is transcribed while you speak: each finished
+stretch goes to the model at your next pause (or, without one, every 35 s at
+the quietest moment). Release then only waits for the words since your last
+pause, however long you talked: with Parakeet on an RTX 3090 text arrived
+0.25-0.32 s after the key press when you had paused and 0.8 s when you stopped
+mid-sentence, for 11 s to 199 s recordings alike. There is no six-minute
+limit, only a four-hour safety stop.
+A hotkey press during that final step queues the next dictation so the valid
+pending result cannot be superseded and discarded. A queued hold-to-talk start
+is cancelled if you release the key before processing finishes. Vulkan is
+preferred when available; CPU is the automatic fallback. Raw audio passes
+directly from QuickDictate's 16 kHz pipeline to the native runtime-there is no
+temporary WAV file or Python/PyTorch environment.
+
+For Cohere, long recordings are divided at the quietest available boundary
+into clips no longer than 35 seconds before native inference, then reassembled
+in order. This mirrors the model's intended long-form windowing and prevents a
+single several-minute decoder pass from falling into a repeated-phrase loop.
+Whisper and Parakeet keep their native single-pass behavior.
+
+Local packs come from:
+
+- [handy-computer/transcribe.cpp](https://github.com/handy-computer/transcribe.cpp) (MIT)
+- [Cohere Transcribe GGUF](https://huggingface.co/handy-computer/cohere-transcribe-03-2026-gguf) (Apache-2.0 model)
+- [Whisper Large v3 Turbo GGUF](https://huggingface.co/handy-computer/whisper-large-v3-turbo-gguf) (MIT model)
+- [Parakeet TDT 0.6B v3 GGUF](https://huggingface.co/handy-computer/parakeet-tdt-0.6b-v3-gguf) (CC-BY-4.0 model, by NVIDIA)
+
+---
+
+## Choosing a provider
+
+ElevenLabs, Deepgram, OpenAI, AssemblyAI, and DashScope are all **streaming**
+providers: audio goes out over a WebSocket as you talk and you see your words
+appear live, word by word. **Google** is a cloud **batch**
+(bounded HTTPS segments), so you speak, then pause, and the whole transcript
+for that utterance arrives at once with no live word count in between. If you
+want the most immediate, "watch it type as I talk" feel, pick one of the five
+streaming providers; pick Google only if you specifically want Google's
+recognition quality/language coverage and can live without live word-by-word
+feedback. Pick **Local** when privacy/offline use matters most and your machine
+has enough RAM/disk for the selected model; it also returns results on release.
+
+Whichever you choose, remember: your audio and API keys go only to the
+provider you select, never to the QuickDictate maintainer. (The app itself
+reports only the daily update check and, if you opt in, the pseudonymous
+daily usage report, both described in [SECURITY.md](../.github/SECURITY.md).)
+
+## Custom vocabulary support
+
+`custom_vocabulary` (see the [guide](GUIDE.md#settings-reference)) is a list of
+words and phrases sent to the provider so it recognises them correctly the first
+time, rather than repairing them afterwards with `text_replacements`. Every
+provider maps it onto its own parameter, and the limits are theirs, not ours.
+A provider with no biasing knob ignores the list entirely; nothing breaks and
+nothing else changes.
+
+| Provider | Parameter | Limit QuickDictate applies |
+| --- | --- | --- |
+| ElevenLabs | `keyterms` | 50 terms, 20 characters each |
+| Deepgram | `keyterm` | 100 terms, and only on `nova-3`/`flux` models (older models reject the parameter) |
+| AssemblyAI | `keyterms_prompt` | 100 terms (their documented hard limit) |
+| OpenAI | transcription `keywords` (`gpt-live-transcribe`) or `prompt` (older models) | One keyword per term; a term holding `<`, `>` or a line break is dropped because the API rejects the whole session over it. Older models get the terms joined into one prompt |
+| Google | `speechContexts[].phrases` | 5000 phrases |
+| DashScope | not supported | DashScope's realtime models need a vocabulary registered up front through a separate API, so there is no inline term list to send |
+| Local (offline) | Whisper `initial_prompt` | Whisper Large v3 Turbo only: terms are joined into one prompt, kept to whole terms within 200 bytes so that it and the text carried over from the previous window share Whisper's 223-token prompt budget, terms holding special-token text such as `<|en|>` are dropped, and it is re-applied to every 30-second window of a long dictation. Cohere Transcribe and Parakeet have no prompt input and ignore the list |
+
+If a term never sticks no matter what, fall back to `text_replacements`: that
+runs locally on the recognised text and always wins.
+
+---
+
+## Not built yet
+
+Ideas that were checked and parked on purpose (owner decision, 2026-10-02),
+so nobody re-researches them from scratch.
+
+**OpenRouter as a "one key, many models" provider.** OpenRouter's
+`POST https://openrouter.ai/api/v1/audio/transcriptions` takes a plain
+OpenRouter API key and serves about two dozen speech models behind it, among
+them `google/chirp-3` (US$0.016/min, the same as Google direct), Gemini 3.5
+Transcribe, AssemblyAI Universal-3.5 Pro, Deepgram Nova-3, OpenAI
+`gpt-transcribe`, Parakeet and Qwen3-ASR. Audio goes up as base64
+`input_audio` (`data` + `format`, e.g. `wav`) and the text comes back in
+`text`. It would also be the only API-key route to Chirp 3.
+
+Why not now: it is upload-after-release only. There is no live stream, so no
+words while you talk, and every request takes an extra hop, while the
+streaming providers already finish 0.07-0.14 s after release (AssemblyAI,
+ElevenLabs). Good later as an extra for users who want many models on one
+key; it does not make anything faster. Before building it, time Chirp 3 on a
+funded OpenRouter key against the same clips (see `live_test.rs`).
+
+**Text-to-speech (Chirp 3 HD voices).** Not applicable: QuickDictate turns
+speech into text and never speaks.
+

@@ -1,0 +1,90 @@
+# Settings sync (Connections)
+
+QuickDictate can optionally back up and sync your **portable preferences** -
+things like mode, language, hotkeys, and STT provider/model, across the
+machines you use, via a LunarWerx Connections account.
+
+**This feature is opt-in and off by default.** If you never click "Sync
+settings with Connections," nothing about how QuickDictate runs changes:
+settings stay local, and no account or network activity for this feature ever
+happens.
+
+## What it does
+
+A **"Settings sync"** card lives in the Settings window. Click *Sync settings
+with Connections* and your system browser opens a normal sign-in page
+(OAuth Authorization Code + PKCE), your password never touches the app
+itself. Once signed in:
+
+- Your portable preferences are pulled down on Settings-window open (so any
+  changes made on another machine show up automatically) and on first sign-in.
+- Your preferences are pushed up whenever you hit **Save** (or **Save &
+  Restart**).
+- Clicking **Stop syncing** signs the app out and drops the local sign-in, so
+  everything reverts to local-only. It does not delete anything straight
+  away: your synced settings and up to 20 earlier versions move to your
+  Connections Trash, and are deleted for good when the Trash period ends.
+
+### How two machines merge (since 1.2.1)
+
+Sync is a three-way merge. Each machine remembers the cloud copy it last saw
+(`quickdictate-sync-baseline.json` in the data folder; it holds preferences
+only, never keys) and compares against it:
+
+- **Save** sends only the settings you changed on this machine since that
+  copy, so a machine that hasn't pulled lately can't overwrite a newer change
+  made on your other machine. A text replacement you delete stays deleted.
+- **Pull** applies only what changed in the cloud since that copy, so a change
+  you saved while offline isn't reverted either.
+- With no baseline yet (first sign-in, or after **Stop syncing**, which
+  deletes it), the first exchange falls back to the whole document.
+
+The merge code is `changes_since` / `remote_changes` in `src/sync/schema.rs`;
+the baseline file is owned by `src/sync/baseline.rs`.
+
+## What syncs and what never does
+
+- **Syncs:** portable preferences only, mode, language, toggle/hold hotkeys,
+  timing tweaks, output formatting toggles, sound/close-behavior settings,
+  STT provider and model choice, text replacements, per-app profiles, the
+  custom vocabulary, the voice-commands toggle, and similar app-behavior
+  settings.
+- **Never syncs:** your **API keys**, microphone **audio**, or **transcripts**.
+  Also excluded: window position/size and other per-machine or local-only
+  settings (e.g. `run_at_startup`, logging toggles, `update_auto_install`,
+  `protect_keys_at_rest`), since those don't make sense to carry between
+  machines.
+
+The two lists are enforced in code: every settings field must be declared
+either synced or machine-local (`SYNCED_KEYS` / `NEVER_SYNCED` in
+`src/sync/schema.rs`), and a test fails the build if a new field is in neither, so
+nothing can silently start or stop syncing again.
+
+Your API keys, dictation audio, and recognized text never leave your machine
+because of this feature, it only ever reads and writes the small set of
+preference fields listed above.
+
+## How to turn it on
+
+1. Open **Settings**.
+2. Find the **Settings sync** card and click **Sync settings with
+   Connections**.
+3. Sign in via the browser window that opens.
+4. Your preferences sync automatically from then on, on Settings-window open
+   and on Save.
+
+## How to turn it off
+
+Open **Settings**, find the **Settings sync** card, and click **Stop
+syncing**. This signs the app out, and QuickDictate goes back to fully
+local-only operation. Your synced settings, and up to 20 earlier versions
+Connections keeps so you can roll back, move to your Connections Trash, where
+they are deleted for good when the Trash period ends: 90 days for anything
+deleted from 29 October 2026, and shorter before then. If your sign-in has
+expired, Stop syncing only signs you out on this PC and leaves the server copy
+where it is. To have your synced settings deleted at once, or if you can no
+longer sign in, email lunawerx@gmail.com and they are deleted within one
+month.
+
+See [.github/SECURITY.md](../.github/SECURITY.md) for the full data-handling
+policy.
