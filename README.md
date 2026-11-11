@@ -80,7 +80,7 @@ connection. Microphone audio stays on your PC.
 | 💬 **Clear live feedback** | Five cloud providers stream words as you talk; batch and Local modes show when the final result is processing. |
 | 🪄 **Little touches that add up** | A custom vocabulary so your jargon is heard right the first time, a fix-list for words it mishears, per-app profiles, a searchable dictation history that survives restarts and updates, a *"scratch that"* voice command, and your music muted or turned down while you talk. |
 | 🤖 **Works with AI tools** | Dictate prompts into Claude, ChatGPT, Cursor or any terminal, or run it as an MCP server so an AI app can transcribe audio files. |
-| 🔒 **Your data stays yours** | Cloud audio goes only to the provider you pick; Local audio never leaves the PC. Optional settings sync is opt-in, and updates ask before installing. |
+| 🔒 **Your data stays yours** | Cloud audio goes only to the engine you pick; Local audio never leaves the PC. Optional settings sync is opt-in, and updates ask before installing. |
 
 ## 🚀 Quick start
 
@@ -182,8 +182,10 @@ models need extra disk space and enough RAM/VRAM to keep the selected model resi
 active.
 
 **Is my data sent anywhere?**
-Your microphone audio goes only to the one cloud provider you select (or nowhere, with the Local
-option), never to the QuickDictate maintainer. QuickDictate itself reports only two things: the update
+Your microphone audio goes only to the engine you select: a cloud provider with your own
+key, Connections Dictation (LunarWerx's own optional engine, only if you choose it and sign
+in), or nowhere, with the Local option. If you turn on the optional AI polish pass, the
+transcript text goes to the AI service you set for it. QuickDictate itself reports only two things: the update
 check, at most once a day while *Check for updates daily* is on, and, only if you opt in, a
 pseudonymous daily usage rollup (numbers only, never your words). An opt-in settings sync can also
 sync preferences like hotkeys and language, but never your API keys, audio, or transcripts.

@@ -1,10 +1,12 @@
 name: Release
 
-# QuickDictate is a genuinely portable, single Windows executable. Its ~12 MB direct `.exe`
-# is both the obvious human download and the self-updater payload. A ZIP saves about 6 MB, but
-# keeping one canonical asset avoids an archive extractor in the running dictation app and
-# preserves updates from every already-published build. GitHub supplies the mandatory SHA-256
-# digest the updater verifies.
+# QuickDictate is a genuinely portable, single Windows executable. Its 15-17 MB direct `.exe`
+# is both the obvious human download and the self-updater payload. A ZIP would save some
+# megabytes, but keeping one canonical asset avoids an archive extractor in the running
+# dictation app and preserves updates from every already-published build. GitHub supplies the
+# mandatory SHA-256 digest the updater verifies. Beside it ship SHA256SUMS.txt and
+# THIRD-PARTY-NOTICES.html, the licence texts of every crate linked into the exe (the About
+# window links to the copy on the running version's release).
 
 # The code lives in the private LunarWerxs/QuickDictate-private; this workflow stays in the
 # public storefront repo, because the Entra federated credential trusts exactly
@@ -34,7 +36,7 @@ concurrency:
 jobs:
   release:
     timeout-minutes: 60
-    name: validate · build · smoke · publish
+    name: validate · deny · test · build · sign · publish
     runs-on: windows-latest
     # The federated credential in Entra trusts exactly one subject:
     # repo:LunarWerxs/QuickDictate:environment:release. Without this line the token
@@ -53,11 +55,11 @@ jobs:
           ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
           persist-credentials: false
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          toolchain: stable
-          components: rustfmt, clippy
+      # The checked-out rust-toolchain.toml pins the exact compiler (and clippy/rustfmt), which
+      # rustup installs on the first cargo invocation, as ci.yml does. A toolchain action here
+      # would override that pin and ship a binary from a compiler nothing else tested.
+      - name: Toolchain
+        run: rustup show
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -74,6 +76,15 @@ jobs:
           }
           ./scripts/release_notes.ps1 -Version $version -OutPath RELEASE_NOTES.md
 
+      # The advisory, licence and source scan, against today's advisory database: a crate
+      # that turned vulnerable since the last CI run stops the release here, before anything
+      # is built or published. Same pinned binary ci.yml installs.
+      - name: Install cargo-deny
+        shell: pwsh
+        run: ./scripts/install-cargo-tool.ps1 -Tool cargo-deny
+      - name: cargo deny check
+        run: cargo deny check
+
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
@@ -82,6 +93,17 @@ jobs:
         run: cargo test --locked --no-fail-fast
       - name: Build release executable
         run: cargo build --release --locked
+
+      # The exe statically links MIT, Apache-2.0, BSD, MPL-2.0, OFL and other crates whose
+      # licences require their notice to travel with binary copies. cargo-about writes every
+      # licence text and the crates under it from about.toml (the same accepted list as
+      # deny.toml) and about.hbs; `--fail` stops the release if a crate's licence cannot be
+      # resolved rather than shipping an incomplete list.
+      - name: Install cargo-about
+        shell: pwsh
+        run: ./scripts/install-cargo-tool.ps1 -Tool cargo-about
+      - name: Third-party notices
+        run: cargo about generate --fail about.hbs -o THIRD-PARTY-NOTICES.html
 
       - name: Validate the exact public executable
         shell: pwsh
@@ -163,11 +185,14 @@ jobs:
           New-Item -ItemType Directory -Path out -Force | Out-Null
           Copy-Item -LiteralPath target/release/quickdictate.exe `
             -Destination out/quickdictate.exe
+          Copy-Item -LiteralPath THIRD-PARTY-NOTICES.html `
+            -Destination out/THIRD-PARTY-NOTICES.html
           $hash = (Get-FileHash -LiteralPath out/quickdictate.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          $noticesHash = (Get-FileHash -LiteralPath out/THIRD-PARTY-NOTICES.html -Algorithm SHA256).Hash.ToLowerInvariant()
           # LF, not the CRLF Set-Content writes on Windows: `sha256sum -c` on Linux and macOS
           # reads the CR as part of the file name and reports the download missing.
-          Set-Content -LiteralPath out/SHA256SUMS.txt -Value "$hash  quickdictate.exe`n" `
-            -NoNewline -Encoding ascii
+          $sums = "$hash  quickdictate.exe`n$noticesHash  THIRD-PARTY-NOTICES.html`n"
+          Set-Content -LiteralPath out/SHA256SUMS.txt -Value $sums -NoNewline -Encoding ascii
           # Echo the AUTHORITATIVE digest. The validation step earlier printed a sha256 of the
           # binary BEFORE signing (correct for what it checks - PE structure, subsystem, version
           # resources - none of which Authenticode touches), and signing changes the bytes. Without
@@ -189,7 +214,13 @@ jobs:
           key="$RUNNER_TEMP/storefront_tag_key"
           printf '%s\n' "$TAG_KEY" > "$key"
           chmod 600 "$key"
-          export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          # GitHub's published ed25519 host key (api.github.com/meta, `ssh_keys`), pinned so the
+          # write key is only ever offered to github.com itself, never to whatever answered first.
+          known="$RUNNER_TEMP/storefront_known_hosts"
+          printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$known"
+          # Single-quoted inside: git hands this string to sh, which would otherwise eat the
+          # backslashes of the runner's Windows temp path.
+          export GIT_SSH_COMMAND="ssh -i '$key' -o IdentitiesOnly=yes -o UserKnownHostsFile='$known' -o StrictHostKeyChecking=yes"
           git init -q "$RUNNER_TEMP/storefront"
           cd "$RUNNER_TEMP/storefront"
           existing=$(git ls-remote "$remote" "refs/tags/$RELEASE_TAG" | cut -f1)
@@ -200,7 +231,7 @@ jobs:
             git push -q "$remote" "FETCH_HEAD:refs/tags/$RELEASE_TAG"
             echo "tagged ${{ github.sha }} as $RELEASE_TAG"
           fi
-          rm -f "$key"
+          rm -f "$key" "$known"
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3

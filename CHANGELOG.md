@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+- **Clean-up no longer breaks web addresses, abbreviations or file names.** `example.com`, `e.g.` and `notes.txt` stay as you said them, and the English-only rules no longer run on other languages.
+- **Picking Connections Dictation or Local now sticks** when you also have API keys saved.
+- **A password you copied before dictating stays out of Clipboard History** when QuickDictate puts your clipboard back: the password manager's "do not record" marks are restored with it.
+- **One bad hotkey no longer turns off every hotkey.** A key name QuickDictate cannot use falls back to its default, and Settings tells you. Out-of-range numbers in settings.json are repaired the same way.
+- **You can see why a dictation failed.** The tray tooltip and Settings show the last error's reason. A crash leaves a short `last-error.txt` in the data folder, even with logging off.
+- **A network filter's error page no longer benches your API key for hours.** Only the provider's own answer counts against a key.
+- **Updates are checked for LunarWerx's signature before they install**, and the local engine's runtime is re-checked before it loads.
+- **QuickDictate starts without a microphone** and picks one up when you plug it in. A restart or update can no longer leave it not running.
+- **The status pip scales with your display.** Audio from 48 kHz microphones is filtered before it is converted, so high sounds no longer fold into speech.
+- **AI clean-up waits up to 2 seconds** (it was 0.3 s, which skipped the default model almost every time).
+- **Per-dictation timings are only written with logging on**, and the file is capped like the main log.
+- **Every release now ships its third-party licence notices** (About, Third-party licences).
+- **File transcription for AI apps** (`--mcp`) tries each of your keys, follows the same licence as dictation, tells the app it uploads audio, and never creates a settings file.
+- **Settings written by a newer QuickDictate keep their new options** when an older copy saves, and a key that cannot be decrypted is kept rather than lost.
+
+- **Start with Windows now starts QuickDictate as soon as you sign in, before other startup apps.**
 - **Connections Dictation engine.** Pick **Connections** in the speech-provider list, then **Use my Connections minutes** to sign in with your Connections account. Audio streams live to the Connections Dictation service, so no API key is needed. Signing in for dictation does not turn settings sync on, and signing out removes the engine's access.
 - **No Settings window at launch when you dictate without a key.** Starting with Connections Dictation selected, or with a local model installed, no longer shows the "No API keys configured" notice or opens Settings.
 - **One press, one paste.** With output held until you release the hotkey, the provider's last words now join the same paste instead of landing a moment later as a second one that could overwrite the first before the app had read it. A press is also one entry in Recent transcriptions, so a long-press replay brings back the whole press.

@@ -63,5 +63,13 @@
 
   "voice_commands": false,
 
+  "polish_enabled": false,
+  "polish_deadline_ms": 2000,
+  "polish_endpoint": "https://api.openai.com/v1/chat/completions",
+  "polish_model": "gpt-4.1-mini",
+  "polish_keys": [],
+
+  "error_reporting_enabled": false,
+  "share_usage_stats": false,
   "persist_history": true
 }
