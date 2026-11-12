@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.6.1] - 2026-11-12
+
+**TL;DR**
+
+- **Connections Dictation engine**: pick Connections in the speech-provider list and sign in; no API key needed.
+- **One press, one paste**: the provider's last words join the same paste instead of a second one.
+- **Start with Windows** now starts QuickDictate right at sign-in, and it starts without a microphone.
+- **Clean-up leaves web addresses, abbreviations and file names alone.**
+- **Privacy and safety**: copied passwords stay out of Clipboard History, updates are signature-checked, and one bad hotkey no longer disables the rest.
+- **You can see why a dictation failed**, and a network filter's error page no longer benches your key.
+
+<details><summary><b>Everything in 1.6.1</b></summary>
+
 - **Clean-up no longer breaks web addresses, abbreviations or file names.** `example.com`, `e.g.` and `notes.txt` stay as you said them, and the English-only rules no longer run on other languages.
 - **Picking Connections Dictation or Local now sticks** when you also have API keys saved.
 - **A password you copied before dictating stays out of Clipboard History** when QuickDictate puts your clipboard back: the password manager's "do not record" marks are restored with it.
@@ -25,6 +38,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Connections Dictation engine.** Pick **Connections** in the speech-provider list, then **Use my Connections minutes** to sign in with your Connections account. Audio streams live to the Connections Dictation service, so no API key is needed. Signing in for dictation does not turn settings sync on, and signing out removes the engine's access.
 - **No Settings window at launch when you dictate without a key.** Starting with Connections Dictation selected, or with a local model installed, no longer shows the "No API keys configured" notice or opens Settings.
 - **One press, one paste.** With output held until you release the hotkey, the provider's last words now join the same paste instead of landing a moment later as a second one that could overwrite the first before the app had read it. A press is also one entry in Recent transcriptions, so a long-press replay brings back the whole press.
+
+</details>
 
 ## [1.5.0] - 2026-10-09
 

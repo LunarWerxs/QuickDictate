@@ -1,6 +1,6 @@
 <div align="center">
 
-<a href="https://quickdictate.github.io/">
+<a href="https://quickdictate.lunarwerx.com/">
   <img src="assets/og-image.png" alt="QuickDictate, talk instead of type, in any app" width="820">
 </a>
 
@@ -13,13 +13,13 @@ Voice typing for Windows 10 and 11. Hold or tap a global hotkey, speak, and the 
 types straight into whatever window has focus: your editor, a chat box, an email, a terminal,
 any web text field. Use <i>your own</i> speech-to-text API key, or install an optional local
 Whisper, Parakeet or Cohere model for fully offline dictation. <b>No QuickDictate subscription
-or account.</b>
+or account.</b> Free for personal and noncommercial use. Work use needs a licence: US$19.99 once or US$1.99 a month per installation.
 </p>
 
 <p>
   <a href="https://github.com/LunarWerxs/QuickDictate/releases/latest/download/quickdictate.exe"><b>⬇️ Download for Windows</b></a>
   &nbsp;·&nbsp;
-  <a href="https://quickdictate.github.io/"><b>🌐 Website</b></a>
+  <a href="https://quickdictate.lunarwerx.com/"><b>🌐 Website</b></a>
   &nbsp;·&nbsp;
   <a href="docs/GUIDE.md">📖 Full guide</a>
   &nbsp;·&nbsp;
